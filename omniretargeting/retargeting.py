@@ -223,25 +223,16 @@ class GenericInteractionRetargeter:
         self.smooth_weight = 0.2
     
     def _validate_joint_mapping(self):
-        """Validate that all mapped robot links exist. Raise error if any are missing."""
-        # Get all body names from robot
-        robot_bodies = set()
-        for i in range(self.robot_model.nbody):
-            body_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, i)
-            if body_name:
-                robot_bodies.add(body_name)
+        """Validate that all mapped robot links exist. Raise error if any are missing.
         
-        # Check all mapped bodies exist
-        missing_bodies = []
-        for target_name, link_name in self.joint_mapping.items():
-            if link_name not in robot_bodies:
-                missing_bodies.append((target_name, link_name))
-        
-        if missing_bodies:
-            raise ValueError(
-                f"The following robot links from joint_mapping were not found in URDF: {missing_bodies}. "
-                f"Please check your joint_mapping. Available bodies: {sorted(list(robot_bodies))[:10]}..."
-            )
+        This method now delegates to the shared utility function in utils.py.
+        """
+        from .utils import validate_robot_joint_mapping
+        validate_robot_joint_mapping(
+            self.robot_model,
+            self.joint_mapping,
+            raise_on_missing=True
+        )
 
     def _setup_terrain_interaction(self):
         """Setup terrain interaction parameters."""

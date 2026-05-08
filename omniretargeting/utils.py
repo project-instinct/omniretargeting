@@ -288,4 +288,52 @@ def compute_world_joint_orientations(*args, **kwargs):
 def load_smplx_trajectory(*args, **kwargs):
     from omniretargeting.data_sources.smplx import load_smplx_trajectory as _impl
 
-    return _impl(*args, **kwargs)
+
+
+def validate_robot_joint_mapping(
+    robot_model,
+    joint_mapping: dict,
+    raise_on_missing: bool = False
+) -> list:
+    """
+    Validate that robot links in joint_mapping exist in the robot model.
+    
+    This is a shared utility to avoid code duplication between OmniRetargeter
+    and GenericInteractionRetargeter.
+    
+    Args:
+        robot_model: MuJoCo model of the robot
+        joint_mapping: Dictionary mapping source target names to robot link (body) names
+        raise_on_missing: If True, raise ValueError when missing links are found.
+                         If False, return list of missing links.
+    
+    Returns:
+        List of missing robot link names (empty if all exist)
+    
+    Raises:
+        ValueError: If raise_on_missing=True and missing links are found
+    
+    Note:
+        joint_mapping maps source target names to robot BODY (link) names,
+        not joint names. This function checks for body names in the URDF.
+    """
+    import mujoco
+    
+    robot_bodies = set()
+    for i in range(robot_model.nbody):
+        body_name = mujoco.mj_id2name(robot_model, mujoco.mjtObj.mjOBJ_BODY, i)
+        if body_name:
+            robot_bodies.add(body_name)
+    
+    mapped_bodies = set(joint_mapping.values())
+    missing_bodies = mapped_bodies - robot_bodies
+    
+    if missing_bodies and raise_on_missing:
+        missing_list = sorted(list(missing_bodies))
+        available_sample = sorted(list(robot_bodies))[:10]
+        raise ValueError(
+            f"The following robot links from joint_mapping were not found in URDF: {missing_list}. "
+            f"Please check your joint_mapping. Available bodies (first 10): {available_sample}..."
+        )
+    
+    return sorted(list(missing_bodies))

@@ -1173,18 +1173,15 @@ class OmniRetargeter:
         
         Note: joint_mapping maps source target names to robot BODY (link) names, not joint names.
         So we check for body names in the URDF.
-        """
-        # Get all body names from the robot model
-        robot_bodies = set()
-        for i in range(self.robot_model.nbody):
-            body_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, i)
-            if body_name:
-                robot_bodies.add(body_name)
         
-        # Check which mapped body names don't exist
-        mapped_bodies = set(self.joint_mapping.values())
-        missing_bodies = mapped_bodies - robot_bodies
-        return list(missing_bodies)
+        This method now delegates to the shared utility function in utils.py.
+        """
+        from .utils import validate_robot_joint_mapping
+        return validate_robot_joint_mapping(
+            self.robot_model,
+            self.joint_mapping,
+            raise_on_missing=False
+        )
 
     def _visualize_trajectory(self, trajectory: np.ndarray, scaled_terrain: trimesh.Trimesh):
         """
