@@ -5,8 +5,6 @@ from __future__ import annotations
 import numpy as np
 from pathlib import Path
 from typing import Tuple, Optional
-import smplx
-import torch
 import trimesh
 from scipy.spatial.transform import Rotation
 
@@ -161,23 +159,10 @@ def align_terrain_to_coordinates(mesh: trimesh.Trimesh,
 
 
 def validate_smplx_trajectory(trajectory: np.ndarray) -> bool:
-    """Validate SMPLX trajectory format."""
-    if len(trajectory.shape) != 3:
-        return False
+    """Validate legacy SMPL-X trajectory format through the neutral motion validator."""
+    from omniretargeting.data_sources.base import validate_motion_positions
 
-    num_frames, num_joints, num_coords = trajectory.shape
-
-    if num_coords != 3:
-        return False
-
-    if num_frames == 0 or num_joints == 0:
-        return False
-
-    # Check for NaN or infinite values
-    if not np.isfinite(trajectory).all():
-        return False
-
-    return True
+    return validate_motion_positions(trajectory)
 
 
 def extract_smplx_joint_positions(trajectory: np.ndarray,
@@ -294,184 +279,13 @@ def calculate_laplacian_matrix(vertices, adj_list, epsilon=1e-6, uniform_weight=
     return laplacian_matrix
 
 
-def compute_world_joint_orientations(
-    global_orient: np.ndarray,
-    full_pose: np.ndarray,
-    parents: np.ndarray,
-    num_body_joints: int = 22,
-) -> np.ndarray:
-    """
-    Compute world-frame joint orientations from SMPLX pose parameters.
-    
-    Args:
-        global_orient: Root orientation in axis-angle format, shape (T, 3)
-        full_pose: Full pose parameters in axis-angle format, shape (T, J_total, 3)
-        parents: Parent indices for kinematic tree, shape (J_total,)
-        num_body_joints: Number of body joints to return (default 22)
-    
-    Returns:
-        Joint orientations as quaternions (wxyz format), shape (T, J, 4)
-    """
-    num_frames = global_orient.shape[0]
-    num_joints = min(full_pose.shape[1], num_body_joints)
-    
-    # Output: quaternions in wxyz format
-    joint_orientations = np.zeros((num_frames, num_joints, 4))
-    
-    for frame_idx in range(num_frames):
-        # Store rotations for this frame
-        frame_rotations = []
-        
-        for joint_idx in range(num_joints):
-            if joint_idx == 0:
-                # Root joint: use global_orient directly
-                rot = Rotation.from_rotvec(global_orient[frame_idx])
-            else:
-                # Other joints: multiply parent's world rotation by local rotation
-                parent_idx = parents[joint_idx]
-                if parent_idx >= 0 and parent_idx < len(frame_rotations):
-                    parent_rot = frame_rotations[parent_idx]
-                    local_rot = Rotation.from_rotvec(full_pose[frame_idx, joint_idx])
-                    rot = parent_rot * local_rot
-                else:
-                    # Fallback: use local rotation as world rotation
-                    rot = Rotation.from_rotvec(full_pose[frame_idx, joint_idx])
-            
-            frame_rotations.append(rot)
-            # Store as quaternion in wxyz format (scalar_first=True)
-            joint_orientations[frame_idx, joint_idx] = rot.as_quat(scalar_first=True)
-    
-    return joint_orientations
+def compute_world_joint_orientations(*args, **kwargs):
+    from omniretargeting.data_sources.smplx import compute_world_joint_orientations as _impl
+
+    return _impl(*args, **kwargs)
 
 
-def load_smplx_trajectory(
-    smplx_file: Path,
-    smplx_model_directory: Optional[str] = None,
-    gender: str = "neutral",
-    return_meta: bool = False,
-) -> tuple[np.ndarray, np.ndarray | None] | tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-    """
-    Load SMPLX trajectory from file.
-    
-    Handles:
-    - Standard .npy files with pre-computed joint positions
-    - Pre-processed .npz files with 'global_joint_positions' key
-    - Raw SMPLX-NG .npz files (e.g., stageii.npz) with SMPLX parameters
-    
-    For raw SMPLX-NG files, requires smplx_model_directory to perform forward kinematics.
-    
-    Args:
-        smplx_file: Path to trajectory file (.npy or .npz)
-        smplx_model_directory: Path to SMPLX model files (required for raw SMPLX-NG files and orientation computation)
-        gender: Gender for SMPLX model ('neutral', 'male', 'female')
-        return_meta: If True, return (positions, orientations, root_orient, trans) instead of (positions, orientations)
-    
-    Returns:
-        Tuple of (positions, orientations) or (positions, orientations, root_orient, trans):
-        
-        If return_meta=False (default):
-            - positions: Joint positions array of shape (T, J, 3)
-            - orientations: Joint orientations as quaternions (wxyz), shape (T, J, 4)
-                           Returns None if orientations cannot be computed (e.g., .npy files)
-        
-        If return_meta=True:
-            - positions: Joint positions array of shape (T, J, 3)
-            - orientations: Joint orientations as quaternions (wxyz), shape (T, J, 4)
-                           Returns None if orientations cannot be computed
-            - root_orient: Root orientation parameters in axis-angle format, shape (T, 3) or None
-            - trans: Translation parameters, shape (T, 3) or None
-    """
-    if smplx_file.suffix == ".npy":
-        joints = np.load(smplx_file, allow_pickle=True)
-        # Cannot compute orientations from positions only
-        print("Warning: Cannot compute orientations from .npy file (positions only). Returning None for orientations.")
-        if return_meta:
-            return joints, None, None, None
-        return joints, None
+def load_smplx_trajectory(*args, **kwargs):
+    from omniretargeting.data_sources.smplx import load_smplx_trajectory as _impl
 
-    smplx_data = np.load(smplx_file, allow_pickle=True)
-
-    if isinstance(smplx_data, np.lib.npyio.NpzFile) and "global_joint_positions" in smplx_data:
-        joints = smplx_data["global_joint_positions"]
-        root_orient = smplx_data["root_orient"] if "root_orient" in smplx_data else None
-        trans = smplx_data["trans"] if "trans" in smplx_data else None
-        
-        # Try to compute orientations if we have the necessary data
-        orientations = None
-        if "full_pose" in smplx_data and smplx_model_directory is not None and root_orient is not None:
-            # Load body model to get parent structure
-            body_model = smplx.create(
-                smplx_model_directory,
-                "smplx",
-                gender=gender,
-                use_pca=False,
-            )
-            full_pose = smplx_data["full_pose"]
-            if isinstance(full_pose, np.ndarray) and len(full_pose.shape) == 2:
-                # Reshape from (T, J*3) to (T, J, 3)
-                full_pose = full_pose.reshape(full_pose.shape[0], -1, 3)
-            
-            orientations = compute_world_joint_orientations(
-                root_orient,
-                full_pose,
-                body_model.parents.cpu().numpy(),
-                num_body_joints=22,
-            )
-        else:
-            print("Warning: Cannot compute orientations from .npz file (missing full_pose, root_orient, or model directory). Returning None for orientations.")
-        
-        if return_meta:
-            return joints, orientations, root_orient, trans
-        return joints, orientations
-
-    # Raw SMPLX-NG file - need to run forward kinematics
-    body_model = smplx.create(
-        smplx_model_directory,
-        "smplx",
-        gender=str(smplx_data.get("gender", "neutral")),
-        use_pca=False,
-    )
-
-    # Extract and adjust betas
-    betas = torch.tensor(smplx_data["betas"]).float().view(1, -1)
-    if betas.shape[1] > 10:
-        betas = betas[:, :10]
-
-    num_frames = smplx_data["pose_body"].shape[0]
-    root_orient = smplx_data["root_orient"]
-    trans = smplx_data["trans"]
-    smplx_output = body_model(
-        betas=betas,  # Shape parameters (1, 10)
-        global_orient=torch.tensor(root_orient).float(),  # (N, 3)
-        body_pose=torch.tensor(smplx_data["pose_body"]).float(),  # (N, 63)
-        transl=torch.tensor(trans).float(),  # (N, 3)
-        left_hand_pose=torch.zeros(num_frames, 45).float(),  # Pose parameters per frame
-        right_hand_pose=torch.zeros(num_frames, 45).float(),  # Pose parameters per frame
-        jaw_pose=torch.zeros(num_frames, 3).float(),  # Pose parameters per frame
-        leye_pose=torch.zeros(num_frames, 3).float(),  # Pose parameters per frame
-        reye_pose=torch.zeros(num_frames, 3).float(),  # Pose parameters per frame
-        expression=torch.zeros(num_frames, 10).float(),  # Expression parameters expanded to num_frames
-        return_full_pose=True,
-    )
-
-    # Extract joint positions
-    joints = smplx_output.joints.detach().cpu().numpy()
-
-    # Return only body joints (first 22)
-    joints = joints[:, :22, :]
-    
-    # Compute world-frame orientations
-    full_pose = smplx_output.full_pose.detach().cpu().numpy()
-    # Reshape from (T, J*3) to (T, J, 3)
-    full_pose = full_pose.reshape(num_frames, -1, 3)
-    
-    orientations = compute_world_joint_orientations(
-        root_orient,
-        full_pose,
-        body_model.parents.cpu().numpy(),
-        num_body_joints=22,
-    )
-    
-    if return_meta:
-        return joints, orientations, root_orient, trans
-    return joints, orientations
+    return _impl(*args, **kwargs)

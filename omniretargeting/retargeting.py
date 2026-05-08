@@ -11,19 +11,16 @@ from scipy.spatial.transform import Rotation
 import trimesh
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
-import yourdfpy
 
 from .utils import (
-    load_terrain_mesh,
     sample_points_on_mesh,
-    scale_mesh,
     compute_mesh_height_at_point,
-    validate_smplx_trajectory,
     transform_points_local_to_world,
     get_adjacency_list,
     calculate_laplacian_coordinates,
     calculate_laplacian_matrix,
 )
+from .data_sources.base import validate_motion_positions
 
 
 class GenericInteractionRetargeter:
@@ -47,7 +44,7 @@ class GenericInteractionRetargeter:
         foot_sticking_tolerance: float = 1e-3,
         collision_detection_threshold: float = 0.1,
         terrain_sample_points: int = 100,
-        valid_joint_names: Optional[List[str]] = None,
+        source_target_names: Optional[List[str]] = None,
         replace_cylinders_with_capsules: bool = False,
         hard_penetration_constraint: bool = False,
         link_offset_config: Optional[Dict[str, np.ndarray]] = None,
@@ -58,7 +55,7 @@ class GenericInteractionRetargeter:
             robot_model: MuJoCo model of the robot
             robot_data: MuJoCo data for the robot
             terrain_mesh: Terrain mesh (already scaled if needed)
-            joint_mapping: Mapping from SMPLX joint names to robot link names
+            joint_mapping: Mapping from source target names to robot link names
             robot_height: Height of the robot
             q_a_init_idx: Index where optimization variables start
             step_size: Trust region size for SQP
@@ -66,7 +63,7 @@ class GenericInteractionRetargeter:
             foot_sticking_tolerance: Tolerance for foot sticking
             collision_detection_threshold: Distance threshold for collision detection
             terrain_sample_points: Number of sampled terrain points for interaction mesh
-            valid_joint_names: Ordered list of joint names to ensure consistent ordering
+            source_target_names: Ordered source target names to ensure consistent ordering
             replace_cylinders_with_capsules: If True, replace all cylinder collision geoms
                 with capsules before computing penetration constraints. This matches
                 IsaacLab/PhysX convention where ``replace_cylinders_with_capsules=True``
@@ -79,13 +76,13 @@ class GenericInteractionRetargeter:
                 link names (values in joint_mapping), values are 3-element local-frame
                 offset vectors [dx, dy, dz] (meters). The offset represents the
                 displacement from the link body origin to the actual target position
-                (e.g., a SMPLX joint position). The local frame is the link
+                (e.g., a source landmark or keypoint position). The local frame is the link
                 coordinate system as expressed in the URDF.
         """
         self.robot_model = robot_model
         self.robot_data = robot_data
         self.terrain_mesh = terrain_mesh
-        self.joint_mapping = joint_mapping  # This should already be filtered to valid joints only
+        self.joint_mapping = joint_mapping  # This should already be filtered to valid source targets only.
         self.robot_height = robot_height
         self.hard_penetration_constraint = hard_penetration_constraint
 
@@ -104,22 +101,22 @@ class GenericInteractionRetargeter:
             print(f"Loaded link offsets for {len(self.link_offset_config)} link(s): "
                   f"{list(self.link_offset_config.keys())}")
 
-        # CRITICAL: Store ordered joint names to ensure consistent ordering
-        # This ensures human_joints[i] matches robot_points[i] for all i
-        if valid_joint_names is not None:
-            self.valid_joint_names = valid_joint_names
-            # Verify that valid_joint_names matches joint_mapping keys
-            if set(self.valid_joint_names) != set(joint_mapping.keys()):
+        # CRITICAL: Store ordered source target names to ensure consistent ordering.
+        # This ensures source_target_positions[i] matches robot_points[i] for all i.
+        if source_target_names is not None:
+            self.source_target_names = source_target_names
+            # Verify that source_target_names matches joint_mapping keys.
+            if set(self.source_target_names) != set(joint_mapping.keys()):
                 raise ValueError(
-                    f"valid_joint_names ({set(self.valid_joint_names)}) "
+                    f"source_target_names ({set(self.source_target_names)}) "
                     f"does not match joint_mapping keys ({set(joint_mapping.keys())})"
                 )
         else:
             # Fallback: use dictionary insertion order (Python 3.7+)
-            self.valid_joint_names = list(joint_mapping.keys())
+            self.source_target_names = list(joint_mapping.keys())
         
-        # Validate that all joints in mapping exist in robot
-        # This is a final safety check - fail fast if joints are missing
+        # Validate that all mapped robot links exist.
+        # This is a final safety check - fail fast if links are missing.
         self._validate_joint_mapping()
 
         # Retargeting parameters
@@ -226,7 +223,7 @@ class GenericInteractionRetargeter:
         self.smooth_weight = 0.2
     
     def _validate_joint_mapping(self):
-        """Validate that all joints in mapping exist in robot. Raise error if any are missing."""
+        """Validate that all mapped robot links exist. Raise error if any are missing."""
         # Get all body names from robot
         robot_bodies = set()
         for i in range(self.robot_model.nbody):
@@ -236,9 +233,9 @@ class GenericInteractionRetargeter:
         
         # Check all mapped bodies exist
         missing_bodies = []
-        for joint_name, link_name in self.joint_mapping.items():
+        for target_name, link_name in self.joint_mapping.items():
             if link_name not in robot_bodies:
-                missing_bodies.append((joint_name, link_name))
+                missing_bodies.append((target_name, link_name))
         
         if missing_bodies:
             raise ValueError(
@@ -252,19 +249,23 @@ class GenericInteractionRetargeter:
         self.terrain_points = sample_points_on_mesh(self.terrain_mesh, self.terrain_sample_points)
 
 
-    def create_interaction_mesh(self, human_joints: np.ndarray, terrain_points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    def create_interaction_mesh(
+        self,
+        source_target_positions: np.ndarray,
+        terrain_points: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Create interaction mesh from human joints and terrain points.
+        Create interaction mesh from source target positions and terrain points.
 
         Args:
-            human_joints: Human joint positions (N, 3)
+            source_target_positions: Source target positions (N, 3)
             terrain_points: Terrain surface points (M, 3)
 
         Returns:
             Tuple of (vertices, tetrahedra)
         """
-        # Combine human joints and terrain points
-        vertices = np.vstack([human_joints, terrain_points])
+        # Combine source targets and terrain points.
+        vertices = np.vstack([source_target_positions, terrain_points])
 
         # Create Delaunay triangulation
         tri = Delaunay(vertices)
@@ -273,17 +274,17 @@ class GenericInteractionRetargeter:
 
     def retarget_frame(
         self,
-        human_joints: np.ndarray,
+        source_target_positions: np.ndarray,
         q_init: np.ndarray,
         max_iter: int = 10,
         q_last: Optional[np.ndarray] = None,
         target_base_orientation: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
-        Retarget a single frame of human motion to robot motion.
+        Retarget a single frame of source target positions to robot motion.
 
         Args:
-            human_joints: Human joint positions (N, 3)
+            source_target_positions: Mapped source target positions (N, 3)
             q_init: Initial robot configuration
             max_iter: Maximum optimization iterations
             q_last: Configuration at previous time step (for smoothness)
@@ -291,14 +292,12 @@ class GenericInteractionRetargeter:
         Returns:
             Optimized robot configuration
         """
-        # Note: self.terrain_points are sampled from self.terrain_mesh
-        # In core.py, self.terrain_mesh is already the *scaled* terrain mesh passed to __init__
-        # So we don't need to apply terrain_scale again here.
-        # We use self.terrain_points directly.
-        scaled_terrain_points = self.terrain_points 
+        # self.terrain_points are sampled from the terrain mesh passed to this retargeter.
+        # The caller owns any batch scaling before constructing the stream state.
+        terrain_points = self.terrain_points
 
         # Create interaction mesh
-        vertices, tetrahedra = self.create_interaction_mesh(human_joints, scaled_terrain_points)
+        vertices, tetrahedra = self.create_interaction_mesh(source_target_positions, terrain_points)
 
         # Create adjacency list
         adj_list = get_adjacency_list(tetrahedra, len(vertices))
@@ -313,7 +312,7 @@ class GenericInteractionRetargeter:
             q_init.copy(),
             target_laplacian,
             adj_list,
-            scaled_terrain_points,
+            terrain_points,
             max_iter=max_iter,
             q_last=q_last,
             target_base_orientation=target_base_orientation
@@ -420,66 +419,66 @@ class GenericInteractionRetargeter:
         self.robot_data.qpos[:] = q
         mujoco.mj_forward(self.robot_model, self.robot_data)
 
-        # Compute Jacobians for mapped joints
+        # Compute Jacobians for mapped robot link points.
         J_V, p_V, _ = self._compute_robot_jacobians(q)
 
         # Create Laplacian matrices
-        # CRITICAL: Ensure robot_points are in the SAME ORDER as human_joints passed to retarget_frame
-        # The order MUST match: human_joints[i] corresponds to robot_points[i] for all i
+        # CRITICAL: Ensure robot_points are in the SAME ORDER as source_target_positions passed to retarget_frame.
+        # The order MUST match: source_target_positions[i] corresponds to robot_points[i] for all i.
         # 
         # Order flow:
-        #   1. In core.py: valid_joint_names is built by iterating joint_mapping.keys() in order
-        #   2. In core.py: mapped_joints = human_joints[mapped_joint_indices] where mapped_joint_indices
-        #      corresponds to valid_joint_names[i] for each i
-        #   3. In core.py: valid_joint_mapping preserves valid_joint_names order
-        #   4. Here: self.joint_mapping IS valid_joint_mapping (passed from core.py)
-        #   5. Here: robot_points built by iterating self.joint_mapping.keys() which matches valid_joint_names
+        #   1. In core.py: valid_source_target_names is built by iterating joint_mapping.keys() in order.
+        #   2. In core.py: mapped_source_targets = source_positions[mapped_source_target_indices]
+        #      where mapped_source_target_indices corresponds to valid_source_target_names[i].
+        #   3. In core.py: valid_source_to_robot_link_mapping preserves valid_source_target_names order.
+        #   4. Here: self.joint_mapping is valid_source_to_robot_link_mapping (passed from core.py).
+        #   5. Here: robot_points built by iterating source_target_names.
         #   6. J_V stacked by iterating self.joint_mapping.keys() in the same order
         #
-        # So: human_joints[i] (from valid_joint_names[i]) should match robot_points[i] (from joint_mapping.keys()[i])
-        # CRITICAL: Use self.valid_joint_names to ensure consistent ordering
-        joint_names_ordered = self.valid_joint_names
+        # So: source_target_positions[i] should match robot_points[i].
+        # CRITICAL: Use self.source_target_names to ensure consistent ordering.
+        source_target_names_ordered = self.source_target_names
         
-        # CRITICAL: Verify that p_V has all joints in the correct order
-        if set(joint_names_ordered) != set(p_V.keys()):
-            missing = set(joint_names_ordered) - set(p_V.keys())
-            extra = set(p_V.keys()) - set(joint_names_ordered)
+        # CRITICAL: Verify that p_V has all source targets in the correct order.
+        if set(source_target_names_ordered) != set(p_V.keys()):
+            missing = set(source_target_names_ordered) - set(p_V.keys())
+            extra = set(p_V.keys()) - set(source_target_names_ordered)
             raise RuntimeError(
-                f"Joint mismatch: p_V has different joints than joint_mapping. "
+                f"Source target mismatch: p_V has different targets than joint_mapping. "
                 f"Missing from p_V: {missing}, Extra in p_V: {extra}"
             )
         
         robot_points = []
-        for joint_name in joint_names_ordered:
-            robot_points.append(p_V[joint_name])
+        for target_name in source_target_names_ordered:
+            robot_points.append(p_V[target_name])
         
         robot_points = np.array(robot_points)
         
         # Debug: Print order for first frame to verify
         import sys
         if not hasattr(sys, '_omni_joint_order_printed'):
-            print(f"\n=== Joint Order Verification ===")
-            print(f"Joint mapping order: {joint_names_ordered}")
+            print(f"\n=== Source Target Order Verification ===")
+            print(f"Source target mapping order: {source_target_names_ordered}")
             print(f"p_V keys order: {list(p_V.keys())}")
-            print(f"First 3 robot points correspond to: {joint_names_ordered[:3]}")
+            print(f"First 3 robot points correspond to: {source_target_names_ordered[:3]}")
             sys._omni_joint_order_printed = True
         
         # CRITICAL: Validate that sizes match exactly
-        expected_num_joints = len(joint_names_ordered)
-        if len(robot_points) != expected_num_joints:
+        expected_num_targets = len(source_target_names_ordered)
+        if len(robot_points) != expected_num_targets:
             raise ValueError(
-                f"Size mismatch: robot_points has {len(robot_points)} joints, "
-                f"but expected {expected_num_joints} joints from joint_mapping.keys()."
+                f"Size mismatch: robot_points has {len(robot_points)} targets, "
+                f"but expected {expected_num_targets} targets from joint_mapping.keys()."
             )
-        if J_V.shape[0] != 3 * expected_num_joints:
+        if J_V.shape[0] != 3 * expected_num_targets:
             raise ValueError(
-                f"Jacobian dimension mismatch: J_V has {J_V.shape[0]//3} joints, "
-                f"but expected {expected_num_joints} joints from joint_mapping. "
-                f"J_V shape: {J_V.shape}, expected rows: {3 * expected_num_joints}"
+                f"Jacobian dimension mismatch: J_V has {J_V.shape[0]//3} targets, "
+                f"but expected {expected_num_targets} targets from joint_mapping. "
+                f"J_V shape: {J_V.shape}, expected rows: {3 * expected_num_targets}"
             )
         if len(robot_points) != J_V.shape[0] // 3:
             raise ValueError(
-                f"Size mismatch between robot_points ({len(robot_points)}) and J_V ({J_V.shape[0]//3} joints)."
+                f"Size mismatch between robot_points ({len(robot_points)}) and J_V ({J_V.shape[0]//3} targets)."
             )
         if len(robot_points) == 0:
             # Handle empty robot points to avoid vstack error
@@ -500,12 +499,12 @@ class GenericInteractionRetargeter:
         # Kron shape: (3*num_vertices, 3*num_vertices)
         Kron = sp.kron(L, sp.eye(3, format="csr"), format="csr")
         
-        # J_V shape: (3*num_joints, nq_a) - stacked Jacobians for each mapped joint
-        # BUT Kron expects input vector of size 3*num_vertices (where vertices = mapped_joints + terrain_points)
-        # J_V maps joint velocities (dqa) to velocities of mapped_joints (and 0 for terrain points)
+        # J_V shape: (3*num_targets, nq_a) - stacked Jacobians for each mapped source target.
+        # BUT Kron expects input vector of size 3*num_vertices (where vertices = mapped source targets + terrain_points).
+        # J_V maps qpos deltas (dqa) to velocities of mapped robot link points (and 0 for terrain points).
         
         # We need to construct a full Jacobian J_full of shape (3*num_vertices, nq_a)
-        # The top part corresponds to robot_points (mapped joints), bottom part (terrain) is zeros
+        # The top part corresponds to robot_points (mapped source targets), bottom part (terrain) is zeros.
         
         num_robot_points = len(robot_points)
         num_terrain_points = len(terrain_points)
@@ -603,7 +602,7 @@ class GenericInteractionRetargeter:
             obj += self.smooth_weight * cp.sum_squares(dqa - dqa_smooth)
         
         # Base orientation tracking cost
-        # Keep the base orientation close to the target (estimated from human joints)
+        # Keep the base orientation close to the target estimated from source target positions.
         if target_base_orientation is not None and 3 in self.q_a_indices:
             # Find quaternion indices in q_a_indices
             quat_indices_in_qa = []
@@ -780,21 +779,21 @@ class GenericInteractionRetargeter:
         return Jp @ T
 
     def _compute_robot_jacobians(self, q: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray], None]:
-        """Compute Jacobians for robot joints in world frame.
+        """Compute Jacobians for mapped robot link points in world frame.
         
         Args:
             q: Robot configuration
             
         Returns:
             Tuple of (J_V, p_dict, None):
-                - J_V: Stacked Jacobians (3*num_joints, nq_a)
-                - p_dict: Dictionary of positions for each joint
+                - J_V: Stacked Jacobians (3*num_targets, nq_a)
+                - p_dict: Dictionary of robot link point positions keyed by source target name
                 - None: Placeholder for compatibility
         """
         J_dict = {}
         p_dict = {}
 
-        for joint_name, link_name in self.joint_mapping.items():
+        for target_name, link_name in self.joint_mapping.items():
             try:
                 body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, link_name)
 
@@ -828,7 +827,7 @@ class GenericInteractionRetargeter:
                 valid_indices = self.q_a_indices[self.q_a_indices < J_full.shape[1]]
                 if len(valid_indices) < len(self.q_a_indices):
                     print(
-                        f"Warning: Truncating indices for joint {joint_name}. "
+                        f"Warning: Truncating indices for source target {target_name}. "
                         f"J width: {J_full.shape[1]}, Max idx: {self.q_a_indices.max()}"
                     )
 
@@ -840,29 +839,28 @@ class GenericInteractionRetargeter:
                     J_pad[:, :J_reduced.shape[1]] = J_reduced
                     J_reduced = J_pad
                     
-                J_dict[joint_name] = J_reduced
-                p_dict[joint_name] = pos
+                J_dict[target_name] = J_reduced
+                p_dict[target_name] = pos
 
             except Exception as e:
-                # CRITICAL: All joints should exist (validated in __init__), so this is unexpected
+                # CRITICAL: All mapped targets should resolve to robot links (validated in __init__).
                 # Raise error instead of skipping to ensure size consistency
                 build_error_msg = (
-                    f"Failed to compute Jacobian for joint '{joint_name}' -> link '{link_name}'. "
+                    f"Failed to compute Jacobian for source target '{target_name}' -> link '{link_name}'. "
                     f"This should not happen if joint_mapping was validated. Error: {e}"
                 )
                 raise RuntimeError(build_error_msg) from e
 
-        # Stack Jacobians in the SAME ORDER as valid_joint_names to match human_joints order
+        # Stack Jacobians in the SAME ORDER as source_target_names to match source_target_positions order.
         # This is critical for correct Laplacian matching!
-        # CRITICAL: Use self.valid_joint_names to ensure consistent ordering
-        joint_names_ordered = self.valid_joint_names
-        num_joints = len(joint_names_ordered)
+        source_target_names_ordered = self.source_target_names
+        num_targets = len(source_target_names_ordered)
         
-        if num_joints > 0:
-            J_V = np.zeros((3 * num_joints, self.nq_a))
-            for i, joint_name in enumerate(joint_names_ordered):
-                if joint_name in J_dict:
-                    J = J_dict[joint_name]
+        if num_targets > 0:
+            J_V = np.zeros((3 * num_targets, self.nq_a))
+            for i, target_name in enumerate(source_target_names_ordered):
+                if target_name in J_dict:
+                    J = J_dict[target_name]
                     # Ensure J has the correct shape (3, nq_a)
                     if J.shape != (3, self.nq_a):
                         if J.shape[1] > self.nq_a:
@@ -873,11 +871,11 @@ class GenericInteractionRetargeter:
                             J = J_pad
                     J_V[3 * i:3 * (i + 1), :] = J
                 else:
-                    # CRITICAL: All joints should exist (validated in __init__), so this is unexpected
+                    # CRITICAL: All targets should exist (validated in __init__), so this is unexpected.
                     raise RuntimeError(
-                        f"Jacobian for joint '{joint_name}' not found in J_dict. "
+                        f"Jacobian for source target '{target_name}' not found in J_dict. "
                         f"This should not happen if joint_mapping was validated. "
-                        f"Available joints in J_dict: {list(J_dict.keys())}"
+                        f"Available targets in J_dict: {list(J_dict.keys())}"
                     )
         else:
             J_V = np.zeros((0, self.nq_a))
@@ -1263,82 +1261,62 @@ class GenericInteractionRetargeter:
         return constraints
 
 
+def retarget_source_to_robot(
+    source_positions: np.ndarray,
+    robot_urdf_path: Path,
+    terrain_mesh_path: Path,
+    joint_mapping: Dict[str, str],
+    robot_height: Optional[float] = None,
+    source_target_names: Optional[List[str]] = None,
+) -> Tuple[float, np.ndarray]:
+    """
+    High-level function to retarget source target positions to any robot on any terrain.
+
+    Args:
+        source_positions: Source target positions (T, N, 3)
+        robot_urdf_path: Path to robot URDF
+        terrain_mesh_path: Path to terrain mesh
+        joint_mapping: Mapping from source target names to robot links
+        robot_height: Robot height override
+        source_target_names: Ordered source target names for source_positions
+
+    Returns:
+        Tuple of (source_to_robot_scale, retargeted_trajectory)
+    """
+    # Validate inputs
+    if not validate_motion_positions(source_positions):
+        raise ValueError("Invalid source position trajectory format")
+
+    from .core import OmniRetargeter
+
+    retargeter = OmniRetargeter(
+        robot_urdf_path=robot_urdf_path,
+        terrain_mesh_path=terrain_mesh_path,
+        joint_mapping=joint_mapping,
+        robot_height=robot_height,
+        source_target_names=source_target_names,
+    )
+    return retargeter.retarget_motion(
+        source_positions,
+        visualize_trajectory=False,
+        enable_terrain_scaling=True,
+    )
+
+
 def retarget_smplx_to_robot(
     smplx_trajectory: np.ndarray,
     robot_urdf_path: Path,
     terrain_mesh_path: Path,
     joint_mapping: Dict[str, str],
     robot_height: Optional[float] = None,
+    smplx_joint_names: Optional[List[str]] = None,
 ) -> Tuple[float, np.ndarray]:
-    """
-    High-level function to retarget SMPLX trajectory to any robot on any terrain.
-
-    Args:
-        smplx_trajectory: SMPLX joint positions (T, J, 3)
-        robot_urdf_path: Path to robot URDF
-        terrain_mesh_path: Path to terrain mesh
-        joint_mapping: Mapping from SMPLX joints to robot links
-        robot_height: Robot height override
-
-    Returns:
-        Tuple of (terrain_scale, retargeted_trajectory)
-    """
-    # Validate inputs
-    if not validate_smplx_trajectory(smplx_trajectory):
-        raise ValueError("Invalid SMPLX trajectory format")
-
-    # Load robot
-    robot_urdf = yourdfpy.URDF.load(str(robot_urdf_path), load_meshes=True)
-    robot_model = mujoco.MjModel.from_xml_path(str(robot_urdf_path))
-    robot_data = mujoco.MjData(robot_model)
-
-    # Detect robot height if not provided
-    if robot_height is None:
-        robot_height = 1.6  # Default humanoid height
-
-    # Load terrain
-    terrain_mesh = load_terrain_mesh(terrain_mesh_path)
-
-    # Compute terrain scaling
-    from .core import OmniRetargeter
-    temp_retargeter = OmniRetargeter(
+    """Backward-compatible wrapper for older SMPL-X-specific callers."""
+    return retarget_source_to_robot(
+        source_positions=smplx_trajectory,
         robot_urdf_path=robot_urdf_path,
         terrain_mesh_path=terrain_mesh_path,
         joint_mapping=joint_mapping,
-        robot_height=robot_height
+        robot_height=robot_height,
+        source_target_names=smplx_joint_names,
     )
-    terrain_scale = temp_retargeter._compute_terrain_scale(smplx_trajectory)
-
-    # Scale terrain
-    scaled_terrain = scale_mesh(terrain_mesh, terrain_scale)
-
-    # Initialize retargeter with scaled terrain
-    retargeter = GenericInteractionRetargeter(
-        robot_model, robot_data, scaled_terrain, joint_mapping, robot_height
-    )
-
-    # Retarget each frame
-    retargeted_trajectory = []
-    q_init = np.zeros(robot_model.nq)
-    q_init[3:7] = [1, 0, 0, 0]  # Identity quaternion
-    q_init[6] = robot_height * 0.5  # Initial height
-    q_last = None
-
-    for frame_idx, human_joints in enumerate(smplx_trajectory):
-        # Extract mapped joints
-        mapped_indices = []  # TODO: Map joint names to indices
-        if len(mapped_indices) == 0:
-            # Fallback: use first few joints
-            mapped_joints = human_joints[:len(joint_mapping)]
-        else:
-            mapped_joints = human_joints[mapped_indices]
-
-        # Retarget frame
-        q_opt = retargeter.retarget_frame(mapped_joints, q_init, terrain_scale, q_last=q_last)
-        retargeted_trajectory.append(q_opt)
-
-        # Update initial guess for next frame
-        q_last = q_opt.copy()
-        q_init = q_opt
-
-    return terrain_scale, np.array(retargeted_trajectory)

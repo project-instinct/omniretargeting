@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from collections.abc import Iterable, Iterator
+
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union, Any
@@ -13,14 +16,25 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 
+from .data_sources.base import DataSource, MotionData, MotionFrame
 from .utils import compute_mesh_height_at_point
+
+
+@dataclass
+class RetargetingStreamState:
+    retargeter: Any
+    q_init: np.ndarray
+    q_last: np.ndarray | None
+    last_estimated_quat: np.ndarray | None
+    frame_idx: int
+    scaled_terrain: trimesh.Trimesh
 
 
 class OmniRetargeter:
     """
     Generic motion retargeting for any humanoid URDF and terrain mesh.
 
-    This class provides functionality to retarget SMPLX trajectories to any humanoid robot
+    This class provides functionality to retarget source trajectories to any humanoid robot
     operating on any terrain mesh by automatically scaling the terrain and computing
     appropriate joint mappings.
     """
@@ -31,13 +45,11 @@ class OmniRetargeter:
         terrain_mesh_path: Union[str, Path],
         joint_mapping: Dict[str, str],
         robot_height: Optional[float] = None,
-        smplx_joint_names: Optional[List[str]] = None,
+        source_target_names: Optional[List[str]] = None,
         height_estimation: Optional[Dict[str, Any]] = None,
         base_orientation: Optional[Dict[str, str]] = None,
         retargeting: Optional[Dict[str, Any]] = None,
         link_offset_config: Optional[Dict[str, Any]] = None,
-        smplx_betas: Optional[List[float]] = None,
-        smplx_model_dir: Optional[str] = None,
     ):
         """
         Initialize the OmniRetargeter.
@@ -45,66 +57,56 @@ class OmniRetargeter:
         Args:
             robot_urdf_path: Path to the humanoid robot URDF file
             terrain_mesh_path: Path to the terrain mesh file (any common format)
-            joint_mapping: Dictionary mapping SMPLX joint names to robot link names
+            joint_mapping: Dictionary mapping source target names to robot link names
             robot_height: Height of the robot in meters (auto-detected if None)
-            smplx_joint_names: List of SMPLX joint names in order (required for proper joint mapping)
-            height_estimation: Optional settings for human height estimation from SMPLX joints
-            base_orientation: Optional joint names used for base orientation estimation
+            source_target_names: Ordered source target names used by joint_mapping
+            height_estimation: Optional settings for human height estimation from source targets
+            base_orientation: Optional source target names used for base orientation estimation
             retargeting: Optional solver/retargeting settings forwarded to interaction retargeter
             link_offset_config: Optional per-link offset dictionary forwarded to GenericInteractionRetargeter.
-            smplx_betas: Optional SMPL-X body shape parameters for computing exact human height
-            smplx_model_dir: Optional path to SMPL-X model directory (overrides default search paths)
         """
         self.robot_urdf_path = Path(robot_urdf_path)
         self.terrain_mesh_path = Path(terrain_mesh_path)
         self.joint_mapping = joint_mapping
 
-        # SMPLX joint names (default to standard SMPLX joint ordering)
-        if smplx_joint_names is None:
-            # Standard SMPLX joint names (first 22 body joints)
-            self.smplx_joint_names = [
-                "Pelvis", "L_Hip", "R_Hip", "Spine1", "L_Knee", "R_Knee",
-                "Spine2", "L_Ankle", "R_Ankle", "Spine3", "L_Foot", "R_Foot",
-                "Neck", "L_Collar", "R_Collar", "Head", "L_Shoulder", "R_Shoulder",
-                "L_Elbow", "R_Elbow", "L_Wrist", "R_Wrist"
-            ]
-        else:
-            self.smplx_joint_names = smplx_joint_names
+        if source_target_names is None:
+            source_target_names = list(joint_mapping.keys())
+        self.source_target_names = source_target_names
 
         # Optional per-robot configuration with safe defaults.
         self.height_estimation_config = dict(height_estimation or {})
         self.base_orientation_config = dict(base_orientation or {})
         self.retargeting_config = dict(retargeting or {})
         self.link_offset_config = link_offset_config
-        self.smplx_betas = smplx_betas
-        self.smplx_model_dir = smplx_model_dir
 
-        # Create mapping from SMPLX joint names to indices
-        self.smplx_joint_indices = {}
-        for idx, name in enumerate(self.smplx_joint_names):
-            self.smplx_joint_indices[name] = idx
+        # Create mapping from source target names to indices.
+        self.source_target_indices = {}
+        for idx, name in enumerate(self.source_target_names):
+            self.source_target_indices[name] = idx
 
-        # Get indices for mapped joints
-        # CRITICAL: Only include joints that exist in SMPLX AND will be validated in robot
-        # Store the valid joint names to ensure consistent ordering
-        self.valid_joint_names = []  # Joint names that exist in both SMPLX and robot
-        self.mapped_joint_indices = []
+        # Get indices for mapped source targets.
+        # CRITICAL: Only include targets that exist in source AND will be validated in robot.
+        # Store the valid target names to ensure consistent ordering.
+        self.valid_source_target_names = []
+        self.mapped_source_target_indices = []
         
-        for smplx_joint_name in joint_mapping.keys():
-            if smplx_joint_name in self.smplx_joint_indices:
-                self.mapped_joint_indices.append(self.smplx_joint_indices[smplx_joint_name])
-                self.valid_joint_names.append(smplx_joint_name)
+        for source_target_name in joint_mapping.keys():
+            if source_target_name in self.source_target_indices:
+                self.mapped_source_target_indices.append(self.source_target_indices[source_target_name])
+                self.valid_source_target_names.append(source_target_name)
             else:
                 raise ValueError(
-                    f"SMPLX joint '{smplx_joint_name}' not found in SMPLX joint names. "
-                    f"Available joints: {list(self.smplx_joint_indices.keys())[:10]}..."
+                    f"Source target '{source_target_name}' not found in source target names. "
+                    f"Available targets: {list(self.source_target_indices.keys())[:10]}..."
                 )
 
-        if len(self.mapped_joint_indices) == 0:
-            raise ValueError("No valid joint mappings found. Please check your joint_mapping dictionary.")
+        if len(self.mapped_source_target_indices) == 0:
+            raise ValueError("No valid source target mappings found. Please check your joint_mapping dictionary.")
         
-        # Store the filtered joint mapping (only valid joints) for use in retargeter
-        self.valid_joint_mapping = {name: joint_mapping[name] for name in self.valid_joint_names}
+        # Store the filtered mapping (only valid source targets) for use in retargeter.
+        self.valid_source_to_robot_link_mapping = {
+            name: joint_mapping[name] for name in self.valid_source_target_names
+        }
 
         # Load robot URDF
         self.robot_urdf = yourdfpy.URDF.load(str(robot_urdf_path), load_meshes=True)
@@ -188,64 +190,17 @@ class OmniRetargeter:
 
         return height
 
-    def _compute_human_height_from_betas(
-        self,
-        betas: List[float],
-        smplx_model_dir: Optional[str] = None,
-    ) -> Optional[float]:
-        """
-        Compute exact human height from SMPL-X body shape parameters.
-
-        Args:
-            betas: SMPL-X body shape parameters
-            smplx_model_dir: Optional path to SMPL-X model directory
-
-        Returns:
-            Human height in meters, or None if computation fails
-        """
-        try:
-            import smplx as smplx_lib
-            import torch
-        except ImportError:
-            return None
-
-        import os
-        search_paths = [smplx_model_dir] if smplx_model_dir else []
-        search_paths.extend([
-            "/localhdd/Datasets/smplx",
-            "/localhdd/Datasets/",
-            "data/body_models/smplx",
-        ])
-        model_path = next((p for p in search_paths if p and os.path.exists(p)), None)
-        if model_path is None:
-            return None
-
-        try:
-            num_betas = len(betas)
-            model = smplx_lib.SMPLX(model_path, num_betas=num_betas, use_hands=False, use_face=False)
-            betas_tensor = torch.tensor([betas], dtype=torch.float32)
-            with torch.no_grad():
-                out = model(betas=betas_tensor)
-            joints_smplx = out.joints[0, :22].numpy()
-
-            # Height is vertical extent in SMPL-X Y-axis (up)
-            human_height = float(joints_smplx[:, 1].max() - joints_smplx[:, 1].min())
-            return human_height
-        except Exception as e:
-            print(f"[OmniRetargeter] Failed to compute height from betas: {e}")
-            return None
-
     def _setup_retargeting_components(self):
         """Setup internal retargeting components."""
-        # Validate joint mapping and filter out invalid joints
-        # CRITICAL: Only keep joints that exist in BOTH SMPLX and robot URDF
-        # This ensures consistent sizes between human_joints and robot_points
+        # Validate source-to-robot mapping and filter out invalid robot links.
+        # CRITICAL: Only keep source targets whose mapped robot links exist in the robot URDF.
+        # This ensures consistent sizes between source target positions and robot link points.
         
-        # First, filter out joints missing from robot URDF
+        # First, filter out source targets mapped to missing robot links.
         missing_robot_links = self.validate_joint_mapping()
         if missing_robot_links:
             print(f"Warning: The following robot links from joint_mapping were not found in URDF: {missing_robot_links}")
-            print("These joints will be removed from the mapping.")
+            print("Source targets mapped to these links will be removed from the mapping.")
             print(f"\nAvailable robot bodies:")
             for i in range(min(20, self.robot_model.nbody)):
                 body_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, i)
@@ -253,31 +208,33 @@ class OmniRetargeter:
             if self.robot_model.nbody > 20:
                 print(f"  ... and {self.robot_model.nbody - 20} more")
             
-            # Remove joints with missing robot links from valid_joint_names
-            self.valid_joint_names = [
-                name for name in self.valid_joint_names 
-                if self.valid_joint_mapping[name] not in missing_robot_links
+            # Remove source targets with missing robot links from valid_source_target_names.
+            self.valid_source_target_names = [
+                name for name in self.valid_source_target_names
+                if self.valid_source_to_robot_link_mapping[name] not in missing_robot_links
             ]
-            # Rebuild mapped_joint_indices and valid_joint_mapping
-            self.mapped_joint_indices = [
-                self.smplx_joint_indices[name] for name in self.valid_joint_names
+            # Rebuild mapped_source_target_indices and valid_source_to_robot_link_mapping.
+            self.mapped_source_target_indices = [
+                self.source_target_indices[name] for name in self.valid_source_target_names
             ]
-            self.valid_joint_mapping = {name: self.joint_mapping[name] for name in self.valid_joint_names}
+            self.valid_source_to_robot_link_mapping = {
+                name: self.joint_mapping[name] for name in self.valid_source_target_names
+            }
         
-        if len(self.valid_joint_names) == 0:
+        if len(self.valid_source_target_names) == 0:
             raise ValueError(
-                "No valid joint mappings found after filtering. "
-                "Please check that joint_mapping contains joints that exist in both SMPLX and robot URDF."
+                "No valid source target mappings found after filtering. "
+                "Please check that joint_mapping maps source targets to robot links that exist in the robot URDF."
             )
         
-        print(f"Successfully initialized retargeting with {len(self.valid_joint_names)} mapped joints.")
-        print(f"Valid joints: {self.valid_joint_names}")
+        print(f"Successfully initialized retargeting with {len(self.valid_source_target_names)} mapped source targets.")
+        print(f"Valid source targets: {self.valid_source_target_names}")
         print(f"Robot height: {self.robot_height:.3f}m")
         print(f"Robot DOF: {self.get_robot_dof()}")
 
     def retarget_motion(
         self,
-        smplx_trajectory: np.ndarray,
+        motion: np.ndarray | MotionData | DataSource,
         base_orientations: np.ndarray | None = None,
         base_translations: np.ndarray | None = None,
         framerate: float | None = None,
@@ -285,105 +242,251 @@ class OmniRetargeter:
         enable_terrain_scaling: bool = False,
     ) -> Tuple[float, np.ndarray]:
         """
-        Retarget SMPLX motion to the robot on the terrain.
+        Retarget a complete source motion and return ``(source_to_robot_scale, robot_motion)``.
 
-        Args:
-            smplx_trajectory: SMPLX joint positions of shape (T, J, 3) where T is frames, J is joints
-            framerate: Motion framerate used by optional post-processing.
-            enable_terrain_scaling: If True, estimate a terrain scale factor from the
-                SMPLX trajectory and retarget against a scaled terrain mesh. If False,
-                keep the original terrain mesh and use a scale factor of 1.0.
-
-        Returns:
-            Tuple of (terrain_scale, retargeted_trajectory)
-            - terrain_scale: Scalar factor to scale the terrain mesh
-            - retargeted_trajectory: Robot motion of shape (T, 7 + DOF) with [pos, quat, joints]
+        ``enable_terrain_scaling`` preserves the existing public API name, but the
+        computed scalar is the robot/source height ratio. When enabled, batch mode
+        applies it to source positions, optional root translations, and the terrain
+        mesh before delegating to ``retarget_stream``.
         """
-        # Step 1: Compute terrain scaling factor
-        if enable_terrain_scaling:
-            terrain_scale = self._compute_terrain_scale(smplx_trajectory)
-            scaled_terrain = self._scale_terrain_mesh(terrain_scale)
-        else:
-            terrain_scale = 1.0
-            scaled_terrain = self.terrain_mesh.copy()
+        motion_data = self._coerce_motion_data(motion)
+        if base_orientations is not None or base_translations is not None:
+            motion_data = MotionData(
+                positions=motion_data.positions,
+                target_names=motion_data.target_names,
+                root_orientations=base_orientations if base_orientations is not None else motion_data.root_orientations,
+                root_translations=base_translations if base_translations is not None else motion_data.root_translations,
+                framerate=framerate if framerate is not None else motion_data.framerate,
+                source_height=motion_data.source_height,
+                metadata=motion_data.metadata,
+            )
+        elif framerate is not None and motion_data.framerate is None:
+            motion_data.framerate = framerate
 
-        # Step 3: Process SMPLX trajectory
-        processed_trajectory = self._process_smplx_trajectory(smplx_trajectory, terrain_scale)
-        processed_base_translations = None
-        if base_translations is not None:
-            processed_base_translations = base_translations * terrain_scale
+        source_to_robot_scale = self._resolve_source_to_robot_scale(
+            apply_source_to_robot_scaling=enable_terrain_scaling,
+            positions=motion_data.positions,
+            source_height=motion_data.source_height,
+        )
+        scaled_terrain = self._scale_terrain_mesh(source_to_robot_scale) if enable_terrain_scaling else self.terrain_mesh.copy()
 
-        # Option Step:
+        scaled_motion_data = MotionData(
+            positions=motion_data.positions * source_to_robot_scale,
+            target_names=motion_data.target_names,
+            root_orientations=motion_data.root_orientations,
+            root_translations=(
+                motion_data.root_translations * source_to_robot_scale
+                if motion_data.root_translations is not None
+                else None
+            ),
+            framerate=motion_data.framerate,
+            source_height=motion_data.source_height,
+            metadata=motion_data.metadata,
+        )
+
         if visualize_trajectory:
-            # visualize the processed_trajectory
-            self._visualize_trajectory(processed_trajectory, scaled_terrain)
+            self._visualize_trajectory(scaled_motion_data.positions, scaled_terrain)
 
-        # Step 4: Perform retargeting using the generic retargeting system
-        retargeted_motion = self._perform_retargeting(
-            processed_trajectory,
-            scaled_terrain,
-            base_orientations=base_orientations,
-            base_translations=processed_base_translations,
+        retargeted_motion = np.array(
+            list(self.retarget_stream(scaled_motion_data, scaled_terrain=scaled_terrain))
         )
 
         retargeting_config = getattr(self, "retargeting_config", {})
         if retargeting_config.get("penetration_resolver", "hard_constraint") == "xyz_nudge":
+            # This stabilization is intentionally batch-only: it detects contact runs,
+            # smooths across windows, and corrects stance drift using temporal context
+            # that retarget_stream() does not have while yielding frames one by one.
             retargeted_motion = self._apply_foot_stabilization(
                 retargeted_motion,
                 scaled_terrain,
-                framerate=framerate,
+                framerate=motion_data.framerate,
             )
 
-        return terrain_scale, retargeted_motion
+        return source_to_robot_scale, retargeted_motion
 
-    def _compute_terrain_scale(
+    def retarget_stream(
         self,
-        smplx_trajectory: np.ndarray,
+        source: DataSource | MotionData | Iterable[MotionFrame] | np.ndarray,
+        scaled_terrain: trimesh.Trimesh | None = None,
+    ) -> Iterator[np.ndarray]:
+        frames = self._iter_motion_frames(source)
+        state = self.create_stream_state(scaled_terrain=scaled_terrain)
+        for frame in frames:
+            yield self.retarget_frame(frame, state)
+
+    def create_stream_state(
+        self,
+        scaled_terrain: trimesh.Trimesh | None = None,
+    ) -> RetargetingStreamState:
+        from .retargeting import GenericInteractionRetargeter
+
+        if scaled_terrain is None:
+            scaled_terrain = self.terrain_mesh.copy()
+
+        retargeter = GenericInteractionRetargeter(
+            self.robot_model,
+            self.robot_data,
+            scaled_terrain,
+            self.valid_source_to_robot_link_mapping,
+            self.robot_height,
+            collision_detection_threshold=float(self.retargeting_config.get("collision_detection_threshold", 0.1)),
+            terrain_sample_points=int(self.retargeting_config.get("terrain_sample_points", 100)),
+            source_target_names=self.valid_source_target_names,
+            replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
+            hard_penetration_constraint=self.retargeting_config.get("penetration_resolver", "hard_constraint") == "hard_constraint",
+            link_offset_config=self.link_offset_config,
+        )
+
+        q_init = np.zeros(self.robot_model.nq)
+        q_init[3:7] = [1, 0, 0, 0]
+        for i in range(self.robot_model.njnt):
+            qpos_adr = self.robot_model.jnt_qposadr[i]
+            if qpos_adr >= 7:
+                joint_range = self.robot_model.jnt_range[i]
+                q_init[qpos_adr] = (joint_range[0] + joint_range[1]) / 2.0
+        q_init[2] = self.robot_height * 0.5
+
+        return RetargetingStreamState(
+            retargeter=retargeter,
+            q_init=q_init,
+            q_last=None,
+            last_estimated_quat=None,
+            frame_idx=0,
+            scaled_terrain=scaled_terrain,
+        )
+
+    def retarget_frame(self, frame: MotionFrame | np.ndarray, state: RetargetingStreamState) -> np.ndarray:
+        positions = frame.positions if isinstance(frame, MotionFrame) else frame
+        root_orientation = frame.root_orientation if isinstance(frame, MotionFrame) else None
+        root_translation = frame.root_translation if isinstance(frame, MotionFrame) else None
+        source_positions = positions
+        q_init = state.q_init
+
+        if state.frame_idx == 0:
+            if root_translation is not None:
+                q_init[:3] = root_translation
+            else:
+                q_init[:3] = source_positions[0]
+            if root_orientation is not None:
+                quat_xyzw = Rotation.from_rotvec(root_orientation).as_quat()
+                q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+            else:
+                quat_xyzw = self._estimate_base_orientation_from_targets(source_positions)
+                if quat_xyzw is not None:
+                    q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+
+        mapped_source_targets = self._extract_mapped_source_targets(source_positions)
+        target_quat_xyzw = self._estimate_base_orientation_from_targets(source_positions, state.last_estimated_quat)
+        state.last_estimated_quat = target_quat_xyzw
+        target_quat_wxyz = None
+        if target_quat_xyzw is not None:
+            target_quat_wxyz = np.array([target_quat_xyzw[3], target_quat_xyzw[0], target_quat_xyzw[1], target_quat_xyzw[2]])
+
+        q_opt = state.retargeter.retarget_frame(
+            mapped_source_targets,
+            q_init,
+            q_last=state.q_last,
+            target_base_orientation=target_quat_wxyz,
+        )
+        state.q_init = q_opt
+        state.q_last = q_opt
+        state.frame_idx += 1
+        return q_opt
+
+    def _extract_mapped_source_targets(self, source_positions: np.ndarray) -> np.ndarray:
+        if len(self.mapped_source_target_indices) != len(self.valid_source_target_names):
+            raise ValueError(
+                f"Order mismatch: mapped_source_target_indices has {len(self.mapped_source_target_indices)} elements, "
+                f"but valid_source_target_names has {len(self.valid_source_target_names)} elements."
+            )
+        for target_name, source_idx in zip(self.valid_source_target_names, self.mapped_source_target_indices):
+            expected_idx = self.source_target_indices.get(target_name)
+            if expected_idx != source_idx:
+                raise ValueError(
+                    f"Order mismatch: source target '{target_name}' has index {source_idx}, "
+                    f"but source_target_indices says it should be {expected_idx}."
+                )
+        mapped_source_targets = source_positions[self.mapped_source_target_indices]
+        expected_num_targets = len(self.valid_source_target_names)
+        if len(mapped_source_targets) != expected_num_targets:
+            raise ValueError(
+                f"Size mismatch: extracted {len(mapped_source_targets)} targets from source positions, "
+                f"but expected {expected_num_targets} targets from valid_source_target_names."
+            )
+        return mapped_source_targets
+
+    def _iter_motion_frames(
+        self,
+        source: DataSource | MotionData | Iterable[MotionFrame] | np.ndarray,
+    ) -> Iterator[MotionFrame]:
+        if isinstance(source, DataSource):
+            return source.iter_frames()
+        if isinstance(source, MotionData):
+            return source.iter_frames()
+        if isinstance(source, np.ndarray):
+            return MotionData(positions=source).iter_frames()
+        return iter(source)
+
+    def _coerce_motion_data(self, motion: np.ndarray | MotionData | DataSource) -> MotionData:
+        if isinstance(motion, MotionData):
+            return motion
+        if isinstance(motion, DataSource):
+            return motion.load()
+        return MotionData(positions=motion)
+
+    def _resolve_source_to_robot_scale(
+        self,
+        apply_source_to_robot_scaling: bool,
+        positions: np.ndarray | None,
+        source_height: float | None,
+    ) -> float:
+        if not apply_source_to_robot_scaling:
+            return 1.0
+        if source_height is None:
+            return self._compute_source_to_robot_scale(positions)
+        return self._compute_source_to_robot_scale(positions, source_height=source_height)
+
+    def _compute_source_to_robot_scale(
+        self,
+        source_positions: np.ndarray,
+        source_height: float | None = None,
     ) -> float:
         """
-        Compute the appropriate scaling factor for the terrain.
+        Compute the source-to-robot length scale from robot and source heights.
 
-        This implementation assumes the terrain provided corresponds to the real-world scale
-        relative to the robot's size.
+        Batch retargeting uses this factor to put source target positions, optional root
+        translations, and optionally the terrain mesh into the robot's scale.
         """
-        # Priority 1: Use exact height from smplx_betas if available
-        estimated_human_height = None
-        if self.smplx_betas is not None:
-            estimated_human_height = self._compute_human_height_from_betas(
-                self.smplx_betas,
-                self.smplx_model_dir,
-            )
-            if estimated_human_height is not None:
-                print(f"Computed human height from smplx_betas: {estimated_human_height:.3f}m")
+        estimated_source_height = source_height
 
-        # Priority 2: Estimate from trajectory if betas unavailable
-        if estimated_human_height is None and smplx_trajectory is not None and len(smplx_trajectory) > 0:
-            # Estimate height from joints
-            # SMPLX/SMPL joints: 0: Pelvis, 10/11: Feet, 15: Head (approx)
+        # Estimate from source target positions if the adapter did not provide height.
+        if estimated_source_height is None and source_positions is not None and len(source_positions) > 0:
+            # Estimate height from source targets.
+            # Source target defaults: 0/root, 10/11 feet, 15 head for SMPL-like body-joint layouts.
             # We can find the max vertical extent across all frames
 
             # Find the frame where the person is most upright (max head height)
             # Assuming Z is up
-            head_joint_name = self.height_estimation_config.get("head_joint", "Head")
-            foot_joint_names = self.height_estimation_config.get("foot_joints", ["L_Foot", "R_Foot"])
+            head_joint_name = self.height_estimation_config.get("head_target", self.height_estimation_config.get("head_joint", "Head"))
+            foot_joint_names = self.height_estimation_config.get("foot_targets", self.height_estimation_config.get("foot_joints", ["L_Foot", "R_Foot"]))
             head_top_offset = float(self.height_estimation_config.get("head_top_offset", 0.12))
 
-            head_idx = self.smplx_joint_indices.get(head_joint_name, 15)
+            head_idx = self.source_target_indices.get(head_joint_name, 15)
             foot_indices = [
-                self.smplx_joint_indices[name]
+                self.source_target_indices[name]
                 for name in foot_joint_names
-                if name in self.smplx_joint_indices
+                if name in self.source_target_indices
             ]
             if not foot_indices:
                 foot_indices = [10, 11]  # fallback defaults
             
-            # Check if we have enough joints
-            if smplx_trajectory.shape[1] > head_idx and all(idx < smplx_trajectory.shape[1] for idx in foot_indices):
+            # Check if we have enough source targets.
+            if source_positions.shape[1] > head_idx and all(idx < source_positions.shape[1] for idx in foot_indices):
                 # Calculate height per frame: Head Z - Average Foot Z
-                head_z = smplx_trajectory[:, head_idx, 2]
+                head_z = source_positions[:, head_idx, 2]
                 
                 # Use min foot Z per frame as ground reference relative to body
-                feet_z = np.min(smplx_trajectory[:, foot_indices, 2], axis=1)
+                feet_z = np.min(source_positions[:, foot_indices, 2], axis=1)
                 
                 # Height per frame
                 heights = head_z - feet_z
@@ -391,230 +494,51 @@ class OmniRetargeter:
                 # Use the maximum height observed (standing pose)
                 # Add offset for top of head (head joint is in neck/center of head)
                 # Approx 10-15cm from head joint to top of head
-                estimated_human_height = np.max(heights) + head_top_offset
+                estimated_source_height = np.max(heights) + head_top_offset
                 
                 # Sanity check: Constrain to reasonable human range [1.4, 2.2]
-                estimated_human_height = np.clip(estimated_human_height, 1.4, 2.2)
+                estimated_source_height = np.clip(estimated_source_height, 1.4, 2.2)
 
-                print(f"Estimated human height from trajectory: {estimated_human_height:.3f}m")
+                print(f"Estimated source height from trajectory: {estimated_source_height:.3f}m")
 
         # Priority 3: Fallback to 1.7m
-        if estimated_human_height is None:
-            estimated_human_height = 1.7
-            print(f"Using default human height: {estimated_human_height:.3f}m")
+        if estimated_source_height is None:
+            estimated_source_height = 1.7
+            print(f"Using default source height: {estimated_source_height:.3f}m")
 
-        scale_factor = self.robot_height / estimated_human_height
+        source_to_robot_scale = self.robot_height / estimated_source_height
 
-        print(f"Computed terrain scale factor: {scale_factor:.4f} (Robot: {self.robot_height}m, Human: {estimated_human_height:.3f}m)")
+        print(f"Computed source-to-robot scale factor: {source_to_robot_scale:.4f} (Robot: {self.robot_height}m, Source: {estimated_source_height:.3f}m)")
 
-        return float(scale_factor)
+        return float(source_to_robot_scale)
 
-    def _extract_foot_positions(self, smplx_trajectory: np.ndarray) -> np.ndarray:
-        """Extract foot positions from SMPLX trajectory."""
-        # SMPLX joint indices for feet
-        # L_Foot: 10, R_Foot: 11 (standard SMPLX ordering)
+    def _extract_foot_positions(self, source_positions: np.ndarray) -> np.ndarray:
+        """Extract foot positions from source trajectory."""
+        # source target indices for feet
+        # L_Foot: 10, R_Foot: 11 (standard source ordering)
         foot_indices = [10, 11]
 
         foot_positions = []
-        for frame in smplx_trajectory:
+        for frame in source_positions:
             for foot_idx in foot_indices:
                 if foot_idx < len(frame):
                     foot_positions.append(frame[foot_idx])
 
         return np.array(foot_positions)
 
-    def _scale_terrain_mesh(self, scale_factor: float) -> trimesh.Trimesh:
+    def _scale_terrain_mesh(self, source_to_robot_scale: float) -> trimesh.Trimesh:
         """Scale the terrain mesh by the given factor."""
         scaled_mesh = self.terrain_mesh.copy()
-        scaled_mesh.apply_scale(scale_factor)
+        scaled_mesh.apply_scale(source_to_robot_scale)
         return scaled_mesh
 
-    def _process_smplx_trajectory(
+    def _estimate_base_orientation_from_targets(
         self,
-        smplx_trajectory: np.ndarray,
-        terrain_scale: float
-    ) -> np.ndarray:
-        """Process SMPLX trajectory for retargeting."""
-        # Apply terrain scaling to trajectory coordinates
-        scaled_trajectory = smplx_trajectory * terrain_scale
-
-        # Transform coordinate system if needed (SMPLX uses different convention)
-        # TODO: Add coordinate system transformation if needed
-
-        return scaled_trajectory
-
-    def _perform_retargeting(
-        self,
-        processed_trajectory: np.ndarray,
-        scaled_terrain: trimesh.Trimesh,
-        base_orientations: np.ndarray | None = None,
-        base_translations: np.ndarray | None = None,
-    ) -> np.ndarray:
-        """Perform the actual motion retargeting using generic interaction mesh retargeting."""
-        from .retargeting import GenericInteractionRetargeter
-
-        # Create retargeter instance
-        # Note: scaled_terrain is already scaled by _scale_terrain_mesh
-        # CRITICAL: Pass only valid_joint_mapping to ensure consistent sizes
-        # This ensures robot_points and human_joints have the same number of joints
-        retargeter = GenericInteractionRetargeter(
-            self.robot_model,
-            self.robot_data,
-            scaled_terrain,
-            self.valid_joint_mapping,  # Use filtered mapping, not full joint_mapping
-            self.robot_height,
-            collision_detection_threshold=float(self.retargeting_config.get("collision_detection_threshold", 0.1)),
-            terrain_sample_points=int(self.retargeting_config.get("terrain_sample_points", 100)),
-            valid_joint_names=self.valid_joint_names,  # CRITICAL: Pass ordered joint names for consistency
-            replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
-            hard_penetration_constraint=self.retargeting_config.get("penetration_resolver", "hard_constraint") == "hard_constraint",
-            link_offset_config=self.link_offset_config,
-        )
-
-        # Retarget each frame
-        retargeted_trajectory = []
-        
-        # Initialize with a reasonable standing configuration
-        q_init = np.zeros(self.robot_model.nq)
-        q_init[3:7] = [1, 0, 0, 0]  # Identity quaternion (wxyz)
-        
-        # Set joint angles to mid-range to avoid limit violations
-        # This is safer than all zeros which might violate limits
-        for i in range(self.robot_model.njnt):
-            qpos_adr = self.robot_model.jnt_qposadr[i]
-            if qpos_adr >= 7:  # Skip floating base
-                joint_range = self.robot_model.jnt_range[i]
-                # Set to middle of range
-                q_init[qpos_adr] = (joint_range[0] + joint_range[1]) / 2.0
-        
-        # Initial height: Use processed (scaled) trajectory root height or default
-        # Assuming joint 0 is root
-        if len(processed_trajectory) > 0:
-            q_init[:3] = processed_trajectory[0, 0] # Start at first frame root pos
-            # Maintain initial rotation (identity or from trajectory if available)
-        else:
-            q_init[2] = self.robot_height * 0.5  # Default height (Z coordinate)
-
-        for frame_idx, human_joints in enumerate(processed_trajectory):
-            # Only initialize base from SMPLX for the first frame
-            # For subsequent frames, the optimization will handle base movement
-            if frame_idx == 0:
-                # Initialize base position from SMPLX root
-                if base_translations is not None:
-                    q_init[:3] = base_translations[frame_idx]
-                else:
-                    # Use SMPLX pelvis position as initial guess
-                    q_init[:3] = human_joints[0]
-
-                # Initialize base orientation
-                if base_orientations is not None:
-                    root_rotvec = base_orientations[frame_idx]
-                    quat_xyzw = Rotation.from_rotvec(root_rotvec).as_quat()
-                    q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
-                else:
-                    quat_xyzw = self._estimate_base_orientation_from_joints(human_joints)
-                    if quat_xyzw is not None:
-                        q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
-            # For subsequent frames, q_init already contains the previous optimized configuration
-            
-            # Extract mapped joints using the proper indices
-            # CRITICAL: The order MUST match valid_joint_names exactly
-            # mapped_joint_indices[i] corresponds to valid_joint_names[i] for all i
-            # human_joints shape: (num_smplx_joints, 3)
-            
-            # Validate order consistency before extraction
-            if len(self.mapped_joint_indices) != len(self.valid_joint_names):
-                raise ValueError(
-                    f"Order mismatch: mapped_joint_indices has {len(self.mapped_joint_indices)} elements, "
-                    f"but valid_joint_names has {len(self.valid_joint_names)} elements."
-                )
-            
-            # Verify that each index corresponds to the correct joint name
-            for i, (joint_name, smplx_idx) in enumerate(zip(self.valid_joint_names, self.mapped_joint_indices)):
-                expected_idx = self.smplx_joint_indices.get(joint_name)
-                if expected_idx != smplx_idx:
-                    raise ValueError(
-                        f"Order mismatch at position {i}: joint '{joint_name}' has index {smplx_idx} "
-                        f"in mapped_joint_indices, but smplx_joint_indices says it should be {expected_idx}."
-                    )
-            
-            mapped_joints = human_joints[self.mapped_joint_indices]
-            # mapped_joints shape: (num_mapped_joints, 3)
-            # mapped_joints[i] corresponds to valid_joint_names[i] for all i
-            
-            # CRITICAL: Validate that we extracted the expected number of joints
-            expected_num_joints = len(self.valid_joint_names)
-            if len(mapped_joints) != expected_num_joints:
-                raise ValueError(
-                    f"Size mismatch: extracted {len(mapped_joints)} joints from human_joints, "
-                    f"but expected {expected_num_joints} joints from valid_joint_names. "
-                    f"This indicates an inconsistency in joint mapping."
-                )
-            
-            # Debug: Print order and actual positions for first frame to verify matching
-            import sys
-            if not hasattr(sys, '_omni_human_joint_order_printed'):
-                print(f"\n=== Human Joint Extraction Order ===")
-                print(f"valid_joint_names: {self.valid_joint_names}")
-                print(f"mapped_joint_indices: {self.mapped_joint_indices}")
-                print(f"Extracted {len(mapped_joints)} joints in order: {self.valid_joint_names}")
-                print(f"\n=== First Frame Joint Positions (to verify order) ===")
-                for i, (name, idx) in enumerate(zip(self.valid_joint_names, self.mapped_joint_indices)):
-                    pos = mapped_joints[i] if frame_idx == 0 else mapped_joints[i]
-                    if frame_idx == 0:
-                        print(f"  {i}: {name} (SMPLX idx {idx}) -> pos: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]")
-                # Specifically check knee vs ankle positions
-                if frame_idx == 0:
-                    l_knee_idx = self.valid_joint_names.index("L_Knee") if "L_Knee" in self.valid_joint_names else None
-                    l_ankle_idx = self.valid_joint_names.index("L_Ankle") if "L_Ankle" in self.valid_joint_names else None
-                    if l_knee_idx is not None and l_ankle_idx is not None:
-                        l_knee_pos = mapped_joints[l_knee_idx]
-                        l_ankle_pos = mapped_joints[l_ankle_idx]
-                        print(f"\n=== Knee vs Ankle Position Check ===")
-                        print(f"L_Knee (idx {l_knee_idx}, SMPLX {self.mapped_joint_indices[l_knee_idx]}): [{l_knee_pos[0]:.3f}, {l_knee_pos[1]:.3f}, {l_knee_pos[2]:.3f}]")
-                        print(f"L_Ankle (idx {l_ankle_idx}, SMPLX {self.mapped_joint_indices[l_ankle_idx]}): [{l_ankle_pos[0]:.3f}, {l_ankle_pos[1]:.3f}, {l_ankle_pos[2]:.3f}]")
-                        print(f"Knee should be HIGHER than ankle (knee.z > ankle.z): {l_knee_pos[2] > l_ankle_pos[2]}")
-                sys._omni_human_joint_order_printed = True
-
-            # Estimate target base orientation from human joints
-            last_target_quat = None
-            if frame_idx > 0 and len(retargeted_trajectory) > 0:
-                # Get last orientation from previous frame result or previous target estimate
-                # We use the result (wxyz) converted back to xyzw for continuity check
-                # But wait, retargeted_trajectory has wxyz.
-                # _estimate returns xyzw.
-                # Better to store the previous estimated xyzw.
-                pass
-                
-            # We need to maintain state of estimated quaternion to ensure continuity
-            if not hasattr(self, '_last_estimated_quat'):
-                self._last_estimated_quat = None
-                
-            target_quat_xyzw = self._estimate_base_orientation_from_joints(human_joints, self._last_estimated_quat)
-            self._last_estimated_quat = target_quat_xyzw
-            
-            target_quat_wxyz = None
-            if target_quat_xyzw is not None:
-                # Convert xyzw to wxyz for MuJoCo
-                target_quat_wxyz = np.array([target_quat_xyzw[3], target_quat_xyzw[0], 
-                                            target_quat_xyzw[1], target_quat_xyzw[2]])
-
-            # Retarget frame with previous frame as reference for smoothness
-            q_last = retargeted_trajectory[-1] if len(retargeted_trajectory) > 0 else None
-            q_opt = retargeter.retarget_frame(
-                mapped_joints, q_init, q_last=q_last, 
-                target_base_orientation=target_quat_wxyz
-            )
-            retargeted_trajectory.append(q_opt)
-
-            # Update initial guess for next frame (smooth trajectory)
-            q_init = q_opt
-
-        return np.array(retargeted_trajectory)
-
-    def _estimate_base_orientation_from_joints(self, joints: np.ndarray, last_quat: np.ndarray | None = None) -> np.ndarray | None:
+        source_targets: np.ndarray,
+        last_quat: np.ndarray | None = None,
+    ) -> np.ndarray | None:
         """
-        Estimate a base orientation from joint positions.
+        Estimate a base orientation from source target positions.
 
         Uses pelvis/hips/spine to build an approximate body frame:
         - up: pelvis -> spine1
@@ -623,10 +547,10 @@ class OmniRetargeter:
         Returns quaternion in xyzw order.
         
         Args:
-            joints: Joint positions array.
+            source_targets: Source target positions array.
             last_quat: Quaternion from previous frame to ensure continuity (xyzw).
         """
-        if joints.shape[0] < 4:
+        if source_targets.shape[0] < 4:
             return None
 
         pelvis_name = self.base_orientation_config.get("pelvis", "Pelvis")
@@ -634,19 +558,19 @@ class OmniRetargeter:
         right_hip_name = self.base_orientation_config.get("right_hip", "R_Hip")
         spine_name = self.base_orientation_config.get("spine", "Spine1")
 
-        pelvis_idx = self.smplx_joint_indices.get(pelvis_name, 0)
-        left_hip_idx = self.smplx_joint_indices.get(left_hip_name, 1)
-        right_hip_idx = self.smplx_joint_indices.get(right_hip_name, 2)
-        spine_idx = self.smplx_joint_indices.get(spine_name, 3)
+        pelvis_idx = self.source_target_indices.get(pelvis_name, 0)
+        left_hip_idx = self.source_target_indices.get(left_hip_name, 1)
+        right_hip_idx = self.source_target_indices.get(right_hip_name, 2)
+        spine_idx = self.source_target_indices.get(spine_name, 3)
 
         max_required_idx = max(pelvis_idx, left_hip_idx, right_hip_idx, spine_idx)
-        if joints.shape[0] <= max_required_idx:
+        if source_targets.shape[0] <= max_required_idx:
             return None
 
-        pelvis = joints[pelvis_idx]
-        left_hip = joints[left_hip_idx]
-        right_hip = joints[right_hip_idx]
-        spine1 = joints[spine_idx]
+        pelvis = source_targets[pelvis_idx]
+        left_hip = source_targets[left_hip_idx]
+        right_hip = source_targets[right_hip_idx]
+        spine1 = source_targets[spine_idx]
 
         up = spine1 - pelvis
         right = right_hip - left_hip
@@ -863,8 +787,8 @@ class OmniRetargeter:
                 body_id = self._body_name_to_id(explicit_name)
 
             if body_id < 0:
-                for joint_name in joint_candidates:
-                    body_name = self.valid_joint_mapping.get(joint_name)
+                for target_name in joint_candidates:
+                    body_name = self.valid_source_to_robot_link_mapping.get(target_name)
                     if body_name:
                         body_id = self._body_name_to_id(body_name)
                         if body_id >= 0:
@@ -1235,86 +1159,6 @@ class OmniRetargeter:
             runs.append((start, len(mask)))
         return runs
 
-    def _estimate_base_orientation_from_joints(self, joints: np.ndarray, last_quat: np.ndarray | None = None) -> np.ndarray | None:
-        """
-        Estimate a base orientation from joint positions.
-
-        Uses pelvis/hips/spine to build an approximate body frame:
-        - up: pelvis -> spine1
-        - right: left_hip -> right_hip
-        - forward: right x up
-        Returns quaternion in xyzw order.
-        
-        Args:
-            joints: Joint positions array.
-            last_quat: Quaternion from previous frame to ensure continuity (xyzw).
-        """
-        if joints.shape[0] < 4:
-            return None
-
-        pelvis_name = self.base_orientation_config.get("pelvis", "Pelvis")
-        left_hip_name = self.base_orientation_config.get("left_hip", "L_Hip")
-        right_hip_name = self.base_orientation_config.get("right_hip", "R_Hip")
-        spine_name = self.base_orientation_config.get("spine", "Spine1")
-
-        pelvis_idx = self.smplx_joint_indices.get(pelvis_name, 0)
-        left_hip_idx = self.smplx_joint_indices.get(left_hip_name, 1)
-        right_hip_idx = self.smplx_joint_indices.get(right_hip_name, 2)
-        spine_idx = self.smplx_joint_indices.get(spine_name, 3)
-
-        max_required_idx = max(pelvis_idx, left_hip_idx, right_hip_idx, spine_idx)
-        if joints.shape[0] <= max_required_idx:
-            return None
-
-        pelvis = joints[pelvis_idx]
-        left_hip = joints[left_hip_idx]
-        right_hip = joints[right_hip_idx]
-        spine1 = joints[spine_idx]
-
-        up = spine1 - pelvis
-        right = right_hip - left_hip
-
-        up_norm = np.linalg.norm(up)
-        right_norm = np.linalg.norm(right)
-        if up_norm < 1e-8 or right_norm < 1e-8:
-            return None
-
-        up = up / up_norm
-        right = right / right_norm
-        
-        # Build forward using right-hand rule
-        forward = np.cross(up, right)
-        forward_norm = np.linalg.norm(forward)
-        if forward_norm < 1e-8:
-            return None
-        forward = forward / forward_norm
-
-        # Re-orthogonalize right to ensure perfect orthogonality
-        right = np.cross(up, forward)
-        right = right / np.linalg.norm(right)
-
-        # Rotation matrix with body axes in world coordinates.
-        # Convention: X=forward, Y=right, Z=up
-        rot = np.column_stack([forward, right, up])
-        
-        # Verify right-handed
-        det = np.linalg.det(rot)
-        if det < 0:
-            forward = -forward
-            right = -right
-            rot = np.column_stack([forward, right, up])
-        
-        current_quat = Rotation.from_matrix(rot).as_quat() # xyzw
-        
-        # Ensure continuity if last quaternion is provided
-        if last_quat is not None:
-            # Check dot product to see if we need to flip sign
-            dot = np.dot(current_quat, last_quat)
-            if dot < 0:
-                current_quat = -current_quat
-                
-        return current_quat
-
     def get_robot_dof(self) -> int:
         """Get the number of degrees of freedom of the robot."""
         return self.robot_model.nq - 7  # Subtract floating base DOF
@@ -1327,7 +1171,7 @@ class OmniRetargeter:
     def validate_joint_mapping(self) -> List[str]:
         """Validate that the joint mapping is compatible with the robot.
         
-        Note: joint_mapping maps SMPLX joint names to robot BODY (link) names, not joint names.
+        Note: joint_mapping maps source target names to robot BODY (link) names, not joint names.
         So we check for body names in the URDF.
         """
         # Get all body names from the robot model
@@ -1344,10 +1188,10 @@ class OmniRetargeter:
 
     def _visualize_trajectory(self, trajectory: np.ndarray, scaled_terrain: trimesh.Trimesh):
         """
-        Visualize the SMPLX trajectory using matplotlib 3D animation with terrain mesh.
+        Visualize the source trajectory using matplotlib 3D animation with terrain mesh.
         
         Args:
-            trajectory: Processed trajectory of shape (T, J, 3) where T is frames, J is joints
+            trajectory: Processed trajectory of shape (T, N, 3) where T is frames, N is source targets
                        Coordinates are assumed to be in +Z up convention (already transformed)
             scaled_terrain: Scaled terrain mesh
         """
@@ -1355,7 +1199,7 @@ class OmniRetargeter:
         print(f"Terrain mesh: {len(scaled_terrain.vertices)} vertices, {len(scaled_terrain.faces)} faces")
         print("Coordinate system: +Z is up")
         
-        num_frames, num_joints, _ = trajectory.shape
+        num_frames, num_targets, _ = trajectory.shape
         
         # Create figure and 3D axis
         fig = plt.figure(figsize=(14, 12))
@@ -1390,7 +1234,7 @@ class OmniRetargeter:
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
         ax.set_zlabel('Z (m) - Up')
-        ax.set_title('SMPLX Trajectory with Terrain Visualization')
+        ax.set_title('Source Trajectory with Terrain Visualization')
         
         # Set equal aspect ratio
         max_range = max(x_range, y_range, z_range)
@@ -1440,14 +1284,14 @@ class OmniRetargeter:
             linewidth=0
         )
         
-        # Initialize scatter plot for joints
+        # Initialize scatter plot for source targets.
         scatter = ax.scatter([], [], [], c='blue', marker='o', s=50, alpha=0.9, edgecolors='black', linewidths=0.5)
         
         # Add text for frame counter
         frame_text = ax.text2D(0.02, 0.95, '', transform=ax.transAxes, fontsize=12)
         
-        # Define SMPLX skeleton connections (approximate body structure)
-        # These are indices in the standard SMPLX joint ordering
+        # Define source skeleton connections (approximate body structure)
+        # These are indices in the standard source target ordering
         skeleton_connections = [
             # Spine
             (0, 3),   # Pelvis -> Spine1
@@ -1481,8 +1325,8 @@ class OmniRetargeter:
             (19, 21), # R_Elbow -> R_Wrist
         ]
         
-        # Filter connections to only include joints we have
-        valid_connections = [(i, j) for i, j in skeleton_connections if i < num_joints and j < num_joints]
+        # Filter connections to only include targets we have.
+        valid_connections = [(i, j) for i, j in skeleton_connections if i < num_targets and j < num_targets]
         
         # Initialize line objects for skeleton
         lines = []
@@ -1504,11 +1348,11 @@ class OmniRetargeter:
         
         def update(frame_idx):
             """Update animation for each frame."""
-            # Get joint positions for current frame
-            joints = trajectory[frame_idx]  # Shape: (J, 3)
+            # Get source target positions for current frame.
+            targets = trajectory[frame_idx]  # Shape: (N, 3)
             
             # Update scatter plot
-            xs, ys, zs = joints[:, 0], joints[:, 1], joints[:, 2]
+            xs, ys, zs = targets[:, 0], targets[:, 1], targets[:, 2]
             scatter._offsets3d = (xs, ys, zs)
             
             # Update frame counter
@@ -1516,9 +1360,9 @@ class OmniRetargeter:
             
             # Update skeleton lines
             for line, (i, j) in zip(lines, valid_connections):
-                x_data = [joints[i, 0], joints[j, 0]]
-                y_data = [joints[i, 1], joints[j, 1]]
-                z_data = [joints[i, 2], joints[j, 2]]
+                x_data = [targets[i, 0], targets[j, 0]]
+                y_data = [targets[i, 1], targets[j, 1]]
+                z_data = [targets[i, 2], targets[j, 2]]
                 line.set_data(x_data, y_data)
                 line.set_3d_properties(z_data)
             

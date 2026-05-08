@@ -9,7 +9,8 @@ import time
 
 from omniretargeting import OmniRetargeter
 from omniretargeting.robot_config import load_robot_config
-from omniretargeting.utils import load_smplx_trajectory, normalize_retargeted_output_path
+from omniretargeting.data_sources.smplx import SmplxDataSource
+from omniretargeting.utils import normalize_retargeted_output_path
 
 import contextlib
 import shutil
@@ -413,8 +414,10 @@ def main():
         default=DEFAULT_ROBOT_CONFIG_PATH,
         help=f"Path to robot configuration JSON file (default: {DEFAULT_ROBOT_CONFIG_PATH})",
     )
-    parser.add_argument("--smplx_model_dir", required=True, help="Directory containing SMPLX model files")
-    parser.add_argument("--smplx_motion", required=True, help="Path to SMPLX motion file (.npz)")
+    parser.add_argument("--source", default=None, help="Source entry name or source type from the robot profile (default: active_source)")
+    parser.add_argument("--motion", default=None, help="Path to source motion file")
+    parser.add_argument("--smplx_model_dir", default=None, help="Directory containing SMPLX model files")
+    parser.add_argument("--smplx_motion", default=None, help="Path to SMPLX motion file (.npz)")
     parser.add_argument("--output", required=True, help="Path to save output motion (.npy)")
     parser.add_argument("--terrain", help="Path to terrain mesh file (optional, defaults to flat ground)")
     parser.add_argument(
@@ -469,13 +472,27 @@ def main():
             "Robot URDF is required. Set 'urdf_path' in the robot profile JSON (--robot-config)."
         )
 
+    selected_source = robot_config.get("selected_source", {})
+    if args.source:
+        source_entries = robot_config.get("source", [])
+        matches = [s for s in source_entries if s.get("name") == args.source or s.get("type") == args.source]
+        if len(matches) != 1:
+            raise ValueError(f"--source {args.source!r} must match exactly one source entry by name or type.")
+        selected_source = matches[0]
+
     robot_height = robot_config.get("robot_height")
-    smplx_joint_names = robot_config.get("smplx_joint_names")
+    source_target_names_override = selected_source.get("target_names_override", selected_source.get("target_names", robot_config.get("source_target_names", robot_config.get("smplx_joint_names"))))
     height_estimation = robot_config.get("height_estimation")
     base_orientation = robot_config.get("base_orientation")
     retargeting = robot_config.get("retargeting")
     link_offset_config = robot_config.get("link_offset_config")
-    smplx_betas = robot_config.get("smplx_betas")
+    source_betas = selected_source.get("betas", robot_config.get("smplx_betas"))
+    source_type = selected_source.get("type", "smplx")
+    source_motion_path = args.motion or args.smplx_motion
+    if source_motion_path is None:
+        raise ValueError("Motion input is required. Provide --motion or legacy --smplx_motion.")
+    source_model_dir = args.smplx_model_dir or selected_source.get("smpl_model_dir") or robot_config.get("smpl_model_dir")
+    source_gender = selected_source.get("gender", robot_config.get("source_gender", "neutral"))
 
     # Merge CLI flag into retargeting config
     if retargeting is None:
@@ -498,38 +515,30 @@ def main():
         terrain_path = temp_terrain_path
 
     try:
-        # Load SMPLX trajectory
-        print(f"Loading SMPLX trajectory from {args.smplx_motion}...")
-        smplx_trajectory, smplx_orientations = load_smplx_trajectory(
-            smplx_file=Path(args.smplx_motion),
-            smplx_model_directory=args.smplx_model_dir,
+        if source_type != "smplx":
+            raise ValueError(f"Unsupported source type: {source_type!r}")
+
+        print(f"Loading {source_type} motion from {source_motion_path}...")
+        data_source = SmplxDataSource(
+            motion_file=Path(source_motion_path),
+            model_directory=source_model_dir,
+            gender=source_gender,
+            target_names_override=source_target_names_override,
+            betas=source_betas,
         )
-        
-        # Try to detect framerate from SMPLX file if not provided
-        framerate = args.framerate
-        if framerate is None:
-            try:
-                smplx_data = np.load(args.smplx_motion, allow_pickle=True)
-                if isinstance(smplx_data, np.lib.npyio.NpzFile):
-                    if "framerate" in smplx_data:
-                        framerate = float(smplx_data["framerate"])
-                        print(f"Detected framerate from file: {framerate}")
-                    elif "mocap_framerate" in smplx_data:
-                        framerate = float(smplx_data["mocap_framerate"])
-                        print(f"Detected mocap_framerate from file: {framerate}")
-                    elif "mocap_frame_rate" in smplx_data:
-                        framerate = float(smplx_data["mocap_frame_rate"])
-                        print(f"Detected mocap_frame_rate from file: {framerate}")
-            except Exception:
-                pass
-        
+        motion_data = data_source.load()
+        source_positions = motion_data.positions
+        source_orientations = motion_data.metadata.get("joint_orientations")
+        framerate = args.framerate or motion_data.framerate
         if framerate is None:
             framerate = 30.0
             print(f"Using default framerate: {framerate}")
+        else:
+            print(f"Using framerate: {framerate}")
 
-        print(f"Loaded trajectory with shape: {smplx_trajectory.shape}")
-        if smplx_orientations is not None:
-            print(f"Loaded orientations with shape: {smplx_orientations.shape}")
+        print(f"Loaded trajectory with shape: {source_positions.shape}")
+        if source_orientations is not None:
+            print(f"Loaded orientations with shape: {source_orientations.shape}")
         else:
             print("Warning: Orientations not available for this file format.")
 
@@ -540,20 +549,18 @@ def main():
             terrain_mesh_path=terrain_path,
             joint_mapping=joint_mapping,
             robot_height=robot_height,
-            smplx_joint_names=smplx_joint_names,
+            source_target_names=motion_data.target_names,
             height_estimation=height_estimation,
             base_orientation=base_orientation,
             retargeting=retargeting,
             link_offset_config=link_offset_config,
-            smplx_betas=smplx_betas,
-            smplx_model_dir=args.smplx_model_dir,
         )
 
         # Perform retargeting
         print("Retargeting motion...")
         enable_terrain_scaling = bool(args.output_scaled_terrain)
-        terrain_scale, retargeted_motion = retargeter.retarget_motion(
-            smplx_trajectory,
+        source_to_robot_scale, retargeted_motion = retargeter.retarget_motion(
+            motion_data,
             framerate=framerate,
             visualize_trajectory=args.vis,
             enable_terrain_scaling=enable_terrain_scaling,
@@ -561,7 +568,7 @@ def main():
 
         if args.output_scaled_terrain:
             scaled_terrain = trimesh.load(terrain_path, force="mesh")
-            scaled_terrain.apply_scale(terrain_scale)
+            scaled_terrain.apply_scale(source_to_robot_scale)
             output_scaled_terrain_path = Path(args.output_scaled_terrain)
             output_scaled_terrain_path.parent.mkdir(parents=True, exist_ok=True)
             scaled_terrain.export(output_scaled_terrain_path)
@@ -601,7 +608,7 @@ def main():
             base_quat_w=base_quat # Saving as wxyz (MuJoCo convention)
         )
         
-        print(f"Done! Terrain scale used: {terrain_scale}")
+        print(f"Done! Source-to-robot scale used: {source_to_robot_scale}")
 
         # Load terrain for visualization/video if needed
         vis_terrain = None
@@ -609,19 +616,19 @@ def main():
             try:
                 vis_terrain = trimesh.load(terrain_path, force='mesh')
                 if args.output_scaled_terrain:
-                    vis_terrain.apply_scale(terrain_scale)
+                    vis_terrain.apply_scale(source_to_robot_scale)
             except Exception as e:
                 print(f"Could not load terrain for visualization: {e}")
 
         if args.save_video:
             save_trajectory_video(
                 robot_urdf_path, retargeted_motion, args.save_video,
-                smplx_trajectory=smplx_trajectory * terrain_scale,
+                smplx_trajectory=source_positions * source_to_robot_scale,
                 terrain_mesh=vis_terrain, fps=framerate,
             )
 
         if args.vis:
-            visualize_trajectory(robot_urdf_path, retargeted_motion, smplx_trajectory * terrain_scale, terrain_mesh=vis_terrain)
+            visualize_trajectory(robot_urdf_path, retargeted_motion, source_positions * source_to_robot_scale, terrain_mesh=vis_terrain)
 
     finally:
         # Cleanup temp file
