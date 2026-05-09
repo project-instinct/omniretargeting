@@ -46,7 +46,6 @@ class OmniRetargeter:
         joint_mapping: Dict[str, str],
         robot_height: Optional[float] = None,
         source_target_names: Optional[List[str]] = None,
-        base_orientation: Optional[Dict[str, str]] = None,
         retargeting: Optional[Dict[str, Any]] = None,
         link_offset_config: Optional[Dict[str, Any]] = None,
     ):
@@ -74,7 +73,6 @@ class OmniRetargeter:
 
         # Optional per-robot configuration with safe defaults.
 
-        self.base_orientation_config = dict(base_orientation or {})
         self.retargeting_config = dict(retargeting or {})
         self.link_offset_config = link_offset_config
 
@@ -368,17 +366,14 @@ class OmniRetargeter:
             if root_orientation is not None:
                 quat_xyzw = Rotation.from_rotvec(root_orientation).as_quat()
                 q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
-            else:
-                quat_xyzw = self._estimate_base_orientation_from_targets(source_positions)
-                if quat_xyzw is not None:
-                    q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
 
         mapped_source_targets = self._extract_mapped_source_targets(source_positions)
-        target_quat_xyzw = self._estimate_base_orientation_from_targets(source_positions, state.last_estimated_quat)
-        state.last_estimated_quat = target_quat_xyzw
+        
+        # Use root_orientation from motion data if available
         target_quat_wxyz = None
-        if target_quat_xyzw is not None:
-            target_quat_wxyz = np.array([target_quat_xyzw[3], target_quat_xyzw[0], target_quat_xyzw[1], target_quat_xyzw[2]])
+        if root_orientation is not None:
+            quat_xyzw = Rotation.from_rotvec(root_orientation).as_quat()
+            target_quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
 
         q_opt = state.retargeter.retarget_frame(
             mapped_source_targets,
@@ -489,90 +484,6 @@ class OmniRetargeter:
         scaled_mesh = self.terrain_mesh.copy()
         scaled_mesh.apply_scale(source_to_robot_scale)
         return scaled_mesh
-
-    def _estimate_base_orientation_from_targets(
-        self,
-        source_targets: np.ndarray,
-        last_quat: np.ndarray | None = None,
-    ) -> np.ndarray | None:
-        """
-        Estimate a base orientation from source target positions.
-
-        Uses pelvis/hips/spine to build an approximate body frame:
-        - up: pelvis -> spine1
-        - right: left_hip -> right_hip
-        - forward: right x up
-        Returns quaternion in xyzw order.
-        
-        Args:
-            source_targets: Source target positions array.
-            last_quat: Quaternion from previous frame to ensure continuity (xyzw).
-        """
-        if source_targets.shape[0] < 4:
-            return None
-
-        pelvis_name = self.base_orientation_config.get("pelvis", "Pelvis")
-        left_hip_name = self.base_orientation_config.get("left_hip", "L_Hip")
-        right_hip_name = self.base_orientation_config.get("right_hip", "R_Hip")
-        spine_name = self.base_orientation_config.get("spine", "Spine1")
-
-        pelvis_idx = self.source_target_indices.get(pelvis_name, 0)
-        left_hip_idx = self.source_target_indices.get(left_hip_name, 1)
-        right_hip_idx = self.source_target_indices.get(right_hip_name, 2)
-        spine_idx = self.source_target_indices.get(spine_name, 3)
-
-        max_required_idx = max(pelvis_idx, left_hip_idx, right_hip_idx, spine_idx)
-        if source_targets.shape[0] <= max_required_idx:
-            return None
-
-        pelvis = source_targets[pelvis_idx]
-        left_hip = source_targets[left_hip_idx]
-        right_hip = source_targets[right_hip_idx]
-        spine1 = source_targets[spine_idx]
-
-        up = spine1 - pelvis
-        right = right_hip - left_hip
-
-        up_norm = np.linalg.norm(up)
-        right_norm = np.linalg.norm(right)
-        if up_norm < 1e-8 or right_norm < 1e-8:
-            return None
-
-        up = up / up_norm
-        right = right / right_norm
-        
-        # Build forward using right-hand rule
-        forward = np.cross(up, right)
-        forward_norm = np.linalg.norm(forward)
-        if forward_norm < 1e-8:
-            return None
-        forward = forward / forward_norm
-
-        # Re-orthogonalize right to ensure perfect orthogonality
-        right = np.cross(up, forward)
-        right = right / np.linalg.norm(right)
-
-        # Rotation matrix with body axes in world coordinates.
-        # Convention: X=forward, Y=right, Z=up
-        rot = np.column_stack([forward, right, up])
-        
-        # Verify right-handed
-        det = np.linalg.det(rot)
-        if det < 0:
-            forward = -forward
-            right = -right
-            rot = np.column_stack([forward, right, up])
-        
-        current_quat = Rotation.from_matrix(rot).as_quat() # xyzw
-        
-        # Ensure continuity if last quaternion is provided
-        if last_quat is not None:
-            # Check dot product to see if we need to flip sign
-            dot = np.dot(current_quat, last_quat)
-            if dot < 0:
-                current_quat = -current_quat
-                
-        return current_quat
 
     def _get_foot_stabilization_config(self) -> Dict[str, Any]:
         """Return merged foot stabilization settings."""

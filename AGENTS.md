@@ -84,11 +84,15 @@
   - Orchestrating `GenericInteractionRetargeter` (the math engine)
 
 **Current Status:**
-- ✅ Height estimation moved to `SmplxDataSource` (no longer in `OmniRetargeter`)
-- ⚠️ Base orientation estimation still uses SMPL-X joint names in `OmniRetargeter`
-  - TODO: Move to `DataSource` for full source-agnosticism
+- ✅ Height estimation moved to `SmplxDataSource`
+- ✅ Base orientation uses `motion_data.root_orientations` (provided by DataSource)
+- ✅ OmniRetargeter is now fully source-agnostic
 
 **API Parameters:**
 - `robot_urdf_path`, `terrain_mesh_path`, `joint_mapping`, `robot_height`, `retargeting`, `link_offset_config` - ✅ Source-agnostic
-- `source_target_names` - ⚠️ Should come from `motion_data.target_names` (currently passed explicitly)
-- `base_orientation` - ❌ SMPL-X specific (needs refactoring)
+- `source_target_names` - ✅ Comes from `motion_data.target_names`
+
+**Note on Foot Stabilization:**
+- Hardcoded fallback joint names (`L_Foot`, `R_Foot`, etc.) exist in `_resolve_foot_body_ids()`
+- These are only fallbacks; the method first tries to resolve from `joint_mapping`
+- Not a blocker for source-agnosticism as they're just defaults

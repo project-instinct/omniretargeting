@@ -482,7 +482,6 @@ def main():
 
     robot_height = robot_config.get("robot_height")
     source_target_names_override = selected_source.get("target_names_override", selected_source.get("target_names", robot_config.get("source_target_names", robot_config.get("smplx_joint_names"))))
-    base_orientation = robot_config.get("base_orientation")
     retargeting = robot_config.get("retargeting")
     link_offset_config = robot_config.get("link_offset_config")
     source_betas = selected_source.get("betas", robot_config.get("smplx_betas"))
@@ -549,7 +548,6 @@ def main():
             joint_mapping=joint_mapping,
             robot_height=robot_height,
             source_target_names=motion_data.target_names,
-            base_orientation=base_orientation,
             retargeting=retargeting,
             link_offset_config=link_offset_config,
         )
