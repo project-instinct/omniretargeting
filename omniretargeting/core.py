@@ -46,7 +46,6 @@ class OmniRetargeter:
         joint_mapping: Dict[str, str],
         robot_height: Optional[float] = None,
         source_target_names: Optional[List[str]] = None,
-        height_estimation: Optional[Dict[str, Any]] = None,
         base_orientation: Optional[Dict[str, str]] = None,
         retargeting: Optional[Dict[str, Any]] = None,
         link_offset_config: Optional[Dict[str, Any]] = None,
@@ -60,7 +59,7 @@ class OmniRetargeter:
             joint_mapping: Dictionary mapping source target names to robot link names
             robot_height: Height of the robot in meters (auto-detected if None)
             source_target_names: Ordered source target names used by joint_mapping
-            height_estimation: Optional settings for human height estimation from source targets
+
             base_orientation: Optional source target names used for base orientation estimation
             retargeting: Optional solver/retargeting settings forwarded to interaction retargeter
             link_offset_config: Optional per-link offset dictionary forwarded to GenericInteractionRetargeter.
@@ -74,7 +73,7 @@ class OmniRetargeter:
         self.source_target_names = source_target_names
 
         # Optional per-robot configuration with safe defaults.
-        self.height_estimation_config = dict(height_estimation or {})
+
         self.base_orientation_config = dict(base_orientation or {})
         self.retargeting_config = dict(retargeting or {})
         self.link_offset_config = link_offset_config
@@ -265,7 +264,6 @@ class OmniRetargeter:
 
         source_to_robot_scale = self._resolve_source_to_robot_scale(
             apply_source_to_robot_scaling=enable_terrain_scaling,
-            positions=motion_data.positions,
             source_height=motion_data.source_height,
         )
         scaled_terrain = self._scale_terrain_mesh(source_to_robot_scale) if enable_terrain_scaling else self.terrain_mesh.copy()
@@ -437,18 +435,14 @@ class OmniRetargeter:
     def _resolve_source_to_robot_scale(
         self,
         apply_source_to_robot_scaling: bool,
-        positions: np.ndarray | None,
         source_height: float | None,
     ) -> float:
         if not apply_source_to_robot_scaling:
             return 1.0
-        if source_height is None:
-            return self._compute_source_to_robot_scale(positions)
-        return self._compute_source_to_robot_scale(positions, source_height=source_height)
+        return self._compute_source_to_robot_scale(source_height=source_height)
 
     def _compute_source_to_robot_scale(
         self,
-        source_positions: np.ndarray,
         source_height: float | None = None,
     ) -> float:
         """
@@ -456,59 +450,23 @@ class OmniRetargeter:
 
         Batch retargeting uses this factor to put source target positions, optional root
         translations, and optionally the terrain mesh into the robot's scale.
+        
+        Args:
+            source_height: Source height in meters (from motion data source)
+        
+        Returns:
+            Scale factor to convert source coordinates to robot scale
         """
-        estimated_source_height = source_height
+        # Use provided source height, or fallback to default human height
+        if source_height is None:
+            source_height = 1.7
+            print(f"Using default source height: {source_height:.3f}m")
+        else:
+            print(f"Using source height from data source: {source_height:.3f}m")
 
-        # Estimate from source target positions if the adapter did not provide height.
-        if estimated_source_height is None and source_positions is not None and len(source_positions) > 0:
-            # Estimate height from source targets.
-            # Source target defaults: 0/root, 10/11 feet, 15 head for SMPL-like body-joint layouts.
-            # We can find the max vertical extent across all frames
+        source_to_robot_scale = self.robot_height / source_height
 
-            # Find the frame where the person is most upright (max head height)
-            # Assuming Z is up
-            head_joint_name = self.height_estimation_config.get("head_target", self.height_estimation_config.get("head_joint", "Head"))
-            foot_joint_names = self.height_estimation_config.get("foot_targets", self.height_estimation_config.get("foot_joints", ["L_Foot", "R_Foot"]))
-            head_top_offset = float(self.height_estimation_config.get("head_top_offset", 0.12))
-
-            head_idx = self.source_target_indices.get(head_joint_name, 15)
-            foot_indices = [
-                self.source_target_indices[name]
-                for name in foot_joint_names
-                if name in self.source_target_indices
-            ]
-            if not foot_indices:
-                foot_indices = [10, 11]  # fallback defaults
-            
-            # Check if we have enough source targets.
-            if source_positions.shape[1] > head_idx and all(idx < source_positions.shape[1] for idx in foot_indices):
-                # Calculate height per frame: Head Z - Average Foot Z
-                head_z = source_positions[:, head_idx, 2]
-                
-                # Use min foot Z per frame as ground reference relative to body
-                feet_z = np.min(source_positions[:, foot_indices, 2], axis=1)
-                
-                # Height per frame
-                heights = head_z - feet_z
-                
-                # Use the maximum height observed (standing pose)
-                # Add offset for top of head (head joint is in neck/center of head)
-                # Approx 10-15cm from head joint to top of head
-                estimated_source_height = np.max(heights) + head_top_offset
-                
-                # Sanity check: Constrain to reasonable human range [1.4, 2.2]
-                estimated_source_height = np.clip(estimated_source_height, 1.4, 2.2)
-
-                print(f"Estimated source height from trajectory: {estimated_source_height:.3f}m")
-
-        # Priority 3: Fallback to 1.7m
-        if estimated_source_height is None:
-            estimated_source_height = 1.7
-            print(f"Using default source height: {estimated_source_height:.3f}m")
-
-        source_to_robot_scale = self.robot_height / estimated_source_height
-
-        print(f"Computed source-to-robot scale factor: {source_to_robot_scale:.4f} (Robot: {self.robot_height}m, Source: {estimated_source_height:.3f}m)")
+        print(f"Computed source-to-robot scale factor: {source_to_robot_scale:.4f} (Robot: {self.robot_height}m, Source: {source_height:.3f}m)")
 
         return float(source_to_robot_scale)
 

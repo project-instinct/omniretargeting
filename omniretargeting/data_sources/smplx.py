@@ -54,13 +54,19 @@ class SmplxDataSource(DataSource):
         if self._motion_data is None:
             positions, orientations, root_orient, trans, framerate, metadata = self._load_arrays(self.motion_file)
             names = self.target_names_override or DEFAULT_SMPLX_TARGET_NAMES[: positions.shape[1]]
+            
+            # Compute source height: try betas first, then trajectory, then None
+            source_height = self.compute_human_height()
+            if source_height is None:
+                source_height = self.estimate_height_from_trajectory(positions)
+            
             self._motion_data = MotionData(
                 positions=positions,
                 target_names=names,
                 root_orientations=root_orient,
                 root_translations=trans,
                 framerate=framerate,
-                source_height=self.compute_human_height(),
+                source_height=source_height,
                 metadata={**self.metadata, **metadata, "source_type": "smplx", "joint_orientations": orientations},
             )
         return self._motion_data
@@ -103,6 +109,64 @@ class SmplxDataSource(DataSource):
             return float(joints[:, 1].max() - joints[:, 1].min())
         except Exception as exc:
             print(f"[SmplxDataSource] Failed to compute height from betas: {exc}")
+            return None
+
+
+    def estimate_height_from_trajectory(self, positions: np.ndarray) -> float | None:
+        """
+        Estimate human height from trajectory positions.
+        
+        Uses head and foot positions across all frames to estimate standing height.
+        
+        Args:
+            positions: Motion positions array of shape (T, J, 3)
+            
+        Returns:
+            Estimated height in meters, or None if estimation fails
+        """
+        if positions is None or len(positions) == 0:
+            return None
+        
+        # Default SMPL-X joint indices
+        head_idx = 15
+        foot_indices = [10, 11]
+        head_top_offset = 0.12
+        
+        # Try to use target names if available
+        if self.target_names_override:
+            try:
+                head_idx = self.target_names_override.index("Head")
+            except ValueError:
+                pass
+            
+            foot_indices = []
+            for foot_name in ["L_Foot", "R_Foot"]:
+                try:
+                    foot_indices.append(self.target_names_override.index(foot_name))
+                except ValueError:
+                    pass
+            if not foot_indices:
+                foot_indices = [10, 11]
+        
+        # Check if we have enough joints
+        if positions.shape[1] <= head_idx or not all(idx < positions.shape[1] for idx in foot_indices):
+            return None
+        
+        try:
+            # Calculate height per frame: Head Z - Min Foot Z
+            head_z = positions[:, head_idx, 2]
+            feet_z = np.min(positions[:, foot_indices, 2], axis=1)
+            heights = head_z - feet_z
+            
+            # Use maximum height (standing pose) + head top offset
+            estimated_height = float(np.max(heights) + head_top_offset)
+            
+            # Sanity check: reasonable human range
+            estimated_height = np.clip(estimated_height, 1.4, 2.2)
+            
+            return estimated_height
+        except Exception as e:
+            print(f"[SmplxDataSource] Failed to estimate height from trajectory: {e}")
             return None
 
     def _load_arrays(
