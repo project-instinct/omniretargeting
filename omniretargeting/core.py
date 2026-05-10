@@ -465,20 +465,6 @@ class OmniRetargeter:
 
         return float(source_to_robot_scale)
 
-    def _extract_foot_positions(self, source_positions: np.ndarray) -> np.ndarray:
-        """Extract foot positions from source trajectory."""
-        # source target indices for feet
-        # L_Foot: 10, R_Foot: 11 (standard source ordering)
-        foot_indices = [10, 11]
-
-        foot_positions = []
-        for frame in source_positions:
-            for foot_idx in foot_indices:
-                if foot_idx < len(frame):
-                    foot_positions.append(frame[foot_idx])
-
-        return np.array(foot_positions)
-
     def _scale_terrain_mesh(self, source_to_robot_scale: float) -> trimesh.Trimesh:
         """Scale the terrain mesh by the given factor."""
         scaled_mesh = self.terrain_mesh.copy()
@@ -1161,43 +1147,43 @@ class OmniRetargeter:
         # Add text for frame counter
         frame_text = ax.text2D(0.02, 0.95, '', transform=ax.transAxes, fontsize=12)
         
-        # Define source skeleton connections (approximate body structure)
-        # These are indices in the standard source target ordering
-        skeleton_connections = [
+        # Build skeleton connections dynamically based on available targets
+        skeleton_pairs = [
             # Spine
-            (0, 3),   # Pelvis -> Spine1
-            (3, 6),   # Spine1 -> Spine2
-            (6, 9),   # Spine2 -> Spine3
-            (9, 12),  # Spine3 -> Neck
-            (12, 15), # Neck -> Head
-            
+            ("Pelvis", "Spine1"),
+            ("Spine1", "Spine2"),
+            ("Spine2", "Spine3"),
+            ("Spine3", "Neck"),
+            ("Neck", "Head"),
             # Left leg
-            (0, 1),   # Pelvis -> L_Hip
-            (1, 4),   # L_Hip -> L_Knee
-            (4, 7),   # L_Knee -> L_Ankle
-            (7, 10),  # L_Ankle -> L_Foot
-            
+            ("Pelvis", "L_Hip"),
+            ("L_Hip", "L_Knee"),
+            ("L_Knee", "L_Ankle"),
+            ("L_Ankle", "L_Foot"),
             # Right leg
-            (0, 2),   # Pelvis -> R_Hip
-            (2, 5),   # R_Hip -> R_Knee
-            (5, 8),   # R_Knee -> R_Ankle
-            (8, 11),  # R_Ankle -> R_Foot
-            
+            ("Pelvis", "R_Hip"),
+            ("R_Hip", "R_Knee"),
+            ("R_Knee", "R_Ankle"),
+            ("R_Ankle", "R_Foot"),
             # Left arm
-            (9, 13),  # Spine3 -> L_Collar
-            (13, 16), # L_Collar -> L_Shoulder
-            (16, 18), # L_Shoulder -> L_Elbow
-            (18, 20), # L_Elbow -> L_Wrist
-            
+            ("Spine3", "L_Collar"),
+            ("L_Collar", "L_Shoulder"),
+            ("L_Shoulder", "L_Elbow"),
+            ("L_Elbow", "L_Wrist"),
             # Right arm
-            (9, 14),  # Spine3 -> R_Collar
-            (14, 17), # R_Collar -> R_Shoulder
-            (17, 19), # R_Shoulder -> R_Elbow
-            (19, 21), # R_Elbow -> R_Wrist
+            ("Spine3", "R_Collar"),
+            ("R_Collar", "R_Shoulder"),
+            ("R_Shoulder", "R_Elbow"),
+            ("R_Elbow", "R_Wrist"),
         ]
         
-        # Filter connections to only include targets we have.
-        valid_connections = [(i, j) for i, j in skeleton_connections if i < num_targets and j < num_targets]
+        # Convert target names to indices using the mapping
+        valid_connections = []
+        for name1, name2 in skeleton_pairs:
+            if name1 in self.source_target_indices and name2 in self.source_target_indices:
+                idx1 = self.source_target_indices[name1]
+                idx2 = self.source_target_indices[name2]
+                valid_connections.append((idx1, idx2))
         
         # Initialize line objects for skeleton
         lines = []
