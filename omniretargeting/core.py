@@ -642,27 +642,32 @@ class OmniRetargeter:
         return specs
 
     def _resolve_foot_body_ids(self, cfg: Dict[str, Any]) -> Dict[str, int]:
-        """Resolve left/right foot body ids from config, mapping, or robot body names."""
+        """Resolve left/right foot body ids from explicit config or robot body name search.
+        
+        Resolution order:
+        1. Explicit config: cfg["body_names"]["left"|"right"] specifies robot body name
+        2. Keyword search: search robot bodies for side ("left"/"l_") + ("foot"/"ankle")
+        
+        This is source-agnostic - it does not depend on source target names like
+        "L_Foot" or "R_Foot". The user can override via foot_stabilization config:
+            retargeting:
+              foot_stabilization:
+                body_names:
+                  left: "left_ankle_roll_link"
+                  right: "right_ankle_roll_link"
+        """
         resolved = {}
         explicit = dict(cfg.get("body_names", {}) or {})
 
-        for side, joint_candidates in {
-            "left": ["L_Foot", "L_Ankle"],
-            "right": ["R_Foot", "R_Ankle"],
-        }.items():
+        for side in ("left", "right"):
             body_id = -1
+            
+            # Priority 1: Explicit robot body name from config
             explicit_name = explicit.get(side)
             if explicit_name:
                 body_id = self._body_name_to_id(explicit_name)
 
-            if body_id < 0:
-                for target_name in joint_candidates:
-                    body_name = self.valid_source_to_robot_link_mapping.get(target_name)
-                    if body_name:
-                        body_id = self._body_name_to_id(body_name)
-                        if body_id >= 0:
-                            break
-
+            # Priority 2: Keyword-based search of robot body names
             if body_id < 0:
                 body_id = self._search_body_id_by_keywords(side)
 
