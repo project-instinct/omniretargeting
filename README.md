@@ -4,6 +4,52 @@
 
 This is a re-implementation of the [OmniRetarget](https://arxiv.org/abs/2509.26633) method. OmniRetargeting is a flexible motion retargeting system that converts ordered human/source target positions to any humanoid robot operating on any terrain mesh. Unlike specialized retargeting systems, OmniRetargeting automatically adapts to different robot morphologies and terrain types.
 
+
+
+## Source-Agnostic Architecture
+
+OmniRetargeting uses a source-agnostic architecture that supports multiple motion data formats through a registry system.
+
+### Supported Source Types
+
+- **SMPL-X**: Human body model motion data
+- **Custom sources**: Easily add new source adapters
+
+### Using Different Sources
+
+```python
+from omniretargeting import OmniRetargeter
+from omniretargeting.data_sources import create_data_source
+
+# Create a data source (automatically uses registry)
+data_source = create_data_source(
+    source_type="smplx",
+    motion_file="path/to/motion.npz",
+    source_config={"model_directory": "/path/to/models"}
+)
+
+# Create retargeter
+retargeter = OmniRetargeter(
+    robot_urdf_path="robot.urdf",
+    terrain_mesh_path="terrain.obj",
+    joint_mapping={"Pelvis": "torso_link", ...},
+    robot_height=1.6
+)
+
+# Retarget motion (batch mode)
+scale, robot_motion = retargeter.retarget_motion(data_source)
+
+# Or stream mode for frame-by-frame processing
+for robot_frame in retargeter.retarget_stream(data_source):
+    # Process each frame
+    pass
+```
+
+### Adding New Source Adapters
+
+See `docs/ADDING_SOURCE_ADAPTERS.md` for a guide on implementing new source adapters.
+
+
 ## Installation
 
 install from source:
