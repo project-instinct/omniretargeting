@@ -33,7 +33,8 @@
           0.0,
           0.0
         ]
-      }
+      },
+      "default_pose_on_robot": "T-Pose"
     }
   ],
   "height_estimation": {
@@ -136,25 +137,27 @@
       0.0
     ]
   },
-  "joint_pos_fitting_smplx": {
-    "left_hip_yaw_joint": 0.0,
-    "left_hip_roll_joint": 0.0,
-    "left_hip_pitch_joint": 0.0,
-    "left_knee_joint": 0.0,
-    "left_ankle_joint": 0.0,
-    "right_hip_yaw_joint": 0.0,
-    "right_hip_roll_joint": 0.0,
-    "right_hip_pitch_joint": 0.0,
-    "right_knee_joint": 0.0,
-    "right_ankle_joint": 0.0,
-    "torso_joint": 0.0,
-    "left_shoulder_pitch_joint": 0.0,
-    "left_shoulder_roll_joint": 0.0,
-    "left_shoulder_yaw_joint": 0.0,
-    "left_elbow_joint": 0.0,
-    "right_shoulder_pitch_joint": 0.0,
-    "right_shoulder_roll_joint": 0.0,
-    "right_shoulder_yaw_joint": 0.0,
-    "right_elbow_joint": 0.0
+  "default_joint_positions": {
+    "T-Pose": {
+      "left_hip_yaw_joint": 0.0,
+      "left_hip_roll_joint": 0.0,
+      "left_hip_pitch_joint": 0.0,
+      "left_knee_joint": 0.0,
+      "left_ankle_joint": 0.0,
+      "right_hip_yaw_joint": 0.0,
+      "right_hip_roll_joint": 0.0,
+      "right_hip_pitch_joint": 0.0,
+      "right_knee_joint": 0.0,
+      "right_ankle_joint": 0.0,
+      "torso_joint": 0.0,
+      "left_shoulder_pitch_joint": 0.0,
+      "left_shoulder_roll_joint": 0.0,
+      "left_shoulder_yaw_joint": 0.0,
+      "left_elbow_joint": 0.0,
+      "right_shoulder_pitch_joint": 0.0,
+      "right_shoulder_roll_joint": 0.0,
+      "right_shoulder_yaw_joint": 0.0,
+      "right_elbow_joint": 0.0
+    }
   }
 }
