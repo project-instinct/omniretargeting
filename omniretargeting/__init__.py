@@ -2,6 +2,16 @@
 
 from .__version__ import __version__
 from .core import OmniRetargeter
+from .data_sources.base import DataSource, MotionData, MotionFrame, validate_motion_frame_positions, validate_motion_positions
 from .robot_config import load_robot_config
 
-__all__ = ["OmniRetargeter", "load_robot_config", "__version__"]
+__all__ = [
+    "DataSource",
+    "MotionData",
+    "MotionFrame",
+    "OmniRetargeter",
+    "load_robot_config",
+    "validate_motion_frame_positions",
+    "validate_motion_positions",
+    "__version__",
+]

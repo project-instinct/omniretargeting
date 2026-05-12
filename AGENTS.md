@@ -32,3 +32,67 @@
 
 - Verified remote test baseline and marsbrain setup details are in `agents/marsbrain-computation.md`.
 - `agents/computation/` may be empty in this repo because some computation configuration is private.
+
+## Architecture Design Principles
+
+### OmniRetargeter: Source-Agnostic Interface
+
+ (in ) is designed as a **source-agnostic** high-level interface for motion retargeting. It should not contain logic specific to any particular motion capture format (SMPL-X, BVH, etc.).
+
+**Design Guidelines:**
+- **Source-specific logic belongs in DataSource adapters** (e.g., , )
+- DataSources are responsible for:
+  - Loading and parsing motion data
+  - Estimating source height from their specific format
+  - Computing base orientations from their joint structure
+  - Providing standardized  output
+- **OmniRetargeter handles generic retargeting concerns:**
+  - Robot configuration and validation
+  - Terrain scaling
+  - Batch/streaming processing
+  - Post-processing (foot stabilization, collision correction)
+  - Orchestrating  (the math engine)
+
+**Current Status:**
+- ✅ Height estimation moved to  (no longer in )
+- ⚠️ Base orientation estimation still uses SMPL-X joint names in 
+  - TODO: Move to  for full source-agnosticism
+
+**API Parameters:**
+- , , , , ,  - ✅ Source-agnostic
+-  - ⚠️ Should come from  (currently passed explicitly)
+-  - ❌ SMPL-X specific (needs refactoring)
+
+## Architecture Design Principles
+
+### OmniRetargeter: Source-Agnostic Interface
+
+`OmniRetargeter` (in `omniretargeting/core.py`) is designed as a **source-agnostic** high-level interface for motion retargeting. It should not contain logic specific to any particular motion capture format (SMPL-X, BVH, etc.).
+
+**Design Guidelines:**
+- **Source-specific logic belongs in DataSource adapters** (e.g., `SmplxDataSource`, `BvhDataSource`)
+- DataSources are responsible for:
+  - Loading and parsing motion data
+  - Estimating source height from their specific format
+  - Computing base orientations from their joint structure
+  - Providing standardized `MotionData` output
+- **OmniRetargeter handles generic retargeting concerns:**
+  - Robot configuration and validation
+  - Terrain scaling
+  - Batch/streaming processing
+  - Post-processing (foot stabilization, collision correction)
+  - Orchestrating `GenericInteractionRetargeter` (the math engine)
+
+**Current Status:**
+- ✅ Height estimation moved to `SmplxDataSource`
+- ✅ Base orientation uses `motion_data.root_orientations` (provided by DataSource)
+- ✅ OmniRetargeter is now fully source-agnostic
+
+**API Parameters:**
+- `robot_urdf_path`, `terrain_mesh_path`, `joint_mapping`, `robot_height`, `retargeting`, `link_offset_config` - ✅ Source-agnostic
+- `source_target_names` - ✅ Comes from `motion_data.target_names`
+
+**Note on Foot Stabilization:**
+- Hardcoded fallback joint names (`L_Foot`, `R_Foot`, etc.) exist in `_resolve_foot_body_ids()`
+- These are only fallbacks; the method first tries to resolve from `joint_mapping`
+- Not a blocker for source-agnosticism as they're just defaults

@@ -14,12 +14,10 @@ authors = [
 dependencies = [
     # Core dependencies from holosoma_retargeting
     "numpy==2.3.5",
-    "torch",
     "tqdm",
     "scipy",
     "matplotlib",
     "trimesh",
-    "smplx",
     "jinja2",
     "mujoco",
     "viser",
@@ -36,6 +34,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["mypy", "ruff", "pytest", "black"]
 test = ["pytest", "pytest-cov"]
+smplx = ["smplx", "torch"]
+all = ["omniretargeting[smplx]"]
 
 [tool.setuptools.packages.find]
 where = ["."]

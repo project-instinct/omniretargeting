@@ -11,7 +11,7 @@ from matplotlib.lines import Line2D
 import mujoco
 import numpy as np
 
-from .robot_config import load_robot_config
+from omniretargeting.robot_config import load_robot_config
 
 
 SMPLX_JOINT_NAMES = [
@@ -103,20 +103,20 @@ def _detect_robot_height(model: mujoco.MjModel, data: mujoco.MjData) -> float:
     return 1.6
 
 
-def _apply_joint_pos_fitting_smplx(
+def _apply_default_joint_positions(
     model: mujoco.MjModel,
     data: mujoco.MjData,
-    joint_pos_fitting_smplx: dict[str, float] | None,
+    default_joint_positions: dict[str, float] | None,
 ) -> None:
-    if not joint_pos_fitting_smplx:
+    if not default_joint_positions:
         return
 
-    for joint_name, joint_value in joint_pos_fitting_smplx.items():
+    for joint_name, joint_value in default_joint_positions.items():
         joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
         if joint_id < 0:
-            raise ValueError(f"Robot joint '{joint_name}' from joint_pos_fitting_smplx was not found in the URDF.")
+            raise ValueError(f"Robot joint '{joint_name}' from default_joint_positions was not found in the URDF.")
         if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
-            raise ValueError(f"Robot joint '{joint_name}' in joint_pos_fitting_smplx cannot be a free joint.")
+            raise ValueError(f"Robot joint '{joint_name}' in default_joint_positions cannot be a free joint.")
         qpos_adr = int(model.jnt_qposadr[joint_id])
         next_qpos_adr = model.nq
         for next_joint_id in range(joint_id + 1, model.njnt):
@@ -127,21 +127,21 @@ def _apply_joint_pos_fitting_smplx(
         qpos_width = next_qpos_adr - qpos_adr
         if qpos_width != 1:
             raise ValueError(
-                f"Robot joint '{joint_name}' in joint_pos_fitting_smplx must map to exactly one qpos entry, got {qpos_width}."
+                f"Robot joint '{joint_name}' in default_joint_positions must map to exactly one qpos entry, got {qpos_width}."
             )
         data.qpos[qpos_adr] = float(joint_value)
 
 
 def _load_robot_default_pose(
     urdf_path: str | Path,
-    joint_pos_fitting_smplx: dict[str, float] | None = None,
+    default_joint_positions: dict[str, float] | None = None,
 ) -> tuple[mujoco.MjModel, mujoco.MjData, dict[str, int], np.ndarray, np.ndarray]:
     model = mujoco.MjModel.from_xml_path(str(urdf_path))
     data = mujoco.MjData(model)
     mujoco.mj_resetData(model, data)
     if model.njnt > 0 and model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE and model.nq >= 7:
         data.qpos[3:7] = np.array([1.0, 0.0, 0.0, 0.0])
-    _apply_joint_pos_fitting_smplx(model, data, joint_pos_fitting_smplx)
+    _apply_default_joint_positions(model, data, default_joint_positions)
     mujoco.mj_forward(model, data)
 
     body_ids = {}
@@ -441,10 +441,10 @@ def main() -> None:
     if not isinstance(joint_mapping, dict) or not joint_mapping:
         raise ValueError("Robot config must define a non-empty 'joint_mapping'.")
 
-    joint_pos_fitting_smplx = robot_config.get("joint_pos_fitting_smplx")
+    default_joint_positions = robot_config.get("default_joint_positions")
     model, data, body_ids, body_positions, body_rotations = _load_robot_default_pose(
         robot_urdf_path,
-        joint_pos_fitting_smplx=joint_pos_fitting_smplx,
+        default_joint_positions=default_joint_positions,
     )
     missing_bodies = sorted({body_name for body_name in joint_mapping.values() if body_name not in body_ids})
     if missing_bodies:
@@ -488,7 +488,7 @@ def main() -> None:
 
     print(f"[visualize_offsets] robot_config={config_path}")
     print(f"[visualize_offsets] robot_urdf={robot_urdf_path}")
-    print(f"[visualize_offsets] joint_pos_fitting_smplx={0 if not joint_pos_fitting_smplx else len(joint_pos_fitting_smplx)}")
+    print(f"[visualize_offsets] default_joint_positions={0 if not default_joint_positions else len(default_joint_positions)}")
     print(f"[visualize_offsets] smplx_betas={'none' if not smplx_betas else len(smplx_betas)}")
     print(f"[visualize_offsets] robot_height={robot_height:.3f} m")
     print(f"[visualize_offsets] mapped_links={len(joint_mapping)}")
