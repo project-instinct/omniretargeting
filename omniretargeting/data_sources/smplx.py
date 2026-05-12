@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from omniretargeting.data_sources.base import DataSource, MotionData, MotionFrame
+from omniretargeting.data_sources.registry import register_data_source
 
 DEFAULT_SMPLX_TARGET_NAMES = [
     "Pelvis", "L_Hip", "R_Hip", "Spine1", "L_Knee", "R_Knee",
@@ -306,6 +307,43 @@ def compute_world_joint_orientations(*args, **kwargs):
     return SmplxDataSource.compute_world_joint_orientations(*args, **kwargs)
 
 
+def validate_smplx_trajectory(trajectory: np.ndarray) -> bool:
+    from omniretargeting.data_sources.base import validate_motion_positions
+
+    return validate_motion_positions(trajectory)
+
+
+def extract_smplx_joint_positions(trajectory: np.ndarray, joint_indices: list) -> np.ndarray:
+    return trajectory[:, joint_indices, :]
+
+
+def create_smplx_data_source(
+    motion_file: Path,
+    source_config: dict | None = None,
+    runtime_options: dict | None = None,
+) -> SmplxDataSource:
+    source_config = dict(source_config or {})
+    runtime_options = dict(runtime_options or {})
+    adapter_options = dict(source_config.get("adapter_options") or {})
+
+    def option(*keys, default=None):
+        for container in (runtime_options, adapter_options, source_config):
+            for key in keys:
+                if key in container and container[key] is not None:
+                    return container[key]
+        return default
+
+    target_names = option("target_names_override", "target_names", "joint_names")
+    model_directory = option("model_directory", "model_dir", "smpl_model_dir", "smplx_model_dir")
+    return SmplxDataSource(
+        motion_file=motion_file,
+        model_directory=model_directory,
+        gender=option("gender", default="neutral"),
+        target_names_override=target_names,
+        betas=option("betas", "smplx_betas"),
+    )
+
+
 def load_smplx_motion(
     smplx_file: Path,
     smplx_model_directory: Optional[str] = None,
@@ -333,3 +371,27 @@ def load_smplx_trajectory(
         model_directory=smplx_model_directory,
         gender=gender,
     ).load_trajectory(return_meta=return_meta)
+
+
+def retarget_smplx_to_robot(
+    smplx_trajectory: np.ndarray,
+    robot_urdf_path: Path,
+    terrain_mesh_path: Path,
+    joint_mapping: Dict[str, str],
+    robot_height: Optional[float] = None,
+    smplx_joint_names: Optional[List[str]] = None,
+) -> Tuple[float, np.ndarray]:
+    """Backward-compatible wrapper for older SMPL-X-specific callers."""
+    from omniretargeting.retargeting import retarget_source_to_robot
+
+    return retarget_source_to_robot(
+        source_positions=smplx_trajectory,
+        robot_urdf_path=robot_urdf_path,
+        terrain_mesh_path=terrain_mesh_path,
+        joint_mapping=joint_mapping,
+        robot_height=robot_height,
+        source_target_names=smplx_joint_names,
+    )
+
+
+register_data_source("smplx", create_smplx_data_source)

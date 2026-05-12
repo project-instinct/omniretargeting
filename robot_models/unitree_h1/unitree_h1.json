@@ -15,6 +15,27 @@
     "L_Elbow": "left_elbow_link",
     "R_Elbow": "right_elbow_link"
   },
+  "active_source": "smplx",
+  "source": [
+    {
+      "name": "smplx",
+      "type": "smplx",
+      "adapter_options": {
+        "betas": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  ],
   "height_estimation": {
     "head_joint": "Head",
     "foot_joints": [
@@ -135,17 +156,5 @@
     "right_shoulder_roll_joint": 0.0,
     "right_shoulder_yaw_joint": 0.0,
     "right_elbow_joint": 0.0
-  },
-  "smplx_betas": [
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0
-  ]
+  }
 }

@@ -28,8 +28,6 @@ def _normalize_source_entry(entry: dict[str, Any]) -> dict[str, Any]:
     source = dict(entry)
     if "target_names" not in source and "joint_names" in source:
         source["target_names"] = source["joint_names"]
-    if "target_names" not in source and "smplx_joint_names" in source:
-        source["target_names"] = source["smplx_joint_names"]
     if "target_mapping" not in source and "joint_mapping" in source:
         source["target_mapping"] = source["joint_mapping"]
     return source
@@ -101,29 +99,16 @@ def load_robot_config(config_path: str | Path) -> Dict[str, Any]:
     config["joint_mapping"] = target_mapping
     config["target_mapping"] = target_mapping
 
-    target_names = selected_source.get("target_names", config.get("smplx_joint_names"))
+    target_names = selected_source.get("target_names", config.get("source_target_names"))
     if target_names is not None:
-        config["smplx_joint_names"] = target_names
         config["source_target_names"] = target_names
 
     for key in ("height_estimation", "base_orientation"):
         if key in selected_source:
             config[key] = selected_source[key]
 
-    if "betas" in selected_source and "smplx_betas" not in config:
-        config["smplx_betas"] = selected_source["betas"]
-    if "gender" in selected_source:
-        config["source_gender"] = selected_source["gender"]
-    if "smpl_model_dir" in selected_source:
-        config["smpl_model_dir"] = selected_source["smpl_model_dir"]
-
-    joint_pos_fitting_smplx = config.get("joint_pos_fitting_smplx")
-    if joint_pos_fitting_smplx is not None and not isinstance(joint_pos_fitting_smplx, dict):
-        raise ValueError("Robot config 'joint_pos_fitting_smplx' must be a JSON object.")
-
-    smplx_betas = config.get("smplx_betas")
-    if smplx_betas is not None:
-        if not isinstance(smplx_betas, list) or not all(isinstance(v, (int, float)) for v in smplx_betas):
-            raise ValueError("Robot config 'smplx_betas' must be a list of numbers.")
+    source_options = selected_source.get("adapter_options")
+    if source_options is not None and not isinstance(source_options, dict):
+        raise ValueError("Robot config source 'adapter_options' must be a JSON object.")
 
     return config

@@ -11,7 +11,7 @@ from matplotlib.lines import Line2D
 import mujoco
 import numpy as np
 
-from .robot_config import load_robot_config
+from omniretargeting.robot_config import load_robot_config
 
 
 SMPLX_JOINT_NAMES = [

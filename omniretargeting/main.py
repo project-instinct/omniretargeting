@@ -1,4 +1,5 @@
 import argparse
+import warnings
 import numpy as np
 import trimesh
 from pathlib import Path
@@ -6,10 +7,11 @@ import tempfile
 import os
 import json
 import time
+import warnings
 
 from omniretargeting import OmniRetargeter
 from omniretargeting.robot_config import load_robot_config
-from omniretargeting.data_sources.smplx import SmplxDataSource
+from omniretargeting.data_sources.registry import create_data_source
 from omniretargeting.utils import normalize_retargeted_output_path
 
 import contextlib
@@ -179,7 +181,7 @@ def temporary_visualization_scene(urdf_path, terrain_mesh, target_faces=5000):
                 except OSError:
                     pass
 
-def save_trajectory_video(urdf_path, trajectory, output_path, smplx_trajectory=None, terrain_mesh=None, fps=30, width=640, height=480):
+def save_trajectory_video(urdf_path, trajectory, output_path, source_trajectory=None, terrain_mesh=None, fps=30, width=640, height=480):
     """Render the retargeted trajectory to a video file using MuJoCo offscreen renderer.
 
     Requires MUJOCO_GL=egl (or osmesa) for headless rendering.
@@ -272,8 +274,8 @@ def save_trajectory_video(urdf_path, trajectory, output_path, smplx_trajectory=N
 
 
 
-def visualize_trajectory(urdf_path, trajectory, smplx_trajectory=None, terrain_mesh=None):
-    """Visualize the retargeted trajectory and optional SMPLX joints in MuJoCo viewer."""
+def visualize_trajectory(urdf_path, trajectory, source_trajectory=None, terrain_mesh=None):
+    """Visualize the retargeted trajectory and optional source targets in MuJoCo viewer."""
     try:
         import mujoco
         import mujoco.viewer
@@ -345,20 +347,19 @@ def visualize_trajectory(urdf_path, trajectory, smplx_trajectory=None, terrain_m
             
             num_frames = len(trajectory)
             frame_idx = 0
-            smplx_frame_idx = 0
+            source_frame_idx = 0
             
             # Playback speed control
             fps = 30.0
             dt = 1.0 / fps
             
-            # Setup SMPLX joint visualization (spheres) if provided
-            smplx_geoms_base = None
-            smplx_num_joints = 0
-            if smplx_trajectory is not None and scene is not None:
-                smplx_num_joints = smplx_trajectory.shape[1]
-                smplx_geoms_base = scene.ngeom
-                for i in range(smplx_num_joints):
-                    geom = scene.geoms[smplx_geoms_base + i]
+            source_geoms_base = None
+            source_num_targets = 0
+            if source_trajectory is not None and scene is not None:
+                source_num_targets = source_trajectory.shape[1]
+                source_geoms_base = scene.ngeom
+                for i in range(source_num_targets):
+                    geom = scene.geoms[source_geoms_base + i]
                     mujoco.mjv_initGeom(
                         geom,
                         type=mujoco.mjtGeom.mjGEOM_SPHERE,
@@ -367,7 +368,7 @@ def visualize_trajectory(urdf_path, trajectory, smplx_trajectory=None, terrain_m
                         mat=np.eye(3).flatten(),
                         rgba=np.array([0.1, 0.9, 0.1, 0.9]),
                     )
-                scene.ngeom = smplx_geoms_base + smplx_num_joints
+                scene.ngeom = source_geoms_base + source_num_targets
 
             while viewer.is_running():
                 step_start = time.time()
@@ -380,16 +381,15 @@ def visualize_trajectory(urdf_path, trajectory, smplx_trajectory=None, terrain_m
                 data.qpos[:] = trajectory[frame_idx]
                 mujoco.mj_forward(model, data)
 
-                # Update SMPLX joint markers
-                if smplx_geoms_base is not None:
-                    smplx_joints = smplx_trajectory[smplx_frame_idx]
-                    for i in range(smplx_num_joints):
-                        scene.geoms[smplx_geoms_base + i].pos = smplx_joints[i]
+                if source_geoms_base is not None:
+                    source_targets = source_trajectory[source_frame_idx]
+                    for i in range(source_num_targets):
+                        scene.geoms[source_geoms_base + i].pos = source_targets[i]
                 
                 # Advance frame
                 frame_idx = (frame_idx + 1) % num_frames
-                if smplx_trajectory is not None:
-                    smplx_frame_idx = (smplx_frame_idx + 1) % len(smplx_trajectory)
+                if source_trajectory is not None:
+                    source_frame_idx = (source_frame_idx + 1) % len(source_trajectory)
                 
                 # Sync viewer
                 viewer.sync()
@@ -416,8 +416,10 @@ def main():
     )
     parser.add_argument("--source", default=None, help="Source entry name or source type from the robot profile (default: active_source)")
     parser.add_argument("--motion", default=None, help="Path to source motion file")
-    parser.add_argument("--smplx_model_dir", default=None, help="Directory containing SMPLX model files")
-    parser.add_argument("--smplx_motion", default=None, help="Path to SMPLX motion file (.npz)")
+    parser.add_argument("--source-options", default=None, help="JSON object with adapter-specific source options")
+    parser.add_argument("--model-dir", default=None, help="Adapter model directory, when required by the source type")
+    parser.add_argument("--smplx_model_dir", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--smplx_motion", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--output", required=True, help="Path to save output motion (.npy)")
     parser.add_argument("--terrain", help="Path to terrain mesh file (optional, defaults to flat ground)")
     parser.add_argument(
@@ -436,6 +438,19 @@ def main():
                         help="Override the contact handling mode for retargeting.")
     
     args = parser.parse_args()
+
+    if args.smplx_motion is not None:
+        warnings.warn(
+            "--smplx_motion is deprecated; use --motion instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    if args.smplx_model_dir is not None:
+        warnings.warn(
+            "--smplx_model_dir is deprecated; use --model-dir or --source-options instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
 
     args.output = normalize_retargeted_output_path(args.output)
 
@@ -481,16 +496,38 @@ def main():
         selected_source = matches[0]
 
     robot_height = robot_config.get("robot_height")
-    source_target_names_override = selected_source.get("target_names_override", selected_source.get("target_names", robot_config.get("source_target_names", robot_config.get("smplx_joint_names"))))
     retargeting = robot_config.get("retargeting")
     link_offset_config = robot_config.get("link_offset_config")
-    source_betas = selected_source.get("betas", robot_config.get("smplx_betas"))
-    source_type = selected_source.get("type", "smplx")
+    source_type = selected_source.get("type", args.source)
+    if not source_type:
+        raise ValueError("Source type is required. Set a source entry in the robot profile or provide --source.")
+    # Deprecation warnings for legacy flags
+    if args.smplx_motion:
+        warnings.warn(
+            "--smplx_motion is deprecated. Use --motion instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+    
     source_motion_path = args.motion or args.smplx_motion
     if source_motion_path is None:
-        raise ValueError("Motion input is required. Provide --motion or legacy --smplx_motion.")
-    source_model_dir = args.smplx_model_dir or selected_source.get("smpl_model_dir") or robot_config.get("smpl_model_dir")
-    source_gender = selected_source.get("gender", robot_config.get("source_gender", "neutral"))
+        raise ValueError("Motion input is required. Provide --motion.")
+
+    runtime_source_options = {}
+    if args.source_options:
+        runtime_source_options = json.loads(args.source_options)
+        if not isinstance(runtime_source_options, dict):
+            raise ValueError("--source-options must be a JSON object.")
+    if args.smplx_model_dir:
+        warnings.warn(
+            "--smplx_model_dir is deprecated. Use --model-dir instead.",
+            DeprecationWarning,
+            stacklevel=2
+        )
+    
+    model_dir = args.model_dir or args.smplx_model_dir
+    if model_dir is not None:
+        runtime_source_options["model_directory"] = model_dir
 
     # Merge CLI flag into retargeting config
     if retargeting is None:
@@ -513,16 +550,12 @@ def main():
         terrain_path = temp_terrain_path
 
     try:
-        if source_type != "smplx":
-            raise ValueError(f"Unsupported source type: {source_type!r}")
-
         print(f"Loading {source_type} motion from {source_motion_path}...")
-        data_source = SmplxDataSource(
-            motion_file=Path(source_motion_path),
-            model_directory=source_model_dir,
-            gender=source_gender,
-            target_names_override=source_target_names_override,
-            betas=source_betas,
+        data_source = create_data_source(
+            source_type=source_type,
+            motion_file=source_motion_path,
+            source_config=selected_source,
+            runtime_options=runtime_source_options,
         )
         motion_data = data_source.load()
         source_positions = motion_data.positions
@@ -619,7 +652,7 @@ def main():
         if args.save_video:
             save_trajectory_video(
                 robot_urdf_path, retargeted_motion, args.save_video,
-                smplx_trajectory=source_positions * source_to_robot_scale,
+                source_trajectory=source_positions * source_to_robot_scale,
                 terrain_mesh=vis_terrain, fps=framerate,
             )
 

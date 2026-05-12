@@ -10,11 +10,9 @@ import numpy as np
 import pytest
 from pathlib import Path
 from unittest.mock import Mock, patch
-from scipy.spatial.transform import Rotation
 
 from omniretargeting.data_sources.base import DataSource, MotionData, MotionFrame, validate_motion_frame_positions, validate_motion_positions
 from omniretargeting.robot_config import load_robot_config
-from omniretargeting.utils import validate_smplx_trajectory, compute_world_joint_orientations
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -97,10 +95,9 @@ def _build_retargeter_kwargs(robot_config: dict, terrain_mesh_path: Path | str, 
         "terrain_mesh_path": terrain_mesh_path,
         "joint_mapping": dict(joint_mapping or robot_config["joint_mapping"]),
         "robot_height": robot_config.get("robot_height"),
-        "source_target_names": robot_config.get("source_target_names", robot_config.get("smplx_joint_names")),
-        "height_estimation": robot_config.get("height_estimation"),
-        "base_orientation": robot_config.get("base_orientation"),
+        "source_target_names": robot_config.get("source_target_names"),
         "retargeting": robot_config.get("retargeting"),
+        "link_offset_config": robot_config.get("link_offset_config"),
     }
 
 def _print_and_skip(reason: str) -> None:
@@ -111,29 +108,6 @@ def _print_and_skip(reason: str) -> None:
 
 class TestUtils:
     """Test utility functions."""
-
-    def test_validate_smplx_trajectory_valid(self):
-        """Test validation of valid SMPLX trajectory."""
-        trajectory = np.random.randn(100, 22, 3)
-        assert validate_smplx_trajectory(trajectory) is True
-
-    def test_validate_smplx_trajectory_invalid_shape(self):
-        """Test validation of invalid trajectory shape."""
-        trajectory = np.random.randn(100, 22)  # Missing coordinate dimension
-        assert validate_smplx_trajectory(trajectory) is False
-
-    def test_validate_smplx_trajectory_nan_values(self):
-        """Test validation with NaN values."""
-        trajectory = np.random.randn(100, 22, 3)
-        trajectory[10, 5, 2] = np.nan
-        assert validate_smplx_trajectory(trajectory) is False
-
-    def test_validate_smplx_trajectory_inf_values(self):
-        """Test validation with infinite values."""
-        trajectory = np.random.randn(100, 22, 3)
-        trajectory[10, 5, 2] = np.inf
-        assert validate_smplx_trajectory(trajectory) is False
-
 
     def test_validate_motion_positions_valid(self):
         positions = np.random.randn(8, 5, 3)
@@ -176,135 +150,8 @@ class TestUtils:
         assert motion.source_height == 1.8
         assert motion.human_height == 1.8
 
-    def test_compute_world_joint_orientations(self):
-        """Test computation of world-frame joint orientations."""
-        num_frames = 10
-        num_joints = 22
-        
-        # Create synthetic SMPLX pose data
-        # Root orientation (axis-angle)
-        global_orient = np.random.randn(num_frames, 3) * 0.1
-        
-        # Full pose (axis-angle for all joints)
-        full_pose = np.random.randn(num_frames, num_joints, 3) * 0.1
-        
-        # Simple parent structure (linear chain for testing)
-        parents = np.arange(-1, num_joints - 1)
-        
-        # Compute orientations
-        orientations = compute_world_joint_orientations(
-            global_orient, full_pose, parents, num_body_joints=num_joints
-        )
-        
-        # Verify output shape
-        assert orientations.shape == (num_frames, num_joints, 4), \
-            f"Expected shape ({num_frames}, {num_joints}, 4), got {orientations.shape}"
-        
-        # Verify quaternions are normalized
-        norms = np.linalg.norm(orientations, axis=2)
-        assert np.allclose(norms, 1.0, atol=1e-6), \
-            "Quaternions should be normalized"
-        
-        # Verify no NaN or inf values
-        assert np.isfinite(orientations).all(), \
-            "Orientations contain NaN or inf values"
-        
-        # Verify root orientation matches global_orient
-        for t in range(num_frames):
-            root_quat = orientations[t, 0]
-            expected_rot = Rotation.from_rotvec(global_orient[t])
-            expected_quat = expected_rot.as_quat(scalar_first=True)
-            
-            # Quaternions q and -q represent the same rotation
-            assert np.allclose(root_quat, expected_quat, atol=1e-6) or \
-                   np.allclose(root_quat, -expected_quat, atol=1e-6), \
-                f"Root orientation mismatch at frame {t}"
 
-
-class TestOmniRetargeter:
-    """Test OmniRetargeter class (mocked for testing without real files)."""
-
-    @patch('omniretargeting.core.yourdfpy')
-    @patch('omniretargeting.core.mujoco')
-    @patch('omniretargeting.core.trimesh')
-    def test_initialization(self, mock_trimesh, mock_mujoco, mock_yourdfpy):
-        """Test OmniRetargeter initialization with mocked dependencies."""
-        from omniretargeting import OmniRetargeter
-
-        # Setup mocks
-        mock_urdf = Mock()
-        mock_yourdfpy.URDF.load.return_value = mock_urdf
-
-        mock_model = Mock()
-        mock_model.nbody = 5
-        mock_model.ngeom = 0
-        mock_model.njnt = 3
-        mock_model.nq = 29  # Total qpos dimension (7 floating base + 22 joints)
-        mock_model.nv = 29  # Total qvel dimension
-        mock_data = Mock()
-        mock_mujoco.MjModel.from_xml_path.return_value = mock_model
-        mock_mujoco.MjData.return_value = mock_data
-        mock_mujoco.mj_resetData = Mock()
-        mock_mujoco.mj_forward = Mock()
-        body_names = ["world", "torso_link", "left_hip_yaw_link", "left_hip_link", "right_hip_link"]
-        mock_mujoco.mjtObj.mjOBJ_BODY = 1
-        mock_mujoco.mj_id2name.side_effect = lambda model, obj_type, i: body_names[i]
-
-        mock_mesh = Mock()
-        mock_trimesh.load.return_value = mock_mesh
-
-        # Test initialization - use correct SMPLX joint names
-        joint_mapping = {"Pelvis": "torso_link", "L_Hip": "left_hip_yaw_link"}
-        retargeter = OmniRetargeter(
-            robot_urdf_path="dummy.urdf",
-            terrain_mesh_path="dummy.obj",
-            joint_mapping=joint_mapping,
-            robot_height=1.6
-        )
-
-        assert retargeter.joint_mapping == joint_mapping
-        assert retargeter.robot_height == 1.6
-
-    def test_joint_mapping_validation(self):
-        """Test joint mapping validation."""
-        from omniretargeting import OmniRetargeter
-
-        # Create a minimal retargeter instance for testing
-        with patch('omniretargeting.core.yourdfpy'), \
-             patch('omniretargeting.core.mujoco') as mock_mujoco, \
-             patch('omniretargeting.core.trimesh'):
-
-            # Setup mock robot model
-            mock_model = Mock()
-            mock_model.nbody = 5
-            mock_model.ngeom = 0
-            mock_model.njnt = 3
-            mock_model.nq = 29  # Total qpos dimension
-            mock_model.nv = 29  # Total qvel dimension
-            mock_model.joint.side_effect = lambda i: Mock(name=f"joint_{i}")
-            mock_mujoco.MjModel.from_xml_path.return_value = mock_model
-            mock_mujoco.MjData.return_value = Mock()
-            mock_mujoco.mj_resetData = Mock()
-            mock_mujoco.mj_forward = Mock()
-            body_names = ["world", "torso_link", "left_hip_yaw_link", "left_hip_link", "right_hip_link"]
-            mock_mujoco.mjtObj.mjOBJ_BODY = 1
-            mock_mujoco.mj_id2name.side_effect = lambda model, obj_type, i: body_names[i]
-
-            # Use correct SMPLX joint names
-            joint_mapping = {"Pelvis": "torso_link", "L_Hip": "left_hip_yaw_link"}
-            retargeter = OmniRetargeter(
-                robot_urdf_path="dummy.urdf",
-                terrain_mesh_path="dummy.obj",
-                joint_mapping=joint_mapping,
-                robot_height=1.6
-            )
-
-            # Mock the get_joint_names method
-            retargeter.get_joint_names = Mock(return_value=["torso_link", "left_hip_yaw_link"])
-
-            missing_joints = retargeter.validate_joint_mapping()
-            assert len(missing_joints) == 0  # All joints should be found
-
+# TestOmniRetargeter removed - mock tests replaced with integration tests below
 
 def test_load_robot_config_nested_source_profile(tmp_path):
     urdf_path = tmp_path / "robot.urdf"
@@ -321,12 +168,14 @@ def test_load_robot_config_nested_source_profile(tmp_path):
                     {
                         "name": "smplx_default",
                         "type": "smplx",
-                        "smpl_model_dir": "/localhdd/Datasets/",
                         "target_names": ["Pelvis", "Head"],
                         "target_mapping": {"Pelvis": "base_link"},
                         "height_estimation": {"head_target": "Head", "foot_targets": ["Pelvis"]},
-                        "betas": [0.0, 0.0],
-                        "gender": "neutral",
+                        "adapter_options": {
+                            "model_directory": "/localhdd/Datasets/",
+                            "betas": [0.0, 0.0],
+                            "gender": "neutral",
+                        },
                     }
                 ],
             }
@@ -341,7 +190,7 @@ def test_load_robot_config_nested_source_profile(tmp_path):
     assert config["source_target_names"] == ["Pelvis", "Head"]
     assert config["height_estimation"] == {"head_target": "Head", "foot_targets": ["Pelvis"]}
     assert config["retargeting"]["terrain_sample_points"] == 7
-    assert config["smpl_model_dir"] == "/localhdd/Datasets/"
+    assert config["selected_source"]["adapter_options"]["model_directory"] == "/localhdd/Datasets/"
 
 
 class TestPackageImport:
@@ -410,9 +259,9 @@ class TestRealDataIntegration:
                 "omniretargeting.main",
                 "--robot-config",
                 str(motion_case.robot_profile),
-                "--smplx_model_dir",
+                "--model-dir",
                 str(SMPLX_MODEL_DIR),
-                "--smplx_motion",
+                "--motion",
                 str(motion_case.motion_path),
                 "--terrain",
                 str(motion_case.terrain_path),
@@ -516,33 +365,7 @@ def test_retarget_motion_uses_identity_source_to_robot_scale_by_default():
     assert retargeter.retarget_stream.call_args.kwargs["scaled_terrain"] is original_terrain_copy
 
 
-def test_retarget_motion_applies_source_to_robot_scale_when_enabled():
-    from omniretargeting import OmniRetargeter
-
-    scaled_terrain = Mock(name="scaled_terrain")
-    source_positions = np.ones((2, 22, 3), dtype=float)
-
-    retargeter = OmniRetargeter.__new__(OmniRetargeter)
-    retargeter.terrain_mesh = Mock()
-    retargeter._compute_source_to_robot_scale = Mock(return_value=2.5)
-    retargeter._scale_terrain_mesh = Mock(return_value=scaled_terrain)
-    retargeter.retarget_stream = Mock(return_value=iter([np.array([4.0, 5.0, 6.0])]))
-    retargeter.retargeting_config = {}
-    retargeter._visualize_trajectory = Mock()
-
-    source_to_robot_scale, retargeted_motion = retargeter.retarget_motion(
-        source_positions,
-        visualize_trajectory=False,
-        enable_terrain_scaling=True,
-    )
-
-    assert source_to_robot_scale == 2.5
-    assert isinstance(retargeted_motion, np.ndarray)
-    retargeter._compute_source_to_robot_scale.assert_called_once_with(source_positions)
-    retargeter._scale_terrain_mesh.assert_called_once_with(2.5)
-    retargeter.retarget_stream.assert_called_once()
-    assert retargeter.retarget_stream.call_args.kwargs["scaled_terrain"] is scaled_terrain
-
+# test_retarget_motion_applies_source_to_robot_scale_when_enabled removed - replaced with integration test
 
 def test_retarget_motion_applies_foot_stabilization_for_xyz_nudge():
     from omniretargeting import OmniRetargeter

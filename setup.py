@@ -10,12 +10,10 @@ setup(
     install_requires=[
         # Core dependencies from holosoma_retargeting
         "numpy==2.3.5",
-        "torch",
         "tqdm",
         "scipy",
         "matplotlib",
         "trimesh",
-        "smplx",
         "jinja2",
         # Due to mujoco `strippath` default value in URDF parsing updated, `strippath=false` by default.
         "mujoco>=3.7.0",
@@ -30,4 +28,10 @@ setup(
         "open3d",
         "pyvista",
     ],
+    extras_require={
+        "smplx": ["smplx", "torch"],
+        "all": ["smplx", "torch"],
+        "dev": ["mypy", "ruff", "pytest", "black"],
+        "test": ["pytest", "pytest-cov"],
+    },
 )

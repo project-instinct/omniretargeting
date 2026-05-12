@@ -17,6 +17,27 @@
     "L_Wrist": "left_wrist_yaw_link",
     "R_Wrist": "right_wrist_yaw_link"
   },
+  "active_source": "smplx",
+  "source": [
+    {
+      "name": "smplx",
+      "type": "smplx",
+      "adapter_options": {
+        "betas": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  ],
   "height_estimation": {
     "head_joint": "Head",
     "foot_joints": [
@@ -157,17 +178,5 @@
     "right_wrist_roll_joint": 0.0,
     "right_wrist_pitch_joint": 0.0,
     "right_wrist_yaw_joint": 0.0
-  },
-  "smplx_betas": [
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0
-  ]
+  }
 }

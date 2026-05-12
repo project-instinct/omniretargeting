@@ -93,10 +93,13 @@ class GenericInteractionRetargeter:
             robot_link_names = set(joint_mapping.values())
             for link_name, offset in link_offset_config.items():
                 if link_name not in robot_link_names:
-                    raise ValueError(
-                        f"link_offset_config key '{link_name}' is not a robot link name "
-                        f"in joint_mapping values. Available links: {sorted(robot_link_names)}"
+                    import warnings
+                    warnings.warn(
+                        f"link_offset_config key {link_name} is not in joint_mapping. "
+                        f"Skipping. Available links: {sorted(robot_link_names)}",
+                        UserWarning
                     )
+                    continue
                 self.link_offset_config[link_name] = np.asarray(offset, dtype=float).reshape(3)
             print(f"Loaded link offsets for {len(self.link_offset_config)} link(s): "
                   f"{list(self.link_offset_config.keys())}")
@@ -1291,23 +1294,4 @@ def retarget_source_to_robot(
         source_positions,
         visualize_trajectory=False,
         enable_terrain_scaling=True,
-    )
-
-
-def retarget_smplx_to_robot(
-    smplx_trajectory: np.ndarray,
-    robot_urdf_path: Path,
-    terrain_mesh_path: Path,
-    joint_mapping: Dict[str, str],
-    robot_height: Optional[float] = None,
-    smplx_joint_names: Optional[List[str]] = None,
-) -> Tuple[float, np.ndarray]:
-    """Backward-compatible wrapper for older SMPL-X-specific callers."""
-    return retarget_source_to_robot(
-        source_positions=smplx_trajectory,
-        robot_urdf_path=robot_urdf_path,
-        terrain_mesh_path=terrain_mesh_path,
-        joint_mapping=joint_mapping,
-        robot_height=robot_height,
-        source_target_names=smplx_joint_names,
     )

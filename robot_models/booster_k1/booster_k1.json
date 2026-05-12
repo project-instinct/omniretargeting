@@ -17,6 +17,27 @@
     "L_Wrist": "left_hand_link",
     "R_Wrist": "right_hand_link"
   },
+  "active_source": "smplx",
+  "source": [
+    {
+      "name": "smplx",
+      "type": "smplx",
+      "adapter_options": {
+        "betas": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    }
+  ],
   "height_estimation": {
     "head_joint": "Head_2",
     "foot_joints": [
@@ -150,17 +171,5 @@
     "Right_Knee_Pitch": 0.0,
     "Right_Ankle_Pitch": 0.0,
     "Right_Ankle_Roll": 0.0
-  },
-  "smplx_betas": [
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0,
-    0.0
-  ]
+  }
 }

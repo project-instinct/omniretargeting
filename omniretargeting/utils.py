@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Tuple, Optional
 import trimesh
 from scipy.spatial.transform import Rotation
+import mujoco
 
 
 def load_terrain_mesh(mesh_path: Path) -> trimesh.Trimesh:
@@ -158,19 +159,6 @@ def align_terrain_to_coordinates(mesh: trimesh.Trimesh,
     return aligned_mesh, transformation
 
 
-def validate_smplx_trajectory(trajectory: np.ndarray) -> bool:
-    """Validate legacy SMPL-X trajectory format through the neutral motion validator."""
-    from omniretargeting.data_sources.base import validate_motion_positions
-
-    return validate_motion_positions(trajectory)
-
-
-def extract_smplx_joint_positions(trajectory: np.ndarray,
-                                joint_indices: list) -> np.ndarray:
-    """Extract specific joint positions from SMPLX trajectory."""
-    return trajectory[:, joint_indices, :]
-
-
 def convert_quaternion_format(quaternions: np.ndarray,
                             input_format: str = 'wxyz',
                             output_format: str = 'xyzw') -> np.ndarray:
@@ -279,17 +267,6 @@ def calculate_laplacian_matrix(vertices, adj_list, epsilon=1e-6, uniform_weight=
     return laplacian_matrix
 
 
-def compute_world_joint_orientations(*args, **kwargs):
-    from omniretargeting.data_sources.smplx import compute_world_joint_orientations as _impl
-
-    return _impl(*args, **kwargs)
-
-
-def load_smplx_trajectory(*args, **kwargs):
-    from omniretargeting.data_sources.smplx import load_smplx_trajectory as _impl
-
-
-
 def validate_robot_joint_mapping(
     robot_model,
     joint_mapping: dict,
@@ -317,8 +294,6 @@ def validate_robot_joint_mapping(
         joint_mapping maps source target names to robot BODY (link) names,
         not joint names. This function checks for body names in the URDF.
     """
-    import mujoco
-    
     robot_bodies = set()
     for i in range(robot_model.nbody):
         body_name = mujoco.mj_id2name(robot_model, mujoco.mjtObj.mjOBJ_BODY, i)
