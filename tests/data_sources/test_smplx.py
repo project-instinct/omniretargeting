@@ -3,7 +3,12 @@
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from omniretargeting.data_sources.smplx import compute_world_joint_orientations, validate_smplx_trajectory
+from omniretargeting.data_sources.smplx import (
+    DEFAULT_SMPLX_TARGET_NAMES,
+    SmplxDataSource,
+    compute_world_joint_orientations,
+    validate_smplx_trajectory,
+)
 
 
 def test_validate_smplx_trajectory_valid():
@@ -26,6 +31,19 @@ def test_validate_smplx_trajectory_inf_values():
     trajectory = np.random.randn(100, 22, 3)
     trajectory[10, 5, 2] = np.inf
     assert validate_smplx_trajectory(trajectory) is False
+
+
+def test_load_npy_generates_default_names_for_extra_joints(tmp_path):
+    trajectory = np.random.randn(4, 24, 3)
+    motion_file = tmp_path / "motion.npy"
+    np.save(motion_file, trajectory)
+
+    motion = SmplxDataSource(motion_file=motion_file).load()
+
+    assert motion.positions.shape == trajectory.shape
+    assert len(motion.target_names) == trajectory.shape[1]
+    assert motion.target_names[:22] == DEFAULT_SMPLX_TARGET_NAMES
+    assert motion.target_names[22:] == ["SMPLX_Joint_22", "SMPLX_Joint_23"]
 
 
 def test_compute_world_joint_orientations():

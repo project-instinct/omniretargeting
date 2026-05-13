@@ -20,6 +20,13 @@ DEFAULT_SMPLX_TARGET_NAMES = [
 ]
 
 
+def _default_target_names(num_targets: int) -> list[str]:
+    names = DEFAULT_SMPLX_TARGET_NAMES[:num_targets]
+    if num_targets > len(DEFAULT_SMPLX_TARGET_NAMES):
+        names.extend(f"SMPLX_Joint_{idx}" for idx in range(len(DEFAULT_SMPLX_TARGET_NAMES), num_targets))
+    return names
+
+
 @dataclass
 class SmplxDataSource(DataSource):
     motion_file: Path
@@ -54,7 +61,7 @@ class SmplxDataSource(DataSource):
     def load(self) -> MotionData:
         if self._motion_data is None:
             positions, orientations, root_orient, trans, framerate, metadata = self._load_arrays(self.motion_file)
-            names = self.target_names_override or DEFAULT_SMPLX_TARGET_NAMES[: positions.shape[1]]
+            names = self.target_names_override or _default_target_names(positions.shape[1])
             
             # Compute source height: try betas first, then trajectory, then None
             source_height = self.compute_human_height()
