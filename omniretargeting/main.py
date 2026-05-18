@@ -6,8 +6,8 @@ from pathlib import Path
 import tempfile
 import os
 import json
+import yaml
 import time
-import warnings
 
 from omniretargeting import OmniRetargeter
 from omniretargeting.robot_config import load_robot_config
@@ -18,12 +18,53 @@ import contextlib
 import shutil
 import re
 import xml.etree.ElementTree as ET
+from scipy.spatial.transform import Rotation
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ROBOT_CONFIG_PATH = REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json"
 
+
+def _object_track_matrix(rotation_matrix: np.ndarray, translation: np.ndarray, scale: float) -> np.ndarray:
+    transform = np.eye(4)
+    transform[:3, :3] = np.asarray(rotation_matrix, dtype=float) * float(scale)
+    transform[:3, 3] = np.asarray(translation, dtype=float)
+    return transform
+
+
+def build_object_tracks(motion_data, source_to_robot_scale: float, apply_scene_scaling: bool):
+    if motion_data is None or getattr(motion_data, "object_mesh", None) is None:
+        return None
+
+    translations = motion_data.metadata.get("object_translations")
+    rotations = motion_data.metadata.get("object_rotations")
+    scales = motion_data.metadata.get("object_scales")
+    if translations is None or rotations is None or scales is None:
+        return None
+
+    scene_scale = float(source_to_robot_scale) if apply_scene_scaling else 1.0
+    object_name = motion_data.metadata.get("object_name", "object")
+    base_mesh = motion_data.object_mesh.copy()
+    centroid_local = motion_data.metadata.get("object_centroid_local")
+    if centroid_local is None:
+        centroid_local = np.asarray(base_mesh.vertices, dtype=float).mean(axis=0)
+    centroid_local = np.asarray(centroid_local, dtype=float)
+    base_mesh.apply_translation(-centroid_local)
+
+    frame_transforms = []
+    for translation, rotation, scale in zip(translations, rotations, scales):
+        translation = np.asarray(translation, dtype=float) * scene_scale
+        scale = float(scale) * scene_scale
+        frame_transforms.append(_object_track_matrix(rotation, translation, scale))
+
+    return [{
+        "name": object_name,
+        "mesh": base_mesh,
+        "frame_transforms": frame_transforms,
+    }]
+
+
 @contextlib.contextmanager
-def temporary_visualization_scene(urdf_path, terrain_mesh, target_faces=5000):
+def temporary_visualization_scene(urdf_path, terrain_mesh, object_meshes=None, target_faces=5000):
     """
     Context manager that creates a temporary MJCF scene with the robot and terrain.
     Yields the path to the temporary XML file.
@@ -123,7 +164,38 @@ def temporary_visualization_scene(urdf_path, terrain_mesh, target_faces=5000):
     </visual>
   </link>
 """
-                new_content = urdf_content.replace("</robot>", terrain_link + "\n</robot>")
+                
+                # Add object meshes if provided
+                object_links = ""
+                if object_meshes:
+                    for obj_idx, obj_mesh_info in enumerate(object_meshes):
+                        obj_mesh = obj_mesh_info["mesh"]
+                        obj_name = obj_mesh_info.get("name", f"object_{obj_idx}")
+                        
+                        try:
+                            fd_obj, temp_obj_path = tempfile.mkstemp(suffix=f"_{obj_name}.obj", dir=mesh_save_dir)
+                            os.close(fd_obj)
+                            files_to_remove.append(temp_obj_path)
+                            obj_mesh.export(temp_obj_path)
+                            obj_filename = os.path.basename(temp_obj_path)
+                            
+                            object_links += f"""
+  <link name="{obj_name}_vis_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <mesh filename="{obj_filename}" scale="1 1 1"/>
+      </geometry>
+      <material name="{obj_name}_mat">
+        <color rgba="0.8 0.6 0.4 1"/>
+      </material>
+    </visual>
+  </link>
+"""
+                        except Exception as e:
+                            print(f"Warning: Could not add object mesh {obj_name}: {e}")
+                
+                new_content = urdf_content.replace("</robot>", terrain_link + object_links + "\n</robot>")
                 
                 with open(temp_urdf_path, "w") as f:
                     f.write(new_content)
@@ -181,7 +253,7 @@ def temporary_visualization_scene(urdf_path, terrain_mesh, target_faces=5000):
                 except OSError:
                     pass
 
-def save_trajectory_video(urdf_path, trajectory, output_path, source_trajectory=None, terrain_mesh=None, fps=30, width=640, height=480):
+def save_trajectory_video(urdf_path, trajectory, output_path, source_trajectory=None, terrain_mesh=None, object_meshes=None, fps=30, width=640, height=480):
     """Render the retargeted trajectory to a video file using MuJoCo offscreen renderer.
 
     Requires MUJOCO_GL=egl (or osmesa) for headless rendering.
@@ -196,7 +268,7 @@ def save_trajectory_video(urdf_path, trajectory, output_path, source_trajectory=
 
     print(f"Saving video to {output_path} ({len(trajectory)} frames @ {fps} fps)...")
 
-    with temporary_visualization_scene(urdf_path, terrain_mesh) as model_path:
+    with temporary_visualization_scene(urdf_path, terrain_mesh, object_meshes) as model_path:
         try:
             model = mujoco.MjModel.from_xml_path(model_path)
         except Exception as e:
@@ -209,59 +281,87 @@ def save_trajectory_video(urdf_path, trajectory, output_path, source_trajectory=
 
         data = mujoco.MjData(model)
         from mujoco.rendering.classic.renderer import Renderer
-        renderer = Renderer(model, height, width)
 
-        # Brighten the scene for video rendering
-        model.vis.headlight.ambient[:] = [0.7, 0.7, 0.7]
-        model.vis.headlight.diffuse[:] = [0.7, 0.7, 0.7]
-        model.vis.headlight.specular[:] = [0.4, 0.4, 0.4]
-        model.vis.map.znear = 0.001
-        model.vis.map.zfar = 50.0
-
-        # Access renderer's scene for background and skybox/fog settings
-        scene = None
-        if hasattr(renderer, 'scene'):
-            scene = renderer.scene
-        elif hasattr(renderer, '_scene'):
-            scene = renderer._scene
-        else:
-            # Try to get scene via model.vis.global_ or other path
-            print("Note: Could not access renderer scene for background customization")
-
-        if scene is not None:
-            try:
-                scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = 0
-                scene.flags[mujoco.mjtRndFlag.mjRND_FOG] = 0
-                if hasattr(scene, 'rgba_background'):
-                    scene.rgba_background[:] = [0.9, 0.9, 0.95, 1.0]
-                print("Video scene lighting customized successfully")
-            except (AttributeError, TypeError) as e:
-                print(f"Could not customize renderer scene: {e}")
-
-        cam = mujoco.MjvCamera()
-        cam.type = mujoco.mjtCamera.mjCAMERA_FREE
-        cam.distance = 3.0
-        cam.azimuth = 120.0
-        cam.elevation = -20.0
-
-        base_body_id = 1 if model.nbody > 1 else 0
-        if model.nbody > 0:
-            root_body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, 0)
-            for body_id in range(1, model.nbody):
-                body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
-                if body_name and body_name != root_body_name and body_name != 'terrain_vis_link':
-                    base_body_id = body_id
-                    break
-
-        num_frames = len(trajectory)
+        renderer = None
+        gl_context = None
         try:
-            with imageio.get_writer(output_path, fps=int(fps), codec="libx264",
-                                    quality=8, macro_block_size=1) as writer:
+            gl_context = mujoco.GLContext(width, height)
+            gl_context.make_current()
+            renderer = Renderer(model, height, width)
+
+            model.vis.headlight.ambient[:] = [0.7, 0.7, 0.7]
+            model.vis.headlight.diffuse[:] = [0.7, 0.7, 0.7]
+            model.vis.headlight.specular[:] = [0.4, 0.4, 0.4]
+            model.vis.map.znear = 0.001
+            model.vis.map.zfar = 50.0
+
+            scene = None
+            if hasattr(renderer, 'scene'):
+                scene = renderer.scene
+            elif hasattr(renderer, '_scene'):
+                scene = renderer._scene
+            else:
+                print("Note: Could not access renderer scene for background customization")
+
+            if scene is not None:
+                try:
+                    scene.flags[mujoco.mjtRndFlag.mjRND_SKYBOX] = 0
+                    scene.flags[mujoco.mjtRndFlag.mjRND_FOG] = 0
+                    if hasattr(scene, 'rgba_background'):
+                        scene.rgba_background[:] = [0.9, 0.9, 0.95, 1.0]
+                    print("Video scene lighting customized successfully")
+                except (AttributeError, TypeError) as e:
+                    print(f"Could not customize renderer scene: {e}")
+
+            cam = mujoco.MjvCamera()
+            cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+            cam.distance = 3.0
+            cam.azimuth = 120.0
+            cam.elevation = -20.0
+
+            base_body_id = 1 if model.nbody > 1 else 0
+            if model.nbody > 0:
+                root_body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, 0)
+                for body_id in range(1, model.nbody):
+                    body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+                    if body_name and body_name != root_body_name and body_name != 'terrain_vis_link':
+                        base_body_id = body_id
+                        break
+
+            dynamic_object_specs = []
+            if object_meshes and scene is not None:
+                if model.nmesh <= 0:
+                    raise ValueError("Dynamic object rendering requires mesh assets in the visualization scene.")
+                for obj_idx, obj_mesh_info in enumerate(object_meshes):
+                    frame_transforms = obj_mesh_info.get("frame_transforms") or []
+                    if not frame_transforms:
+                        continue
+                    geom_idx = scene.ngeom
+                    geom = scene.geoms[geom_idx]
+                    mujoco.mjv_initGeom(
+                        geom,
+                        type=mujoco.mjtGeom.mjGEOM_MESH,
+                        size=np.array([1.0, 1.0, 1.0]),
+                        pos=np.zeros(3),
+                        mat=np.eye(3).flatten(),
+                        rgba=np.array([0.8, 0.6, 0.4, 1.0]),
+                    )
+                    geom.dataid = obj_idx
+                    dynamic_object_specs.append((geom_idx, frame_transforms))
+                    scene.ngeom += 1
+
+            num_frames = len(trajectory)
+            with imageio.get_writer(output_path, fps=int(fps), codec="libx264", quality=8, macro_block_size=1) as writer:
                 for i in range(num_frames):
                     data.qpos[:] = trajectory[i]
                     mujoco.mj_forward(model, data)
                     cam.lookat[:] = data.xpos[base_body_id]
                     renderer.update_scene(data, camera=cam)
+                    if scene is not None:
+                        for geom_idx, frame_transforms in dynamic_object_specs:
+                            transform = frame_transforms[min(i, len(frame_transforms) - 1)]
+                            scene.geoms[geom_idx].pos = transform[:3, 3]
+                            scene.geoms[geom_idx].mat[:] = transform[:3, :3]
                     frame = renderer.render()
                     writer.append_data(frame)
                     if (i + 1) % 100 == 0:
@@ -270,11 +370,17 @@ def save_trajectory_video(urdf_path, trajectory, output_path, source_trajectory=
             size_mb = os.path.getsize(output_path) / 1024 / 1024
             print(f"Video saved: {output_path} ({size_mb:.1f} MB)")
         finally:
-            renderer.close()
+            if renderer is not None:
+                renderer.close()
+            if gl_context is not None:
+                try:
+                    gl_context.free()
+                except Exception:
+                    pass
 
 
 
-def visualize_trajectory(urdf_path, trajectory, source_trajectory=None, terrain_mesh=None):
+def visualize_trajectory(urdf_path, trajectory, source_trajectory=None, terrain_mesh=None, object_meshes=None):
     """Visualize the retargeted trajectory and optional source targets in MuJoCo viewer."""
     try:
         import mujoco
@@ -286,7 +392,7 @@ def visualize_trajectory(urdf_path, trajectory, source_trajectory=None, terrain_
     print("Launching viewer...")
     print("Controls: Space to pause/resume, [ and ] to step frames.")
     
-    with temporary_visualization_scene(urdf_path, terrain_mesh) as model_path:
+    with temporary_visualization_scene(urdf_path, terrain_mesh, object_meshes) as model_path:
         # Load model
         try:
             model = mujoco.MjModel.from_xml_path(model_path)
@@ -370,6 +476,28 @@ def visualize_trajectory(urdf_path, trajectory, source_trajectory=None, terrain_
                     )
                 scene.ngeom = source_geoms_base + source_num_targets
 
+            dynamic_object_specs = []
+            if object_meshes and scene is not None:
+                if model.nmesh <= 0:
+                    raise ValueError("Dynamic object rendering requires mesh assets in the visualization scene.")
+                for obj_idx, obj_mesh_info in enumerate(object_meshes):
+                    frame_transforms = obj_mesh_info.get("frame_transforms") or []
+                    if not frame_transforms:
+                        continue
+                    geom_idx = scene.ngeom
+                    geom = scene.geoms[geom_idx]
+                    mujoco.mjv_initGeom(
+                        geom,
+                        type=mujoco.mjtGeom.mjGEOM_MESH,
+                        size=np.array([1.0, 1.0, 1.0]),
+                        pos=np.zeros(3),
+                        mat=np.eye(3).flatten(),
+                        rgba=np.array([0.8, 0.6, 0.4, 1.0]),
+                    )
+                    geom.dataid = obj_idx
+                    dynamic_object_specs.append((geom_idx, frame_transforms))
+                    scene.ngeom += 1
+
             while viewer.is_running():
                 step_start = time.time()
                 
@@ -407,6 +535,27 @@ def create_flat_terrain(size=10.0):
     mesh.apply_translation([0, 0, -0.05])
     return mesh
 
+
+def load_source_config(yaml_path: Path) -> dict:
+    """Load source configuration from YAML file."""
+    yaml_path = Path(yaml_path)
+    if not yaml_path.exists():
+        raise FileNotFoundError(f"Source config file not found: {yaml_path}")
+    
+    with open(yaml_path, "r") as f:
+        config = yaml.safe_load(f)
+    
+    if not isinstance(config, dict):
+        raise ValueError(f"Source config must be a YAML object/dict, got {type(config)}")
+    
+    if "type" not in config:
+        raise ValueError("Source config must specify 'type' field (e.g., 'omomo', 'smplx')")
+    if "motion" not in config:
+        raise ValueError("Source config must specify 'motion' field (path to motion file)")
+    
+    return config
+
+
 def main():
     parser = argparse.ArgumentParser(description="OmniRetargeting CLI")
     parser.add_argument(
@@ -414,12 +563,14 @@ def main():
         default=DEFAULT_ROBOT_CONFIG_PATH,
         help=f"Path to robot configuration JSON file (default: {DEFAULT_ROBOT_CONFIG_PATH})",
     )
-    parser.add_argument("--source", default=None, help="Source entry name or source type from the robot profile (default: active_source)")
-    parser.add_argument("--motion", default=None, help="Path to source motion file")
-    parser.add_argument("--source-options", default=None, help="JSON object with adapter-specific source options")
-    parser.add_argument("--model-dir", default=None, help="Adapter model directory, when required by the source type")
+    parser.add_argument("--source-config", default=None, help="Path to YAML source configuration file (see config_templates/ for examples)")
+    parser.add_argument("--source", default=None, help="Legacy source entry name or source type from the robot profile (default: active_source)")
+    parser.add_argument("--motion", default=None, help="Legacy path to source motion file")
+    parser.add_argument("--source-options", default=None, help="Legacy JSON object with adapter-specific source options")
+    parser.add_argument("--model-dir", default=None, help="Legacy adapter model directory, when required by the source type")
     parser.add_argument("--smplx_model_dir", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--smplx_motion", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--scaled-objects", default=None, help="Directory to save scaled object meshes and pose trajectories (optional)")
     parser.add_argument("--output", required=True, help="Path to save output motion (.npy)")
     parser.add_argument("--terrain", help="Path to terrain mesh file (optional, defaults to flat ground)")
     parser.add_argument(
@@ -436,21 +587,8 @@ def main():
                         help="Replace cylinder collision geoms with capsules to match IsaacLab/PhysX convention.")
     parser.add_argument("--penetration-resolver", choices=["hard_constraint", "xyz_nudge"], default="xyz_nudge",
                         help="Override the contact handling mode for retargeting.")
-    
-    args = parser.parse_args()
 
-    if args.smplx_motion is not None:
-        warnings.warn(
-            "--smplx_motion is deprecated; use --motion instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    if args.smplx_model_dir is not None:
-        warnings.warn(
-            "--smplx_model_dir is deprecated; use --model-dir or --source-options instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
+    args = parser.parse_args()
 
     args.output = normalize_retargeted_output_path(args.output)
 
@@ -488,46 +626,87 @@ def main():
         )
 
     selected_source = robot_config.get("selected_source", {})
-    if args.source:
-        source_entries = robot_config.get("source", [])
-        matches = [s for s in source_entries if s.get("name") == args.source or s.get("type") == args.source]
-        if len(matches) != 1:
-            raise ValueError(f"--source {args.source!r} must match exactly one source entry by name or type.")
-        selected_source = matches[0]
+    legacy_motion_path = args.motion or args.smplx_motion
+    legacy_model_dir = args.model_dir or args.smplx_model_dir
+    runtime_source_options = {}
+    data_source_source_config = {}
+
+    if args.smplx_motion is not None:
+        warnings.warn(
+            "--smplx_motion is deprecated; use --motion or --source-config instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+    if args.smplx_model_dir is not None:
+        warnings.warn(
+            "--smplx_model_dir is deprecated; use --model-dir or define model_directory in --source-config.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
+    if args.source_config:
+        print(f"Loading source config from {args.source_config}...")
+        source_config_dict = load_source_config(args.source_config)
+        source_type = source_config_dict["type"]
+        source_motion_path = source_config_dict["motion"]
+        runtime_source_options = {
+            key: value
+            for key, value in source_config_dict.items()
+            if key not in ["type", "motion"]
+        }
+        if legacy_model_dir is not None and "model_directory" not in runtime_source_options and "smplx_model_dir" not in runtime_source_options:
+            warnings.warn(
+                "--model-dir is deprecated with --source-config; prefer model_directory in the YAML file.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            runtime_source_options["model_directory"] = legacy_model_dir
+        if args.source or legacy_motion_path is not None or args.source_options is not None:
+            warnings.warn(
+                "Ignoring legacy source arguments because --source-config was provided.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        print(f"Source type: {source_type}")
+        print(f"Motion file: {source_motion_path}")
+    else:
+        warnings.warn(
+            "Legacy CLI source arguments are deprecated; prefer --source-config.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        if args.source:
+            source_entries = robot_config.get("source", [])
+            matches = [s for s in source_entries if s.get("name") == args.source or s.get("type") == args.source]
+            if len(matches) != 1:
+                raise ValueError(f"--source {args.source!r} must match exactly one source entry by name or type.")
+            selected_source = matches[0]
+
+        source_type = selected_source.get("type", args.source)
+        if not source_type:
+            raise ValueError(
+                "Source type is required. Provide --source-config, set a source entry in the robot profile, or pass --source."
+            )
+
+        source_motion_path = legacy_motion_path
+        if source_motion_path is None:
+            raise ValueError("Motion input is required. Provide --source-config or use legacy --motion.")
+
+        if args.source_options:
+            runtime_source_options = json.loads(args.source_options)
+            if not isinstance(runtime_source_options, dict):
+                raise ValueError("--source-options must be a JSON object.")
+
+        if legacy_model_dir is not None:
+            runtime_source_options["model_directory"] = legacy_model_dir
+
+        data_source_source_config = dict(selected_source)
+        print(f"Using legacy CLI source resolution for type: {source_type}")
+        print(f"Motion file: {source_motion_path}")
 
     robot_height = robot_config.get("robot_height")
     retargeting = robot_config.get("retargeting")
     link_offset_config = robot_config.get("link_offset_config")
-    source_type = selected_source.get("type", args.source)
-    if not source_type:
-        raise ValueError("Source type is required. Set a source entry in the robot profile or provide --source.")
-    # Deprecation warnings for legacy flags
-    if args.smplx_motion:
-        warnings.warn(
-            "--smplx_motion is deprecated. Use --motion instead.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-    
-    source_motion_path = args.motion or args.smplx_motion
-    if source_motion_path is None:
-        raise ValueError("Motion input is required. Provide --motion.")
-
-    runtime_source_options = {}
-    if args.source_options:
-        runtime_source_options = json.loads(args.source_options)
-        if not isinstance(runtime_source_options, dict):
-            raise ValueError("--source-options must be a JSON object.")
-    if args.smplx_model_dir:
-        warnings.warn(
-            "--smplx_model_dir is deprecated. Use --model-dir instead.",
-            DeprecationWarning,
-            stacklevel=2
-        )
-    
-    model_dir = args.model_dir or args.smplx_model_dir
-    if model_dir is not None:
-        runtime_source_options["model_directory"] = model_dir
 
     # Merge CLI flag into retargeting config
     if retargeting is None:
@@ -554,7 +733,7 @@ def main():
         data_source = create_data_source(
             source_type=source_type,
             motion_file=source_motion_path,
-            source_config=selected_source,
+            source_config=data_source_source_config,
             runtime_options=runtime_source_options,
         )
         motion_data = data_source.load()
@@ -603,6 +782,45 @@ def main():
             scaled_terrain.export(output_scaled_terrain_path)
             print(f"Saved scaled terrain mesh to {output_scaled_terrain_path}")
         
+        # Export scaled objects if requested
+        if args.scaled_objects and hasattr(motion_data, 'object_mesh') and motion_data.object_mesh is not None:
+            scaled_objects_dir = Path(args.scaled_objects)
+            scaled_objects_dir.mkdir(parents=True, exist_ok=True)
+
+            object_name = motion_data.metadata.get("object_name", "object")
+            centroid_local = motion_data.metadata.get("object_centroid_local")
+            if centroid_local is None:
+                centroid_local = np.asarray(motion_data.object_mesh.vertices, dtype=float).mean(axis=0)
+            centroid_local = np.asarray(centroid_local, dtype=float)
+
+            # Save centered object mesh so per-frame transforms carry the motion explicitly.
+            scaled_mesh = motion_data.object_mesh.copy()
+            scaled_mesh.apply_translation(-centroid_local)
+            if args.output_scaled_terrain:
+                scaled_mesh.apply_scale(source_to_robot_scale)
+            mesh_path = scaled_objects_dir / f"{object_name}.obj"
+            scaled_mesh.export(mesh_path)
+            print(f"Saved scaled object mesh to {mesh_path}")
+
+            translations = motion_data.metadata.get("object_translations")
+            rotations = motion_data.metadata.get("object_rotations")
+            scales = motion_data.metadata.get("object_scales")
+            if translations is not None and rotations is not None and scales is not None:
+                scene_scale = source_to_robot_scale if args.output_scaled_terrain else 1.0
+                poses = []
+                for t in range(len(translations)):
+                    poses.append({
+                        "frame": t,
+                        "translation": np.asarray(translations[t]).tolist(),
+                        "rotation_matrix": np.asarray(rotations[t]).tolist(),
+                        "scale": float(scales[t]) * scene_scale
+                    })
+
+                pose_path = scaled_objects_dir / f"{object_name}_poses.json"
+                with open(pose_path, "w") as f:
+                    json.dump(poses, f, indent=2)
+                print(f"Saved object pose trajectory to {pose_path}")
+
         # Save output
         print(f"Saving output to {args.output}...")
         
@@ -649,15 +867,26 @@ def main():
             except Exception as e:
                 print(f"Could not load terrain for visualization: {e}")
 
+        # Extract per-frame object tracks for visualization if available
+        vis_object_meshes = None
+        if args.vis or args.save_video:
+            vis_object_meshes = build_object_tracks(
+                motion_data,
+                source_to_robot_scale=source_to_robot_scale,
+                apply_scene_scaling=bool(args.output_scaled_terrain),
+            )
+            if vis_object_meshes:
+                print(f"Loaded object track for visualization: {vis_object_meshes[0]['name']}")
+
         if args.save_video:
             save_trajectory_video(
                 robot_urdf_path, retargeted_motion, args.save_video,
                 source_trajectory=source_positions * source_to_robot_scale,
-                terrain_mesh=vis_terrain, fps=framerate,
+                terrain_mesh=vis_terrain, object_meshes=vis_object_meshes, fps=framerate,
             )
 
         if args.vis:
-            visualize_trajectory(robot_urdf_path, retargeted_motion, source_positions * source_to_robot_scale, terrain_mesh=vis_terrain)
+            visualize_trajectory(robot_urdf_path, retargeted_motion, source_positions * source_to_robot_scale, terrain_mesh=vis_terrain, object_meshes=vis_object_meshes)
 
     finally:
         # Cleanup temp file

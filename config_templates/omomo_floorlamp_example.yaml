@@ -1,0 +1,14 @@
+# Example: OMOMO Floor Lamp Manipulation
+# This is a real example using sequence 318 from the OMOMO test set
+# Sequence: sub17_floorlamp_023 (73 frames, ~2.4 seconds at 30fps)
+
+type: omomo
+motion: /localhdd/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p
+sequence_index: 318
+data_root: /localhdd/Datasets/OMOMO
+n_object_samples: 50
+
+# This sequence shows a person manipulating a floor lamp
+# Object mesh: floorlamp_cleaned_simplified.obj
+# The retargeting will preserve the spatial relationship between
+# the human body and the floor lamp throughout the motion

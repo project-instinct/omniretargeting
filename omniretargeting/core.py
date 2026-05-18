@@ -236,16 +236,35 @@ class OmniRetargeter:
         base_translations: np.ndarray | None = None,
         framerate: float | None = None,
         visualize_trajectory: bool = True,
-        enable_terrain_scaling: bool = False,
+        enable_terrain_scaling: bool | None = None,
+        enable_scene_scaling: bool | None = None,
     ) -> Tuple[float, np.ndarray]:
         """
         Retarget a complete source motion and return ``(source_to_robot_scale, robot_motion)``.
 
-        ``enable_terrain_scaling`` preserves the existing public API name, but the
-        computed scalar is the robot/source height ratio. When enabled, batch mode
-        applies it to source positions, optional root translations, and the terrain
-        mesh before delegating to ``retarget_stream``.
+        Args:
+            enable_scene_scaling: When True, scale terrain, human trajectory, and objects.
+            enable_terrain_scaling: Deprecated alias for enable_scene_scaling.
+
+        The computed scalar is the robot/source height ratio. When enabled, batch mode
+        applies it to source positions, root translations, object points, and terrain mesh.
         """
+        # Handle backward compatibility
+        if enable_terrain_scaling is not None and enable_scene_scaling is not None:
+            raise ValueError("Cannot specify both enable_terrain_scaling and enable_scene_scaling.")
+        
+        if enable_terrain_scaling is not None:
+            import warnings
+            warnings.warn(
+                "enable_terrain_scaling is deprecated, use enable_scene_scaling instead",
+                DeprecationWarning,
+                stacklevel=2
+            )
+            enable_scene_scaling = enable_terrain_scaling
+        
+        if enable_scene_scaling is None:
+            enable_scene_scaling = False
+        
         motion_data = self._coerce_motion_data(motion)
         if base_orientations is not None or base_translations is not None:
             motion_data = MotionData(
@@ -255,28 +274,34 @@ class OmniRetargeter:
                 root_translations=base_translations if base_translations is not None else motion_data.root_translations,
                 framerate=framerate if framerate is not None else motion_data.framerate,
                 source_height=motion_data.source_height,
+                object_points=motion_data.object_points,
                 metadata=motion_data.metadata,
             )
         elif framerate is not None and motion_data.framerate is None:
             motion_data.framerate = framerate
 
         source_to_robot_scale = self._resolve_source_to_robot_scale(
-            apply_source_to_robot_scaling=enable_terrain_scaling,
+            apply_source_to_robot_scaling=enable_scene_scaling,
             source_height=motion_data.source_height,
         )
-        scaled_terrain = self._scale_terrain_mesh(source_to_robot_scale) if enable_terrain_scaling else self.terrain_mesh.copy()
+        scaled_terrain = self._scale_terrain_mesh(source_to_robot_scale) if enable_scene_scaling else self.terrain_mesh.copy()
 
         scaled_motion_data = MotionData(
-            positions=motion_data.positions * source_to_robot_scale,
+            positions=motion_data.positions * source_to_robot_scale if enable_scene_scaling else motion_data.positions,
             target_names=motion_data.target_names,
             root_orientations=motion_data.root_orientations,
             root_translations=(
                 motion_data.root_translations * source_to_robot_scale
-                if motion_data.root_translations is not None
-                else None
+                if enable_scene_scaling and motion_data.root_translations is not None
+                else motion_data.root_translations
             ),
             framerate=motion_data.framerate,
             source_height=motion_data.source_height,
+            object_points=(
+                motion_data.object_points * source_to_robot_scale
+                if enable_scene_scaling and motion_data.object_points is not None
+                else motion_data.object_points
+            ),
             metadata=motion_data.metadata,
         )
 
@@ -375,11 +400,15 @@ class OmniRetargeter:
             quat_xyzw = Rotation.from_rotvec(root_orientation).as_quat()
             target_quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
 
+        # Extract object points if present
+        object_points = frame.object_points if isinstance(frame, MotionFrame) else None
+
         q_opt = state.retargeter.retarget_frame(
             mapped_source_targets,
             q_init,
             q_last=state.q_last,
             target_base_orientation=target_quat_wxyz,
+            object_points=object_points,
         )
         state.q_init = q_opt
         state.q_last = q_opt

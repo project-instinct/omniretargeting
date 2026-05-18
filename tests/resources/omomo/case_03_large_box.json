@@ -1,0 +1,23 @@
+{
+    "name": "largebox_lifting",
+    "description": "Large box lifting and manipulation",
+    "omomo_sequence_file": "/localhdd/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p",
+    "omomo_sequence_index": 31,
+    "omomo_data_root": "/localhdd/Datasets/OMOMO",
+    "n_object_samples": 32,
+    "terrain": {
+        "type": "flat",
+        "size": 10.0,
+        "height": 0.0,
+        "n_points": 4
+    },
+    "retargeting": {
+        "enable_scene_scaling": true,
+        "visualize_trajectory": false
+    },
+    "validation": {
+        "check_collision": false,
+        "check_joint_limits": true,
+        "max_frames": 100
+    }
+}

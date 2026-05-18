@@ -312,3 +312,45 @@ def validate_robot_joint_mapping(
         )
     
     return sorted(list(missing_bodies))
+
+
+def create_flat_terrain(size: float = 10.0, height: float = 0.0, n_points: int = 4) -> trimesh.Trimesh:
+    """
+    Create a flat plane terrain mesh with minimal triangulation.
+    
+    Args:
+        size: Side length of the square plane (meters)
+        height: Z-coordinate of the plane
+        n_points: Number of points per side (minimum 2)
+    
+    Returns:
+        Trimesh object representing the flat terrain
+    """
+    if n_points < 2:
+        raise ValueError("n_points must be at least 2")
+    
+    # Create grid of vertices
+    x = np.linspace(-size/2, size/2, n_points)
+    y = np.linspace(-size/2, size/2, n_points)
+    xx, yy = np.meshgrid(x, y)
+    
+    vertices = np.stack([
+        xx.flatten(),
+        yy.flatten(),
+        np.full(n_points * n_points, height)
+    ], axis=1)
+    
+    # Create triangular faces
+    faces = []
+    for i in range(n_points - 1):
+        for j in range(n_points - 1):
+            # Two triangles per grid cell
+            v0 = i * n_points + j
+            v1 = i * n_points + (j + 1)
+            v2 = (i + 1) * n_points + j
+            v3 = (i + 1) * n_points + (j + 1)
+            
+            faces.append([v0, v1, v2])
+            faces.append([v1, v3, v2])
+    
+    return trimesh.Trimesh(vertices=vertices, faces=faces)
