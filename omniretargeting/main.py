@@ -760,6 +760,7 @@ def main():
             joint_mapping=joint_mapping,
             robot_height=robot_height,
             source_target_names=motion_data.target_names,
+            base_orientation=robot_config.get("base_orientation"),
             retargeting=retargeting,
             link_offset_config=link_offset_config,
         )

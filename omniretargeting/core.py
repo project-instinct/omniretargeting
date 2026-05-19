@@ -46,6 +46,7 @@ class OmniRetargeter:
         joint_mapping: Dict[str, str],
         robot_height: Optional[float] = None,
         source_target_names: Optional[List[str]] = None,
+        base_orientation: Optional[Dict[str, str]] = None,
         retargeting: Optional[Dict[str, Any]] = None,
         link_offset_config: Optional[Dict[str, Any]] = None,
     ):
@@ -73,6 +74,7 @@ class OmniRetargeter:
 
         # Optional per-robot configuration with safe defaults.
 
+        self.base_orientation_config = dict(base_orientation or {})
         self.retargeting_config = dict(retargeting or {})
         self.link_offset_config = link_offset_config
 
@@ -267,6 +269,11 @@ class OmniRetargeter:
         
         motion_data = self._coerce_motion_data(motion)
         if base_orientations is not None or base_translations is not None:
+            metadata = dict(motion_data.metadata)
+            if base_orientations is not None:
+                metadata["use_explicit_root_orientation"] = True
+            if base_translations is not None:
+                metadata["use_explicit_root_translation"] = True
             motion_data = MotionData(
                 positions=motion_data.positions,
                 target_names=motion_data.target_names,
@@ -275,7 +282,7 @@ class OmniRetargeter:
                 framerate=framerate if framerate is not None else motion_data.framerate,
                 source_height=motion_data.source_height,
                 object_points=motion_data.object_points,
-                metadata=motion_data.metadata,
+                metadata=metadata,
             )
         elif framerate is not None and motion_data.framerate is None:
             motion_data.framerate = framerate
@@ -302,7 +309,7 @@ class OmniRetargeter:
                 if enable_scene_scaling and motion_data.object_points is not None
                 else motion_data.object_points
             ),
-            metadata=motion_data.metadata,
+            metadata=dict(motion_data.metadata),
         )
 
         if visualize_trajectory:
@@ -376,12 +383,80 @@ class OmniRetargeter:
             scaled_terrain=scaled_terrain,
         )
 
+    def _estimate_base_orientation_from_joints(
+        self,
+        joints: np.ndarray,
+        last_quat: np.ndarray | None = None,
+    ) -> np.ndarray | None:
+        if joints.shape[0] == 0:
+            return None
+
+        pelvis_name = self.base_orientation_config.get("pelvis", "Pelvis")
+        left_hip_name = self.base_orientation_config.get("left_hip", "L_Hip")
+        right_hip_name = self.base_orientation_config.get("right_hip", "R_Hip")
+        spine_name = self.base_orientation_config.get("spine", "Spine1")
+
+        joint_indices = {name: idx for idx, name in enumerate(self.source_target_names)}
+        pelvis_idx = joint_indices.get(pelvis_name, 0)
+        left_hip_idx = joint_indices.get(left_hip_name, 1)
+        right_hip_idx = joint_indices.get(right_hip_name, 2)
+        spine_idx = joint_indices.get(spine_name, 3)
+
+        max_required_idx = max(pelvis_idx, left_hip_idx, right_hip_idx, spine_idx)
+        if joints.shape[0] <= max_required_idx:
+            return None
+
+        pelvis = joints[pelvis_idx]
+        left_hip = joints[left_hip_idx]
+        right_hip = joints[right_hip_idx]
+        spine = joints[spine_idx]
+
+        up = spine - pelvis
+        right = right_hip - left_hip
+
+        up_norm = np.linalg.norm(up)
+        right_norm = np.linalg.norm(right)
+        if up_norm < 1e-8 or right_norm < 1e-8:
+            return None
+
+        up = up / up_norm
+        right = right / right_norm
+        forward = np.cross(up, right)
+        forward_norm = np.linalg.norm(forward)
+        if forward_norm < 1e-8:
+            return None
+        forward = forward / forward_norm
+
+        right = np.cross(up, forward)
+        right_norm = np.linalg.norm(right)
+        if right_norm < 1e-8:
+            return None
+        right = right / right_norm
+
+        rot = np.column_stack([forward, right, up])
+        if np.linalg.det(rot) < 0:
+            forward = -forward
+            right = -right
+            rot = np.column_stack([forward, right, up])
+
+        quat_xyzw = Rotation.from_matrix(rot).as_quat()
+        if last_quat is not None and np.dot(quat_xyzw, last_quat) < 0:
+            quat_xyzw = -quat_xyzw
+        return quat_xyzw
+
     def retarget_frame(self, frame: MotionFrame | np.ndarray, state: RetargetingStreamState) -> np.ndarray:
         positions = frame.positions if isinstance(frame, MotionFrame) else frame
-        root_orientation = frame.root_orientation if isinstance(frame, MotionFrame) else None
-        root_translation = frame.root_translation if isinstance(frame, MotionFrame) else None
+        use_root_orientation = isinstance(frame, MotionFrame) and bool(frame.metadata.get("use_explicit_root_orientation", False))
+        use_root_translation = isinstance(frame, MotionFrame) and bool(frame.metadata.get("use_explicit_root_translation", False))
+        root_orientation = frame.root_orientation if use_root_orientation else None
+        root_translation = frame.root_translation if use_root_translation else None
         source_positions = positions
         q_init = state.q_init
+
+        estimated_quat_xyzw = self._estimate_base_orientation_from_joints(
+            source_positions,
+            state.last_estimated_quat,
+        )
 
         if state.frame_idx == 0:
             if root_translation is not None:
@@ -391,14 +466,25 @@ class OmniRetargeter:
             if root_orientation is not None:
                 quat_xyzw = Rotation.from_rotvec(root_orientation).as_quat()
                 q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+            elif estimated_quat_xyzw is not None:
+                q_init[3:7] = np.array([
+                    estimated_quat_xyzw[3],
+                    estimated_quat_xyzw[0],
+                    estimated_quat_xyzw[1],
+                    estimated_quat_xyzw[2],
+                ])
 
         mapped_source_targets = self._extract_mapped_source_targets(source_positions)
-        
-        # Use root_orientation from motion data if available
+
         target_quat_wxyz = None
-        if root_orientation is not None:
-            quat_xyzw = Rotation.from_rotvec(root_orientation).as_quat()
-            target_quat_wxyz = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+        if estimated_quat_xyzw is not None:
+            target_quat_wxyz = np.array([
+                estimated_quat_xyzw[3],
+                estimated_quat_xyzw[0],
+                estimated_quat_xyzw[1],
+                estimated_quat_xyzw[2],
+            ])
+            state.last_estimated_quat = estimated_quat_xyzw
 
         # Extract object points if present
         object_points = frame.object_points if isinstance(frame, MotionFrame) else None
