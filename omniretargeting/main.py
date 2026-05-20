@@ -24,9 +24,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ROBOT_CONFIG_PATH = REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json"
 
 
-def _object_track_matrix(rotation_matrix: np.ndarray, translation: np.ndarray, scale: float) -> np.ndarray:
+def _object_track_matrix(rotation_matrix: np.ndarray, translation: np.ndarray) -> np.ndarray:
     transform = np.eye(4)
-    transform[:3, :3] = np.asarray(rotation_matrix, dtype=float) * float(scale)
+    transform[:3, :3] = np.asarray(rotation_matrix, dtype=float)
     transform[:3, 3] = np.asarray(translation, dtype=float)
     return transform
 
@@ -44,17 +44,21 @@ def build_object_tracks(motion_data, source_to_robot_scale: float, apply_scene_s
     scene_scale = float(source_to_robot_scale) if apply_scene_scaling else 1.0
     object_name = motion_data.metadata.get("object_name", "object")
     base_mesh = motion_data.object_mesh.copy()
+
+    # Get the first scale to apply to the base mesh
+    first_scale = float(scales[0]) * scene_scale
+    base_mesh.apply_scale(first_scale)
+
     centroid_local = motion_data.metadata.get("object_centroid_local")
     if centroid_local is None:
         centroid_local = np.asarray(base_mesh.vertices, dtype=float).mean(axis=0)
-    centroid_local = np.asarray(centroid_local, dtype=float)
+    centroid_local = np.asarray(centroid_local, dtype=float) * first_scale
     base_mesh.apply_translation(-centroid_local)
 
     frame_transforms = []
-    for translation, rotation, scale in zip(translations, rotations, scales):
+    for translation, rotation in zip(translations, rotations):
         translation = np.asarray(translation, dtype=float) * scene_scale
-        scale = float(scale) * scene_scale
-        frame_transforms.append(_object_track_matrix(rotation, translation, scale))
+        frame_transforms.append(_object_track_matrix(rotation.T, translation))
 
     return [{
         "name": object_name,
@@ -328,28 +332,6 @@ def save_trajectory_video(urdf_path, trajectory, output_path, source_trajectory=
                         base_body_id = body_id
                         break
 
-            dynamic_object_specs = []
-            if object_meshes and scene is not None:
-                if model.nmesh <= 0:
-                    raise ValueError("Dynamic object rendering requires mesh assets in the visualization scene.")
-                for obj_idx, obj_mesh_info in enumerate(object_meshes):
-                    frame_transforms = obj_mesh_info.get("frame_transforms") or []
-                    if not frame_transforms:
-                        continue
-                    geom_idx = scene.ngeom
-                    geom = scene.geoms[geom_idx]
-                    mujoco.mjv_initGeom(
-                        geom,
-                        type=mujoco.mjtGeom.mjGEOM_MESH,
-                        size=np.array([1.0, 1.0, 1.0]),
-                        pos=np.zeros(3),
-                        mat=np.eye(3).flatten(),
-                        rgba=np.array([0.8, 0.6, 0.4, 1.0]),
-                    )
-                    geom.dataid = obj_idx
-                    dynamic_object_specs.append((geom_idx, frame_transforms))
-                    scene.ngeom += 1
-
             num_frames = len(trajectory)
             with imageio.get_writer(output_path, fps=int(fps), codec="libx264", quality=8, macro_block_size=1) as writer:
                 for i in range(num_frames):
@@ -357,11 +339,35 @@ def save_trajectory_video(urdf_path, trajectory, output_path, source_trajectory=
                     mujoco.mj_forward(model, data)
                     cam.lookat[:] = data.xpos[base_body_id]
                     renderer.update_scene(data, camera=cam)
-                    if scene is not None:
-                        for geom_idx, frame_transforms in dynamic_object_specs:
+                    
+                    # Hide static object geoms by making them fully transparent
+                    if object_meshes and scene is not None:
+                        for obj_idx in range(len(object_meshes)):
+                            mesh_asset_id = model.nmesh - len(object_meshes) + obj_idx
+                            for g_idx in range(scene.ngeom):
+                                if scene.geoms[g_idx].dataid == mesh_asset_id:
+                                    scene.geoms[g_idx].rgba[3] = 0
+                    
+                    # Add dynamic object geoms AFTER update_scene (which resets the scene)
+                    if object_meshes and scene is not None:
+                        for obj_idx, obj_mesh_info in enumerate(object_meshes):
+                            frame_transforms = obj_mesh_info.get("frame_transforms") or []
+                            if not frame_transforms:
+                                continue
                             transform = frame_transforms[min(i, len(frame_transforms) - 1)]
-                            scene.geoms[geom_idx].pos = transform[:3, 3]
-                            scene.geoms[geom_idx].mat[:] = transform[:3, :3]
+                            geom_idx = scene.ngeom
+                            geom = scene.geoms[geom_idx]
+                            mujoco.mjv_initGeom(
+                                geom,
+                                type=mujoco.mjtGeom.mjGEOM_MESH,
+                                size=np.array([1.0, 1.0, 1.0]),
+                                pos=transform[:3, 3],
+                                mat=transform[:3, :3].flatten(),
+                                rgba=np.array([0.8, 0.6, 0.4, 1.0]),
+                            )
+                            mesh_asset_id = model.nmesh - len(object_meshes) + obj_idx
+                            geom.dataid = mesh_asset_id
+                            scene.ngeom += 1
                     frame = renderer.render()
                     writer.append_data(frame)
                     if (i + 1) % 100 == 0:
@@ -792,7 +798,6 @@ def main():
             centroid_local = motion_data.metadata.get("object_centroid_local")
             if centroid_local is None:
                 centroid_local = np.asarray(motion_data.object_mesh.vertices, dtype=float).mean(axis=0)
-            centroid_local = np.asarray(centroid_local, dtype=float)
 
             # Save centered object mesh so per-frame transforms carry the motion explicitly.
             scaled_mesh = motion_data.object_mesh.copy()
