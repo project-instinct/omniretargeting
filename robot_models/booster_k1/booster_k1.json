@@ -75,7 +75,8 @@
       "wall_red_axis_only": true,
       "wall_normal_z_threshold": 0.35,
       "wall_x_dominance_threshold": 0.5
-    }
+    },
+    "replace_cylinders_with_capsules": false
   },
   "link_offset_config": {
     "Left_Hip_Roll": [

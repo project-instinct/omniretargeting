@@ -4,10 +4,10 @@
 # SMPL body parameters with object 6D poses for manipulation tasks.
 #
 # Usage:
-#   python -m omniretargeting.main \
-#     --robot-config robot_models/unitree_g1/unitree_g1.json \
-#     --source-config config_templates/omomo_template.yaml \
-#     --output output.npz \
+#   python -m omniretargeting.main \\
+#     --robot-config robot_models/unitree_g1/unitree_g1.json \\
+#     --source-config config_templates/omomo_template.yaml \\
+#     --output output.npz \\
 #     --save-video output.mp4
 
 # Required: Data source type
@@ -23,6 +23,16 @@ sequence_index: 318
 # Required: Root directory of OMOMO dataset
 # Used to locate object meshes in data/captured_objects/
 data_root: /localhdd/Datasets/OMOMO
+
+# Required: Path to SMPL-X model directory
+# OMOMO uses SMPL body parameters that require SMPL-X forward kinematics
+# Should contain SMPLX_{gender}.pkl files
+model_directory: /localhdd/Datasets/smplx
+
+# Optional: Path to terrain mesh file
+# If not specified, a flat ground plane will be used
+# OMOMO sequences typically use flat ground unless captured in a specific scene
+# terrain: /path/to/terrain.obj
 
 # Optional: Number of points to sample from object mesh (default: 100)
 # Higher values provide better object representation but slower optimization

@@ -5,10 +5,10 @@
 # and processed joint positions (.npz with global_joint_positions).
 #
 # Usage:
-#   python -m omniretargeting.main \
-#     --robot-config robot_models/unitree_g1/unitree_g1.json \
-#     --source-config config_templates/smplx_template.yaml \
-#     --output output.npz \
+#   python -m omniretargeting.main \\
+#     --robot-config robot_models/unitree_g1/unitree_g1.json \\
+#     --source-config config_templates/smplx_template.yaml \\
+#     --output output.npz \\
 #     --save-video output.mp4
 
 # Required: Data source type
@@ -19,12 +19,17 @@ type: smplx
 #   - .npz with raw SMPL-X parameters (betas, pose_body, root_orient, trans)
 #   - .npz with processed joint positions (global_joint_positions)
 #   - .npy with joint positions only (no orientations)
-motion: /path/to/motion.npz
+motion: tests/resources/amass/wall_flip_smplx_amass.npz
 
 # Required (for raw .npz): Path to SMPL-X model directory
 # Should contain SMPLX_{gender}.pkl files
 # Common locations: /localhdd/Datasets/smplx, /localhdd/Datasets/, data/body_models/smplx
 model_directory: /localhdd/Datasets/smplx
+
+# Optional: Path to terrain mesh file
+# If not specified, a flat ground plane will be used
+# For wall_flip motion, use the corresponding scene mesh
+terrain: tests/resources/terrain/wall_flip_scene.obj
 
 # Optional: Gender for SMPL-X model (default: "neutral")
 # Options: "neutral", "male", "female"
@@ -33,7 +38,7 @@ gender: neutral
 # Optional: SMPL-X shape parameters (betas)
 # If not specified, will use betas from the motion file
 # 10 values for body shape
-betas: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# betas: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 # Optional: Override joint names
 # If not specified, uses default SMPL-X joint names
@@ -69,3 +74,4 @@ betas: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 # - For processed .npz files with global_joint_positions, model_directory is optional
 # - Joint orientations are computed when model_directory is available
 # - Height estimation uses betas if available, otherwise estimates from trajectory
+# - Terrain mesh should match the motion capture environment for accurate retargeting

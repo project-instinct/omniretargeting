@@ -55,25 +55,25 @@ def main():
     parser.add_argument("--motion", default=None, help="Legacy path to source motion file")
     parser.add_argument("--source-options", default=None, help="Legacy JSON object with adapter-specific source options")
     parser.add_argument("--model-dir", default=None, help="Legacy adapter model directory, when required by the source type")
-    parser.add_argument("--smplx_model_dir", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--smplx_motion", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--smplx_model_dir", default=None, help=argparse.SUPPRESS) # Legacy flag for backward compatibility with old source configs that expect 'model_directory' under the root of the config dict.
+    parser.add_argument("--smplx_motion", default=None, help=argparse.SUPPRESS) # Legacy flag for backward compatibility with old source configs that expect 'motion' under the root of the config dict.
     parser.add_argument("--scaled-objects", default=None, help="Directory to save scaled object meshes and pose trajectories (optional)")
     parser.add_argument("--output", required=True, help="Path to save output motion (.npy)")
-    parser.add_argument("--terrain", help="Path to terrain mesh file (optional, defaults to flat ground)")
+    parser.add_argument("--terrain", help="Legacy path to terrain mesh file (optional, defaults to flat ground)")
     parser.add_argument(
         "--output-scaled-terrain",
         dest="output_scaled_terrain",
         default=None,
         help="Path to save the scaled terrain mesh. When provided, terrain scaling is enabled.",
     )
-    parser.add_argument("--mapping", help="Path to joint mapping JSON file (optional, overrides robot profile mapping)")
+    parser.add_argument("--mapping", help="Legacy path to joint mapping JSON file (optional, overrides robot profile mapping)")
     parser.add_argument("--vis", action="store_true", help="Visualize the retargeted motion")
     parser.add_argument("--save-video", dest="save_video", default=None, help="Save retargeted motion video to file (e.g. /tmp/out.mp4). Uses offscreen rendering (set MUJOCO_GL=egl for headless).")
     parser.add_argument("--framerate", type=float, default=None, help="Framerate of the motion (optional, defaults to 30.0 or auto-detected)")
     parser.add_argument("--replace-cylinders-with-capsules", dest="replace_cylinders_with_capsules", action="store_true", default=False,
-                        help="Replace cylinder collision geoms with capsules to match IsaacLab/PhysX convention.")
-    parser.add_argument("--penetration-resolver", choices=["hard_constraint", "xyz_nudge"], default="xyz_nudge",
-                        help="Override the contact handling mode for retargeting.")
+                        help="Legacy flag to replace cylinder collision geoms with capsules to match IsaacLab/PhysX convention.")
+    parser.add_argument("--penetration-resolver", choices=["hard_constraint", "xyz_nudge"], default=None,
+                        help="Legacy override the contact handling mode for retargeting.")
 
     args = parser.parse_args()
 
@@ -205,7 +205,11 @@ def main():
 
     # Handle terrain
     temp_terrain_path = None
-    if args.terrain:
+    # Check if terrain is in source config first
+    if "terrain" in runtime_source_options:
+        terrain_path = runtime_source_options.pop("terrain")
+        print(f"Using terrain from source config: {terrain_path}")
+    elif args.terrain:
         terrain_path = args.terrain
     else:
         print("No terrain provided, creating default flat terrain.")
