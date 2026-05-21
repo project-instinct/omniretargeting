@@ -12,6 +12,33 @@ This a rule starting point for most agents. The `AGENTS.md` file should guide th
 - state assumptions, risks, and limitations clearly
 - do not go out-side of the project folder without explicitly asking (once will do)
 
+## Code of Conduct Following Linus's Coding Taste
+
+This is a primary engineering constraint, not a style preference.
+
+### Default Direction
+
+- Prefer simple, direct data flow and control flow. Do not add abstraction layers for theoretical elegance.
+- Solve real problems first. Do not pre-build complex frameworks for imagined future cases.
+- Eliminate complexity in the design instead of hiding it behind names like manager, factory, or coordinator.
+
+### Must Follow
+
+- Prefer small, clear interfaces.
+- Compose existing stable modules first. Do not add universal layers, unified abstraction layers, `Base*` classes, or over-generalized wrappers without a concrete need.
+- Prefer better data structures that remove special cases instead of piling on more `if`/`else` branches.
+- Names must be plain and precise. They should describe the real semantics, ownership, lifetime, and failure path.
+- Do not silently smooth over bad state. When something is invalid, expose where the invariant was broken.
+- A new abstraction must prove that it reduces overall complexity. If it only moves complexity around, do not add it.
+
+### Explicitly Discouraged
+
+- Adding architectural layers only to make patterns look uniform.
+- Excessive object orientation, inheritance, configuration, or generic abstraction.
+- Splitting complex interactions into many weakly related small files.
+- Using silent fallbacks, implicit synchronization, or magic defaults to keep the surface looking clean.
+- Adding adapters only to avoid changing old code.
+
 ## Working Style
 
 Before editing:
