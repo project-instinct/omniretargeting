@@ -1,0 +1,49 @@
+# OMOMO Data Source Configuration Template
+# 
+# OMOMO (Object Motion Guided Human Motion Synthesis) dataset provides
+# SMPL body parameters with object 6D poses for manipulation tasks.
+#
+# Usage:
+#   python -m omniretargeting.main \\
+#     --robot-config robot_models/unitree_g1/unitree_g1.json \\
+#     --source-config config_templates/omomo_template.yaml \\
+#     --output output.npz \\
+#     --save-video output.mp4
+
+# Required: Data source type
+type: omomo
+
+# Required: Path to OMOMO sequence file (.p file)
+motion: /localhdd/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p
+
+# Required: Sequence index to load from the file
+# Each .p file contains multiple sequences, specify which one to use
+sequence_index: 318
+
+# Required: Root directory of OMOMO dataset
+# Used to locate object meshes in data/captured_objects/
+data_root: /localhdd/Datasets/OMOMO
+
+# Required: Path to SMPL-X model directory
+# OMOMO uses SMPL body parameters that require SMPL-X forward kinematics
+# Should contain SMPLX_{gender}.pkl files
+model_directory: /localhdd/Datasets/smplx
+
+# Optional: Path to terrain mesh file
+# If not specified, a flat ground plane will be used
+# OMOMO sequences typically use flat ground unless captured in a specific scene
+# terrain: /path/to/terrain.obj
+
+# Optional: Number of points to sample from object mesh (default: 100)
+# Higher values provide better object representation but slower optimization
+# Recommended range: 50-200
+n_object_samples: 100
+
+# Optional: Framerate override (default: 30.0)
+# framerate: 30.0
+
+# Notes:
+# - Object mesh is automatically loaded from: {data_root}/data/captured_objects/{object_name}_cleaned_simplified.obj
+# - Object name is extracted from sequence name (e.g., "sub17_floorlamp_023" -> "floorlamp")
+# - Object points are transformed to world frame using per-frame 6D poses from the sequence
+# - The object mesh is included in visualization and can be exported with --scaled-objects

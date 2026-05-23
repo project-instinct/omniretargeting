@@ -246,11 +246,11 @@ Standard URDF format for humanoid robots. The system automatically:
 source_to_robot_scale, retargeted_motion = retargeter.retarget_motion(
     motion,
     framerate=30.0,
-    enable_terrain_scaling=True,
+    enable_scene_scaling=True,
 )
 ```
 
-- **`source_to_robot_scale`**: `1.0` by default, or the computed robot/source height ratio when `enable_terrain_scaling=True`.
+- **`source_to_robot_scale`**: `1.0` by default, or the computed robot/source height ratio when `enable_scene_scaling=True`.
 - **`retargeted_motion`**: Numpy array of shape `(T, 7 + DOF)` containing:
   - `[0:3]`: Root position (x, y, z)
   - `[3:7]`: Root quaternion in **wxyz** order (MuJoCo convention)
@@ -271,7 +271,9 @@ with `_retargeted.npz` if it doesn't already):
 | `base_quat_w`  | `(T, 4)`   | Root quaternion in world frame (wxyz).           |
 
 If `--output-scaled-terrain` is provided, the scaled terrain mesh used for
-retargeting is exported to that path as well.
+retargeting is exported to that path as well. If `--scaled-objects DIR` is
+provided and the source adapter exposes an object mesh, the CLI also exports a
+scaled object mesh plus per-frame object poses into that directory.
 
 ## Advanced Usage
 
@@ -292,11 +294,17 @@ The CLI is driven by a per-robot JSON profile. The URDF path, joint mapping,
 and retargeting settings all come from the profile — the CLI does **not**
 accept a separate URDF argument.
 
+#### Recommended: YAML source configs
+
+New workflows should use `--source-config`, which moves source-specific options
+into a YAML file instead of requiring many CLI flags.
+
+**SMPL-X example**
+
 ```bash
 python -m omniretargeting.main \
   --robot-config robot_models/unitree_g1/unitree_g1.json \
-  --motion /path/to/motion_stageii.npz \
-  --smplx_model_dir /path/to/smplx/models \
+  --source-config config_templates/smplx_template.yaml \
   --terrain /path/to/terrain.obj \
   --output /path/to/output.npz \
   --output-scaled-terrain /path/to/scaled-terrain.obj \
@@ -304,24 +312,60 @@ python -m omniretargeting.main \
   --penetration-resolver xyz_nudge
 ```
 
+**OMOMO / object-interaction example**
+
+```bash
+python -m omniretargeting.main \
+  --robot-config robot_models/unitree_g1/unitree_g1.json \
+  --source-config config_templates/omomo_floorlamp_example.yaml \
+  --terrain /path/to/terrain.obj \
+  --output /path/to/output.npz \
+  --output-scaled-terrain /path/to/scaled-terrain.obj \
+  --scaled-objects /path/to/scaled-objects \
+  --save-video /path/to/output.mp4
+```
+
+#### Legacy CLI compatibility
+
+The legacy flags still work for existing scripts and tests, but they now emit
+DeprecationWarnings and should be migrated to `--source-config` over time.
+
+```bash
+python -m omniretargeting.main \
+  --robot-config robot_models/unitree_g1/unitree_g1.json \
+  --motion /path/to/motion_stageii.npz \
+  --model-dir /path/to/smplx/models \
+  --terrain /path/to/terrain.obj \
+  --output /path/to/output.npz
+```
+
 Main arguments:
 
 | Flag | Default | Description |
 |---|---|---|
 | `--robot-config` | `robot_models/unitree_g1/unitree_g1.json` | Path to robot profile JSON. |
-| `--source` | profile `active_source` / SMPL-X | Source entry name or source type from the robot profile. Only `smplx` is implemented today. |
-| `--motion` | *(required)* | Path to source motion file. |
-| `--smplx_model_dir` | profile / `None` | Directory containing SMPL-X model files. Required for raw SMPL-X parameter files and orientation computation. |
-| `--smplx_motion` | `None` | Legacy alias for `--motion`. |
+| `--source-config` | `None` | Recommended YAML source configuration file. See `config_templates/`. |
 | `--output` | *(required)* | Output `.npz` path (normalized to end in `_retargeted.npz`). |
 | `--terrain` | flat ground | Path to terrain mesh; a default flat terrain is generated if omitted. |
-| `--output-scaled-terrain` | `None` | If set, enables terrain scaling and exports the scaled mesh. |
+| `--output-scaled-terrain` | `None` | Enables scene scaling and exports the scaled terrain mesh. |
+| `--scaled-objects` | `None` | Directory for scaled object mesh exports and per-frame object poses when the source adapter provides them. |
 | `--mapping` | profile | Overrides the profile's `joint_mapping` with an external JSON file. |
 | `--framerate` | auto / 30 | Motion framerate; auto-detected from the source file when possible. |
 | `--vis` | off | Launch a MuJoCo viewer on the retargeted motion. |
 | `--save-video PATH` | off | Render the retargeted motion to video (requires `imageio[ffmpeg]`, and `MUJOCO_GL=egl`/`osmesa` for headless). |
 | `--replace-cylinders-with-capsules` | off | Swap cylinder collision geoms for capsules (IsaacLab/PhysX convention). |
 | `--penetration-resolver {hard_constraint,xyz_nudge}` | `xyz_nudge` | Contact handling mode; overrides the value in the profile. |
+
+Legacy source-loading flags:
+
+| Flag | Status | Description |
+|---|---|---|
+| `--source` | deprecated | Source entry name or source type from the robot profile. |
+| `--motion` | deprecated | Legacy path to source motion file. |
+| `--source-options` | deprecated | Legacy JSON object with adapter-specific options. |
+| `--model-dir` | deprecated | Legacy adapter model directory, e.g. SMPL-X model files. |
+| `--smplx_motion` | deprecated alias | Legacy alias for `--motion`. |
+| `--smplx_model_dir` | deprecated alias | Legacy alias for `--model-dir`. |
 
 ### Robot Profile Config (Per-Humanoid)
 
@@ -453,6 +497,12 @@ holosoma_retargeting project to work with generic robots and terrains:
 - **Foot stabilization tuning**: The `xyz_nudge` resolver is effective on flat
   and mildly uneven terrain but may need per-robot tuning
   (`foot_stabilization` block in the profile) for complex scenes with walls.
+- **Object interaction (v1)**:
+  - Objects are represented as concatenated point clouds `(T, N, 3)` without per-object identity.
+  - No explicit robot-object collision constraints (relies on Laplacian preservation only).
+  - Non-convex objects sampled as points may cause issues if penetration constraints are added in future versions (convex hull of points != actual object geometry).
+  - No per-object Laplacian weights or metadata tracking.
+  - Adapters must provide object points in world frame; core does not handle object pose transformation.
 
 ## Contributing
 

@@ -1,0 +1,24 @@
+{
+    "name": "clothesstand_manipulation",
+    "description": "Human manipulating clothesstand with G1 robot retargeting",
+    "omomo_sequence_file": "/localhdd/Datasets/OMOMO/data/train_diffusion_manip_seq_joints24.p",
+    "omomo_sequence_index": 0,
+    "omomo_data_root": "/localhdd/Datasets/OMOMO",
+    "n_object_samples": 100,
+    "robot_config": "robot_models/unitree_g1/unitree_g1.json",
+    "terrain": {
+        "type": "flat",
+        "size": 10.0,
+        "height": 0.0,
+        "n_points": 4
+    },
+    "retargeting": {
+        "enable_scene_scaling": true,
+        "visualize_trajectory": false
+    },
+    "validation": {
+        "check_collision": false,
+        "check_joint_limits": true,
+        "max_frames": 100
+    }
+}

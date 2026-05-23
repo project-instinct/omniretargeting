@@ -8,11 +8,15 @@ import tempfile
 from dataclasses import dataclass
 import numpy as np
 import pytest
+import trimesh
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from scipy.spatial.transform import Rotation
+
 from omniretargeting.data_sources.base import DataSource, MotionData, MotionFrame, validate_motion_frame_positions, validate_motion_positions
 from omniretargeting.robot_config import load_robot_config
+from omniretargeting.main import export_scaled_objects, select_robot_source
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +55,35 @@ class MotionCase:
     robot_profile: Path
     motion_path: Path
     terrain_path: Path
+
+
+def test_export_scaled_objects_scales_pose_translations_with_scene(tmp_path):
+    object_mesh = trimesh.creation.box(extents=[1.0, 1.0, 1.0])
+    motion_data = MotionData(
+        positions=np.zeros((2, 1, 3), dtype=float),
+        object_mesh=object_mesh,
+        metadata={
+            "object_name": "box",
+            "object_translations": np.array([[1.0, 2.0, 3.0], [-1.0, 0.5, 4.0]]),
+            "object_rotations": np.repeat(np.eye(3)[None, :, :], 2, axis=0),
+            "object_scales": np.array([0.5, 0.25]),
+        },
+    )
+
+    mesh_path, pose_path = export_scaled_objects(
+        motion_data,
+        tmp_path,
+        source_to_robot_scale=2.0,
+        apply_scene_scaling=True,
+    )
+
+    assert mesh_path.exists()
+    assert pose_path.exists()
+    poses = json.loads(pose_path.read_text())
+    assert poses[0]["translation"] == [2.0, 4.0, 6.0]
+    assert poses[1]["translation"] == [-2.0, 1.0, 8.0]
+    assert poses[0]["scale"] == 1.0
+    assert poses[1]["scale"] == 0.5
 
 
 ROBOT_MOTION_MATRIX_ROBOTS = (
@@ -96,6 +129,7 @@ def _build_retargeter_kwargs(robot_config: dict, terrain_mesh_path: Path | str, 
         "joint_mapping": dict(joint_mapping or robot_config["joint_mapping"]),
         "robot_height": robot_config.get("robot_height"),
         "source_target_names": robot_config.get("source_target_names"),
+        "base_orientation": robot_config.get("base_orientation"),
         "retargeting": robot_config.get("retargeting"),
         "link_offset_config": robot_config.get("link_offset_config"),
     }
@@ -171,6 +205,7 @@ def test_load_robot_config_nested_source_profile(tmp_path):
                         "target_names": ["Pelvis", "Head"],
                         "target_mapping": {"Pelvis": "base_link"},
                         "height_estimation": {"head_target": "Head", "foot_targets": ["Pelvis"]},
+                        "base_orientation": {"pelvis": "Pelvis", "spine": "Head"},
                         "adapter_options": {
                             "model_directory": "/localhdd/Datasets/",
                             "betas": [0.0, 0.0],
@@ -189,8 +224,28 @@ def test_load_robot_config_nested_source_profile(tmp_path):
     assert config["joint_mapping"] == {"Pelvis": "base_link"}
     assert config["source_target_names"] == ["Pelvis", "Head"]
     assert config["height_estimation"] == {"head_target": "Head", "foot_targets": ["Pelvis"]}
+    assert config["base_orientation"] == {"pelvis": "Pelvis", "spine": "Head"}
     assert config["retargeting"]["terrain_sample_points"] == 7
     assert config["selected_source"]["adapter_options"]["model_directory"] == "/localhdd/Datasets/"
+
+
+@pytest.mark.parametrize("_profile_name,profile_path", ROBOT_PROFILE_CASES)
+def test_robot_profile_mappings_are_source_local(_profile_name, profile_path):
+    raw = json.loads(profile_path.read_text())
+
+    assert "active_source" not in raw
+    assert "joint_mapping" not in raw
+    assert raw.get("source")
+    source_types = {source.get("type") for source in raw["source"]}
+    assert {"smplx", "omomo"}.issubset(source_types)
+    for source in raw["source"]:
+        assert isinstance(source.get("target_mapping"), dict)
+        assert source["target_mapping"]
+
+    config = load_robot_config(profile_path)
+    assert config["joint_mapping"] == config["selected_source"]["target_mapping"]
+    assert select_robot_source(config, "omomo")["type"] == "omomo"
+    assert select_robot_source(config, "smplx")["type"] == "smplx"
 
 
 class TestPackageImport:
@@ -430,6 +485,167 @@ def test_retarget_motion_skips_foot_stabilization_for_hard_constraint():
     assert source_to_robot_scale == 1.0
     np.testing.assert_array_equal(retargeted_motion, raw_motion)
     retargeter._apply_foot_stabilization.assert_not_called()
+
+
+
+def test_retarget_motion_uses_base_inputs_as_root_pose_arrays():
+    from omniretargeting import OmniRetargeter
+
+    base_orientations = np.ones((1, 3), dtype=float)
+    base_translations = np.full((1, 3), 2.0, dtype=float)
+    motion_data = MotionData(
+        positions=np.zeros((1, 2, 3), dtype=float),
+        target_names=["Pelvis", "Head"],
+        root_orientations=np.zeros((1, 3), dtype=float),
+        root_translations=np.zeros((1, 3), dtype=float),
+        framerate=30.0,
+        metadata={"source_type": "test"},
+    )
+
+    captured = {}
+    scaled_terrain = Mock()
+
+    retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter._coerce_motion_data = Mock(return_value=motion_data)
+    retargeter._resolve_source_to_robot_scale = Mock(return_value=1.0)
+    retargeter.terrain_mesh = Mock()
+    retargeter.terrain_mesh.copy.return_value = scaled_terrain
+    retargeter.retargeting_config = {"penetration_resolver": "hard_constraint"}
+
+    def fake_retarget_stream(motion, scaled_terrain=None):
+        captured["motion"] = motion
+        captured["terrain"] = scaled_terrain
+        return [np.zeros(7, dtype=float)]
+
+    retargeter.retarget_stream = Mock(side_effect=fake_retarget_stream)
+
+    retargeter.retarget_motion(
+        motion_data,
+        base_orientations=base_orientations,
+        base_translations=base_translations,
+        visualize_trajectory=False,
+    )
+
+    assert captured["terrain"] is scaled_terrain
+    np.testing.assert_array_equal(captured["motion"].root_orientations, base_orientations)
+    np.testing.assert_array_equal(captured["motion"].root_translations, base_translations)
+    assert "use_explicit_root_orientation" not in captured["motion"].metadata
+    assert "use_explicit_root_translation" not in captured["motion"].metadata
+
+
+def test_retarget_frame_uses_root_pose_for_frame_zero_init_when_present():
+    from omniretargeting.core import RetargetingStreamState
+    from omniretargeting import OmniRetargeter
+
+    estimated_quat_xyzw = np.array([0.1, 0.2, 0.3, 0.9], dtype=float)
+    estimated_quat_xyzw /= np.linalg.norm(estimated_quat_xyzw)
+    mapped_targets = np.arange(12, dtype=float).reshape(4, 3)
+    q_result = np.arange(7, dtype=float)
+
+    inner_retargeter = Mock()
+    inner_retargeter.retarget_frame.return_value = q_result
+
+    retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter._estimate_base_orientation_from_joints = Mock(return_value=estimated_quat_xyzw)
+    retargeter._extract_mapped_source_targets = Mock(return_value=mapped_targets)
+
+    state = RetargetingStreamState(
+        retargeter=inner_retargeter,
+        q_init=np.zeros(7, dtype=float),
+        q_last=None,
+        last_estimated_quat=None,
+        frame_idx=0,
+        scaled_terrain=Mock(),
+    )
+
+    root_translation = np.array([1.0, 2.0, 3.0], dtype=float)
+    root_orientation = np.array([0.0, 0.0, np.pi / 2.0], dtype=float)
+    frame = MotionFrame(
+        positions=np.zeros((4, 3), dtype=float),
+        root_orientation=root_orientation,
+        root_translation=root_translation,
+    )
+
+    result = retargeter.retarget_frame(frame, state)
+
+    expected_init_xyzw = Rotation.from_rotvec(root_orientation).as_quat()
+    expected_init_wxyz = np.array([
+        expected_init_xyzw[3],
+        expected_init_xyzw[0],
+        expected_init_xyzw[1],
+        expected_init_xyzw[2],
+    ])
+    expected_target_wxyz = np.array([
+        estimated_quat_xyzw[3],
+        estimated_quat_xyzw[0],
+        estimated_quat_xyzw[1],
+        estimated_quat_xyzw[2],
+    ])
+
+    call_args = inner_retargeter.retarget_frame.call_args
+    np.testing.assert_array_equal(call_args.args[0], mapped_targets)
+    np.testing.assert_allclose(call_args.args[1][:3], root_translation)
+    np.testing.assert_allclose(call_args.args[1][3:7], expected_init_wxyz)
+    assert call_args.kwargs["q_last"] is None
+    np.testing.assert_allclose(call_args.kwargs["target_base_orientation"], expected_target_wxyz)
+    np.testing.assert_allclose(state.last_estimated_quat, estimated_quat_xyzw)
+    assert state.frame_idx == 1
+    np.testing.assert_array_equal(state.q_init, q_result)
+    np.testing.assert_array_equal(state.q_last, q_result)
+    np.testing.assert_array_equal(result, q_result)
+
+
+def test_retarget_frame_falls_back_to_estimated_root_pose_when_absent():
+    from omniretargeting.core import RetargetingStreamState
+    from omniretargeting import OmniRetargeter
+
+    estimated_quat_xyzw = np.array([0.3, -0.2, 0.1, 0.9], dtype=float)
+    estimated_quat_xyzw /= np.linalg.norm(estimated_quat_xyzw)
+    positions = np.array(
+        [[10.0, 11.0, 12.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+        dtype=float,
+    )
+    mapped_targets = np.arange(12, dtype=float).reshape(4, 3)
+    previous_q = np.ones(7, dtype=float)
+    q_result = np.arange(7, dtype=float) + 10.0
+
+    inner_retargeter = Mock()
+    inner_retargeter.retarget_frame.return_value = q_result
+
+    retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter._estimate_base_orientation_from_joints = Mock(return_value=estimated_quat_xyzw)
+    retargeter._extract_mapped_source_targets = Mock(return_value=mapped_targets)
+
+    state = RetargetingStreamState(
+        retargeter=inner_retargeter,
+        q_init=np.zeros(7, dtype=float),
+        q_last=previous_q,
+        last_estimated_quat=np.array([0.0, 0.0, 0.0, 1.0], dtype=float),
+        frame_idx=0,
+        scaled_terrain=Mock(),
+    )
+
+    frame = MotionFrame(positions=positions)
+    result = retargeter.retarget_frame(frame, state)
+
+    expected_target_wxyz = np.array([
+        estimated_quat_xyzw[3],
+        estimated_quat_xyzw[0],
+        estimated_quat_xyzw[1],
+        estimated_quat_xyzw[2],
+    ])
+
+    call_args = inner_retargeter.retarget_frame.call_args
+    np.testing.assert_array_equal(call_args.args[0], mapped_targets)
+    np.testing.assert_allclose(call_args.args[1][:3], positions[0])
+    np.testing.assert_allclose(call_args.args[1][3:7], expected_target_wxyz)
+    np.testing.assert_array_equal(call_args.kwargs["q_last"], previous_q)
+    np.testing.assert_allclose(call_args.kwargs["target_base_orientation"], expected_target_wxyz)
+    np.testing.assert_allclose(state.last_estimated_quat, estimated_quat_xyzw)
+    assert state.frame_idx == 1
+    np.testing.assert_array_equal(state.q_init, q_result)
+    np.testing.assert_array_equal(state.q_last, q_result)
+    np.testing.assert_array_equal(result, q_result)
 
 
 def test_create_stream_state_passes_hard_penetration_constraint():

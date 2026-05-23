@@ -1,100 +1,113 @@
 # OmniRetargeting Progress
 
-Last Updated: 2026-05-11
+Last Updated: 2026-05-18
 
-## Current Status: Source-Agnostic Architecture Complete ✅
+## Current Status: HOI/Object Interaction Integration In Progress 🔄
 
-The codebase has been successfully refactored to be fully source-agnostic.
+The source-agnostic adapter architecture remains in place, and this branch now extends it toward
+human-object interaction support with OMOMO object sampling, object-aware visualization, and dual-mode
+CLI loading (new YAML configs plus deprecated legacy CLI compatibility).
 
-## Architecture
+## Current Branch Focus
 
-### Source Adapter Registry
+### Object Interaction (HOI) Support
+- **Status:** 🔄 Core pieces implemented and validated with focused tests
+- `MotionFrame` and `MotionData` now support per-frame `object_points`
+- `MotionData` also carries optional `object_mesh` for visualization/export
+- `OmniRetargeter.retarget_motion()` supports scene scaling for object points via `enable_scene_scaling`
+- `GenericInteractionRetargeter` accepts object points in frame retargeting
+
+### OMOMO Adapter
 - **Status:** ✅ Implemented
-- **Location:** `omniretargeting/data_sources/registry.py`
-- Adapters register themselves and are loaded dynamically
-- Supports multiple motion data formats
+- **Location:** `omniretargeting/data_sources/omomo.py`
+- Loads OMOMO sequences, object meshes, and sampled object point clouds
+- Transforms sampled object points into world coordinates per frame
+- Exposes metadata such as object name and sequence name
 
-### Available Source Adapters
-1. **SMPL-X** (`omniretargeting/data_sources/smplx.py`)
-   - Human body model motion data
-   - Supports .npz files with SMPL-X parameters
-   - Includes visualization tools
+### Visualization / Export
+- **Status:** ✅ Implemented
+- `temporary_visualization_scene()` can inject object meshes for MuJoCo visualization
+- `save_trajectory_video()` and `visualize_trajectory()` accept object meshes
+- CLI supports `--scaled-objects` export for scaled meshes and pose trajectories
 
-### Generic APIs
-- **OmniRetargeter** accepts:
-  - `DataSource` objects (any registered adapter)
-  - `MotionData` objects (source-neutral)
-  - Raw numpy arrays
-- **Stream mode:** Frame-by-frame processing via `retarget_stream()`
-- **Batch mode:** Full motion via `retarget_motion()`
+### CLI Migration
+- **Status:** 🔄 YAML mode added, legacy compatibility restored
+- `--source-config` YAML loading is supported for new source-driven workflows
+- Legacy CLI arguments (`--motion`, `--model-dir`, `--source`, `--source-options`) still work
+- Deprecated legacy flags now coexist with YAML mode instead of breaking existing tests
 
-## Recent Changes (2026-05-11)
+## Recent Changes (2026-05-18)
 
-### Phase 1: Architecture Review ✅
-- Verified registry system works
-- Confirmed SMPL-X isolation
-- Validated generic APIs
+### HOI Data Flow ✅
+- Added `object_points` validation for frame and motion containers
+- Added per-frame extraction of object points through `MotionData.iter_frames()`
+- Added object-point scaling support in batch retargeting
 
-### Phase 2: Test Refactoring ✅
-- Created `tests/data_sources/test_smplx.py` (5 tests)
-- Verified generic tests (6 tests)
-- Removed 3 problematic mock tests
-- Fixed root cause: moved mujoco import to file level
+### OMOMO Integration ✅
+- Added OMOMO adapter and integration tests
+- Verified object mesh loading and sampled point generation
+- Verified OMOMO fixtures load successfully in focused tests
 
-### Phase 3: Code Organization ✅
-- Moved `visualize_offsets.py` to `data_sources/smplx_visualize.py`
-- Fixed imports to use absolute paths
-
-### Phase 4: Deprecation Warnings ✅
-- Added warnings for legacy CLI flags:
-  - `--smplx_motion` → use `--motion`
-  - `--smplx_model_dir` → use `--model-dir`
-
-### Phase 5: Documentation ✅
-- Updated README.md with source-agnostic architecture section
-- Created `docs/ADDING_SOURCE_ADAPTERS.md` guide
-- Updated this PROGRESS.md
+### CLI / Compatibility Fix ✅
+- Fixed `omniretargeting/main.py` so YAML source configs do not break legacy CLI users
+- Restored compatibility with existing `tests/test_basic.py` main-script integration coverage
+- Kept deprecation path for legacy arguments while preserving current workflows
 
 ## Test Results
 
-**Current:** 33/37 tests passing (89%)
-- SMPL-X adapter: 5/5 ✅
-- Generic utils: 6/6 ✅
-- Config loading: 1/1 ✅
-- Package import: 2/2 ✅
-- Real data integration: 19/19 ✅
-- T-pose alignment: 0/4 ❌ (pre-existing issues)
+### Sequential Validation on marsbrain (2026-05-18)
+- `pytest -q tests/data_sources/test_smplx.py` → **6 passed**
+- `pytest -q tests/test_validation.py` → **8 passed**
+- `pytest -q tests/test_objects.py` → **15 passed**
+- `pytest -q tests/test_omomo_integration.py` → **7 passed**
+- `pytest -q tests/test_basic.py::TestUtils tests/test_basic.py::test_load_robot_config_nested_source_profile tests/test_basic.py::TestPackageImport` → **9 passed**
+- `pytest -q` G1 real-data main-script cases (`simplelab`, `wallflip`, `prox-sofa`) → **3 passed**
+- `pytest -q` H1 real-data main-script cases (`simplelab`, `wallflip`, `prox-sofa`) → **3 passed**
+- `pytest -q` Booster K1 real-data main-script cases (`simplelab`, `wallflip`, `prox-sofa`) → **3 passed**
+- `pytest -q` Mini Pi Plus real-data main-script cases: `simplelab` → **passed**, `wallflip` → **passed**
+- Mini Pi Plus `prox-sofa` was validated manually by running the equivalent CLI command directly on marsbrain, producing `/tmp/mini_pi_plus_prox_sofa_manual_retargeted.npz` and `/tmp/mini_pi_plus_prox_sofa_scaled.obj`
+- `python -m py_compile omniretargeting/main.py` → **passed**
 
-## Next Steps (Optional)
+### Notes
+- No stale `pytest` processes remained on marsbrain after cleanup.
+- Some single-case `pytest` node-id invocations for the Mini Pi Plus `prox-sofa` case appeared to hang in the local task wrapper even though the underlying retargeting pipeline completed when run directly.
+- The previously stale progress numbers from 2026-05-11 are no longer representative of this branch.
 
-1. Fix 4 T-pose alignment tests (pre-existing issues)
-2. Add more source adapters (BVH, FBX, etc.)
-3. Add integration tests with real URDF files
-4. Performance optimization
+## Remaining Work
 
-## Documentation
-
-- **Architecture:** See `agents/FINAL_ARCHITECTURE_REVIEW.md`
-- **Adding adapters:** See `docs/ADDING_SOURCE_ADAPTERS.md`
-- **Test results:** See `agents/TEST_REFACTORING_SUMMARY.md`
-- **Implementation plan:** See `agents/PLAN.md`
+1. Validate object interaction retargeting quality with real OMOMO end-to-end runs, not just structure/tests
+2. Clean up branch artifacts if confirmed safe (`*.backup`, draft notes)
+3. Decide whether to add dedicated regression tests for YAML config loading and scaled-object export
+4. Investigate why certain single-case `pytest` node-id runs can hang in the local task wrapper even when the equivalent marsbrain CLI run completes
 
 ## Key Files
 
 ### Core
-- `omniretargeting/core.py` - OmniRetargeter class
-- `omniretargeting/retargeting.py` - Generic retargeting logic
-- `omniretargeting/utils.py` - Utility functions
+- `omniretargeting/core.py` - scene scaling and frame object-point handling
+- `omniretargeting/retargeting.py` - interaction mesh construction with environment/object samples
+- `omniretargeting/main.py` - YAML + legacy CLI loading, visualization, export
 
 ### Data Sources
-- `omniretargeting/data_sources/base.py` - Base classes
-- `omniretargeting/data_sources/registry.py` - Registry system
-- `omniretargeting/data_sources/smplx.py` - SMPL-X adapter
+- `omniretargeting/data_sources/base.py` - motion container object fields and validation
+- `omniretargeting/data_sources/omomo.py` - OMOMO object adapter
+- `omniretargeting/data_sources/smplx.py` - SMPL-X adapter used by legacy/integration flows
 
 ### Tests
-- `tests/test_basic.py` - Generic tests
-- `tests/data_sources/test_smplx.py` - SMPL-X adapter tests
+- `tests/test_objects.py` - object-point unit coverage
+- `tests/test_omomo_integration.py` - OMOMO integration coverage
+- `tests/test_basic.py` - CLI and regression coverage
 
 ## Conclusion
 
-The source-agnostic architecture is complete and production-ready. The codebase now supports multiple motion data formats through a clean registry system, with SMPL-X as the first adapter.
+This branch now has the main HOI plumbing in place: object-aware motion containers, OMOMO adapter support,
+object visualization/export, and a CLI that supports the new YAML path without regressing the existing
+main-script workflows. The next important step is deeper end-to-end validation of actual retargeted HOI output quality.
+
+## Investigation Note (2026-05-20)
+
+### OMOMO Object Mesh Orientation
+- The stale AGENTS.md note about base orientation has been removed; the current architecture note correctly says root orientation comes from motion_data.root_orientations.
+- Diagnostics on the OMOMO floorlamp sequence showed the raw object transform convention itself was consistent with a vertical lamp when using the adapter's current point transform (scaled_points at rotation.T plus translation).
+- The first render issue was a visualization/export handoff mismatch: build_object_tracks() needed to transpose each object rotation so the rendered mesh used the same world-frame convention as the sampled OMOMO object points.
+- The second render issue was in MuJoCo dynamic mesh binding: _dynamic_object_specs() was storing 2 * object_mesh_ids[obj_idx] instead of the actual mesh asset id, so the renderer could attach the object transform to the wrong mesh asset/data id.
+- After changing build_object_tracks() to transpose the rotation and _dynamic_object_specs() to preserve the real mesh id, a second marsbrain render test succeeded and wrote updated outputs under /tmp/omniretargeting_20260520_tests/, including floorlamp_orientation_fix_v2.mp4, floorlamp_retargeted_v2_retargeted.npz, and floorlamp_scaled_objects_v2/.

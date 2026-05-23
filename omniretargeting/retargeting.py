@@ -247,19 +247,24 @@ class GenericInteractionRetargeter:
         self,
         source_target_positions: np.ndarray,
         terrain_points: np.ndarray,
+        object_points: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Create interaction mesh from source target positions and terrain points.
+        Create interaction mesh from source target positions, terrain points, and optional object points.
 
         Args:
             source_target_positions: Source target positions (N, 3)
             terrain_points: Terrain surface points (M, 3)
+            object_points: Optional object surface points (K, 3)
 
         Returns:
             Tuple of (vertices, tetrahedra)
         """
-        # Combine source targets and terrain points.
-        vertices = np.vstack([source_target_positions, terrain_points])
+        # Combine source targets, terrain points, and object points.
+        vertices = [source_target_positions, terrain_points]
+        if object_points is not None and len(object_points) > 0:
+            vertices.append(object_points)
+        vertices = np.vstack(vertices)
 
         # Create Delaunay triangulation
         tri = Delaunay(vertices)
@@ -272,7 +277,8 @@ class GenericInteractionRetargeter:
         q_init: np.ndarray,
         max_iter: int = 10,
         q_last: Optional[np.ndarray] = None,
-        target_base_orientation: Optional[np.ndarray] = None
+        target_base_orientation: Optional[np.ndarray] = None,
+        object_points: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Retarget a single frame of source target positions to robot motion.
@@ -282,6 +288,7 @@ class GenericInteractionRetargeter:
             q_init: Initial robot configuration
             max_iter: Maximum optimization iterations
             q_last: Configuration at previous time step (for smoothness)
+            object_points: Optional object surface points (K, 3)
 
         Returns:
             Optimized robot configuration
@@ -291,7 +298,9 @@ class GenericInteractionRetargeter:
         terrain_points = self.terrain_points
 
         # Create interaction mesh
-        vertices, tetrahedra = self.create_interaction_mesh(source_target_positions, terrain_points)
+        vertices, tetrahedra = self.create_interaction_mesh(
+            source_target_positions, terrain_points, object_points
+        )
 
         # Create adjacency list
         adj_list = get_adjacency_list(tetrahedra, len(vertices))
@@ -309,7 +318,8 @@ class GenericInteractionRetargeter:
             terrain_points,
             max_iter=max_iter,
             q_last=q_last,
-            target_base_orientation=target_base_orientation
+            target_base_orientation=target_base_orientation,
+            object_points=object_points,
         )
 
         return q_opt
@@ -322,7 +332,8 @@ class GenericInteractionRetargeter:
         terrain_points: np.ndarray,
         max_iter: int = 10,
         q_last: Optional[np.ndarray] = None,
-        target_base_orientation: Optional[np.ndarray] = None
+        target_base_orientation: Optional[np.ndarray] = None,
+        object_points: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Optimize robot configuration using SQP with interaction mesh constraints.
@@ -365,7 +376,7 @@ class GenericInteractionRetargeter:
         for iteration in range(max_iter):
             # Single optimization step
             q_new, cost = self._single_optimization_step(
-                q, target_laplacian, adj_list, terrain_points, q_last, target_base_orientation
+                q, target_laplacian, adj_list, terrain_points, q_last, target_base_orientation, object_points
             )
             
             if show_debug and iteration < 3:
@@ -394,7 +405,8 @@ class GenericInteractionRetargeter:
         adj_list: List[List[int]],
         terrain_points: np.ndarray,
         q_last: Optional[np.ndarray] = None,
-        target_base_orientation: Optional[np.ndarray] = None
+        target_base_orientation: Optional[np.ndarray] = None,
+        object_points: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Single SQP optimization step.
@@ -474,15 +486,19 @@ class GenericInteractionRetargeter:
             raise ValueError(
                 f"Size mismatch between robot_points ({len(robot_points)}) and J_V ({J_V.shape[0]//3} targets)."
             )
+        # Combine all environment points (terrain + objects) as locked vertices
+        env_points_list = [terrain_points]
+        if object_points is not None and len(object_points) > 0:
+            env_points_list.append(object_points)
+        all_env_points = np.vstack(env_points_list)
+
         if len(robot_points) == 0:
-            # Handle empty robot points to avoid vstack error
-            if len(terrain_points) == 0:
-                # Both empty, raise error as we can't do anything
-                raise ValueError("Both robot_points and terrain_points are empty")
-            vertices = terrain_points
-            print("WARNING: No robot points found! Only using terrain points.")
+            if len(all_env_points) == 0:
+                raise ValueError("Both robot_points and environment points are empty")
+            vertices = all_env_points
+            print("WARNING: No robot points found! Only using environment points.")
         else:
-            vertices = np.vstack([robot_points, terrain_points])
+            vertices = np.vstack([robot_points, all_env_points])
 
         # CRITICAL: Use uniform_weight=True to match target_laplacian computation
         # This ensures consistent Laplacian computation between target and current
@@ -501,8 +517,8 @@ class GenericInteractionRetargeter:
         # The top part corresponds to robot_points (mapped source targets), bottom part (terrain) is zeros.
         
         num_robot_points = len(robot_points)
-        num_terrain_points = len(terrain_points)
-        num_vertices = num_robot_points + num_terrain_points
+        num_env_points = len(all_env_points)
+        num_vertices = num_robot_points + num_env_points
         
         # Verify sizes match
         if J_V.shape[0] != 3 * num_robot_points:
@@ -511,10 +527,10 @@ class GenericInteractionRetargeter:
              print(f"Warning: J_V rows ({J_V.shape[0]}) != 3 * num_robot_points ({3*num_robot_points})")
         
         # Construct full Jacobian for all vertices
-        # Top part: J_V (robot points), Bottom part: 0 (terrain points, static)
+        # Top part: J_V (robot points), Bottom part: 0 (environment points, static)
         J_full_vertices = sp.vstack([
             sp.csr_matrix(J_V),  # Jacobians for robot points
-            sp.csr_matrix((3 * num_terrain_points, self.nq_a)) # Zeros for terrain points
+            sp.csr_matrix((3 * num_env_points, self.nq_a)) # Zeros for environment points (terrain + objects)
         ])
         
         # Now J_L = Kron @ J_full_vertices
