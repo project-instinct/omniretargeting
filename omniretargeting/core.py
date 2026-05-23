@@ -269,11 +269,6 @@ class OmniRetargeter:
         
         motion_data = self._coerce_motion_data(motion)
         if base_orientations is not None or base_translations is not None:
-            metadata = dict(motion_data.metadata)
-            if base_orientations is not None:
-                metadata["use_explicit_root_orientation"] = True
-            if base_translations is not None:
-                metadata["use_explicit_root_translation"] = True
             motion_data = MotionData(
                 positions=motion_data.positions,
                 target_names=motion_data.target_names,
@@ -282,7 +277,7 @@ class OmniRetargeter:
                 framerate=framerate if framerate is not None else motion_data.framerate,
                 source_height=motion_data.source_height,
                 object_points=motion_data.object_points,
-                metadata=metadata,
+                metadata=dict(motion_data.metadata),
             )
         elif framerate is not None and motion_data.framerate is None:
             motion_data.framerate = framerate
@@ -446,10 +441,8 @@ class OmniRetargeter:
 
     def retarget_frame(self, frame: MotionFrame | np.ndarray, state: RetargetingStreamState) -> np.ndarray:
         positions = frame.positions if isinstance(frame, MotionFrame) else frame
-        use_root_orientation = isinstance(frame, MotionFrame) and bool(frame.metadata.get("use_explicit_root_orientation", False))
-        use_root_translation = isinstance(frame, MotionFrame) and bool(frame.metadata.get("use_explicit_root_translation", False))
-        root_orientation = frame.root_orientation if use_root_orientation else None
-        root_translation = frame.root_translation if use_root_translation else None
+        root_orientation = frame.root_orientation if isinstance(frame, MotionFrame) else None
+        root_translation = frame.root_translation if isinstance(frame, MotionFrame) else None
         source_positions = positions
         q_init = state.q_init
 

@@ -43,6 +43,59 @@ def load_source_config(yaml_path: Path) -> dict:
     return config
 
 
+def export_scaled_objects(
+    motion_data,
+    scaled_objects_dir: Path,
+    source_to_robot_scale: float,
+    apply_scene_scaling: bool,
+):
+    if motion_data is None or getattr(motion_data, "object_mesh", None) is None:
+        return None
+
+    scaled_objects_dir = Path(scaled_objects_dir)
+    scaled_objects_dir.mkdir(parents=True, exist_ok=True)
+
+    object_name = motion_data.metadata.get("object_name", "object")
+    centroid_local = motion_data.metadata.get("object_centroid_local")
+    if centroid_local is None:
+        centroid_local = np.asarray(motion_data.object_mesh.vertices, dtype=float).mean(axis=0)
+
+    scene_scale = float(source_to_robot_scale) if apply_scene_scaling else 1.0
+
+    # Save centered object mesh so per-frame transforms carry the motion explicitly.
+    scaled_mesh = motion_data.object_mesh.copy()
+    scaled_mesh.apply_translation(-centroid_local)
+    if apply_scene_scaling:
+        scaled_mesh.apply_scale(scene_scale)
+    mesh_path = scaled_objects_dir / f"{object_name}.obj"
+    scaled_mesh.export(mesh_path)
+    print(f"Saved scaled object mesh to {mesh_path}")
+
+    translations = motion_data.metadata.get("object_translations")
+    rotations = motion_data.metadata.get("object_rotations")
+    scales = motion_data.metadata.get("object_scales")
+    if translations is None or rotations is None or scales is None:
+        return mesh_path, None
+
+    poses = []
+    for t in range(len(translations)):
+        poses.append(
+            {
+                "frame": t,
+                "translation": (np.asarray(translations[t], dtype=float) * scene_scale).tolist(),
+                "rotation_matrix": np.asarray(rotations[t]).tolist(),
+                "scale": float(scales[t]) * scene_scale,
+            }
+        )
+
+    pose_path = scaled_objects_dir / f"{object_name}_poses.json"
+    with open(pose_path, "w") as f:
+        json.dump(poses, f, indent=2)
+    print(f"Saved object pose trajectory to {pose_path}")
+
+    return mesh_path, pose_path
+
+
 def main():
     parser = argparse.ArgumentParser(description="OmniRetargeting CLI")
     parser.add_argument(
@@ -276,41 +329,12 @@ def main():
         
         # Export scaled objects if requested
         if args.scaled_objects and hasattr(motion_data, 'object_mesh') and motion_data.object_mesh is not None:
-            scaled_objects_dir = Path(args.scaled_objects)
-            scaled_objects_dir.mkdir(parents=True, exist_ok=True)
-
-            object_name = motion_data.metadata.get("object_name", "object")
-            centroid_local = motion_data.metadata.get("object_centroid_local")
-            if centroid_local is None:
-                centroid_local = np.asarray(motion_data.object_mesh.vertices, dtype=float).mean(axis=0)
-
-            # Save centered object mesh so per-frame transforms carry the motion explicitly.
-            scaled_mesh = motion_data.object_mesh.copy()
-            scaled_mesh.apply_translation(-centroid_local)
-            if args.output_scaled_terrain:
-                scaled_mesh.apply_scale(source_to_robot_scale)
-            mesh_path = scaled_objects_dir / f"{object_name}.obj"
-            scaled_mesh.export(mesh_path)
-            print(f"Saved scaled object mesh to {mesh_path}")
-
-            translations = motion_data.metadata.get("object_translations")
-            rotations = motion_data.metadata.get("object_rotations")
-            scales = motion_data.metadata.get("object_scales")
-            if translations is not None and rotations is not None and scales is not None:
-                scene_scale = source_to_robot_scale if args.output_scaled_terrain else 1.0
-                poses = []
-                for t in range(len(translations)):
-                    poses.append({
-                        "frame": t,
-                        "translation": np.asarray(translations[t]).tolist(),
-                        "rotation_matrix": np.asarray(rotations[t]).tolist(),
-                        "scale": float(scales[t]) * scene_scale
-                    })
-
-                pose_path = scaled_objects_dir / f"{object_name}_poses.json"
-                with open(pose_path, "w") as f:
-                    json.dump(poses, f, indent=2)
-                print(f"Saved object pose trajectory to {pose_path}")
+            export_scaled_objects(
+                motion_data,
+                Path(args.scaled_objects),
+                source_to_robot_scale,
+                apply_scene_scaling=bool(args.output_scaled_terrain),
+            )
 
         # Save output
         print(f"Saving output to {args.output}...")
