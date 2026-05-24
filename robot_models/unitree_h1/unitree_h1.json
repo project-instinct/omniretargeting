@@ -1,25 +1,24 @@
 {
   "name": "unitree_h1",
   "urdf_path": "h1.urdf",
-  "joint_mapping": {
-    "Pelvis": "pelvis",
-    "L_Hip": "left_hip_roll_link",
-    "R_Hip": "right_hip_roll_link",
-    "Spine1": "torso_link",
-    "L_Knee": "left_knee_link",
-    "R_Knee": "right_knee_link",
-    "L_Ankle": "left_ankle_link",
-    "R_Ankle": "right_ankle_link",
-    "L_Shoulder": "left_shoulder_roll_link",
-    "R_Shoulder": "right_shoulder_roll_link",
-    "L_Elbow": "left_elbow_link",
-    "R_Elbow": "right_elbow_link"
-  },
-  "active_source": "smplx",
   "source": [
     {
       "name": "smplx",
       "type": "smplx",
+      "target_mapping": {
+        "Pelvis": "pelvis",
+        "L_Hip": "left_hip_roll_link",
+        "R_Hip": "right_hip_roll_link",
+        "Spine1": "torso_link",
+        "L_Knee": "left_knee_link",
+        "R_Knee": "right_knee_link",
+        "L_Ankle": "left_ankle_link",
+        "R_Ankle": "right_ankle_link",
+        "L_Shoulder": "left_shoulder_roll_link",
+        "R_Shoulder": "right_shoulder_roll_link",
+        "L_Elbow": "left_elbow_link",
+        "R_Elbow": "right_elbow_link"
+      },
       "adapter_options": {
         "betas": [
           0.0,
@@ -35,6 +34,24 @@
         ]
       },
       "default_pose_on_robot": "T-Pose"
+    },
+    {
+      "name": "omomo",
+      "type": "omomo",
+      "target_mapping": {
+        "Pelvis": "pelvis",
+        "L_Hip": "left_hip_roll_link",
+        "R_Hip": "right_hip_roll_link",
+        "Spine1": "torso_link",
+        "L_Knee": "left_knee_link",
+        "R_Knee": "right_knee_link",
+        "L_Ankle": "left_ankle_link",
+        "R_Ankle": "right_ankle_link",
+        "L_Shoulder": "left_shoulder_roll_link",
+        "R_Shoulder": "right_shoulder_roll_link",
+        "L_Elbow": "left_elbow_link",
+        "R_Elbow": "right_elbow_link"
+      }
     }
   ],
   "height_estimation": {

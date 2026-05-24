@@ -111,3 +111,11 @@ main-script workflows. The next important step is deeper end-to-end validation o
 - The first render issue was a visualization/export handoff mismatch: build_object_tracks() needed to transpose each object rotation so the rendered mesh used the same world-frame convention as the sampled OMOMO object points.
 - The second render issue was in MuJoCo dynamic mesh binding: _dynamic_object_specs() was storing 2 * object_mesh_ids[obj_idx] instead of the actual mesh asset id, so the renderer could attach the object transform to the wrong mesh asset/data id.
 - After changing build_object_tracks() to transpose the rotation and _dynamic_object_specs() to preserve the real mesh id, a second marsbrain render test succeeded and wrote updated outputs under /tmp/omniretargeting_20260520_tests/, including floorlamp_orientation_fix_v2.mp4, floorlamp_retargeted_v2_retargeted.npz, and floorlamp_scaled_objects_v2/.
+
+## Configuration Cleanup Note (2026-05-21)
+
+- Moved robot profile source-target link mappings from top-level `joint_mapping` into each source entry as `target_mapping` so source target names stay source-local.
+- Added explicit `omomo` source entries to robot profiles and removed `active_source` to avoid implying SMPL-X is the universal source mapping.
+- Updated CLI YAML mode to select the robot profile source entry matching the source config type before choosing the target mapping.
+- Added regression coverage that robot profiles keep mappings under source entries while `load_robot_config()` still exposes the selected mapping for runtime compatibility.
+

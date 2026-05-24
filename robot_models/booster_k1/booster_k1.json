@@ -1,27 +1,26 @@
 {
   "name": "booster_k1",
   "urdf_path": "K1_22dof.urdf",
-  "joint_mapping": {
-    "L_Hip": "Left_Hip_Roll",
-    "R_Hip": "Right_Hip_Roll",
-    "Spine1": "Trunk",
-    "L_Knee": "Left_Shank",
-    "R_Knee": "Right_Shank",
-    "L_Ankle": "Left_Ankle_Cross",
-    "R_Ankle": "Right_Ankle_Cross",
-    "Head": "Head_2",
-    "L_Shoulder": "Left_Arm_2",
-    "R_Shoulder": "Right_Arm_2",
-    "L_Elbow": "Left_Arm_3",
-    "R_Elbow": "Right_Arm_3",
-    "L_Wrist": "left_hand_link",
-    "R_Wrist": "right_hand_link"
-  },
-  "active_source": "smplx",
   "source": [
     {
       "name": "smplx",
       "type": "smplx",
+      "target_mapping": {
+        "L_Hip": "Left_Hip_Roll",
+        "R_Hip": "Right_Hip_Roll",
+        "Spine1": "Trunk",
+        "L_Knee": "Left_Shank",
+        "R_Knee": "Right_Shank",
+        "L_Ankle": "Left_Ankle_Cross",
+        "R_Ankle": "Right_Ankle_Cross",
+        "Head": "Head_2",
+        "L_Shoulder": "Left_Arm_2",
+        "R_Shoulder": "Right_Arm_2",
+        "L_Elbow": "Left_Arm_3",
+        "R_Elbow": "Right_Arm_3",
+        "L_Wrist": "left_hand_link",
+        "R_Wrist": "right_hand_link"
+      },
       "adapter_options": {
         "betas": [
           0.0,
@@ -37,6 +36,26 @@
         ]
       },
       "default_pose_on_robot": "T-Pose"
+    },
+    {
+      "name": "omomo",
+      "type": "omomo",
+      "target_mapping": {
+        "L_Hip": "Left_Hip_Roll",
+        "R_Hip": "Right_Hip_Roll",
+        "Spine1": "Trunk",
+        "L_Knee": "Left_Shank",
+        "R_Knee": "Right_Shank",
+        "L_Ankle": "Left_Ankle_Cross",
+        "R_Ankle": "Right_Ankle_Cross",
+        "Head": "Head_2",
+        "L_Shoulder": "Left_Arm_2",
+        "R_Shoulder": "Right_Arm_2",
+        "L_Elbow": "Left_Arm_3",
+        "R_Elbow": "Right_Arm_3",
+        "L_Wrist": "left_hand_link",
+        "R_Wrist": "right_hand_link"
+      }
     }
   ],
   "height_estimation": {

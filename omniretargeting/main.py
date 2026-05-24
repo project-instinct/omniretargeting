@@ -43,6 +43,17 @@ def load_source_config(yaml_path: Path) -> dict:
     return config
 
 
+def select_robot_source(robot_config: dict, source_type: str) -> dict:
+    matches = [
+        source
+        for source in robot_config.get("source", [])
+        if source.get("name") == source_type or source.get("type") == source_type
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"Robot profile must contain exactly one source entry for {source_type!r}.")
+    return matches[0]
+
+
 def export_scaled_objects(
     motion_data,
     scaled_objects_dir: Path,
@@ -104,7 +115,7 @@ def main():
         help=f"Path to robot configuration JSON file (default: {DEFAULT_ROBOT_CONFIG_PATH})",
     )
     parser.add_argument("--source-config", default=None, help="Path to YAML source configuration file (see config_templates/ for examples)")
-    parser.add_argument("--source", default=None, help="Legacy source entry name or source type from the robot profile (default: active_source)")
+    parser.add_argument("--source", default=None, help="Legacy source entry name or source type from the robot profile (default: first source entry)")
     parser.add_argument("--motion", default=None, help="Legacy path to source motion file")
     parser.add_argument("--source-options", default=None, help="Legacy JSON object with adapter-specific source options")
     parser.add_argument("--model-dir", default=None, help="Legacy adapter model directory, when required by the source type")
@@ -119,7 +130,6 @@ def main():
         default=None,
         help="Path to save the scaled terrain mesh. When provided, terrain scaling is enabled.",
     )
-    parser.add_argument("--mapping", help="Legacy path to joint mapping JSON file (optional, overrides robot profile mapping)")
     parser.add_argument("--vis", action="store_true", help="Visualize the retargeted motion")
     parser.add_argument("--save-video", dest="save_video", default=None, help="Save retargeted motion video to file (e.g. /tmp/out.mp4). Uses offscreen rendering (set MUJOCO_GL=egl for headless).")
     parser.add_argument("--framerate", type=float, default=None, help="Framerate of the motion (optional, defaults to 30.0 or auto-detected)")
@@ -145,19 +155,6 @@ def main():
         else:
             raise FileNotFoundError(f"Robot config not found: {args.robot_config}")
 
-    # Load joint mapping
-    if args.mapping:
-        with open(args.mapping, 'r') as f:
-            joint_mapping = json.load(f)
-    elif "joint_mapping" in robot_config:
-        joint_mapping = robot_config["joint_mapping"]
-    else:
-        raise ValueError(
-            "No joint mapping available. Provide --mapping or use a robot profile with 'joint_mapping'."
-        )
-
-    if not isinstance(joint_mapping, dict) or not joint_mapping:
-        raise ValueError("Joint mapping must be a non-empty JSON object.")
 
     robot_urdf_path = robot_config.get("urdf_path")
     if not robot_urdf_path:
@@ -207,6 +204,8 @@ def main():
                 DeprecationWarning,
                 stacklevel=2,
             )
+        selected_source = select_robot_source(robot_config, source_type)
+        data_source_source_config = dict(selected_source)
         print(f"Source type: {source_type}")
         print(f"Motion file: {source_motion_path}")
     else:
@@ -243,6 +242,11 @@ def main():
         data_source_source_config = dict(selected_source)
         print(f"Using legacy CLI source resolution for type: {source_type}")
         print(f"Motion file: {source_motion_path}")
+
+    joint_mapping = selected_source.get("target_mapping")
+
+    if not isinstance(joint_mapping, dict) or not joint_mapping:
+        raise ValueError("Joint mapping must be a non-empty JSON object.")
 
     robot_height = robot_config.get("robot_height")
     retargeting = robot_config.get("retargeting")

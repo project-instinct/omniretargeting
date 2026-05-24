@@ -349,7 +349,6 @@ Main arguments:
 | `--terrain` | flat ground | Path to terrain mesh; a default flat terrain is generated if omitted. |
 | `--output-scaled-terrain` | `None` | Enables scene scaling and exports the scaled terrain mesh. |
 | `--scaled-objects` | `None` | Directory for scaled object mesh exports and per-frame object poses when the source adapter provides them. |
-| `--mapping` | profile | Overrides the profile's `joint_mapping` with an external JSON file. |
 | `--framerate` | auto / 30 | Motion framerate; auto-detected from the source file when possible. |
 | `--vis` | off | Launch a MuJoCo viewer on the retargeted motion. |
 | `--save-video PATH` | off | Render the retargeted motion to video (requires `imageio[ffmpeg]`, and `MUJOCO_GL=egl`/`osmesa` for headless). |

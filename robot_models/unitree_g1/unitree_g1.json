@@ -1,27 +1,26 @@
 {
   "name": "unitree_g1",
   "urdf_path": "g1_29dof_popsicle.urdf",
-  "joint_mapping": {
-    "Pelvis": "pelvis",
-    "L_Hip": "left_hip_roll_link",
-    "R_Hip": "right_hip_roll_link",
-    "Spine2": "waist_roll_link",
-    "L_Knee": "left_knee_link",
-    "R_Knee": "right_knee_link",
-    "L_Ankle": "left_ankle_roll_link",
-    "R_Ankle": "right_ankle_roll_link",
-    "L_Shoulder": "left_shoulder_roll_link",
-    "R_Shoulder": "right_shoulder_roll_link",
-    "L_Elbow": "left_elbow_link",
-    "R_Elbow": "right_elbow_link",
-    "L_Wrist": "left_wrist_yaw_link",
-    "R_Wrist": "right_wrist_yaw_link"
-  },
-  "active_source": "smplx",
   "source": [
     {
       "name": "smplx",
       "type": "smplx",
+      "target_mapping": {
+        "Pelvis": "pelvis",
+        "L_Hip": "left_hip_roll_link",
+        "R_Hip": "right_hip_roll_link",
+        "Spine2": "waist_roll_link",
+        "L_Knee": "left_knee_link",
+        "R_Knee": "right_knee_link",
+        "L_Ankle": "left_ankle_roll_link",
+        "R_Ankle": "right_ankle_roll_link",
+        "L_Shoulder": "left_shoulder_roll_link",
+        "R_Shoulder": "right_shoulder_roll_link",
+        "L_Elbow": "left_elbow_link",
+        "R_Elbow": "right_elbow_link",
+        "L_Wrist": "left_wrist_yaw_link",
+        "R_Wrist": "right_wrist_yaw_link"
+      },
       "adapter_options": {
         "betas": [
           0.0,
@@ -37,6 +36,26 @@
         ]
       },
       "default_pose_on_robot": "T-Pose"
+    },
+    {
+      "name": "omomo",
+      "type": "omomo",
+      "target_mapping": {
+        "Pelvis": "pelvis",
+        "L_Hip": "left_hip_roll_link",
+        "R_Hip": "right_hip_roll_link",
+        "Spine2": "waist_roll_link",
+        "L_Knee": "left_knee_link",
+        "R_Knee": "right_knee_link",
+        "L_Ankle": "left_ankle_roll_link",
+        "R_Ankle": "right_ankle_roll_link",
+        "L_Shoulder": "left_shoulder_roll_link",
+        "R_Shoulder": "right_shoulder_roll_link",
+        "L_Elbow": "left_elbow_link",
+        "R_Elbow": "right_elbow_link",
+        "L_Wrist": "left_wrist_yaw_link",
+        "R_Wrist": "right_wrist_yaw_link"
+      }
     }
   ],
   "height_estimation": {

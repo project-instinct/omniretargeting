@@ -1,30 +1,29 @@
 {
   "name": "hightorque_mini_pi_plus",
   "urdf_path": "PiPlus_S_12L8A0G2H1W.urdf",
-  "joint_mapping": {
-    "Pelvis": "base_link",
-    "L_Hip": "l_hip_roll_link",
-    "R_Hip": "r_hip_roll_link",
-    "Spine1": "torso_link",
-    "L_Knee": "l_calf_link",
-    "R_Knee": "r_calf_link",
-    "L_Ankle": "l_ankle_pitch_link",
-    "R_Ankle": "r_ankle_pitch_link",
-    "L_Foot": "l_ankle_roll_link",
-    "R_Foot": "r_ankle_roll_link",
-    "Head": "head_pitch_link",
-    "L_Shoulder": "l_shoulder_roll_link",
-    "R_Shoulder": "r_shoulder_roll_link",
-    "L_Elbow": "l_elbow_link",
-    "R_Elbow": "r_elbow_link",
-    "L_Wrist": "l_wrist_link",
-    "R_Wrist": "r_wrist_link"
-  },
-  "active_source": "smplx",
   "source": [
     {
       "name": "smplx",
       "type": "smplx",
+      "target_mapping": {
+        "Pelvis": "base_link",
+        "L_Hip": "l_hip_roll_link",
+        "R_Hip": "r_hip_roll_link",
+        "Spine1": "torso_link",
+        "L_Knee": "l_calf_link",
+        "R_Knee": "r_calf_link",
+        "L_Ankle": "l_ankle_pitch_link",
+        "R_Ankle": "r_ankle_pitch_link",
+        "L_Foot": "l_ankle_roll_link",
+        "R_Foot": "r_ankle_roll_link",
+        "Head": "head_pitch_link",
+        "L_Shoulder": "l_shoulder_roll_link",
+        "R_Shoulder": "r_shoulder_roll_link",
+        "L_Elbow": "l_elbow_link",
+        "R_Elbow": "r_elbow_link",
+        "L_Wrist": "l_wrist_link",
+        "R_Wrist": "r_wrist_link"
+      },
       "adapter_options": {
         "betas": [
           0.0,
@@ -40,6 +39,29 @@
         ]
       },
       "default_pose_on_robot": "T-Pose"
+    },
+    {
+      "name": "omomo",
+      "type": "omomo",
+      "target_mapping": {
+        "Pelvis": "base_link",
+        "L_Hip": "l_hip_roll_link",
+        "R_Hip": "r_hip_roll_link",
+        "Spine1": "torso_link",
+        "L_Knee": "l_calf_link",
+        "R_Knee": "r_calf_link",
+        "L_Ankle": "l_ankle_pitch_link",
+        "R_Ankle": "r_ankle_pitch_link",
+        "L_Foot": "l_ankle_roll_link",
+        "R_Foot": "r_ankle_roll_link",
+        "Head": "head_pitch_link",
+        "L_Shoulder": "l_shoulder_roll_link",
+        "R_Shoulder": "r_shoulder_roll_link",
+        "L_Elbow": "l_elbow_link",
+        "R_Elbow": "r_elbow_link",
+        "L_Wrist": "l_wrist_link",
+        "R_Wrist": "r_wrist_link"
+      }
     }
   ],
   "height_estimation": {
