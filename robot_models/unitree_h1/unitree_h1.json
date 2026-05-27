@@ -33,7 +33,69 @@
           0.0
         ]
       },
-      "default_pose_on_robot": "T-Pose"
+      "default_pose_on_robot": "T-Pose",
+      "link_offset_config": {
+        "pelvis": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "torso_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_knee_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_knee_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_ankle_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_ankle_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
     },
     {
       "name": "omomo",
@@ -51,6 +113,154 @@
         "R_Shoulder": "right_shoulder_roll_link",
         "L_Elbow": "left_elbow_link",
         "R_Elbow": "right_elbow_link"
+      },
+      "link_offset_config": {
+        "pelvis": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "torso_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_knee_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_knee_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_ankle_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_ankle_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "name": "lafan1",
+      "type": "lafan1",
+      "target_mapping": {
+        "Hips": "pelvis",
+        "LeftUpLeg": "left_hip_roll_link",
+        "RightUpLeg": "right_hip_roll_link",
+        "Spine1": "torso_link",
+        "LeftLeg": "left_knee_link",
+        "RightLeg": "right_knee_link",
+        "LeftFoot": "left_ankle_link",
+        "RightFoot": "right_ankle_link",
+        "LeftArm": "left_shoulder_roll_link",
+        "LeftForeArm": "left_elbow_link",
+        "RightArm": "right_shoulder_roll_link",
+        "RightForeArm": "right_elbow_link"
+      },
+      "base_orientation": {
+        "pelvis": "Hips",
+        "left_hip": "LeftUpLeg",
+        "right_hip": "RightUpLeg",
+        "spine": "Spine1"
+      },
+      "link_offset_config": {
+        "pelvis": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "torso_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_knee_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_knee_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_ankle_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_ankle_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "left_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "right_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ]
       }
     }
   ],

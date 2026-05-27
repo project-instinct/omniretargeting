@@ -38,7 +38,94 @@
           0.0
         ]
       },
-      "default_pose_on_robot": "T-Pose"
+      "default_pose_on_robot": "T-Pose",
+      "link_offset_config": {
+        "base_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "torso_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_calf_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_calf_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_ankle_pitch_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_ankle_pitch_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_ankle_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_ankle_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "head_pitch_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_wrist_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_wrist_link": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
     },
     {
       "name": "omomo",
@@ -61,6 +148,194 @@
         "R_Elbow": "r_elbow_link",
         "L_Wrist": "l_wrist_link",
         "R_Wrist": "r_wrist_link"
+      },
+      "link_offset_config": {
+        "base_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "torso_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_calf_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_calf_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_ankle_pitch_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_ankle_pitch_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_ankle_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_ankle_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "head_pitch_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_wrist_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_wrist_link": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "name": "lafan1",
+      "type": "lafan1",
+      "target_mapping": {
+        "Hips": "base_link",
+        "LeftUpLeg": "l_hip_roll_link",
+        "RightUpLeg": "r_hip_roll_link",
+        "Spine1": "torso_link",
+        "LeftLeg": "l_calf_link",
+        "RightLeg": "r_calf_link",
+        "LeftFoot": "l_ankle_pitch_link",
+        "RightFoot": "r_ankle_pitch_link",
+        "LeftArm": "l_shoulder_roll_link",
+        "LeftForeArm": "l_elbow_link",
+        "LeftHand": "l_wrist_link",
+        "RightArm": "r_shoulder_roll_link",
+        "RightForeArm": "r_elbow_link",
+        "RightHand": "r_wrist_link",
+        "Head": "head_pitch_link",
+        "LeftToe": "l_ankle_roll_link",
+        "RightToe": "r_ankle_roll_link"
+      },
+      "base_orientation": {
+        "pelvis": "Hips",
+        "left_hip": "LeftUpLeg",
+        "right_hip": "RightUpLeg",
+        "spine": "Spine1"
+      },
+      "link_offset_config": {
+        "base_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_hip_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "torso_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_calf_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_calf_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_ankle_pitch_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_ankle_pitch_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_shoulder_roll_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_elbow_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "l_wrist_link": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "r_wrist_link": [
+          0.0,
+          0.0,
+          0.0
+        ]
       }
     }
   ],

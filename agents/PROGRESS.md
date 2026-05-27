@@ -115,7 +115,49 @@ main-script workflows. The next important step is deeper end-to-end validation o
 ## Configuration Cleanup Note (2026-05-21)
 
 - Moved robot profile source-target link mappings from top-level `joint_mapping` into each source entry as `target_mapping` so source target names stay source-local.
-- Added explicit `omomo` source entries to robot profiles and removed `active_source` to avoid implying SMPL-X is the universal source mapping.
-- Updated CLI YAML mode to select the robot profile source entry matching the source config type before choosing the target mapping.
-- Added regression coverage that robot profiles keep mappings under source entries while `load_robot_config()` still exposes the selected mapping for runtime compatibility.
 
+## LAFAN1 BVH Adapter Added (2026-05-26)
+
+- Added `omniretargeting/data_sources/lafan1.py` - BVH motion data source adapter
+- Added `config_templates/lafan1_template.yaml` - usage template
+- Added `tests/data_sources/test_lafan1.py` - 15 focused tests (all passing)
+- Self-contained BVH parser (no external dependencies beyond numpy/scipy)
+- Auto-detects: bone hierarchy, framerate from Frame Time, human height from head/foot positions
+- Converts BVH Y-up coordinates (cm) to Z-up (meters)
+- Root orientations returned as axis-angle (rotvec) for consistency with existing adapters
+- Registered as "lafan1" source type, usable via --source-config YAML
+
+## LAFAN1 Rendering Validation (2026-05-26)
+
+- Rendered 3 LAFAN1 motions to Unitree G1 with flat terrain on marsbrain:
+  - `fallAndGetUp1_subject1.bvh` (5,047 frames) - fall and recovery
+  - `fight1_subject5.bvh` (7,347 frames) - fighting motion
+  - `sprint1_subject2.bvh` (8,194 frames) - sprinting motion
+- All rendered successfully via `--save-video` with `MUJOCO_GL=egl`
+- Output: `/tmp/omniretargeting_lafan1_demo/` (videos + .npz files)
+- Used LAFAN1→G1 joint mapping: Hips→pelvis, LeftUpLeg→left_hip_roll_link, RightUpLeg→right_hip_roll_link, Spine1→waist_roll_link, etc.
+- Base orientation config needed override for LAFAN1 bone names (Hips, LeftUpLeg, RightUpLeg, Spine1 vs SMPL-X Pelvis, L_Hip, R_Hip, Spine1)
+- Robot config still needs permanent lafan1 source entry; current workaround uses /tmp/g1_lafan1_config.json
+
+## LAFAN1 Robot Config + per-source base_orientation (2026-05-26)
+
+- Modified `omniretargeting/main.py` to support per-source `base_orientation`:
+  - `selected_source.get("base_orientation", robot_config.get("base_orientation"))`
+  - Falls back to top-level base_orientation for backward compatibility
+- Added `lafan1` source entries to all 4 robot configs with:
+  - `target_mapping`: LAFAN1 bone names mapped to robot links
+  - `base_orientation`: Hips/LeftUpLeg/RightUpLeg/Spine1
+- Robots configured: unitree_g1 (14 joints), unitree_h1 (12 joints), booster_k1 (13 joints), hightorque_mini_pi_plus (14 joints)
+- Re-rendered fallAndGetUp1 with fixed config (fall_v2.mp4)
+
+## Arm Mapping Fix + per-source link_offset_config (2026-05-27)
+
+- Fixed LAFAN1 arm mapping across all 4 robot configs. The arm chain was shifted by one joint:
+  - `LeftShoulder` (clavicle) → **unmapped** (was wrongly mapped to shoulder_roll_link)
+  - `LeftArm` (shoulder joint) → shoulder_roll_link (was wrongly mapped to elbow_link)
+  - `LeftForeArm` (elbow joint) → elbow_link (was wrongly mapped to wrist_yaw_link)
+  - `LeftHand` (wrist joint) → wrist_yaw_link (was unmapped)
+  - Same fix applied to right arm chain
+- Moved `link_offset_config` into each source entry (smplx, omomo, lafan1) with fallback to top-level
+- Updated `main.py` to check `selected_source.get("link_offset_config", robot_config.get("link_offset_config"))`
+- Re-rendered fallAndGetUp1 as fall_v3.mp4 with corrected arm mapping

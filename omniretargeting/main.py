@@ -250,7 +250,7 @@ def main():
 
     robot_height = robot_config.get("robot_height")
     retargeting = robot_config.get("retargeting")
-    link_offset_config = robot_config.get("link_offset_config")
+    link_offset_config = selected_source.get("link_offset_config", robot_config.get("link_offset_config"))
 
     # Merge CLI flag into retargeting config
     if retargeting is None:
@@ -308,7 +308,7 @@ def main():
             joint_mapping=joint_mapping,
             robot_height=robot_height,
             source_target_names=motion_data.target_names,
-            base_orientation=robot_config.get("base_orientation"),
+            base_orientation=selected_source.get("base_orientation", robot_config.get("base_orientation")),
             retargeting=retargeting,
             link_offset_config=link_offset_config,
         )

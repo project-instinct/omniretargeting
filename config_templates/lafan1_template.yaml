@@ -1,0 +1,32 @@
+# LAFAN1 BVH Data Source Configuration Template
+#
+# LAFAN1 is a motion capture dataset stored in BVH format.
+# BVH files contain skeleton hierarchy, bone names, and per-frame
+# joint rotations/positions.
+#
+# Usage:
+#   python -m omniretargeting.main \
+#     --robot-config robot_models/unitree_g1/unitree_g1.json \
+#     --source-config config_templates/lafan1_template.yaml \
+#     --output output.npz \
+#     --save-video output.mp4
+
+# Required: Data source type
+type: lafan1
+
+# Required: Path to LAFAN1 BVH motion file
+motion: /path/to/lafan1/motion.bvh
+
+# Optional: Path to terrain mesh file
+# If not specified, a flat ground plane will be used
+# terrain: /path/to/terrain.obj
+
+# Optional: Framerate override (default: auto-detected from BVH "Frame Time")
+# framerate: 30.0
+
+# Notes:
+# - BVH files from LAFAN1 use Y-up coordinate system (converted to Z-up automatically)
+# - Bone names are extracted from the BVH hierarchy and used as target_names
+# - Human height is estimated from head and foot positions in the first frame
+# - Position units are automatically converted from cm to meters
+# - Root orientation is returned as axis-angle (rotvec) for consistency
