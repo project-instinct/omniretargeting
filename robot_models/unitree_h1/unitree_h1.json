@@ -261,7 +261,8 @@
           0.0,
           0.0
         ]
-      }
+      },
+      "default_pose_on_robot": "T-Pose"
     }
   ],
   "height_estimation": {

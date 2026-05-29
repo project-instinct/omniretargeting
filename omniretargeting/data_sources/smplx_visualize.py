@@ -12,6 +12,7 @@ import mujoco
 import numpy as np
 
 from omniretargeting.robot_config import load_robot_config
+from omniretargeting.utils import detect_robot_height
 
 
 SMPLX_JOINT_NAMES = [
@@ -65,42 +66,6 @@ def _joint_color(name: str) -> tuple[float, float, float]:
     if name in {"Head", "Neck"}:
         return (0.80, 0.70, 0.25)
     return (0.65, 0.65, 0.65)
-
-
-def _detect_robot_height(model: mujoco.MjModel, data: mujoco.MjData) -> float:
-    min_z = float("inf")
-    max_z = float("-inf")
-
-    for body_idx in range(model.nbody):
-        z = float(data.xpos[body_idx][2])
-        min_z = min(min_z, z)
-        max_z = max(max_z, z)
-
-    for geom_idx in range(model.ngeom):
-        z = float(data.geom_xpos[geom_idx][2])
-        geom_size = model.geom_size[geom_idx]
-        geom_type = model.geom_type[geom_idx]
-        if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
-            radius = float(geom_size[0])
-            min_z = min(min_z, z - radius)
-            max_z = max(max_z, z + radius)
-        elif geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
-            radius = float(geom_size[0])
-            half_height = float(geom_size[1])
-            min_z = min(min_z, z - half_height - radius)
-            max_z = max(max_z, z + half_height + radius)
-        elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
-            half_size = float(geom_size[2])
-            min_z = min(min_z, z - half_size)
-            max_z = max(max_z, z + half_size)
-        else:
-            min_z = min(min_z, z)
-            max_z = max(max_z, z)
-
-    height = max_z - min_z
-    if 0.3 <= height <= 3.0:
-        return float(height)
-    return 1.6
 
 
 def _apply_default_joint_positions(
@@ -426,6 +391,10 @@ def main() -> None:
         default=None,
         help="Path to SMPL-X model directory (overrides search paths).",
     )
+    parser.add_argument(
+        "--scale-with-robot", dest="scale_with_robot", action="store_true", default=False,
+        help="Scale source positions to match robot height.",
+    )
     args = parser.parse_args()
 
     if args.output:
@@ -441,10 +410,14 @@ def main() -> None:
     if not isinstance(joint_mapping, dict) or not joint_mapping:
         raise ValueError("Robot config must define a non-empty 'joint_mapping'.")
 
-    default_joint_positions = robot_config.get("default_joint_positions")
+    all_poses = robot_config.get("default_joint_positions", {})
+    default_joint_positions = all_poses
+    if all_poses and isinstance(next(iter(all_poses.values()), None), dict):
+        pose_name = "T-Pose"  # default for SMPL-X
+        default_joint_positions = all_poses.get(pose_name, next(iter(all_poses.values())))
     model, data, body_ids, body_positions, body_rotations = _load_robot_default_pose(
         robot_urdf_path,
-        default_joint_positions=default_joint_positions,
+        default_joint_positions=default_joint_positions if default_joint_positions else None,
     )
     missing_bodies = sorted({body_name for body_name in joint_mapping.values() if body_name not in body_ids})
     if missing_bodies:
@@ -455,8 +428,10 @@ def main() -> None:
         raise ValueError("Robot config 'link_offset_config' must be a JSON object when provided.")
 
     robot_height = robot_config.get("robot_height")
-    if robot_height is None:
-        robot_height = _detect_robot_height(model, data)
+    if robot_height is None and args.scale_with_robot:
+        robot_height = detect_robot_height(model, data)
+    if not args.scale_with_robot:
+        robot_height = None
 
     pelvis_body_name = joint_mapping.get("Pelvis")
     pelvis_position = body_positions[body_ids[pelvis_body_name]] if pelvis_body_name else np.zeros(3, dtype=float)
@@ -465,15 +440,19 @@ def main() -> None:
     smplx_joints = None
     if smplx_betas is not None:
         raw_joints = _load_smplx_joints_from_betas(smplx_betas, smplx_model_dir=args.smplx_model_dir)
-        if raw_joints is not None:
+        if raw_joints is not None and robot_height is not None:
             smplx_height = float(raw_joints[:, 2].max() - raw_joints[:, 2].min())
             scale = robot_height / smplx_height if smplx_height > 0 else 1.0
             smplx_joints = pelvis_position[None, :] + (raw_joints - raw_joints[0:1]) * scale
-            print(f"[visualize_offsets] using SMPL-X model with {len(smplx_betas)} betas, smplx_height={smplx_height:.3f} m, scale={scale:.3f}")
+            print(f"[visualize_offsets] using SMPL-X model (scaled) with {len(smplx_betas)} betas, scale={scale:.3f}")
+        elif raw_joints is not None:
+            smplx_joints = pelvis_position[None, :] + (raw_joints - raw_joints[0:1])
+            print(f"[visualize_offsets] using SMPL-X model (unscaled) with {len(smplx_betas)} betas")
 
     if smplx_joints is None:
         smplx_joints = _build_default_smplx_pose(pelvis_position=pelvis_position, robot_height=robot_height)
-        print("[visualize_offsets] using hardcoded SMPL-X template")
+        scaled = "scaled" if robot_height else "unscaled"
+        print(f"[visualize_offsets] using hardcoded SMPL-X template ({scaled})")
 
     output_path = Path(args.output) if args.output else None
     _plot_visualization(
@@ -490,7 +469,8 @@ def main() -> None:
     print(f"[visualize_offsets] robot_urdf={robot_urdf_path}")
     print(f"[visualize_offsets] default_joint_positions={0 if not default_joint_positions else len(default_joint_positions)}")
     print(f"[visualize_offsets] smplx_betas={'none' if not smplx_betas else len(smplx_betas)}")
-    print(f"[visualize_offsets] robot_height={robot_height:.3f} m")
+    robot_height_str = f"{robot_height:.3f}" if robot_height else "none (unscaled)"
+    print(f"[visualize_offsets] robot_height={robot_height_str} m")
     print(f"[visualize_offsets] mapped_links={len(joint_mapping)}")
     print(f"[visualize_offsets] link_offsets={0 if not link_offset_config else len(link_offset_config)}")
     if output_path is not None:

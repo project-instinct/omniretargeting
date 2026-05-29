@@ -222,10 +222,12 @@ _ROTATION_QUAT = Rotation.from_matrix(_ROTATION_MATRIX).as_quat(scalar_first=Tru
 @dataclass
 class Lafan1DataSource(DataSource):
     motion_file: Path
+    start_frame: int = 0
     metadata: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.motion_file = Path(self.motion_file)
+        self.start_frame = max(0, int(self.start_frame))
         self._motion_data: MotionData | None = None
 
     @property
@@ -260,6 +262,10 @@ class Lafan1DataSource(DataSource):
         parents = bvh["parents"]
         names = bvh["names"]
         frametime = bvh["frametime"]
+
+        if self.start_frame > 0:
+            quats = quats[self.start_frame:]
+            positions = positions[self.start_frame:]
 
         # Forward kinematics to global quats and positions (still in BVH coords, cm)
         global_quats, global_positions = _quat_fk(quats, positions, parents)
@@ -342,6 +348,7 @@ def create_lafan1_data_source(
 
     return Lafan1DataSource(
         motion_file=motion_file,
+        start_frame=int(runtime_options.get("start_frame", 0)),
         metadata=runtime_options.get("metadata", {}),
     )
 

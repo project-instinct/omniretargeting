@@ -17,7 +17,7 @@ from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 
 from .data_sources.base import DataSource, MotionData, MotionFrame
-from .utils import compute_mesh_height_at_point
+from .utils import compute_mesh_height_at_point, detect_robot_height
 
 
 @dataclass
@@ -117,77 +117,13 @@ class OmniRetargeter:
 
         # Detect robot height if not provided
         if robot_height is None:
-            self.robot_height = self._detect_robot_height()
+            self.robot_height = detect_robot_height(self.robot_model, self.robot_data)
         else:
             self.robot_height = robot_height
 
         # Initialize retargeting components
         self._setup_retargeting_components()
 
-    def _detect_robot_height(self) -> float:
-        """
-        Detect robot height from URDF by calculating the vertical span of the robot in its default configuration.
-        
-        Since this is a floating-base robot, we assume the default configuration puts the robot
-        in a nominal pose (e.g. standing). We calculate the difference between the highest
-        and lowest points of all visual meshes to get the full height.
-        """
-        # Use MuJoCo to get robot height in default configuration
-        # This is more reliable than parsing the URDF scene graph
-        
-        # Set robot to default configuration (zeros)
-        mujoco.mj_resetData(self.robot_model, self.robot_data)
-        self.robot_data.qpos[3:7] = [1, 0, 0, 0]  # Set base quaternion to identity
-        mujoco.mj_forward(self.robot_model, self.robot_data)
-        
-        min_z = float('inf')
-        max_z = float('-inf')
-        
-        # Iterate through all bodies and get their positions
-        for body_idx in range(self.robot_model.nbody):
-            body_pos = self.robot_data.xpos[body_idx]
-            z = body_pos[2]
-            min_z = min(min_z, z)
-            max_z = max(max_z, z)
-        
-        # Also check geometry positions for more accuracy
-        for geom_idx in range(self.robot_model.ngeom):
-            geom_pos = self.robot_data.geom_xpos[geom_idx]
-            z = geom_pos[2]
-            
-            # Get geometry size to account for extent
-            geom_size = self.robot_model.geom_size[geom_idx]
-            geom_type = self.robot_model.geom_type[geom_idx]
-            
-            # Estimate vertical extent based on geometry type
-            if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
-                radius = geom_size[0]
-                min_z = min(min_z, z - radius)
-                max_z = max(max_z, z + radius)
-            elif geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
-                radius = geom_size[0]
-                half_height = geom_size[1]
-                min_z = min(min_z, z - half_height - radius)
-                max_z = max(max_z, z + half_height + radius)
-            elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
-                half_size = geom_size[2]  # Z dimension
-                min_z = min(min_z, z - half_size)
-                max_z = max(max_z, z + half_size)
-            else:
-                # For other types, just use the position
-                min_z = min(min_z, z)
-                max_z = max(max_z, z)
-        
-        height = max_z - min_z
-        
-        # Sanity check
-        if height < 0.3 or height > 3.0:
-            print(f"Warning: Detected height {height:.3f}m seems unreasonable. Using default 1.6m")
-            return 1.6
-        
-        print(f"Detected robot height: {height:.4f}m (Min Z: {min_z:.4f}, Max Z: {max_z:.4f})")
-
-        return height
 
     def _setup_retargeting_components(self):
         """Setup internal retargeting components."""

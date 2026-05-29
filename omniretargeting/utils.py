@@ -354,3 +354,37 @@ def create_flat_terrain(size: float = 10.0, height: float = 0.0, n_points: int =
             faces.append([v1, v3, v2])
     
     return trimesh.Trimesh(vertices=vertices, faces=faces)
+
+
+def detect_robot_height(model: "mujoco.MjModel", data: "mujoco.MjData") -> float:
+    """Detect robot height from MuJoCo geom extents (includes head casing, etc.).
+
+    Shared by core.py, and {data}_visualize.py to avoid code duplication. 
+    This is a fallback when height_estimation is not provided in the JSON config.
+    """
+    mujoco.mj_resetData(model, data)
+    if model.njnt > 0 and model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE and model.nq >= 7:
+        data.qpos[3:7] = [1, 0, 0, 0]
+    mujoco.mj_forward(model, data)
+
+    min_z = float("inf")
+    max_z = float("-inf")
+    for geom_idx in range(model.ngeom):
+        z = float(data.geom_xpos[geom_idx][2])
+        geom_size = model.geom_size[geom_idx]
+        geom_type = model.geom_type[geom_idx]
+        if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+            r = float(geom_size[0])
+            min_z = min(min_z, z - r); max_z = max(max_z, z + r)
+        elif geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+            r = float(geom_size[0]); hh = float(geom_size[1])
+            min_z = min(min_z, z - hh - r); max_z = max(max_z, z + hh + r)
+        elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+            hs = float(geom_size[2])
+            min_z = min(min_z, z - hs); max_z = max(max_z, z + hs)
+        else:
+            min_z = min(min_z, z); max_z = max(max_z, z)
+    height = float(max_z - min_z)
+    if height < 0.3 or height > 3.0:
+        return 1.6
+    return height
