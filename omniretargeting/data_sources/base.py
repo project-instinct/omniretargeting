@@ -109,6 +109,36 @@ class MotionData:
             if val is not None and isinstance(val, np.ndarray) and val.shape[0] == T:
                 new_metadata[key] = linear_interpolate(val, dst_indices, axis=0)
 
+        # Semantic per-frame metadata has to follow the resampling too. A
+        # trajectory that keeps its original length while positions are
+        # resampled is silently misaligned in time, and nothing downstream can
+        # detect that: the arrays are still well formed, just describing
+        # different instants.
+        centres = new_metadata.get("foot_sole_centres")
+        if isinstance(centres, dict):
+            new_metadata["foot_sole_centres"] = {
+                name: linear_interpolate(np.asarray(series), dst_indices, axis=0)
+                if getattr(series, "shape", (0,))[0] == T else series
+                for name, series in centres.items()
+            }
+
+        rotations = new_metadata.get("link_orientations")
+        if isinstance(rotations, dict):
+            from scipy.spatial.transform import Rotation, Slerp
+            src_times = np.arange(T, dtype=np.float64)
+            resampled = {}
+            for name, series in rotations.items():
+                series = np.asarray(series)
+                if series.ndim == 3 and series.shape[1:] == (3, 3) and series.shape[0] == T:
+                    # Rotations interpolate on the sphere; component-wise linear
+                    # interpolation of a rotation matrix leaves SO(3).
+                    resampled[name] = Slerp(src_times, Rotation.from_matrix(series))(
+                        dst_indices
+                    ).as_matrix()
+                else:
+                    resampled[name] = series
+            new_metadata["link_orientations"] = resampled
+
         obj_rot = new_metadata.get("object_rotations")
         if obj_rot is not None and isinstance(obj_rot, np.ndarray) and obj_rot.shape[0] == T:
             from scipy.spatial.transform import Rotation, Slerp

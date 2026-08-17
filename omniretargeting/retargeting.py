@@ -614,6 +614,7 @@ class GenericInteractionRetargeter:
 
         self.link_orientation_specs: Dict[str, dict] = {}
         self.link_orientation_weight = 0.0
+        self.link_orientation_relative_to_root = False
         self.link_orientation_enabled = False
 
         if not config or not config.get("enabled", False):
@@ -656,6 +657,7 @@ class GenericInteractionRetargeter:
             }
 
         self.link_orientation_weight = weight
+        self.link_orientation_relative_to_root = bool(config.get("relative_to_root", False))
         self.link_orientation_enabled = True
 
     def _setup_scene_contact(self, config: Optional[Dict]) -> None:
@@ -808,6 +810,7 @@ class GenericInteractionRetargeter:
         self,
         targets: Optional[Dict[str, np.ndarray]],
         T: Optional[np.ndarray] = None,
+        source_root_rot: Optional[np.ndarray] = None,
     ) -> List[Tuple[np.ndarray, np.ndarray]]:
         """Root-relative orientation residuals, one per configured link.
 
@@ -841,16 +844,40 @@ class GenericInteractionRetargeter:
                 continue
             target_world = np.asarray(target_world, dtype=float)
             if target_world.shape != (3, 3):
-                raise ValueError(f"foot orientation target for {side!r} must be a 3x3 rotation")
+                raise ValueError(f"link orientation target for {side!r} must be a 3x3 rotation")
 
             current_world = self.robot_data.xmat[spec["body_id"]].reshape(3, 3) @ spec["body_to_sole"]
 
-            current_rel = root_rot.T @ current_world
-            target_rel = root_rot.T @ target_world
-            error = Rotation.from_matrix(target_rel @ current_rel.T).as_rotvec()
-
-            # Relative angular velocity in the root frame.
-            jac = root_rot.T @ (self._body_angular_jacobian(spec["body_id"], T=T) - root_jac)
+            # Error and Jacobian must describe the same quantity.  Two
+            # consistent choices exist and they optimise different things:
+            #
+            # world:    the link's world orientation matches the source's world
+            #           orientation.  This is what "the foot points where the
+            #           person's foot pointed" means, and it is what a viewer
+            #           judges.  The floating base can in principle be rotated
+            #           to satisfy it, so the base orientation objective is what
+            #           bounds that; measured here the pelvis moves by under a
+            #           degree when this term is enabled.
+            # relative: the link's orientation relative to its own root matches
+            #           the source's relative to its own root.  Rotating the
+            #           base cannot satisfy it at all, but it inherits whatever
+            #           error the base already has -- with a pelvis ten degrees
+            #           out, the world sole orientation lands seven degrees out
+            #           even when the relative term is fully satisfied.
+            #
+            # World is the default because it targets the quantity that was
+            # wrong in the first place.  An earlier version mixed the two: a
+            # world-frame error against a relative Jacobian, which only
+            # converged because the base happened to track closely.
+            if self.link_orientation_relative_to_root:
+                source_root = root_rot if source_root_rot is None else source_root_rot
+                error = Rotation.from_matrix(
+                    (source_root.T @ target_world) @ (root_rot.T @ current_world).T
+                ).as_rotvec()
+                jac = root_rot.T @ (self._body_angular_jacobian(spec["body_id"], T=T) - root_jac)
+            else:
+                error = Rotation.from_matrix(target_world @ current_world.T).as_rotvec()
+                jac = self._body_angular_jacobian(spec["body_id"], T=T)
             residuals.append((jac, error))
 
         return residuals
@@ -1281,7 +1308,20 @@ class GenericInteractionRetargeter:
         foot_terms: List[Tuple[np.ndarray, np.ndarray]] = []
         if self.link_orientation_enabled and link_orientation_targets:
             w_foot = self.link_orientation_weight
-            for jac, error in self._link_orientation_residuals(link_orientation_targets, T=T_qvel):
+            source_root_rot = None
+            if target_base_orientation is not None:
+                root_quat = np.asarray(target_base_orientation, dtype=float)
+                if (
+                    root_quat.shape == (4,)
+                    and np.isfinite(root_quat).all()
+                    and np.linalg.norm(root_quat) > 1e-8
+                ):
+                    source_root_rot = Rotation.from_quat(
+                        root_quat / np.linalg.norm(root_quat), scalar_first=True
+                    ).as_matrix()
+            for jac, error in self._link_orientation_residuals(
+                link_orientation_targets, T=T_qvel, source_root_rot=source_root_rot
+            ):
                 P = P + sp.csr_matrix(2.0 * w_foot * (jac.T @ jac))
                 c = c - 2.0 * w_foot * (jac.T @ error)
                 foot_terms.append((jac, error))

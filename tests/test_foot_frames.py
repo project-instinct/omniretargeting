@@ -209,3 +209,78 @@ class TestOrthonormalize:
     def test_reflection_is_mapped_to_a_proper_rotation(self):
         repaired = orthonormalize(np.diag([1.0, 1.0, -1.0]))
         assert np.isclose(np.linalg.det(repaired), 1.0)
+
+
+class TestSoleDerivedFromCollisionGeoms:
+    """The robot-side sole read off the foot's own collision geoms.
+
+    A hand-measured offset per robot does not transfer: across the humanoids in
+    this repository the sole plane sits between 3.5 cm and 19 cm below the foot
+    body origin, and as a fraction of robot height that spans 2.8 to 11 percent,
+    so neither a constant nor a height-normalised constant works.
+    """
+
+    @staticmethod
+    def _slab(length=0.20, width=0.08, thickness=0.02, drop=0.05, n=9):
+        """A flat sole plate hanging below the body origin, like a real foot."""
+        xs = np.linspace(-0.05, length - 0.05, n)
+        ys = np.linspace(-width / 2, width / 2, n)
+        zs = np.array([-drop - thickness, -drop])
+        return np.array([[x, y, z] for x in xs for y in ys for z in zs])
+
+    def test_reference_point_lands_on_the_lowest_surface(self):
+        from omniretargeting.foot_frames import derive_sole_from_points
+
+        pts = self._slab()
+        sole = derive_sole_from_points(pts)
+        assert sole.reference_point[2] == pytest.approx(pts[:, 2].min(), abs=1e-9)
+        np.testing.assert_allclose(sole.normal, [0.0, 0.0, 1.0], atol=1e-6)
+
+    def test_extents_recover_the_plate_dimensions(self):
+        from omniretargeting.foot_frames import derive_sole_from_points
+
+        sole = derive_sole_from_points(self._slab(length=0.20, width=0.08))
+        assert sole.extent_forward == pytest.approx(0.20, abs=0.01)
+        assert sole.extent_lateral == pytest.approx(0.08, abs=0.01)
+
+    def test_normal_points_away_from_the_ground_toward_the_ankle(self):
+        from omniretargeting.foot_frames import derive_sole_from_points
+
+        # Mirror the plate above the origin: the normal must flip with it.
+        pts = self._slab()
+        pts[:, 2] *= -1.0
+        sole = derive_sole_from_points(pts)
+        np.testing.assert_allclose(sole.normal, [0.0, 0.0, -1.0], atol=1e-6)
+
+    def test_tilted_sole_is_recovered_by_refinement(self):
+        """A first normal a few degrees off truncates the detected sole.
+
+        On one robot here the unrefined pass reported a 7 cm sole for a 19 cm
+        foot, because a tilted band only catches the lowest patch.
+        """
+        from scipy.spatial.transform import Rotation
+
+        from omniretargeting.foot_frames import derive_sole_from_points
+
+        tilt = Rotation.from_euler("y", 8.0, degrees=True).as_matrix()
+        pts = self._slab(length=0.20) @ tilt.T
+        sole = derive_sole_from_points(pts)
+        assert sole.extent_forward == pytest.approx(0.20, abs=0.02)
+        recovered = np.degrees(
+            np.arccos(np.clip(sole.normal @ (tilt @ np.array([0.0, 0.0, 1.0])), -1.0, 1.0))
+        )
+        assert recovered < 1.5
+
+    def test_blobby_geometry_is_rejected_rather_than_guessed(self):
+        from omniretargeting.foot_frames import derive_sole_from_points
+
+        rng = np.random.default_rng(4)
+        blob = rng.normal(size=(300, 3)) * 0.05
+        with pytest.raises(ValueError, match="no distinguishable sole plane"):
+            derive_sole_from_points(blob)
+
+    def test_too_few_points_is_rejected(self):
+        from omniretargeting.foot_frames import derive_sole_from_points
+
+        with pytest.raises(ValueError, match="at least 4"):
+            derive_sole_from_points(np.zeros((3, 3)))

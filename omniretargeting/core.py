@@ -869,6 +869,10 @@ class OmniRetargeter:
         if not geom_ids:
             return np.zeros((0, 3), dtype=float)
 
+        # Prefer primitives when a body carries both: they are the collision
+        # proxy the model author intended, and a mesh alongside them is usually
+        # the visual shell.  A mesh-only foot still has to be sampled, though,
+        # rather than collapsed to its origin.
         primitive_geom_ids = [
             geom_id for geom_id in geom_ids
             if int(self.robot_model.geom_type[geom_id]) != mujoco.mjtGeom.mjGEOM_MESH
@@ -932,6 +936,22 @@ class OmniRetargeter:
                 [0.0, ry, 0.0],
                 [0.0, -ry, 0.0],
             ])
+        elif geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+            # A mesh foot is the common case for shelled robots, and returning a
+            # single point for it silently reduces the foot to its origin.  The
+            # convex hull of a subsample keeps the boundary that matters for
+            # support while staying small enough to work with.
+            mesh_id = int(self.robot_model.geom_dataid[geom_id])
+            if mesh_id < 0:
+                points_local = np.zeros((1, 3), dtype=float)
+            else:
+                start = int(self.robot_model.mesh_vertadr[mesh_id])
+                count = int(self.robot_model.mesh_vertnum[mesh_id])
+                verts = np.asarray(
+                    self.robot_model.mesh_vert[start:start + count], dtype=float
+                ).reshape(-1, 3)
+                stride = max(1, verts.shape[0] // 512)
+                points_local = verts[::stride]
         else:
             points_local = np.zeros((1, 3), dtype=float)
 

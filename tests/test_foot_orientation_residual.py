@@ -182,16 +182,14 @@ class TestRootRelativeResidual:
         for _, error in residuals:
             np.testing.assert_allclose(error, np.zeros(3), atol=1e-9)
 
-    def test_rotating_the_whole_robot_leaves_the_error_unchanged(self, robot):
-        """The residual must not be satisfiable by turning the base.
+    @staticmethod
+    def _errors_before_and_after_a_rigid_turn(r, model, data, seed):
+        """Misalign both feet, then turn robot and targets together.
 
-        The actuated set includes the floating base and the base is barely
-        regularized, so a world-frame foot residual would be cheapest to
-        satisfy by rolling the entire robot instead of moving the ankle.
+        A rigid turn of the whole scene changes nothing physical, so it is the
+        cleanest probe of what a residual actually measures.
         """
-        model, data = robot
-        r = _retargeter(model, data)
-        rng = np.random.default_rng(13)
+        rng = np.random.default_rng(seed)
         q = _pose(model, rng)
         data.qpos[:] = q
         mujoco.mj_forward(model, data)
@@ -203,21 +201,76 @@ class TestRootRelativeResidual:
             )
             for side, spec in r.link_orientation_specs.items()
         }
-        before = {side: err for (side, (_, err)) in zip(
-            r.link_orientation_specs, r._link_orientation_residuals(misaligned))}
+        before = dict(zip(r.link_orientation_specs, (e for _, e in r._link_orientation_residuals(misaligned))))
 
-        # Rotate base and targets together, exactly as a rigid turn of the scene.
         spin = Rotation.from_euler("z", 35.0, degrees=True)
         q_spun = q.copy()
         q_spun[3:7] = (spin * Rotation.from_quat(q[3:7], scalar_first=True)).as_quat(scalar_first=True)
         data.qpos[:] = q_spun
         mujoco.mj_forward(model, data)
-        spun_targets = {side: spin.as_matrix() @ rot for side, rot in misaligned.items()}
-        after = {side: err for (side, (_, err)) in zip(
-            r.link_orientation_specs, r._link_orientation_residuals(spun_targets))}
+        spun = {side: spin.as_matrix() @ rot for side, rot in misaligned.items()}
+        # The source root turns with the scene too.
+        after = dict(zip(
+            r.link_orientation_specs,
+            (e for _, e in r._link_orientation_residuals(spun, source_root_rot=spin.as_matrix())),
+        ))
+        return before, after
 
+    def test_world_mode_preserves_the_error_magnitude_under_a_rigid_turn(self, robot):
+        """In world mode the error is a world quantity, so it turns with the scene.
+
+        Its magnitude is what is physical and must not change; the components
+        rotate. Asserting the components instead would be asserting the relative
+        formulation's property against the world one.
+        """
+        model, data = robot
+        r = _retargeter(model, data)
+        assert r.link_orientation_relative_to_root is False
+        before, after = self._errors_before_and_after_a_rigid_turn(r, model, data, seed=13)
+        for side in before:
+            assert np.linalg.norm(after[side]) == pytest.approx(np.linalg.norm(before[side]), abs=1e-8)
+
+    def test_relative_mode_preserves_the_error_vector_under_a_rigid_turn(self, robot):
+        """In relative mode the error lives in the root frame, so it is invariant.
+
+        This is the property that makes rotating the base useless as a way to
+        satisfy the task: base and target move together and the error does not
+        respond.
+        """
+        model, data = robot
+        r = _retargeter(model, data)
+        r.link_orientation_relative_to_root = True
+        before, after = self._errors_before_and_after_a_rigid_turn(r, model, data, seed=13)
         for side in before:
             np.testing.assert_allclose(after[side], before[side], atol=1e-8)
+
+    def test_relative_mode_compares_each_side_against_its_own_root(self, robot):
+        """Relativising the source target by the robot root is the wrong pairing.
+
+        It leaves a world-frame error paired with a relative Jacobian, which
+        agrees with the correct formulation only while the two roots coincide.
+        """
+        model, data = robot
+        r = _retargeter(model, data)
+        r.link_orientation_relative_to_root = True
+        rng = np.random.default_rng(23)
+        data.qpos[:] = _pose(model, rng)
+        mujoco.mj_forward(model, data)
+
+        side, spec = next(iter(r.link_orientation_specs.items()))
+        current = data.xmat[spec["body_id"]].reshape(3, 3)
+        source_root = Rotation.from_euler("y", 12.0, degrees=True).as_matrix()
+        robot_root = data.xmat[r.root_body_id].reshape(3, 3)
+
+        # Target chosen so the two roots' relative orientations agree exactly.
+        target = source_root @ robot_root.T @ current
+        (_, error), = [
+            t for s, t in zip(r.link_orientation_specs,
+                              r._link_orientation_residuals({side: target}, source_root_rot=source_root))
+            if s == side
+        ]
+        np.testing.assert_allclose(error, np.zeros(3), atol=1e-9)
+        assert not np.allclose(target, current, atol=1e-6), "fixture must make the roots differ"
 
     def test_disabled_task_produces_no_residuals(self, robot):
         model, data = robot
