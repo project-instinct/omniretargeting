@@ -483,8 +483,10 @@ class OmniRetargeter:
             )
 
         print(
-            f"[skeleton_matching] source skeleton scaled by {scale:.4f} about its contacts; "
-            f"pelvis descends about {(1.0 - scale) * self._source_leg_length(positions, names):.3f} m"
+            f"[skeleton_matching] source skeleton scaled by {scale:.4f} about its contacts "
+            f"(pelvis-to-sole span: source "
+            f"{self._source_leg_length(positions, names, motion_data.metadata.get('foot_sole_centres')):.3f} m, "
+            f"robot {self._robot_leg_length():.3f} m)"
         )
         return MotionData(
             positions=rescaled,
@@ -498,21 +500,49 @@ class OmniRetargeter:
             metadata=dict(motion_data.metadata),
         )
 
+    # The leg span is taken at a high percentile rather than at the median.
+    # Stance is where the source leg is most extended, and stance is exactly
+    # when the sole is pinned, so a median taken over a clip full of bent-leg
+    # swing frames calibrates the scale on the wrong part of the motion and
+    # leaves the stance demand outside what the robot can reach.
+    _LEG_SPAN_PERCENTILE = 90.0
+
     @staticmethod
-    def _source_leg_length(positions: np.ndarray, names: List[str]) -> float:
-        """Median pelvis-to-ankle distance in the source, in metres."""
+    def _source_leg_length(
+        positions: np.ndarray,
+        names: List[str],
+        sole_centres: Optional[Dict[str, np.ndarray]] = None,
+    ) -> float:
+        """Pelvis-to-sole distance in the source, in metres.
+
+        Measured to the sole rather than to the ankle joint.  The contact task
+        pins the sole, so the sole is the point whose reach decides whether the
+        robot can stand where the source stood.  The two differ by more than
+        they look: the human's ankle sits about 8 cm above its own sole while
+        this robot's sits 3.5 cm above, so a scale derived from ankle spans
+        leaves several centimetres the leg cannot make up once the sole is
+        planted -- which the base then absorbs by dropping, but only on the
+        frames where a contact is active.
+        """
         try:
             pelvis = names.index("Pelvis")
         except ValueError:
             return 0.0
-        ankles = [n for n in ("L_Ankle", "R_Ankle") if n in names]
-        if not ankles:
+
+        targets = []
+        if sole_centres:
+            targets = [np.asarray(v, dtype=float) for v in sole_centres.values()]
+        if not targets:
+            targets = [
+                positions[:, names.index(a)] for a in ("L_Ankle", "R_Ankle") if a in names
+            ]
+        if not targets:
             return 0.0
-        lengths = [
-            np.linalg.norm(positions[:, pelvis] - positions[:, names.index(a)], axis=1)
-            for a in ankles
-        ]
-        return float(np.median(np.concatenate(lengths)))
+
+        lengths = [np.linalg.norm(positions[:, pelvis] - t, axis=1) for t in targets]
+        return float(
+            np.percentile(np.concatenate(lengths), OmniRetargeter._LEG_SPAN_PERCENTILE)
+        )
 
     def _robot_leg_length(self) -> float:
         """Pelvis-to-ankle distance on the robot at its nominal configuration."""
@@ -537,13 +567,32 @@ class OmniRetargeter:
         )
         if pelvis_id < 0:
             return 0.0
+        # Measure to the sole, matching the source side and matching the point
+        # the contact task pins.  The sole is read off the foot's own collision
+        # geoms rather than assumed, so this holds for feet of any shape.
+        from omniretargeting.foot_frames import (
+            derive_sole_from_points,
+            sample_body_collision_points,
+        )
+
         lengths = []
         for link in ankle_links:
             if not link:
                 continue
             body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, link)
-            if body_id >= 0:
-                lengths.append(float(np.linalg.norm(data.xpos[body_id] - data.xpos[pelvis_id])))
+            if body_id < 0:
+                continue
+            sole_offset = np.zeros(3)
+            try:
+                points = sample_body_collision_points(self.robot_model, body_id)
+                sole_offset = derive_sole_from_points(points).reference_point
+            except (ValueError, ImportError) as exc:
+                print(
+                    f"Warning: could not derive the sole of {link!r} ({exc}); "
+                    "measuring the leg to the ankle instead"
+                )
+            sole_world = data.xpos[body_id] + data.xmat[body_id].reshape(3, 3) @ sole_offset
+            lengths.append(float(np.linalg.norm(sole_world - data.xpos[pelvis_id])))
         return float(np.median(lengths)) if lengths else 0.0
 
     def _derive_skeleton_scale(self, motion_data: MotionData, config: dict) -> Optional[float]:
@@ -559,7 +608,9 @@ class OmniRetargeter:
             return float(override)
 
         source_leg = self._source_leg_length(
-            np.asarray(motion_data.positions, dtype=float), motion_data.target_names or []
+            np.asarray(motion_data.positions, dtype=float),
+            motion_data.target_names or [],
+            motion_data.metadata.get("foot_sole_centres"),
         )
         robot_leg = self._robot_leg_length()
         if source_leg <= 1e-6 or robot_leg <= 1e-6:

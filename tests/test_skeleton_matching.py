@@ -19,30 +19,71 @@ from omniretargeting.core import OmniRetargeter
 
 
 class TestSkeletonScaleDerivation:
-    """The scale is measured from the segment that has to span the gap."""
+    """The scale is measured from the segment that has to span the gap.
+
+    Which segment that is turned out to matter by several centimetres. The
+    contact task pins the sole, so the sole is the point whose reach decides
+    whether the robot can stand where the source stood. Measuring to the ankle
+    joint instead leaves the human's ankle-to-sole offset, about 8 cm, against
+    this robot's 3.5 cm, unaccounted for; the leg then cannot span the gap once
+    the sole is planted and the base drops to make up the difference on exactly
+    the frames where a contact is active.
+    """
 
     NAMES = ["Pelvis", "L_Ankle", "R_Ankle"]
 
-    def _positions(self, leg_length):
-        # Two frames, pelvis above both ankles at the given distance.
-        p = np.zeros((2, 3, 3))
+    def _positions(self, leg_length, n=2):
+        p = np.zeros((n, 3, 3))
         p[:, 0] = [0.0, 0.0, leg_length]
         p[:, 1] = [0.0, 0.10, 0.0]
         p[:, 2] = [0.0, -0.10, 0.0]
         return p
 
-    def test_source_leg_length_is_the_median_pelvis_to_ankle_distance(self):
+    def test_the_sole_is_measured_to_when_it_is_available(self):
         pos = self._positions(0.90)
-        measured = OmniRetargeter._source_leg_length(pos, self.NAMES)
+        # Soles 8 cm below the ankles, as on a human.
+        soles = {
+            "left": np.tile([0.0, 0.10, -0.08], (2, 1)),
+            "right": np.tile([0.0, -0.10, -0.08], (2, 1)),
+        }
+        to_sole = OmniRetargeter._source_leg_length(pos, self.NAMES, soles)
+        to_ankle = OmniRetargeter._source_leg_length(pos, self.NAMES, None)
+        assert to_sole == pytest.approx(np.hypot(0.98, 0.10), abs=1e-9)
+        assert to_sole - to_ankle == pytest.approx(0.08, abs=1e-3)
+
+    def test_the_ankle_is_the_fallback_when_no_soles_are_known(self):
+        pos = self._positions(0.90)
+        measured = OmniRetargeter._source_leg_length(pos, self.NAMES, None)
         assert measured == pytest.approx(np.hypot(0.90, 0.10), abs=1e-9)
+
+    def test_the_span_is_taken_at_stance_not_at_the_median(self):
+        """Stance is where the leg is most extended, and stance is when it is pinned.
+
+        A median over a clip full of bent-leg swing frames calibrates on the
+        wrong part of the motion and leaves the stance demand beyond reach.
+        """
+        # Ten frames: eight crouched, two extended. The median sees only the
+        # crouch; the extended frames are the ones that carry a contact.
+        pos = np.zeros((10, 3, 3))
+        pos[:, 0] = [0.0, 0.0, 0.70]
+        pos[-2:, 0] = [0.0, 0.0, 0.95]
+        pos[:, 1] = [0.0, 0.0, 0.0]
+        pos[:, 2] = [0.0, 0.0, 0.0]
+
+        measured = OmniRetargeter._source_leg_length(pos, self.NAMES, None)
+        assert measured > 0.70, "a median would report the crouch and miss stance"
+        assert measured == pytest.approx(
+            np.percentile(np.concatenate([pos[:, 0, 2]] * 2), OmniRetargeter._LEG_SPAN_PERCENTILE),
+            abs=1e-9,
+        )
 
     def test_missing_pelvis_reports_zero_rather_than_guessing(self):
         pos = self._positions(0.90)
-        assert OmniRetargeter._source_leg_length(pos, ["A", "B", "C"]) == 0.0
+        assert OmniRetargeter._source_leg_length(pos, ["A", "B", "C"], None) == 0.0
 
-    def test_missing_ankles_report_zero(self):
+    def test_missing_ankles_and_soles_report_zero(self):
         pos = self._positions(0.90)
-        assert OmniRetargeter._source_leg_length(pos, ["Pelvis", "B", "C"]) == 0.0
+        assert OmniRetargeter._source_leg_length(pos, ["Pelvis", "B", "C"], None) == 0.0
 
     def test_height_is_not_used_as_a_proxy(self):
         """Leg length, not height, decides whether the feet reach the ground.
@@ -50,8 +91,8 @@ class TestSkeletonScaleDerivation:
         Two robots of equal height can have very different leg-to-torso
         proportions, and it is the leg that has to span the gap.
         """
-        short_legs = OmniRetargeter._source_leg_length(self._positions(0.70), self.NAMES)
-        long_legs = OmniRetargeter._source_leg_length(self._positions(0.95), self.NAMES)
+        short_legs = OmniRetargeter._source_leg_length(self._positions(0.70), self.NAMES, None)
+        long_legs = OmniRetargeter._source_leg_length(self._positions(0.95), self.NAMES, None)
         assert long_legs > short_legs
 
 
