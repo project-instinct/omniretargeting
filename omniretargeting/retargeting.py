@@ -239,6 +239,7 @@ class GenericInteractionRetargeter:
         base_position_tracking_weight: float = 0.0,
         link_orientation: Optional[Dict] = None,
         scene_contact: Optional[Dict] = None,
+        smooth_weight: float = 0.2,
     ):
         """Initialize the generic retargeter.
 
@@ -378,6 +379,7 @@ class GenericInteractionRetargeter:
         self.penetration_hard_bound = float(ps.get("hard_bound", 0.03))
         self.penetration_slack_penalty = float(ps.get("slack_penalty", 1e5))
         self.base_position_tracking_weight = float(base_position_tracking_weight)
+        self._smooth_weight = float(smooth_weight)
         self.max_trust_region_retries = 6
         self.trust_region_shrink = 0.4
         self._solver_stats = {"solves": 0, "retries": 0, "failures": 0}
@@ -498,8 +500,12 @@ class GenericInteractionRetargeter:
         if len(base_indices_in_qa) > 0:
             self.Q_diag[base_indices_in_qa] = base_weight
         
-        # Store smoothness weight (matching original: 0.2)
-        self.smooth_weight = 0.2
+        # Temporal smoothness of the actuated step.  Configurable because the
+        # right value depends on what else is pulling on the solve: an
+        # end-effector task that switches on and off across a contact boundary
+        # asks for a different pose from one frame to the next, and this is the
+        # term that decides how much of that jump reaches the output.
+        self.smooth_weight = float(getattr(self, "_smooth_weight", 0.2))
 
         # Per-joint regularization boost (constant across SQP iterations).
         # Modify Q_diag for specific joints (matching original MANUAL_COST logic).
@@ -699,6 +705,7 @@ class GenericInteractionRetargeter:
         targets: Optional[Dict[str, np.ndarray]],
         T: Optional[np.ndarray] = None,
         normals: Optional[Dict[str, np.ndarray]] = None,
+        blend: Optional[Dict[str, float]] = None,
     ) -> List[Tuple[np.ndarray, np.ndarray]]:
         """Residuals pinning each contacting sole point onto the scene.
 
@@ -767,6 +774,17 @@ class GenericInteractionRetargeter:
                     )
                     jac = metric @ jac
                     error = metric @ error
+
+            # Ease the task in and out across the interval boundaries. Scaling
+            # both sides by sqrt(b) makes the assembled term b * w * ||.||^2.
+            if blend is not None:
+                b = float(blend.get(side, 1.0))
+                if b <= 0.0:
+                    continue
+                if b < 1.0:
+                    root = np.sqrt(b)
+                    jac = jac * root
+                    error = error * root
 
             residuals.append((jac, error))
 
@@ -849,6 +867,7 @@ class GenericInteractionRetargeter:
         link_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_normals: Optional[Dict[str, np.ndarray]] = None,
+        contact_weights: Optional[Dict[str, float]] = None,
     ) -> np.ndarray:
         """
         Retarget a single frame of source target positions to robot motion.
@@ -924,6 +943,7 @@ class GenericInteractionRetargeter:
             link_orientation_targets=link_orientation_targets,
             contact_targets=contact_targets,
             contact_normals=contact_normals,
+            contact_weights=contact_weights,
         )
 
         return q_opt
@@ -944,6 +964,7 @@ class GenericInteractionRetargeter:
         link_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_normals: Optional[Dict[str, np.ndarray]] = None,
+        contact_weights: Optional[Dict[str, float]] = None,
     ) -> np.ndarray:
         """
         Optimize robot configuration using SQP with interaction mesh constraints.
@@ -989,6 +1010,7 @@ class GenericInteractionRetargeter:
                 link_orientation_targets=link_orientation_targets,
                 contact_targets=contact_targets,
                 contact_normals=contact_normals,
+                contact_weights=contact_weights,
             )
 
             # Solver failure at this linearization point: an identical retry
@@ -1075,6 +1097,7 @@ class GenericInteractionRetargeter:
         link_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_normals: Optional[Dict[str, np.ndarray]] = None,
+        contact_weights: Optional[Dict[str, float]] = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Single SQP optimization step.
@@ -1268,7 +1291,7 @@ class GenericInteractionRetargeter:
         if self.scene_contact_enabled and contact_targets:
             w_contact = self.scene_contact_weight
             for jac, error in self._scene_contact_residuals(
-                contact_targets, T=T_qvel, normals=contact_normals
+                contact_targets, T=T_qvel, normals=contact_normals, blend=contact_weights
             ):
                 P = P + sp.csr_matrix(2.0 * w_contact * (jac.T @ jac))
                 c = c + 2.0 * w_contact * (jac.T @ error)

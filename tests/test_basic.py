@@ -953,6 +953,7 @@ def test_create_stream_state_passes_hard_penetration_constraint():
         terrain_sample_seed=None,
         link_orientation=None,
         scene_contact=None,
+        smooth_weight=0.2,
         source_target_names=["Pelvis"],
         replace_cylinders_with_capsules=True,
         hard_penetration_constraint=True,

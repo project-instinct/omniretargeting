@@ -713,7 +713,8 @@
             -0.035
           ]
         }
-      }
+      },
+      "blend_frames": 0
     },
     "penetration_resolver": "xyz_nudge",
     "foot_stabilization": {
@@ -759,7 +760,8 @@
           "body": "torso_link"
         }
       }
-    }
+    },
+    "smooth_weight": 4.0
   },
   "default_joint_positions": {
     "T-Pose": {

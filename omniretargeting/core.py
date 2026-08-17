@@ -308,6 +308,7 @@ class OmniRetargeter:
             terrain_sample_seed=self.retargeting_config.get("terrain_sample_seed"),
             link_orientation=self.retargeting_config.get("link_orientation"),
             scene_contact=self.retargeting_config.get("scene_contact"),
+            smooth_weight=float(self.retargeting_config.get("smooth_weight", 0.2)),
             source_target_names=self.valid_source_target_names,
             replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
             hard_penetration_constraint=penetration_resolver in ("hard_constraint", "hard_constraint_slack"),
@@ -453,13 +454,15 @@ class OmniRetargeter:
             speed_threshold=float(config.get("speed_threshold", 0.6)),
             min_frames=int(config.get("min_frames", 3)),
             anchor_frames=int(config.get("anchor_frames", 3)),
+            blend_frames=int(config.get("blend_frames", 3)),
         )
         scaled_centres = {side: np.asarray(pts, dtype=float) * scale for side, pts in centres.items()}
-        targets, normals, stats = infer_contact_targets(
+        targets, normals, weights, stats = infer_contact_targets(
             scaled_centres, terrain, motion_data.framerate, spec
         )
         motion_data.metadata["contact_targets"] = targets
         motion_data.metadata["contact_normals"] = normals
+        motion_data.metadata["contact_weights"] = weights
         for name, entry in stats.items():
             print(
                 f"[scene_contact] {name}: {entry['contact_frames']} contact frames "
@@ -538,6 +541,9 @@ class OmniRetargeter:
         contact_normals = (
             frame.metadata.get("contact_normals") if isinstance(frame, MotionFrame) else None
         )
+        contact_weights = (
+            frame.metadata.get("contact_weights") if isinstance(frame, MotionFrame) else None
+        )
 
         q_opt = state.retargeter.retarget_frame(
             mapped_source_targets,
@@ -550,6 +556,7 @@ class OmniRetargeter:
             link_orientation_targets=link_orientation_targets,
             contact_targets=contact_targets,
             contact_normals=contact_normals,
+            contact_weights=contact_weights,
         )
         state.q_init = q_opt
         state.q_last = q_opt

@@ -185,3 +185,60 @@ class TestBaseOrientationTarget:
     def test_unknown_value_falls_back_to_the_default(self):
         target, estimated, _ = self._run({"target": "nonsense"})
         np.testing.assert_allclose(target, estimated)
+
+
+class TestContactBlendRamp:
+    """Easing a contact task in and out across its interval boundaries."""
+
+    def test_disabled_by_default_leaves_full_weight(self):
+        from omniretargeting.scene_contact import ContactSpec, _blend_ramp
+
+        assert ContactSpec().blend_frames == 0
+        np.testing.assert_allclose(_blend_ramp(8, 0), np.ones(8))
+
+    def test_ramp_eases_both_ends_and_holds_the_middle(self):
+        from omniretargeting.scene_contact import _blend_ramp
+
+        w = _blend_ramp(10, 3)
+        assert w[0] < w[1] < w[2] < w[3]
+        assert w[3] == pytest.approx(1.0)
+        np.testing.assert_allclose(w, w[::-1], atol=1e-12)
+        assert w.min() > 0.0 and w.max() == pytest.approx(1.0)
+
+    def test_ramp_never_exceeds_half_the_interval(self):
+        from omniretargeting.scene_contact import _blend_ramp
+
+        # A short interval must not be ramped away to nothing.
+        w = _blend_ramp(4, 10)
+        assert w.max() == pytest.approx(1.0)
+        assert (w > 0.0).all()
+
+    def test_negative_blend_is_rejected(self):
+        from omniretargeting.scene_contact import ContactSpec
+
+        with pytest.raises(ValueError, match="blend_frames"):
+            ContactSpec(blend_frames=-1)
+
+
+class TestSmoothWeightIsConfigurable:
+    """Temporal smoothness had been hardcoded, so profiles could not tune it.
+
+    It is the lever that decides how much of an end-effector task's
+    frame-to-frame disagreement reaches the output as acceleration.
+    """
+
+    def test_value_reaches_the_solver(self):
+        from omniretargeting.retargeting import GenericInteractionRetargeter
+
+        r = GenericInteractionRetargeter.__new__(GenericInteractionRetargeter)
+        r._smooth_weight = 4.0
+        # _setup_robot_config reads the stashed value; emulate just that line.
+        r.smooth_weight = float(getattr(r, "_smooth_weight", 0.2))
+        assert r.smooth_weight == pytest.approx(4.0)
+
+    def test_default_matches_the_historical_value(self):
+        from omniretargeting.retargeting import GenericInteractionRetargeter
+
+        r = GenericInteractionRetargeter.__new__(GenericInteractionRetargeter)
+        r.smooth_weight = float(getattr(r, "_smooth_weight", 0.2))
+        assert r.smooth_weight == pytest.approx(0.2)

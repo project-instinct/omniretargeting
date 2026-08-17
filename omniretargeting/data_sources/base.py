@@ -138,6 +138,7 @@ class MotionData:
         sole_rotations = self.metadata.get("link_orientations")
         contact_targets = self.metadata.get("contact_targets")
         contact_normals = self.metadata.get("contact_normals")
+        contact_weights = self.metadata.get("contact_weights")
         for frame_idx, positions in enumerate(self.positions):
             root_orientation = self.root_orientations[frame_idx] if self.root_orientations is not None else None
             root_translation = self.root_translations[frame_idx] if self.root_translations is not None else None
@@ -159,6 +160,13 @@ class MotionData:
                         frame_contacts[name] = series[frame_idx]
                 if frame_contacts:
                     frame_metadata["contact_targets"] = frame_contacts
+                    if contact_weights:
+                        frame_metadata["contact_weights"] = {
+                            name: float(contact_weights[name][frame_idx])
+                            for name in frame_contacts
+                            if name in contact_weights
+                            and frame_idx < len(contact_weights[name])
+                        }
                     if contact_normals:
                         frame_metadata["contact_normals"] = {
                             name: contact_normals[name][frame_idx]
