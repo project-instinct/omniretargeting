@@ -227,6 +227,7 @@ class GenericInteractionRetargeter:
         foot_sticking_tolerance: float = 1e-3,
         collision_detection_threshold: float = 0.1,
         terrain_sample_points: int = 100,
+        terrain_sample_seed: Optional[int] = None,
         source_target_names: Optional[List[str]] = None,
         replace_cylinders_with_capsules: bool = False,
         hard_penetration_constraint: bool = False,
@@ -254,6 +255,8 @@ class GenericInteractionRetargeter:
             foot_sticking_tolerance: Tolerance for foot sticking
             collision_detection_threshold: Distance threshold for collision detection
             terrain_sample_points: Number of sampled terrain points for interaction mesh
+            terrain_sample_seed: Seed for the terrain surface draw. Leave unset for the
+                historical non-reproducible behaviour; set it to compare runs.
             source_target_names: Ordered source target names to ensure consistent ordering
             replace_cylinders_with_capsules: If True, replace all cylinder collision geoms
                 with capsules before computing penetration constraints. This matches
@@ -390,6 +393,9 @@ class GenericInteractionRetargeter:
         self.foot_sticking_tolerance = foot_sticking_tolerance
         self.collision_detection_threshold = collision_detection_threshold
         self.terrain_sample_points = int(terrain_sample_points)
+        self.terrain_sample_seed = (
+            None if terrain_sample_seed is None else int(terrain_sample_seed)
+        )
 
         # Apply cylinder → capsule replacement if requested
         if replace_cylinders_with_capsules:
@@ -524,7 +530,9 @@ class GenericInteractionRetargeter:
     def _setup_terrain_interaction(self):
         """Setup terrain interaction parameters."""
         # Sample points on terrain for interaction mesh
-        self.terrain_points = sample_points_on_mesh(self.terrain_mesh, self.terrain_sample_points)
+        self.terrain_points = sample_points_on_mesh(
+            self.terrain_mesh, self.terrain_sample_points, seed=self.terrain_sample_seed
+        )
 
         # Conservative bounding-sphere radius per geom, used to skip terrain
         # proximity queries for geoms that provably cannot be within
@@ -728,12 +736,14 @@ class GenericInteractionRetargeter:
             if not np.isfinite(cost):
                 break
 
-            # Check convergence
-            if abs(cost - last_cost) < 1e-6:
-                break
-
+            # Accept the step before testing convergence.  The step that meets
+            # the tolerance is still an improvement, so breaking ahead of the
+            # assignment would discard it and return the previous iterate.
+            converged = abs(cost - last_cost) < 1e-6
             q = q_new
             last_cost = cost
+            if converged:
+                break
 
         return q
 
@@ -941,6 +951,7 @@ class GenericInteractionRetargeter:
         # the target estimated from source target positions.
         orientation_weight = 5.0  # Strong preference to maintain orientation
         orient_terms: List[Tuple[int, float]] = []
+        base_pos_terms: List[Tuple[int, float]] = []
         if target_base_orientation is not None and 3 in self.q_a_indices:
             # Find quaternion indices in q_a_indices
             quat_indices_in_qa = []
@@ -975,6 +986,7 @@ class GenericInteractionRetargeter:
                     # so the QP cost is w * (dqa[idx] + diff)^2.
                     P_diag_extra[idx_in_qa] += 2.0 * w_pos
                     c[idx_in_qa] += 2.0 * w_pos * diff
+                    base_pos_terms.append((idx_in_qa, diff))
 
         P = P + sp.diags(P_diag_extra)
 
@@ -1034,6 +1046,8 @@ class GenericInteractionRetargeter:
             cost += self.smooth_weight * float(((dqa_opt - dqa_smooth) ** 2).sum())
         for qa_idx, diff in orient_terms:
             cost += orientation_weight * (dqa_opt[qa_idx] + diff) ** 2
+        for qa_idx, diff in base_pos_terms:
+            cost += self.base_position_tracking_weight * (dqa_opt[qa_idx] + diff) ** 2
         if m:
             s_true = np.array([span for (_, _, span) in slack_rows]) * x[n:]
             cost += (self.penetration_slack_penalty / 2.0) * float((s_true ** 2).sum())

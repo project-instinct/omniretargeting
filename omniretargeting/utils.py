@@ -214,9 +214,15 @@ def transform_mesh(mesh: trimesh.Trimesh,
     return transformed_mesh
 
 
-def sample_points_on_mesh(mesh: trimesh.Trimesh, num_points: int) -> np.ndarray:
-    """Sample points uniformly on the surface of a mesh."""
-    points, _ = trimesh.sample.sample_surface(mesh, num_points)
+def sample_points_on_mesh(
+    mesh: trimesh.Trimesh, num_points: int, seed: Optional[int] = None
+) -> np.ndarray:
+    """Sample points uniformly on the surface of a mesh.
+
+    Passing ``seed`` makes the draw reproducible across processes, which is a
+    prerequisite for comparing two retargeting runs against each other.
+    """
+    points, _ = trimesh.sample.sample_surface(mesh, num_points, seed=seed)
     return points
 
 

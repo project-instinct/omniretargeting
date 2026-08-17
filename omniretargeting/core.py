@@ -300,6 +300,7 @@ class OmniRetargeter:
             self.robot_height,
             collision_detection_threshold=float(self.retargeting_config.get("collision_detection_threshold", 0.1)),
             terrain_sample_points=int(self.retargeting_config.get("terrain_sample_points", 100)),
+            terrain_sample_seed=self.retargeting_config.get("terrain_sample_seed"),
             source_target_names=self.valid_source_target_names,
             replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
             hard_penetration_constraint=penetration_resolver in ("hard_constraint", "hard_constraint_slack"),
