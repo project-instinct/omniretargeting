@@ -135,17 +135,28 @@ class MotionData:
         )
 
     def iter_frames(self) -> Iterator[MotionFrame]:
+        sole_rotations = self.metadata.get("foot_sole_rotations")
         for frame_idx, positions in enumerate(self.positions):
             root_orientation = self.root_orientations[frame_idx] if self.root_orientations is not None else None
             root_translation = self.root_translations[frame_idx] if self.root_translations is not None else None
             object_points_frame = self.object_points[frame_idx] if self.object_points is not None else None
+            frame_metadata = {"frame_index": frame_idx, **self.metadata}
+            if sole_rotations:
+                # Hand the frame its own slice rather than the whole
+                # trajectory, so a per-frame consumer cannot accidentally read
+                # another frame's orientation.
+                frame_metadata["foot_sole_rotations"] = {
+                    side: rotations[frame_idx]
+                    for side, rotations in sole_rotations.items()
+                    if frame_idx < len(rotations)
+                }
             yield MotionFrame(
                 positions=positions,
                 root_orientation=root_orientation,
                 root_translation=root_translation,
                 timestamp=(frame_idx / self.framerate) if self.framerate else None,
                 object_points=object_points_frame,
-                metadata={"frame_index": frame_idx, **self.metadata},
+                metadata=frame_metadata,
             )
 
 

@@ -237,6 +237,7 @@ class GenericInteractionRetargeter:
         bone_direction: Optional[Dict] = None,
         penetration_slack: Optional[Dict] = None,
         base_position_tracking_weight: float = 0.0,
+        foot_orientation: Optional[Dict] = None,
     ):
         """Initialize the generic retargeter.
 
@@ -376,6 +377,7 @@ class GenericInteractionRetargeter:
         self.penetration_hard_bound = float(ps.get("hard_bound", 0.03))
         self.penetration_slack_penalty = float(ps.get("slack_penalty", 1e5))
         self.base_position_tracking_weight = float(base_position_tracking_weight)
+        self._setup_foot_orientation(foot_orientation)
         if self.penetration_slack_enabled and self.penetration_hard_bound <= self.penetration_soft_tolerance:
             raise ValueError(
                 f"penetration_slack.hard_bound ({self.penetration_hard_bound}) must be "
@@ -589,6 +591,123 @@ class GenericInteractionRetargeter:
 
         return vertices, tri.simplices
 
+    def _setup_foot_orientation(self, config: Optional[Dict]) -> None:
+        """Resolve the foot orientation task from the robot profile.
+
+        Left disabled unless a profile asks for it, so existing profiles keep
+        their behaviour. Bodies are resolved once here rather than per frame,
+        and a missing body is an error at construction instead of a silently
+        skipped objective at frame two hundred.
+        """
+        from omniretargeting.foot_frames import parse_body_to_sole
+
+        self.foot_orientation_specs: Dict[str, dict] = {}
+        self.foot_orientation_weight = 0.0
+        self.foot_orientation_enabled = False
+
+        if not config or not config.get("enabled", False):
+            return
+
+        weight = float(config.get("weight", 0.0))
+        if weight <= 0.0:
+            return
+
+        effectors = config.get("effectors") or {}
+        if not effectors:
+            raise ValueError("foot_orientation is enabled but declares no effectors")
+
+        # The body carrying the free joint is the root the residual is taken
+        # relative to. Body 0 is always the world.
+        free_joints = [
+            j for j in range(self.robot_model.njnt)
+            if self.robot_model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE
+        ]
+        if len(free_joints) != 1:
+            raise ValueError(
+                f"foot_orientation expects exactly one free joint, found {len(free_joints)}"
+            )
+        self.root_body_id = int(self.robot_model.jnt_bodyid[free_joints[0]])
+
+        for side, spec in effectors.items():
+            body_name = spec.get("body")
+            if not body_name:
+                raise ValueError(f"foot_orientation effector {side!r} is missing 'body'")
+            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id < 0:
+                raise ValueError(
+                    f"foot_orientation effector {side!r} references body {body_name!r}, "
+                    "which is not present in the compiled model"
+                )
+            self.foot_orientation_specs[side] = {
+                "body_name": body_name,
+                "body_id": int(body_id),
+                "body_to_sole": parse_body_to_sole(spec.get("body_to_sole"), f"{side} foot"),
+            }
+
+        self.foot_orientation_weight = weight
+        self.foot_orientation_enabled = True
+
+    def _body_angular_jacobian(self, body_id: int, T: Optional[np.ndarray] = None) -> np.ndarray:
+        """World angular Jacobian of a body, in qpos coordinates, actuated columns."""
+        if T is None:
+            T = self._build_transform_qdot_to_qvel_fast()
+        p_W = self.robot_data.xpos[int(body_id)].astype(np.float64).reshape(3, 1)
+        Jp = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
+        Jr = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
+        mujoco.mj_jac(self.robot_model, self.robot_data, Jp, Jr, p_W, int(body_id))
+        return (Jr @ T)[:, self.q_a_indices]
+
+    def _foot_orientation_residuals(
+        self,
+        targets: Optional[Dict[str, np.ndarray]],
+        T: Optional[np.ndarray] = None,
+    ) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Root-relative sole orientation residuals, one per configured foot.
+
+        The residual is expressed relative to the floating base rather than in
+        the world.  The actuated index set includes the base degrees of
+        freedom, and the base carries almost no regularization, so a
+        world-frame foot residual is cheapest to satisfy by rolling the whole
+        robot.  Taking the residual relative to the root removes that
+        shortcut: rotating the base moves target and current together and
+        cannot reduce the error.  Base attitude stays the job of the existing
+        base orientation objective.
+
+        Returns a list of ``(J, e)`` with ``J`` of shape (3, nq_a), such that
+        the term to minimise is ``weight * ||J @ dqa - e||^2``.
+        """
+        if not self.foot_orientation_enabled or not targets:
+            return []
+
+        from scipy.spatial.transform import Rotation
+
+        if T is None:
+            T = self._build_transform_qdot_to_qvel_fast()
+
+        root_rot = self.robot_data.xmat[self.root_body_id].reshape(3, 3)
+        root_jac = self._body_angular_jacobian(self.root_body_id, T=T)
+
+        residuals: List[Tuple[np.ndarray, np.ndarray]] = []
+        for side, spec in self.foot_orientation_specs.items():
+            target_world = targets.get(side)
+            if target_world is None:
+                continue
+            target_world = np.asarray(target_world, dtype=float)
+            if target_world.shape != (3, 3):
+                raise ValueError(f"foot orientation target for {side!r} must be a 3x3 rotation")
+
+            current_world = self.robot_data.xmat[spec["body_id"]].reshape(3, 3) @ spec["body_to_sole"]
+
+            current_rel = root_rot.T @ current_world
+            target_rel = root_rot.T @ target_world
+            error = Rotation.from_matrix(target_rel @ current_rel.T).as_rotvec()
+
+            # Relative angular velocity in the root frame.
+            jac = root_rot.T @ (self._body_angular_jacobian(spec["body_id"], T=T) - root_jac)
+            residuals.append((jac, error))
+
+        return residuals
+
     def retarget_frame(
         self,
         source_target_positions: np.ndarray,
@@ -598,6 +717,7 @@ class GenericInteractionRetargeter:
         target_base_orientation: Optional[np.ndarray] = None,
         object_points: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
+        foot_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
     ) -> np.ndarray:
         """
         Retarget a single frame of source target positions to robot motion.
@@ -670,6 +790,7 @@ class GenericInteractionRetargeter:
             object_points=object_points,
             bone_targets=bone_targets,
             root_translation=root_translation,
+            foot_orientation_targets=foot_orientation_targets,
         )
 
         return q_opt
@@ -687,6 +808,7 @@ class GenericInteractionRetargeter:
         object_points: Optional[np.ndarray] = None,
         bone_targets: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
+        foot_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
     ) -> np.ndarray:
         """
         Optimize robot configuration using SQP with interaction mesh constraints.
@@ -729,6 +851,7 @@ class GenericInteractionRetargeter:
                 object_points=object_points,
                 bone_targets=bone_targets,
                 root_translation=root_translation,
+                foot_orientation_targets=foot_orientation_targets,
             )
 
             # Solver failure at this linearization point: an identical retry
@@ -812,6 +935,7 @@ class GenericInteractionRetargeter:
         object_points: Optional[np.ndarray] = None,
         bone_targets: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
+        foot_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Single SQP optimization step.
@@ -988,6 +1112,18 @@ class GenericInteractionRetargeter:
                     c[idx_in_qa] += 2.0 * w_pos * diff
                     base_pos_terms.append((idx_in_qa, diff))
 
+        # Foot sole orientation, root-relative.  Unlike the base orientation
+        # term this is not diagonal in the actuated coordinates: rotating a
+        # sole couples the whole leg chain, so it contributes a dense rank-3
+        # block rather than per-index entries.
+        foot_terms: List[Tuple[np.ndarray, np.ndarray]] = []
+        if self.foot_orientation_enabled and foot_orientation_targets:
+            w_foot = self.foot_orientation_weight
+            for jac, error in self._foot_orientation_residuals(foot_orientation_targets, T=T_qvel):
+                P = P + sp.csr_matrix(2.0 * w_foot * (jac.T @ jac))
+                c = c - 2.0 * w_foot * (jac.T @ error)
+                foot_terms.append((jac, error))
+
         P = P + sp.diags(P_diag_extra)
 
         # Non-penetration rows (self-collision + terrain), numeric form:
@@ -1048,6 +1184,9 @@ class GenericInteractionRetargeter:
             cost += orientation_weight * (dqa_opt[qa_idx] + diff) ** 2
         for qa_idx, diff in base_pos_terms:
             cost += self.base_position_tracking_weight * (dqa_opt[qa_idx] + diff) ** 2
+        for jac, error in foot_terms:
+            residual = jac @ dqa_opt - error
+            cost += self.foot_orientation_weight * float(residual @ residual)
         if m:
             s_true = np.array([span for (_, _, span) in slack_rows]) * x[n:]
             cost += (self.penetration_slack_penalty / 2.0) * float((s_true ** 2).sum())

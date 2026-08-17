@@ -301,6 +301,7 @@ class OmniRetargeter:
             collision_detection_threshold=float(self.retargeting_config.get("collision_detection_threshold", 0.1)),
             terrain_sample_points=int(self.retargeting_config.get("terrain_sample_points", 100)),
             terrain_sample_seed=self.retargeting_config.get("terrain_sample_seed"),
+            foot_orientation=self.retargeting_config.get("foot_orientation"),
             source_target_names=self.valid_source_target_names,
             replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
             hard_penetration_constraint=penetration_resolver in ("hard_constraint", "hard_constraint_slack"),
@@ -459,6 +460,10 @@ class OmniRetargeter:
         else:
             max_iter = 10
 
+        foot_orientation_targets = (
+            frame.metadata.get("foot_sole_rotations") if isinstance(frame, MotionFrame) else None
+        )
+
         q_opt = state.retargeter.retarget_frame(
             mapped_source_targets,
             q_init,
@@ -467,6 +472,7 @@ class OmniRetargeter:
             target_base_orientation=target_quat_wxyz,
             object_points=object_points,
             root_translation=root_translation,
+            foot_orientation_targets=foot_orientation_targets,
         )
         state.q_init = q_opt
         state.q_last = q_opt

@@ -633,6 +633,14 @@
     "solver_max_iter": {"first_frame": 50, "subsequent": 10},
     "terrain_sample_points": 100,
     "terrain_sample_seed": 0,
+    "foot_orientation": {
+      "enabled": true,
+      "weight": 20.0,
+      "effectors": {
+        "left": {"body": "left_ankle_roll_link"},
+        "right": {"body": "right_ankle_roll_link"}
+      }
+    },
     "penetration_resolver": "hard_constraint",
     "foot_stabilization": {
       "enabled": true,

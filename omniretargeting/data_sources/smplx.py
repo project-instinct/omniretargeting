@@ -95,9 +95,68 @@ class SmplxDataSource(DataSource):
                 root_translations=trans if self.use_smplx_base_pose else None,
                 framerate=framerate,
                 source_height=source_height,
-                metadata={**self.metadata, **metadata, "source_type": "smplx", "joint_orientations": orientations},
+                metadata={
+                    **self.metadata,
+                    **metadata,
+                    "source_type": "smplx",
+                    "joint_orientations": orientations,
+                    **self._foot_sole_metadata(orientations),
+                },
             )
         return self._motion_data
+
+    # SMPL-X body joint indices for each foot: (ankle, toe base).
+    _FOOT_JOINTS = {"left": (7, 10), "right": (8, 11)}
+
+    def _foot_sole_metadata(self, orientations: np.ndarray | None) -> dict:
+        """Per-frame world sole rotations for each foot, when derivable.
+
+        Returns an empty dict rather than raising when the ingredients are
+        missing, because positions-only sources are legitimate; consumers
+        decide whether to fall back or to disable the orientation task.
+        """
+        if orientations is None or self.model_directory is None:
+            return {}
+
+        try:
+            import smplx
+            import torch
+
+            from omniretargeting.foot_frames import (
+                calibrate_sole_rotation,
+                calibrations_to_metadata,
+                world_sole_rotations,
+            )
+
+            body_model = smplx.create(
+                self.model_directory, "smplx", gender=self.gender, use_pca=False
+            )
+            # The neutral template is enough: measured across body shapes the
+            # calibrated sole normal moves by less than a fifth of a degree,
+            # which is far below the accuracy the calibration itself achieves.
+            with torch.no_grad():
+                template = body_model()
+            template_vertices = template.vertices.detach().numpy()[0]
+            template_joints = template.joints.detach().numpy()[0]
+            weights = body_model.lbs_weights.detach().numpy()
+
+            rotations = {}
+            calibrations = {}
+            for side, (ankle_idx, toe_idx) in self._FOOT_JOINTS.items():
+                mask = (weights[:, ankle_idx] + weights[:, toe_idx]) > 0.5
+                calibration = calibrate_sole_rotation(
+                    side, template_vertices, template_joints, mask, ankle_idx, toe_idx
+                )
+                calibrations[side] = calibration
+                rotations[side] = world_sole_rotations(orientations, calibration)
+        except Exception as exc:  # noqa: BLE001 - degrade to positions-only
+            print(f"Warning: could not calibrate SMPL-X foot sole frames: {exc}")
+            return {}
+
+        return {
+            "foot_sole_rotations": rotations,
+            "foot_sole_calibration": calibrations_to_metadata(calibrations),
+        }
 
     def iter_frames(self):
         yield from self.load().iter_frames()
