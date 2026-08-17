@@ -306,7 +306,7 @@ class OmniRetargeter:
             collision_detection_threshold=float(self.retargeting_config.get("collision_detection_threshold", 0.1)),
             terrain_sample_points=int(self.retargeting_config.get("terrain_sample_points", 100)),
             terrain_sample_seed=self.retargeting_config.get("terrain_sample_seed"),
-            foot_orientation=self.retargeting_config.get("foot_orientation"),
+            link_orientation=self.retargeting_config.get("link_orientation"),
             scene_contact=self.retargeting_config.get("scene_contact"),
             source_target_names=self.valid_source_target_names,
             replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
@@ -490,8 +490,31 @@ class OmniRetargeter:
 
         mapped_source_targets = self._extract_mapped_source_targets(source_positions)
 
+        # Which orientation the base tracks.  The default estimates a frame
+        # from four joint positions, which is only as good as that
+        # construction: measured against SMPL-X it leaves the pelvis about
+        # fourteen degrees out, and the waist then bends to its limit
+        # compensating for the error.  Sources that carry a real root
+        # orientation can ask for it instead; frame zero already trusts it for
+        # initialization, so trusting it as the target too is consistent.
+        # Left as the estimate by default because profiles without a reliable
+        # root orientation depend on the inferred frame.
+        prefer_root = str(
+            (getattr(self, "base_orientation_config", None) or {}).get("target", "estimate")
+        ).lower() == "root"
+
         target_quat_wxyz = None
-        if estimated_quat_wxyz is not None:
+        if prefer_root and root_orientation is not None:
+            target_quat_wxyz = np.asarray(root_orientation, dtype=float)
+            # Keep the hemisphere continuous with the previous frame, as the
+            # estimator does, so the base orientation cost does not see a sign
+            # flip as a large error.
+            if state.last_estimated_quat is not None and np.dot(
+                target_quat_wxyz, state.last_estimated_quat
+            ) < 0:
+                target_quat_wxyz = -target_quat_wxyz
+            state.last_estimated_quat = target_quat_wxyz
+        elif estimated_quat_wxyz is not None:
             target_quat_wxyz = estimated_quat_wxyz
             state.last_estimated_quat = estimated_quat_wxyz
 
@@ -506,8 +529,8 @@ class OmniRetargeter:
         else:
             max_iter = 10
 
-        foot_orientation_targets = (
-            frame.metadata.get("foot_sole_rotations") if isinstance(frame, MotionFrame) else None
+        link_orientation_targets = (
+            frame.metadata.get("link_orientations") if isinstance(frame, MotionFrame) else None
         )
         contact_targets = (
             frame.metadata.get("contact_targets") if isinstance(frame, MotionFrame) else None
@@ -524,7 +547,7 @@ class OmniRetargeter:
             target_base_orientation=target_quat_wxyz,
             object_points=object_points,
             root_translation=root_translation,
-            foot_orientation_targets=foot_orientation_targets,
+            link_orientation_targets=link_orientation_targets,
             contact_targets=contact_targets,
             contact_normals=contact_normals,
         )

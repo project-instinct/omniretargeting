@@ -118,3 +118,70 @@ class TestObjectiveTermParity:
             "base position tracking is assembled into the QP but never added to the "
             "scalar objective used for the convergence test"
         )
+
+
+class TestBaseOrientationTarget:
+    """Which orientation the floating base is asked to track.
+
+    The default infers a frame from four joint positions. That inference is a
+    construction, not a measurement, and on SMPL-X it lands the pelvis about
+    fourteen degrees away from the source, which the waist then absorbs by
+    bending to its limit. Sources carrying a real root orientation can select
+    it instead, but the default has to stay put: profiles whose sources have no
+    root orientation depend on the inferred frame.
+    """
+
+    @staticmethod
+    def _run(base_orientation_config):
+        from unittest.mock import Mock
+
+        from scipy.spatial.transform import Rotation
+
+        from omniretargeting import OmniRetargeter
+        from omniretargeting.core import RetargetingStreamState
+        from omniretargeting.data_sources.base import MotionFrame
+
+        estimated = np.array([0.1, 0.2, 0.3, 0.9])
+        estimated /= np.linalg.norm(estimated)
+        root = Rotation.from_rotvec([0.0, 0.0, np.pi / 2.0]).as_quat(scalar_first=True)
+
+        inner = Mock()
+        inner.retarget_frame.return_value = np.arange(7, dtype=float)
+
+        retargeter = OmniRetargeter.__new__(OmniRetargeter)
+        retargeter.retargeting_config = {}
+        retargeter.base_orientation_config = base_orientation_config
+        retargeter._estimate_base_orientation_from_joints = Mock(return_value=estimated)
+        retargeter._extract_mapped_source_targets = Mock(return_value=np.zeros((4, 3)))
+
+        state = RetargetingStreamState(
+            retargeter=inner,
+            q_init=np.zeros(7),
+            q_last=None,
+            last_estimated_quat=None,
+            frame_idx=0,
+            scaled_terrain=Mock(),
+        )
+        frame = MotionFrame(
+            positions=np.zeros((4, 3)),
+            root_orientation=root,
+            root_translation=np.array([1.0, 2.0, 3.0]),
+        )
+        retargeter.retarget_frame(frame, state)
+        return inner.retarget_frame.call_args.kwargs["target_base_orientation"], estimated, root
+
+    def test_default_keeps_the_inferred_frame(self):
+        target, estimated, _ = self._run({})
+        np.testing.assert_allclose(target, estimated)
+
+    def test_explicit_estimate_keeps_the_inferred_frame(self):
+        target, estimated, _ = self._run({"target": "estimate"})
+        np.testing.assert_allclose(target, estimated)
+
+    def test_root_option_tracks_the_source_orientation(self):
+        target, _, root = self._run({"target": "root"})
+        np.testing.assert_allclose(target, root)
+
+    def test_unknown_value_falls_back_to_the_default(self):
+        target, estimated, _ = self._run({"target": "nonsense"})
+        np.testing.assert_allclose(target, estimated)

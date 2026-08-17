@@ -690,7 +690,8 @@
     "pelvis": "Pelvis",
     "left_hip": "L_Hip",
     "right_hip": "R_Hip",
-    "spine": "Spine1"
+    "spine": "Spine1",
+    "target": "root"
   },
   "retargeting": {
     "collision_detection_threshold": 0.1,
@@ -700,18 +701,6 @@
     },
     "terrain_sample_points": 100,
     "terrain_sample_seed": 0,
-    "foot_orientation": {
-      "enabled": true,
-      "weight": 20.0,
-      "effectors": {
-        "left": {
-          "body": "left_ankle_roll_link"
-        },
-        "right": {
-          "body": "right_ankle_roll_link"
-        }
-      }
-    },
     "scene_contact": {
       "enabled": true,
       "weight": 200.0,
@@ -767,7 +756,22 @@
         "*hip*yaw*": 0.2
       }
     },
-    "penetration_slack": null
+    "penetration_slack": null,
+    "link_orientation": {
+      "enabled": true,
+      "weight": 20.0,
+      "effectors": {
+        "left": {
+          "body": "left_ankle_roll_link"
+        },
+        "right": {
+          "body": "right_ankle_roll_link"
+        },
+        "torso": {
+          "body": "torso_link"
+        }
+      }
+    }
   },
   "default_joint_positions": {
     "T-Pose": {

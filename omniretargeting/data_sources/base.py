@@ -135,7 +135,7 @@ class MotionData:
         )
 
     def iter_frames(self) -> Iterator[MotionFrame]:
-        sole_rotations = self.metadata.get("foot_sole_rotations")
+        sole_rotations = self.metadata.get("link_orientations")
         contact_targets = self.metadata.get("contact_targets")
         contact_normals = self.metadata.get("contact_normals")
         for frame_idx, positions in enumerate(self.positions):
@@ -147,7 +147,7 @@ class MotionData:
                 # Hand the frame its own slice rather than the whole
                 # trajectory, so a per-frame consumer cannot accidentally read
                 # another frame's orientation.
-                frame_metadata["foot_sole_rotations"] = {
+                frame_metadata["link_orientations"] = {
                     side: rotations[frame_idx]
                     for side, rotations in sole_rotations.items()
                     if frame_idx < len(rotations)

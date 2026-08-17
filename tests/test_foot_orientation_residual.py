@@ -49,7 +49,7 @@ def _retargeter(model, data, enabled=True, weight=10.0):
     r.robot_data = data
     r.q_a_indices = np.arange(0, model.nq)
     r.nq_a = model.nq
-    r._setup_foot_orientation(
+    r._setup_link_orientation(
         {
             "enabled": enabled,
             "weight": weight,
@@ -89,7 +89,7 @@ class TestAngularJacobian:
         model, data = robot
         r = _retargeter(model, data)
         rng = np.random.default_rng(3)
-        body_id = r.foot_orientation_specs["left"]["body_id"]
+        body_id = r.link_orientation_specs["left"]["body_id"]
 
         q = _pose(model, rng)
         data.qpos[:] = q
@@ -121,7 +121,7 @@ class TestAngularJacobian:
         model, data = robot
         r = _retargeter(model, data)
         rng = np.random.default_rng(11)
-        body_id = r.foot_orientation_specs["right"]["body_id"]
+        body_id = r.link_orientation_specs["right"]["body_id"]
 
         q = _pose(model, rng)
         data.qpos[:] = q
@@ -145,7 +145,7 @@ class TestAngularJacobian:
         model, data = robot
         r = _retargeter(model, data)
         rng = np.random.default_rng(5)
-        body_id = r.foot_orientation_specs["left"]["body_id"]
+        body_id = r.link_orientation_specs["left"]["body_id"]
 
         tilted = Rotation.from_euler("xyz", [25.0, -40.0, 65.0], degrees=True)
         q = _pose(model, rng, base_rot=tilted.as_quat(scalar_first=True))
@@ -175,9 +175,9 @@ class TestRootRelativeResidual:
 
         targets = {
             side: data.xmat[spec["body_id"]].reshape(3, 3).copy()
-            for side, spec in r.foot_orientation_specs.items()
+            for side, spec in r.link_orientation_specs.items()
         }
-        residuals = r._foot_orientation_residuals(targets)
+        residuals = r._link_orientation_residuals(targets)
         assert len(residuals) == 2
         for _, error in residuals:
             np.testing.assert_allclose(error, np.zeros(3), atol=1e-9)
@@ -201,10 +201,10 @@ class TestRootRelativeResidual:
                 Rotation.from_euler("y", 20.0, degrees=True).as_matrix()
                 @ data.xmat[spec["body_id"]].reshape(3, 3)
             )
-            for side, spec in r.foot_orientation_specs.items()
+            for side, spec in r.link_orientation_specs.items()
         }
         before = {side: err for (side, (_, err)) in zip(
-            r.foot_orientation_specs, r._foot_orientation_residuals(misaligned))}
+            r.link_orientation_specs, r._link_orientation_residuals(misaligned))}
 
         # Rotate base and targets together, exactly as a rigid turn of the scene.
         spin = Rotation.from_euler("z", 35.0, degrees=True)
@@ -214,7 +214,7 @@ class TestRootRelativeResidual:
         mujoco.mj_forward(model, data)
         spun_targets = {side: spin.as_matrix() @ rot for side, rot in misaligned.items()}
         after = {side: err for (side, (_, err)) in zip(
-            r.foot_orientation_specs, r._foot_orientation_residuals(spun_targets))}
+            r.link_orientation_specs, r._link_orientation_residuals(spun_targets))}
 
         for side in before:
             np.testing.assert_allclose(after[side], before[side], atol=1e-8)
@@ -222,7 +222,7 @@ class TestRootRelativeResidual:
     def test_disabled_task_produces_no_residuals(self, robot):
         model, data = robot
         r = _retargeter(model, data, enabled=False)
-        assert r._foot_orientation_residuals({"left": np.eye(3)}) == []
+        assert r._link_orientation_residuals({"left": np.eye(3)}) == []
 
     def test_missing_body_is_rejected_at_construction(self, robot):
         model, data = robot
@@ -231,7 +231,7 @@ class TestRootRelativeResidual:
         r.robot_data = data
         r.q_a_indices = np.arange(0, model.nq)
         with pytest.raises(ValueError, match="not present in the compiled model"):
-            r._setup_foot_orientation(
+            r._setup_link_orientation(
                 {"enabled": True, "weight": 1.0, "effectors": {"left": {"body": "left_toe_link"}}}
             )
 
@@ -242,7 +242,7 @@ class TestRootRelativeResidual:
         r.robot_model = model
         r.robot_data = data
         r.q_a_indices = np.arange(0, model.nq)
-        r._setup_foot_orientation({
+        r._setup_link_orientation({
             "enabled": True,
             "weight": 1.0,
             "effectors": {"left": {"body": LEFT_FOOT, "body_to_sole": rot.as_matrix().tolist()}},
@@ -251,7 +251,7 @@ class TestRootRelativeResidual:
         data.qpos[:] = _pose(model, rng)
         mujoco.mj_forward(model, data)
 
-        body_rot = data.xmat[r.foot_orientation_specs["left"]["body_id"]].reshape(3, 3)
+        body_rot = data.xmat[r.link_orientation_specs["left"]["body_id"]].reshape(3, 3)
         # The sole frame, not the body frame, is what must match the target.
-        (_, error), = r._foot_orientation_residuals({"left": body_rot @ rot.as_matrix()})
+        (_, error), = r._link_orientation_residuals({"left": body_rot @ rot.as_matrix()})
         np.testing.assert_allclose(error, np.zeros(3), atol=1e-9)

@@ -107,6 +107,7 @@ class SmplxDataSource(DataSource):
 
     # SMPL-X body joint indices for each foot: (ankle, toe base).
     _FOOT_JOINTS = {"left": (7, 10), "right": (8, 11)}
+    _SPINE3_INDEX = 9
 
     def _foot_sole_metadata(self, orientations: np.ndarray | None) -> dict:
         """Per-frame world sole rotations for each foot, when derivable.
@@ -157,8 +158,24 @@ class SmplxDataSource(DataSource):
             print(f"Warning: could not calibrate SMPL-X foot sole frames: {exc}")
             return {}
 
+        # The torso needs an orientation target for the same reason the feet
+        # did, and more starkly: on the G1 the torso link origin sits exactly
+        # on the waist pitch axis, so a positional marker there has a zero
+        # lever arm and cannot constrain that joint at all, no matter its
+        # weight.  Every source profile maps its spine marker to the link
+        # upstream of waist pitch, which leaves the joint free to sit at its
+        # limit.  Unlike a foot there is no sole plane to calibrate against:
+        # SMPL-X rest joint rotations are identity, so the same axis remap the
+        # root already uses carries the spine frame into the robot's
+        # convention.
+        rotations["torso"] = np.einsum(
+            "tij,jk->tik",
+            Rotation.from_quat(orientations[:, self._SPINE3_INDEX], scalar_first=True).as_matrix(),
+            _SMPLX_ROOT_OFFSET,
+        )
+
         result = {
-            "foot_sole_rotations": rotations,
+            "link_orientations": rotations,
             "foot_sole_calibration": calibrations_to_metadata(calibrations),
             "foot_sole_vertex_ids": sole_vertex_ids,
         }

@@ -237,7 +237,7 @@ class GenericInteractionRetargeter:
         bone_direction: Optional[Dict] = None,
         penetration_slack: Optional[Dict] = None,
         base_position_tracking_weight: float = 0.0,
-        foot_orientation: Optional[Dict] = None,
+        link_orientation: Optional[Dict] = None,
         scene_contact: Optional[Dict] = None,
     ):
         """Initialize the generic retargeter.
@@ -381,7 +381,7 @@ class GenericInteractionRetargeter:
         self.max_trust_region_retries = 6
         self.trust_region_shrink = 0.4
         self._solver_stats = {"solves": 0, "retries": 0, "failures": 0}
-        self._setup_foot_orientation(foot_orientation)
+        self._setup_link_orientation(link_orientation)
         self._setup_scene_contact(scene_contact)
         if self.penetration_slack_enabled and self.penetration_hard_bound <= self.penetration_soft_tolerance:
             raise ValueError(
@@ -596,8 +596,8 @@ class GenericInteractionRetargeter:
 
         return vertices, tri.simplices
 
-    def _setup_foot_orientation(self, config: Optional[Dict]) -> None:
-        """Resolve the foot orientation task from the robot profile.
+    def _setup_link_orientation(self, config: Optional[Dict]) -> None:
+        """Resolve the link orientation task from the robot profile.
 
         Left disabled unless a profile asks for it, so existing profiles keep
         their behaviour. Bodies are resolved once here rather than per frame,
@@ -606,9 +606,9 @@ class GenericInteractionRetargeter:
         """
         from omniretargeting.foot_frames import parse_body_to_sole
 
-        self.foot_orientation_specs: Dict[str, dict] = {}
-        self.foot_orientation_weight = 0.0
-        self.foot_orientation_enabled = False
+        self.link_orientation_specs: Dict[str, dict] = {}
+        self.link_orientation_weight = 0.0
+        self.link_orientation_enabled = False
 
         if not config or not config.get("enabled", False):
             return
@@ -619,7 +619,7 @@ class GenericInteractionRetargeter:
 
         effectors = config.get("effectors") or {}
         if not effectors:
-            raise ValueError("foot_orientation is enabled but declares no effectors")
+            raise ValueError("link_orientation is enabled but declares no effectors")
 
         # The body carrying the free joint is the root the residual is taken
         # relative to. Body 0 is always the world.
@@ -629,28 +629,28 @@ class GenericInteractionRetargeter:
         ]
         if len(free_joints) != 1:
             raise ValueError(
-                f"foot_orientation expects exactly one free joint, found {len(free_joints)}"
+                f"link_orientation expects exactly one free joint, found {len(free_joints)}"
             )
         self.root_body_id = int(self.robot_model.jnt_bodyid[free_joints[0]])
 
         for side, spec in effectors.items():
             body_name = spec.get("body")
             if not body_name:
-                raise ValueError(f"foot_orientation effector {side!r} is missing 'body'")
+                raise ValueError(f"link_orientation effector {side!r} is missing 'body'")
             body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
             if body_id < 0:
                 raise ValueError(
-                    f"foot_orientation effector {side!r} references body {body_name!r}, "
+                    f"link_orientation effector {side!r} references body {body_name!r}, "
                     "which is not present in the compiled model"
                 )
-            self.foot_orientation_specs[side] = {
+            self.link_orientation_specs[side] = {
                 "body_name": body_name,
                 "body_id": int(body_id),
                 "body_to_sole": parse_body_to_sole(spec.get("body_to_sole"), f"{side} foot"),
             }
 
-        self.foot_orientation_weight = weight
-        self.foot_orientation_enabled = True
+        self.link_orientation_weight = weight
+        self.link_orientation_enabled = True
 
     def _setup_scene_contact(self, config: Optional[Dict]) -> None:
         """Resolve the contact task, which pins an effector onto the scene.
@@ -786,12 +786,12 @@ class GenericInteractionRetargeter:
         """World angular Jacobian of a body, restricted to the actuated columns."""
         return self._body_angular_jacobian_full(body_id, T=T)[:, self.q_a_indices]
 
-    def _foot_orientation_residuals(
+    def _link_orientation_residuals(
         self,
         targets: Optional[Dict[str, np.ndarray]],
         T: Optional[np.ndarray] = None,
     ) -> List[Tuple[np.ndarray, np.ndarray]]:
-        """Root-relative sole orientation residuals, one per configured foot.
+        """Root-relative orientation residuals, one per configured link.
 
         The residual is expressed relative to the floating base rather than in
         the world.  The actuated index set includes the base degrees of
@@ -805,7 +805,7 @@ class GenericInteractionRetargeter:
         Returns a list of ``(J, e)`` with ``J`` of shape (3, nq_a), such that
         the term to minimise is ``weight * ||J @ dqa - e||^2``.
         """
-        if not self.foot_orientation_enabled or not targets:
+        if not self.link_orientation_enabled or not targets:
             return []
 
         from scipy.spatial.transform import Rotation
@@ -817,7 +817,7 @@ class GenericInteractionRetargeter:
         root_jac = self._body_angular_jacobian(self.root_body_id, T=T)
 
         residuals: List[Tuple[np.ndarray, np.ndarray]] = []
-        for side, spec in self.foot_orientation_specs.items():
+        for side, spec in self.link_orientation_specs.items():
             target_world = targets.get(side)
             if target_world is None:
                 continue
@@ -846,7 +846,7 @@ class GenericInteractionRetargeter:
         target_base_orientation: Optional[np.ndarray] = None,
         object_points: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
-        foot_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
+        link_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_normals: Optional[Dict[str, np.ndarray]] = None,
     ) -> np.ndarray:
@@ -921,7 +921,7 @@ class GenericInteractionRetargeter:
             object_points=object_points,
             bone_targets=bone_targets,
             root_translation=root_translation,
-            foot_orientation_targets=foot_orientation_targets,
+            link_orientation_targets=link_orientation_targets,
             contact_targets=contact_targets,
             contact_normals=contact_normals,
         )
@@ -941,7 +941,7 @@ class GenericInteractionRetargeter:
         object_points: Optional[np.ndarray] = None,
         bone_targets: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
-        foot_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
+        link_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_normals: Optional[Dict[str, np.ndarray]] = None,
     ) -> np.ndarray:
@@ -986,7 +986,7 @@ class GenericInteractionRetargeter:
                 object_points=object_points,
                 bone_targets=bone_targets,
                 root_translation=root_translation,
-                foot_orientation_targets=foot_orientation_targets,
+                link_orientation_targets=link_orientation_targets,
                 contact_targets=contact_targets,
                 contact_normals=contact_normals,
             )
@@ -1072,7 +1072,7 @@ class GenericInteractionRetargeter:
         object_points: Optional[np.ndarray] = None,
         bone_targets: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
-        foot_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
+        link_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_targets: Optional[Dict[str, np.ndarray]] = None,
         contact_normals: Optional[Dict[str, np.ndarray]] = None,
     ) -> Tuple[np.ndarray, float]:
@@ -1256,9 +1256,9 @@ class GenericInteractionRetargeter:
         # sole couples the whole leg chain, so it contributes a dense rank-3
         # block rather than per-index entries.
         foot_terms: List[Tuple[np.ndarray, np.ndarray]] = []
-        if self.foot_orientation_enabled and foot_orientation_targets:
-            w_foot = self.foot_orientation_weight
-            for jac, error in self._foot_orientation_residuals(foot_orientation_targets, T=T_qvel):
+        if self.link_orientation_enabled and link_orientation_targets:
+            w_foot = self.link_orientation_weight
+            for jac, error in self._link_orientation_residuals(link_orientation_targets, T=T_qvel):
                 P = P + sp.csr_matrix(2.0 * w_foot * (jac.T @ jac))
                 c = c - 2.0 * w_foot * (jac.T @ error)
                 foot_terms.append((jac, error))
@@ -1350,7 +1350,7 @@ class GenericInteractionRetargeter:
             cost += self.base_position_tracking_weight * (dqa_opt[qa_idx] + diff) ** 2
         for jac, error in foot_terms:
             residual = jac @ dqa_opt - error
-            cost += self.foot_orientation_weight * float(residual @ residual)
+            cost += self.link_orientation_weight * float(residual @ residual)
         for jac, error in contact_terms:
             residual = jac @ dqa_opt + error
             cost += self.scene_contact_weight * float(residual @ residual)
