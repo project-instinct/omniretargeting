@@ -178,6 +178,9 @@ class SmplxDataSource(DataSource):
             "link_orientations": rotations,
             "foot_sole_calibration": calibrations_to_metadata(calibrations),
             "foot_sole_vertex_ids": sole_vertex_ids,
+            # Kept so a consumer can measure the effector's own size without
+            # reloading the body model.
+            "foot_sole_template_vertices": template_vertices,
         }
 
         centres = self._foot_sole_centres(sole_vertex_ids)

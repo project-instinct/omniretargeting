@@ -98,5 +98,32 @@ None. task10 to task12 are queued, not deferred: they are still required by the 
 
 ### Plan Evolution Log
 
+- **Scope added beyond the plan, at the user's direction: generality of the task
+  parameterisation and of the contact detector.** The plan targets one defect,
+  the base height bistability, and AC-5 asks only that the mechanism introduced
+  for it be expressed generally. The two items added here are broader: every
+  task weight in the branch was a dimensional constant hand-tuned on one clip,
+  and the contact detector used absolute thresholds that mean different things
+  at different scene scales. Both were identified as the weakest parts of the
+  work when it was reviewed for generality, and the second had already caused a
+  concrete failure: a 5 cm proximity gate is 23 percent of this subject's foot
+  length and 31 percent of the same foot in a scene scaled to 0.74, which alone
+  moved detection from 27 and 40 contact frames to 4 and 15.
+
+  This still serves the ultimate goal. The bistability was a conflict between
+  objectives whose relative strengths were set by numbers with no physical
+  meaning, so it could not be reasoned about, only swept. Expressing each task
+  as a physical tolerance and a dimensionless priority makes the trade explicit,
+  and improving the detector directly improved the defect: contact-state step
+  5.40 to 4.89 cm and foot slide 4.59 to 2.39 cm.
+
+- **Consequence worth recording: normalising a task block by its residual count
+  weakened the orientation task threefold**, because it declares three
+  effectors. Foot orientation moved from 0.72 and 0.53 degrees to 1.15 and 1.18.
+  That is the intended behaviour rather than a regression: declaring a torso
+  effector should not have tripled the standing of the orientation task against
+  every other objective. The result remains far inside any requirement, and the
+  tolerance is now the knob to turn if it needs tightening.
+
 - **Correction to a figure in the plan's own statement of the problem.** The plan says the pelvis must sit about 22.3 cm lower than the source's, derived by multiplying the source leg length by the height ratio. Measuring the robot's pelvis-to-ankle distance directly gives 0.751 m against the source's 0.861 m, so the required drop is 11.0 cm, not 22.3 cm. The robot has proportionally longer legs than the subject relative to its height. The mechanism is unaffected, since it measures the ratio rather than using the plan's figure, but the plan's arithmetic was wrong and AC-2's tolerance refers to it.
 - **DEC-1 resolved in favour of carrying the anchor forward**, as the plan's Claude position proposed. Implemented as interpolation between known anchors, which also holds the nearest anchor before the first contact and after the last, so no frame is left unpinned.

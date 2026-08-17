@@ -428,6 +428,31 @@ class OmniRetargeter:
             quat_wxyz = -quat_wxyz
         return quat_wxyz
 
+    @staticmethod
+    def _source_effector_lengths(motion_data: MotionData, scale: float) -> Dict[str, float]:
+        """Longest extent of each effector's own contact surface, in metres.
+
+        Used to express the proximity gate as a fraction of the thing being
+        tested rather than as an absolute distance that means different things
+        for different subjects and different scene scales.
+        """
+        ids = motion_data.metadata.get("foot_sole_vertex_ids")
+        template = motion_data.metadata.get("foot_sole_template_vertices")
+        lengths: Dict[str, float] = {}
+        if not ids or template is None:
+            return lengths
+        template = np.asarray(template, dtype=float)
+        for name, vertex_ids in ids.items():
+            try:
+                band = template[np.asarray(vertex_ids, dtype=int)]
+            except (IndexError, TypeError):
+                continue
+            if band.shape[0] < 2:
+                continue
+            extent = band.max(axis=0) - band.min(axis=0)
+            lengths[name] = float(np.max(extent) * scale)
+        return lengths
+
     def _match_skeleton_to_robot(self, motion_data: MotionData) -> MotionData:
         """Bring the source skeleton to robot proportions about its contacts.
 
@@ -707,16 +732,40 @@ class OmniRetargeter:
 
         from omniretargeting.scene_contact import ContactSpec, infer_contact_targets
 
+        defaults = ContactSpec()
         spec = ContactSpec(
-            distance_threshold=float(config.get("distance_threshold", 0.05)),
-            speed_threshold=float(config.get("speed_threshold", 0.6)),
-            min_frames=int(config.get("min_frames", 3)),
-            anchor_frames=int(config.get("anchor_frames", 3)),
-            blend_frames=int(config.get("blend_frames", 3)),
+            enter_gap_fraction=float(config.get("enter_gap_fraction", defaults.enter_gap_fraction)),
+            leave_gap_fraction=float(config.get("leave_gap_fraction", defaults.leave_gap_fraction)),
+            gap_floor=float(config.get("gap_floor", defaults.gap_floor)),
+            enter_speed_fraction=float(
+                config.get("enter_speed_fraction", defaults.enter_speed_fraction)
+            ),
+            leave_speed_fraction=float(
+                config.get("leave_speed_fraction", defaults.leave_speed_fraction)
+            ),
+            min_frames=int(config.get("min_frames", defaults.min_frames)),
+            anchor_frames=int(config.get("anchor_frames", defaults.anchor_frames)),
+            blend_frames=int(config.get("blend_frames", defaults.blend_frames)),
+            bias_percentile=float(config.get("bias_percentile", defaults.bias_percentile)),
+            estimate_bias=bool(config.get("estimate_bias", defaults.estimate_bias)),
         )
         scaled_centres = {side: np.asarray(pts, dtype=float) * scale for side, pts in centres.items()}
+
+        # The gates are fractions of the source's own geometry, so the detector
+        # needs to be told what that geometry is rather than carrying absolute
+        # numbers that only suit one subject in one scene.
+        positions = np.asarray(motion_data.positions, dtype=float) * scale
+        names = motion_data.target_names or []
+        leg_length = self._source_leg_length(positions, names, scaled_centres)
+        effector_lengths = self._source_effector_lengths(motion_data, scale)
+
         targets, normals, weights, stats = infer_contact_targets(
-            scaled_centres, terrain, motion_data.framerate, spec
+            scaled_centres,
+            terrain,
+            motion_data.framerate,
+            spec,
+            effector_lengths=effector_lengths,
+            leg_length=leg_length,
         )
         motion_data.metadata["contact_targets"] = targets
         motion_data.metadata["contact_normals"] = normals
@@ -724,7 +773,10 @@ class OmniRetargeter:
         for name, entry in stats.items():
             print(
                 f"[scene_contact] {name}: {entry['contact_frames']} contact frames "
-                f"in {entry['runs']} runs"
+                f"in {entry['runs']} runs; source floats {entry['float_bias'] * 100:.2f} cm "
+                f"above the scan, gates {entry['enter_gap'] * 100:.2f}/"
+                f"{entry['leave_gap'] * 100:.2f} cm, median confidence "
+                f"{entry['median_confidence']:.2f}"
             )
 
     def retarget_frame(self, frame: MotionFrame | np.ndarray, state: RetargetingStreamState) -> np.ndarray:

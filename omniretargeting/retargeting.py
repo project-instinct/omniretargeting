@@ -620,7 +620,25 @@ class GenericInteractionRetargeter:
         if not config or not config.get("enabled", False):
             return
 
-        weight = float(config.get("weight", 0.0))
+        # A weight that multiplies a squared rotation vector is a number whose
+        # meaning depends on the units of that vector, so it cannot be carried
+        # from one setup to another.  Expressed as a tolerance it can: the
+        # weight is priority / tolerance^2, which makes the tolerance the
+        # angular error the task is content to leave, and the priority a
+        # dimensionless statement about how this task ranks against others.
+        # A bare `weight` is still honoured, for configurations written before
+        # this existed.
+        priority = float(config.get("priority", 1.0))
+        tolerance_deg = config.get("tolerance_deg")
+        if config.get("weight") is not None:
+            weight = float(config["weight"])
+        elif tolerance_deg is not None:
+            tolerance = np.radians(float(tolerance_deg))
+            if tolerance <= 0.0:
+                raise ValueError("link_orientation tolerance_deg must be positive")
+            weight = priority / (tolerance ** 2)
+        else:
+            weight = 0.0
         if weight <= 0.0:
             return
 
@@ -677,8 +695,27 @@ class GenericInteractionRetargeter:
         if not config or not config.get("enabled", False):
             return
 
-        weight = float(config.get("weight", 0.0))
+        # Same reparameterisation as the orientation task: tolerances in metres
+        # rather than a bare weight on squared metres.  The normal tolerance is
+        # how far off the surface a plant may sit; the tangential one is how far
+        # it may sit from where the source planted it, and it is deliberately
+        # the looser of the two, because a robot with different proportions
+        # cannot occupy the source's exact contact location and should not be
+        # asked to.
+        priority = float(config.get("priority", 1.0))
         effectors = config.get("effectors") or {}
+        if config.get("weight") is not None:
+            weight = float(config["weight"])
+            normal_weight = float(config.get("normal_weight", 1.0))
+            tangential_weight = float(config.get("tangential_weight", 0.05))
+        else:
+            normal_tolerance = float(config.get("normal_tolerance_m", 0.045))
+            tangential_tolerance = float(config.get("tangential_tolerance_m", 0.20))
+            if normal_tolerance <= 0.0 or tangential_tolerance <= 0.0:
+                raise ValueError("scene_contact tolerances must be positive")
+            weight = priority
+            normal_weight = 1.0 / (normal_tolerance ** 2)
+            tangential_weight = 1.0 / (tangential_tolerance ** 2)
         if weight <= 0.0 or not effectors:
             return
 
@@ -698,8 +735,8 @@ class GenericInteractionRetargeter:
             }
 
         self.scene_contact_weight = weight
-        self.scene_contact_normal_weight = float(config.get("normal_weight", 1.0))
-        self.scene_contact_tangential_weight = float(config.get("tangential_weight", 0.05))
+        self.scene_contact_normal_weight = normal_weight
+        self.scene_contact_tangential_weight = tangential_weight
         self.scene_contact_enabled = True
 
     def _scene_contact_residuals(
@@ -1305,7 +1342,7 @@ class GenericInteractionRetargeter:
         # term this is not diagonal in the actuated coordinates: rotating a
         # sole couples the whole leg chain, so it contributes a dense rank-3
         # block rather than per-index entries.
-        foot_terms: List[Tuple[np.ndarray, np.ndarray]] = []
+        foot_terms: List[Tuple[np.ndarray, np.ndarray, float]] = []
         if self.link_orientation_enabled and link_orientation_targets:
             w_foot = self.link_orientation_weight
             source_root_rot = None
@@ -1319,23 +1356,28 @@ class GenericInteractionRetargeter:
                     source_root_rot = Rotation.from_quat(
                         root_quat / np.linalg.norm(root_quat), scalar_first=True
                     ).as_matrix()
-            for jac, error in self._link_orientation_residuals(
+            residual_terms = self._link_orientation_residuals(
                 link_orientation_targets, T=T_qvel, source_root_rot=source_root_rot
-            ):
+            )
+            # Divided by the number of links so that declaring a third effector
+            # does not silently raise this task's standing against the others.
+            w_foot = self.link_orientation_weight / max(len(residual_terms), 1)
+            for jac, error in residual_terms:
                 P = P + sp.csr_matrix(2.0 * w_foot * (jac.T @ jac))
                 c = c - 2.0 * w_foot * (jac.T @ error)
-                foot_terms.append((jac, error))
+                foot_terms.append((jac, error, w_foot))
 
         # Scene contact: pin the sole point onto the anchored surface point.
-        contact_terms: List[Tuple[np.ndarray, np.ndarray]] = []
+        contact_terms: List[Tuple[np.ndarray, np.ndarray, float]] = []
         if self.scene_contact_enabled and contact_targets:
-            w_contact = self.scene_contact_weight
-            for jac, error in self._scene_contact_residuals(
+            contact_residuals = self._scene_contact_residuals(
                 contact_targets, T=T_qvel, normals=contact_normals, blend=contact_weights
-            ):
+            )
+            w_contact = self.scene_contact_weight / max(len(contact_residuals), 1)
+            for jac, error in contact_residuals:
                 P = P + sp.csr_matrix(2.0 * w_contact * (jac.T @ jac))
                 c = c + 2.0 * w_contact * (jac.T @ error)
-                contact_terms.append((jac, error))
+                contact_terms.append((jac, error, w_contact))
 
         P = P + sp.diags(P_diag_extra)
 
@@ -1411,12 +1453,12 @@ class GenericInteractionRetargeter:
             cost += orientation_weight * (dqa_opt[qa_idx] + diff) ** 2
         for qa_idx, diff in base_pos_terms:
             cost += self.base_position_tracking_weight * (dqa_opt[qa_idx] + diff) ** 2
-        for jac, error in foot_terms:
+        for jac, error, term_weight in foot_terms:
             residual = jac @ dqa_opt - error
-            cost += self.link_orientation_weight * float(residual @ residual)
-        for jac, error in contact_terms:
+            cost += term_weight * float(residual @ residual)
+        for jac, error, term_weight in contact_terms:
             residual = jac @ dqa_opt + error
-            cost += self.scene_contact_weight * float(residual @ residual)
+            cost += term_weight * float(residual @ residual)
         if m:
             s_true = np.array([span for (_, _, span) in slack_rows]) * x[n:]
             cost += (self.penetration_slack_penalty / 2.0) * float((s_true ** 2).sum())
