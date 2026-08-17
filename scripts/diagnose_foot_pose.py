@@ -27,6 +27,8 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
+from omniretargeting.foot_frames import calibrate_sole_rotation, world_sole_rotations
+
 # SMPL-X body joint indices.
 ANKLE_IDX = {"left": 7, "right": 8}
 TOE_IDX = {"left": 10, "right": 11}
@@ -179,24 +181,15 @@ def calibrate_source_sole_frames(
     world[:, 0] = local[:, 0]
     for j in range(1, 22):
         world[:, j] = world[:, parents[j]] @ local[:, j]
+    world_quats = R.from_matrix(world.reshape(-1, 3, 3)).as_quat(scalar_first=True).reshape(n, 22, 4)
 
     frames = {}
     for side in ("left", "right"):
         a_idx, t_idx = ANKLE_IDX[side], TOE_IDX[side]
         mask = (weights[:, a_idx] + weights[:, t_idx]) > 0.5
-        foot_v = tmpl_v[mask]
-        centered = foot_v - foot_v.mean(axis=0)
-        # Thinnest principal axis of the foot volume is the sole normal.
-        _, _, vh = np.linalg.svd(centered, full_matrices=False)
-        up = vh[-1]
-        if up @ (tmpl_j[a_idx] - foot_v.mean(axis=0)) < 0:
-            up = -up
-        fwd = tmpl_j[t_idx] - tmpl_j[a_idx]
-        fwd = fwd - (fwd @ up) * up
-        fwd /= np.linalg.norm(fwd)
-        lat = np.cross(up, fwd)
-        R_tmpl = np.column_stack([fwd, lat, up])          # joint frame -> sole frame
-        frames[side] = np.einsum("tij,jk->tik", world[:, t_idx], R_tmpl)
+        cal = calibrate_sole_rotation(side, tmpl_v, tmpl_j, mask, a_idx, t_idx)
+        frames[side] = world_sole_rotations(world_quats, cal)
+        frames[f"{side}_calibration"] = cal
         frames[f"{side}_ankle_pos"] = joints[:, a_idx]
         frames[f"{side}_toe_pos"] = joints[:, t_idx]
 
