@@ -244,6 +244,7 @@ class OmniRetargeter:
             scaled_terrain,
             source_to_robot_scale if enable_scene_scaling else 1.0,
         )
+        scaled_motion_data = self._match_skeleton_to_robot(scaled_motion_data)
 
         if visualize_trajectory:
             self._visualize_trajectory(scaled_motion_data.positions, scaled_terrain)
@@ -426,6 +427,212 @@ class OmniRetargeter:
         if last_quat is not None and np.dot(quat_wxyz, last_quat) < 0:
             quat_wxyz = -quat_wxyz
         return quat_wxyz
+
+    def _match_skeleton_to_robot(self, motion_data: MotionData) -> MotionData:
+        """Bring the source skeleton to robot proportions about its contacts.
+
+        The Laplacian tracks absolute source joint positions, so it pulls the
+        pelvis toward wherever the source's pelvis was.  When the scene is left
+        at its captured scale and the robot is shorter than the subject, that
+        target is unreachable: the pelvis cannot be at human height and the feet
+        on the real floor at the same time.  What happened instead was two
+        regimes -- the contact task won on contact frames and dragged the base
+        down, the Laplacian won between them and pulled it back up, eighteen
+        centimetres apart and switching ten times across one clip.
+
+        Rescaling the source skeleton to the robot's proportions removes the
+        conflict rather than balancing it.  The scale is applied about the
+        contacting foot rather than about the pelvis or the origin, which is
+        what keeps the feet on the real surface while the pelvis descends by the
+        leg-length difference.  Between contacts the last anchor is carried
+        forward, so the rescaling never jumps.
+
+        Off unless configured, and a no-op when the scene has been scaled: there
+        the whole world was already brought to the robot and the source targets
+        are reachable as they stand.
+        """
+        config = self.retargeting_config.get("skeleton_matching") or {}
+        if not config.get("enabled", False):
+            return motion_data
+
+        names = motion_data.target_names or []
+        anchors = motion_data.metadata.get("contact_targets")
+        if not anchors:
+            print("Warning: skeleton_matching is enabled but no scene contacts were inferred")
+            return motion_data
+
+        scale = self._derive_skeleton_scale(motion_data, config)
+        if scale is None:
+            return motion_data
+
+        positions = np.asarray(motion_data.positions, dtype=float)
+        surface, source_point = self._contact_anchor_series(
+            positions, names, anchors, motion_data.metadata.get("foot_sole_centres")
+        )
+
+        # Rescale about the source's own contacting point, then place that point
+        # on the surface anchor.  Rescaling about the surface point alone leaves
+        # the foot wherever the source had it, and a source reconstructed from
+        # video floats several centimetres above its own scan, so the Laplacian
+        # would still be asking for a foot the contact task has to drag down.
+        rescaled = surface[:, None, :] + scale * (positions - source_point[:, None, :])
+        root_translations = motion_data.root_translations
+        if root_translations is not None:
+            root_translations = surface + scale * (
+                np.asarray(root_translations, dtype=float) - source_point
+            )
+
+        print(
+            f"[skeleton_matching] source skeleton scaled by {scale:.4f} about its contacts; "
+            f"pelvis descends about {(1.0 - scale) * self._source_leg_length(positions, names):.3f} m"
+        )
+        return MotionData(
+            positions=rescaled,
+            target_names=motion_data.target_names,
+            root_orientations=motion_data.root_orientations,
+            root_translations=root_translations,
+            framerate=motion_data.framerate,
+            source_height=motion_data.source_height,
+            object_points=motion_data.object_points,
+            object_mesh=motion_data.object_mesh,
+            metadata=dict(motion_data.metadata),
+        )
+
+    @staticmethod
+    def _source_leg_length(positions: np.ndarray, names: List[str]) -> float:
+        """Median pelvis-to-ankle distance in the source, in metres."""
+        try:
+            pelvis = names.index("Pelvis")
+        except ValueError:
+            return 0.0
+        ankles = [n for n in ("L_Ankle", "R_Ankle") if n in names]
+        if not ankles:
+            return 0.0
+        lengths = [
+            np.linalg.norm(positions[:, pelvis] - positions[:, names.index(a)], axis=1)
+            for a in ankles
+        ]
+        return float(np.median(np.concatenate(lengths)))
+
+    def _robot_leg_length(self) -> float:
+        """Pelvis-to-ankle distance on the robot at its nominal configuration."""
+        data = mujoco.MjData(self.robot_model)
+        data.qpos[:] = self.robot_model.qpos0
+        mujoco.mj_kinematics(self.robot_model, data)
+
+        # Mapping entries carry a link name alone in the older schema and a
+        # dict with an offset in the newer one.
+        def link_of(name):
+            entry = self.valid_source_to_robot_link_mapping.get(name)
+            if isinstance(entry, dict):
+                return entry.get("robot_link")
+            return entry
+
+        pelvis_link = link_of("Pelvis")
+        ankle_links = [link_of(n) for n in ("L_Ankle", "R_Ankle")]
+        pelvis_id = (
+            mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, pelvis_link)
+            if pelvis_link
+            else -1
+        )
+        if pelvis_id < 0:
+            return 0.0
+        lengths = []
+        for link in ankle_links:
+            if not link:
+                continue
+            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, link)
+            if body_id >= 0:
+                lengths.append(float(np.linalg.norm(data.xpos[body_id] - data.xpos[pelvis_id])))
+        return float(np.median(lengths)) if lengths else 0.0
+
+    def _derive_skeleton_scale(self, motion_data: MotionData, config: dict) -> Optional[float]:
+        """Ratio of robot to source leg length, measured rather than declared.
+
+        Measured from the segment that decides whether the feet reach the
+        ground, not from overall height: two robots of the same height can have
+        very different leg-to-torso proportions, and it is the leg that has to
+        span the gap.
+        """
+        override = config.get("scale")
+        if override is not None:
+            return float(override)
+
+        source_leg = self._source_leg_length(
+            np.asarray(motion_data.positions, dtype=float), motion_data.target_names or []
+        )
+        robot_leg = self._robot_leg_length()
+        if source_leg <= 1e-6 or robot_leg <= 1e-6:
+            print(
+                "Warning: skeleton_matching could not measure leg lengths "
+                f"(source {source_leg:.4f} m, robot {robot_leg:.4f} m); leaving the skeleton alone"
+            )
+            return None
+        return robot_leg / source_leg
+
+    @staticmethod
+    def _contact_anchor_series(
+        positions: np.ndarray,
+        names: List[str],
+        anchors: Dict[str, np.ndarray],
+        sole_centres: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Per-frame pair of points that pins the rescaling.
+
+        Returns ``(surface, source_point)``: where the contact is on the scene,
+        and where the source had the corresponding part of itself.  The
+        rescaling maps the second onto the first.
+
+        A contacting foot when there is one, otherwise the last one carried
+        forward, and before the first contact the first one carried backward.
+        Carrying forward is what keeps the rescaling continuous; recentring on
+        the pelvis between contacts would reintroduce the pull toward human
+        height that this is meant to remove.
+        """
+        n_frames = positions.shape[0]
+        series = np.full((n_frames, 3), np.nan)
+
+        for name, target in anchors.items():
+            target = np.asarray(target, dtype=float)
+            if target.shape[0] != n_frames:
+                continue
+            usable = np.isfinite(target[:, 0])
+            fill = usable & ~np.isfinite(series[:, 0])
+            series[fill] = target[fill]
+
+        source_series = np.full((n_frames, 3), np.nan)
+        if sole_centres:
+            for name, target in anchors.items():
+                centres = sole_centres.get(name)
+                if centres is None:
+                    continue
+                centres = np.asarray(centres, dtype=float)
+                target = np.asarray(target, dtype=float)
+                if centres.shape[0] != n_frames or target.shape[0] != n_frames:
+                    continue
+                usable = np.isfinite(target[:, 0]) & ~np.isfinite(source_series[:, 0])
+                source_series[usable] = centres[usable]
+
+        finite = np.flatnonzero(np.isfinite(series[:, 0]) & np.isfinite(source_series[:, 0]))
+        if finite.size == 0:
+            # Nothing to pin to; rescale about the source's own feet so the body
+            # at least keeps them still relative to itself.
+            foot_names = [n for n in ("L_Ankle", "R_Ankle") if n in names]
+            if foot_names:
+                idx = [names.index(n) for n in foot_names]
+                own = positions[:, idx, :].mean(axis=1)
+            else:
+                own = positions.mean(axis=1)
+            return own, own
+
+        # Hold the nearest known pair on either side of a gap, so the mapping
+        # never jumps when contact starts or ends.
+        for axis in range(3):
+            series[:, axis] = np.interp(np.arange(n_frames), finite, series[finite, axis])
+            source_series[:, axis] = np.interp(
+                np.arange(n_frames), finite, source_series[finite, axis]
+            )
+        return series, source_series
 
     def _attach_contact_targets(
         self,

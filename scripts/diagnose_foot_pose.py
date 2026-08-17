@@ -289,6 +289,7 @@ def main() -> None:
             pos[side], rot[side], terrain, sole_points, args.contact_threshold
         )
         entry["contact_fraction"] = float(contact.mean()) if n else 0.0
+        entry["_contact_flags"] = contact
         if np.isfinite(nearest).any():
             entry["sole_clearance_m"] = summarize(nearest[np.isfinite(nearest)])
 
@@ -331,6 +332,37 @@ def main() -> None:
                 print(f"                swing   median {g['swing']['median']:6.2f}  p90 {g['swing']['p90']:6.2f}")
             print(f"  sole-normal err       median {entry['sole_normal_err_deg']['median']:6.2f}")
             print(f"  forward-axis err      median {entry['forward_axis_err_deg']['median']:6.2f}")
+
+    # Base height continuity.  A base that steps between two levels by contact
+    # state reads as convulsing even when every joint-angle statistic looks
+    # healthy, which is exactly how one such defect escaped notice: the
+    # smoothness numbers covered joint angles and not the floating base.
+    base_z = np.asarray(np.load(args.retargeted)["base_pos_w"], dtype=float)[:, 2]
+    contact_any = np.zeros(len(base_z), dtype=bool)
+    for side in ("left", "right"):
+        entry = report["feet"].get(side, {})
+        flags = entry.pop("_contact_flags", None)
+        if flags is not None and len(flags) == len(contact_any):
+            contact_any |= np.asarray(flags, dtype=bool)
+    base = {
+        "second_difference_rms_mm": float(np.sqrt(np.mean(np.diff(base_z, 2) ** 2)) * 1000.0)
+        if len(base_z) > 2 else 0.0,
+        "max_step_mm": float(np.abs(np.diff(base_z)).max() * 1000.0) if len(base_z) > 1 else 0.0,
+    }
+    if contact_any.any() and not contact_any.all():
+        base["median_with_contact_m"] = float(np.median(base_z[contact_any]))
+        base["median_without_contact_m"] = float(np.median(base_z[~contact_any]))
+        base["contact_state_step_mm"] = float(
+            (base["median_without_contact_m"] - base["median_with_contact_m"]) * 1000.0
+        )
+    report["base_height"] = base
+    print("\nbase height:")
+    print(f"  second-difference RMS  {base['second_difference_rms_mm']:8.2f} mm")
+    print(f"  largest single step    {base['max_step_mm']:8.2f} mm")
+    if "contact_state_step_mm" in base:
+        print(f"  step between contact states {base['contact_state_step_mm']:8.2f} mm"
+              f"   ({base['median_with_contact_m']*100:.2f} cm with contact,"
+              f" {base['median_without_contact_m']*100:.2f} cm without)")
 
     sat = {k: v for k, v in meta["saturation"].items() if v["at_lower"] + v["at_upper"] > 0.05}
     report["saturation"] = sat

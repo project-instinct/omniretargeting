@@ -691,7 +691,7 @@
     "terrain_sample_seed": 0,
     "scene_contact": {
       "enabled": true,
-      "weight": 2000.0,
+      "weight": 500.0,
       "distance_threshold": 0.05,
       "speed_threshold": 0.6,
       "min_frames": 3,
@@ -761,7 +761,10 @@
         }
       }
     },
-    "smooth_weight": 4.0
+    "smooth_weight": 4.0,
+    "skeleton_matching": {
+      "enabled": true
+    }
   },
   "default_joint_positions": {
     "T-Pose": {
