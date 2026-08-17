@@ -120,18 +120,6 @@
         }
       },
       "adapter_options": {
-        "betas": [
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0,
-          0.0
-        ],
         "use_smplx_base_pose": true
       },
       "default_pose_on_robot": "T-Pose"
@@ -703,7 +691,7 @@
     "terrain_sample_seed": 0,
     "scene_contact": {
       "enabled": true,
-      "weight": 200.0,
+      "weight": 2000.0,
       "distance_threshold": 0.05,
       "speed_threshold": 0.6,
       "min_frames": 3,
