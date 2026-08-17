@@ -136,6 +136,8 @@ class MotionData:
 
     def iter_frames(self) -> Iterator[MotionFrame]:
         sole_rotations = self.metadata.get("foot_sole_rotations")
+        contact_targets = self.metadata.get("contact_targets")
+        contact_normals = self.metadata.get("contact_normals")
         for frame_idx, positions in enumerate(self.positions):
             root_orientation = self.root_orientations[frame_idx] if self.root_orientations is not None else None
             root_translation = self.root_translations[frame_idx] if self.root_translations is not None else None
@@ -150,6 +152,20 @@ class MotionData:
                     for side, rotations in sole_rotations.items()
                     if frame_idx < len(rotations)
                 }
+            if contact_targets:
+                frame_contacts = {}
+                for name, series in contact_targets.items():
+                    if frame_idx < len(series) and np.all(np.isfinite(series[frame_idx])):
+                        frame_contacts[name] = series[frame_idx]
+                if frame_contacts:
+                    frame_metadata["contact_targets"] = frame_contacts
+                    if contact_normals:
+                        frame_metadata["contact_normals"] = {
+                            name: contact_normals[name][frame_idx]
+                            for name in frame_contacts
+                            if name in contact_normals
+                            and frame_idx < len(contact_normals[name])
+                        }
             yield MotionFrame(
                 positions=positions,
                 root_orientation=root_orientation,

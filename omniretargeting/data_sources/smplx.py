@@ -142,6 +142,7 @@ class SmplxDataSource(DataSource):
 
             rotations = {}
             calibrations = {}
+            sole_vertex_ids = {}
             for side, (ankle_idx, toe_idx) in self._FOOT_JOINTS.items():
                 mask = (weights[:, ankle_idx] + weights[:, toe_idx]) > 0.5
                 calibration = calibrate_sole_rotation(
@@ -149,14 +150,63 @@ class SmplxDataSource(DataSource):
                 )
                 calibrations[side] = calibration
                 rotations[side] = world_sole_rotations(orientations, calibration)
+                sole_vertex_ids[side] = self._sole_band_vertex_ids(
+                    template_vertices, mask, calibration.rotation[:, 2]
+                )
         except Exception as exc:  # noqa: BLE001 - degrade to positions-only
             print(f"Warning: could not calibrate SMPL-X foot sole frames: {exc}")
             return {}
 
-        return {
+        result = {
             "foot_sole_rotations": rotations,
             "foot_sole_calibration": calibrations_to_metadata(calibrations),
+            "foot_sole_vertex_ids": sole_vertex_ids,
         }
+
+        centres = self._foot_sole_centres(sole_vertex_ids)
+        if centres:
+            result["foot_sole_centres"] = centres
+        return result
+
+    @staticmethod
+    def _sole_band_vertex_ids(
+        template_vertices: np.ndarray, foot_mask: np.ndarray, sole_normal: np.ndarray,
+        band_fraction: float = 0.15,
+    ) -> np.ndarray:
+        """Template vertex ids of the ground-contact band of one foot.
+
+        Fixed ids rather than a per-frame "lowest vertices" query, so the point
+        being tracked is the same piece of anatomy on every frame. Re-selecting
+        per frame would let the tracked point slide around the sole as the foot
+        rotates, which is indistinguishable from the foot itself sliding.
+        """
+        ids = np.flatnonzero(np.asarray(foot_mask, dtype=bool))
+        heights = np.asarray(template_vertices, dtype=float)[ids] @ np.asarray(sole_normal, dtype=float)
+        take = max(4, int(round(band_fraction * len(ids))))
+        return ids[np.argsort(heights)[:take]]
+
+    def _foot_sole_centres(self, sole_vertex_ids: dict) -> dict:
+        """World position of each foot's sole centre, per frame.
+
+        This is the point a contact task anchors: with sole orientation already
+        tracked, pinning one sole point fixes the remaining three degrees of
+        freedom, so position and orientation together give the full foot pose
+        without over-constraining it.
+        """
+        vertices = getattr(self, "_posed_vertices_cache", None)
+        if vertices is None:
+            return {}
+        try:
+            centres = {
+                side: vertices[:, ids, :].mean(axis=1).astype(float)
+                for side, ids in sole_vertex_ids.items()
+            }
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: could not compute SMPL-X sole centres: {exc}")
+            return {}
+        finally:
+            self._posed_vertices_cache = None
+        return centres
 
     def iter_frames(self):
         yield from self.load().iter_frames()
@@ -294,6 +344,9 @@ class SmplxDataSource(DataSource):
         )
 
         joints = output.joints.detach().cpu().numpy()[:, :22, :]
+        # Kept only long enough to read the sole band out of it; the surface is
+        # needed to locate contact points that joints alone cannot express.
+        self._posed_vertices_cache = output.vertices.detach().cpu().numpy()
         full_pose = output.full_pose.detach().cpu().numpy().reshape(num_frames, -1, 3)
         orientations = self.compute_world_joint_orientations(
             root_orient,

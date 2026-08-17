@@ -238,6 +238,7 @@ class GenericInteractionRetargeter:
         penetration_slack: Optional[Dict] = None,
         base_position_tracking_weight: float = 0.0,
         foot_orientation: Optional[Dict] = None,
+        scene_contact: Optional[Dict] = None,
     ):
         """Initialize the generic retargeter.
 
@@ -378,6 +379,7 @@ class GenericInteractionRetargeter:
         self.penetration_slack_penalty = float(ps.get("slack_penalty", 1e5))
         self.base_position_tracking_weight = float(base_position_tracking_weight)
         self._setup_foot_orientation(foot_orientation)
+        self._setup_scene_contact(scene_contact)
         if self.penetration_slack_enabled and self.penetration_hard_bound <= self.penetration_soft_tolerance:
             raise ValueError(
                 f"penetration_slack.hard_bound ({self.penetration_hard_bound}) must be "
@@ -647,15 +649,139 @@ class GenericInteractionRetargeter:
         self.foot_orientation_weight = weight
         self.foot_orientation_enabled = True
 
-    def _body_angular_jacobian(self, body_id: int, T: Optional[np.ndarray] = None) -> np.ndarray:
-        """World angular Jacobian of a body, in qpos coordinates, actuated columns."""
+    def _setup_scene_contact(self, config: Optional[Dict]) -> None:
+        """Resolve the contact task, which pins an effector onto the scene.
+
+        Separate from the orientation task because they constrain different
+        degrees of freedom: orientation fixes how the sole is tilted, contact
+        fixes where it sits.  Together they give the full foot pose, which is
+        what preserving an interaction requires.
+        """
+        self.scene_contact_specs: Dict[str, dict] = {}
+        self.scene_contact_weight = 0.0
+        self.scene_contact_normal_weight = 1.0
+        self.scene_contact_tangential_weight = 0.05
+        self.scene_contact_enabled = False
+
+        if not config or not config.get("enabled", False):
+            return
+
+        weight = float(config.get("weight", 0.0))
+        effectors = config.get("effectors") or {}
+        if weight <= 0.0 or not effectors:
+            return
+
+        for side, spec in effectors.items():
+            body_name = spec.get("body")
+            if not body_name:
+                raise ValueError(f"scene_contact effector {side!r} is missing 'body'")
+            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id < 0:
+                raise ValueError(
+                    f"scene_contact effector {side!r} references body {body_name!r}, "
+                    "which is not present in the compiled model"
+                )
+            self.scene_contact_specs[side] = {
+                "body_id": int(body_id),
+                "sole_offset": np.asarray(spec.get("sole_offset", [0.0, 0.0, 0.0]), dtype=float),
+            }
+
+        self.scene_contact_weight = weight
+        self.scene_contact_normal_weight = float(config.get("normal_weight", 1.0))
+        self.scene_contact_tangential_weight = float(config.get("tangential_weight", 0.05))
+        self.scene_contact_enabled = True
+
+    def _scene_contact_residuals(
+        self,
+        targets: Optional[Dict[str, np.ndarray]],
+        T: Optional[np.ndarray] = None,
+        normals: Optional[Dict[str, np.ndarray]] = None,
+    ) -> List[Tuple[np.ndarray, np.ndarray]]:
+        """Residuals pinning each contacting sole point onto the scene.
+
+        The normal and tangential directions are weighted separately, and by
+        default the tangential one is weighted far lower.  Contact means the
+        sole is *on the surface*; it does not mean the robot's sole is at the
+        exact world position the human's sole occupied.  Those are different
+        requirements, and demanding the second is not achievable: the robot's
+        limb proportions differ from the scaled source, which leaves every
+        mapped target several centimetres from its source position regardless
+        of what the foot does.  Insisting on the full 3D position would spend
+        that irreducible mismatch fighting the rest of the body, while the
+        component that actually decides whether the foot is planted is the one
+        along the surface normal.
+
+        The tangential term is retained at low weight because it is what
+        discourages the plant from sliding along the surface within a contact
+        interval.
+
+        Returns ``(J, e)`` pairs such that the term to minimise is
+        ``weight * ||J @ dqa + e||^2``, already weighted per direction.
+        """
+        if not self.scene_contact_enabled or not targets:
+            return []
+
+        if T is None:
+            T = self._build_transform_qdot_to_qvel_fast()
+
+        residuals: List[Tuple[np.ndarray, np.ndarray]] = []
+        for side, spec in self.scene_contact_specs.items():
+            target = targets.get(side)
+            if target is None:
+                continue
+            target = np.asarray(target, dtype=float)
+            if target.shape != (3,) or not np.all(np.isfinite(target)):
+                continue
+
+            body_id = spec["body_id"]
+            rotation = self.robot_data.xmat[body_id].reshape(3, 3)
+            offset_world = rotation @ spec["sole_offset"]
+            position = self.robot_data.xpos[body_id] + offset_world
+
+            # Both Jacobians are assembled unsliced and reduced together at the
+            # end; the actuated set is not guaranteed to span every column.
+            jac = self._calc_contact_jacobian_from_point(body_id, T=T)
+            if np.any(spec["sole_offset"] != 0.0):
+                # Same cross term the positional targets already use: the point
+                # rides on the body, so rotating the body moves it too.
+                jac = jac - self._skew(offset_world) @ self._body_angular_jacobian_full(body_id, T=T)
+            jac = jac[:, self.q_a_indices]
+            error = position - target
+
+            normal = None if normals is None else normals.get(side)
+            if normal is not None:
+                normal = np.asarray(normal, dtype=float)
+                norm = np.linalg.norm(normal)
+                if np.all(np.isfinite(normal)) and norm > 1e-8:
+                    normal = normal / norm
+                    along = np.outer(normal, normal)
+                    # M = sqrt(w_n) P_n + sqrt(w_t) P_t, so that ||M r||^2 is
+                    # w_n (n.r)^2 + w_t |r_tangential|^2 exactly, because the
+                    # two projectors are orthogonal.
+                    metric = (
+                        np.sqrt(self.scene_contact_normal_weight) * along
+                        + np.sqrt(self.scene_contact_tangential_weight) * (np.eye(3) - along)
+                    )
+                    jac = metric @ jac
+                    error = metric @ error
+
+            residuals.append((jac, error))
+
+        return residuals
+
+    def _body_angular_jacobian_full(self, body_id: int, T: Optional[np.ndarray] = None) -> np.ndarray:
+        """World angular Jacobian of a body, in qpos coordinates, all columns."""
         if T is None:
             T = self._build_transform_qdot_to_qvel_fast()
         p_W = self.robot_data.xpos[int(body_id)].astype(np.float64).reshape(3, 1)
         Jp = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
         Jr = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
         mujoco.mj_jac(self.robot_model, self.robot_data, Jp, Jr, p_W, int(body_id))
-        return (Jr @ T)[:, self.q_a_indices]
+        return Jr @ T
+
+    def _body_angular_jacobian(self, body_id: int, T: Optional[np.ndarray] = None) -> np.ndarray:
+        """World angular Jacobian of a body, restricted to the actuated columns."""
+        return self._body_angular_jacobian_full(body_id, T=T)[:, self.q_a_indices]
 
     def _foot_orientation_residuals(
         self,
@@ -718,6 +844,8 @@ class GenericInteractionRetargeter:
         object_points: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
         foot_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
+        contact_targets: Optional[Dict[str, np.ndarray]] = None,
+        contact_normals: Optional[Dict[str, np.ndarray]] = None,
     ) -> np.ndarray:
         """
         Retarget a single frame of source target positions to robot motion.
@@ -791,6 +919,8 @@ class GenericInteractionRetargeter:
             bone_targets=bone_targets,
             root_translation=root_translation,
             foot_orientation_targets=foot_orientation_targets,
+            contact_targets=contact_targets,
+            contact_normals=contact_normals,
         )
 
         return q_opt
@@ -809,6 +939,8 @@ class GenericInteractionRetargeter:
         bone_targets: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
         foot_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
+        contact_targets: Optional[Dict[str, np.ndarray]] = None,
+        contact_normals: Optional[Dict[str, np.ndarray]] = None,
     ) -> np.ndarray:
         """
         Optimize robot configuration using SQP with interaction mesh constraints.
@@ -852,6 +984,8 @@ class GenericInteractionRetargeter:
                 bone_targets=bone_targets,
                 root_translation=root_translation,
                 foot_orientation_targets=foot_orientation_targets,
+                contact_targets=contact_targets,
+                contact_normals=contact_normals,
             )
 
             # Solver failure at this linearization point: an identical retry
@@ -936,6 +1070,8 @@ class GenericInteractionRetargeter:
         bone_targets: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
         foot_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
+        contact_targets: Optional[Dict[str, np.ndarray]] = None,
+        contact_normals: Optional[Dict[str, np.ndarray]] = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Single SQP optimization step.
@@ -1124,6 +1260,17 @@ class GenericInteractionRetargeter:
                 c = c - 2.0 * w_foot * (jac.T @ error)
                 foot_terms.append((jac, error))
 
+        # Scene contact: pin the sole point onto the anchored surface point.
+        contact_terms: List[Tuple[np.ndarray, np.ndarray]] = []
+        if self.scene_contact_enabled and contact_targets:
+            w_contact = self.scene_contact_weight
+            for jac, error in self._scene_contact_residuals(
+                contact_targets, T=T_qvel, normals=contact_normals
+            ):
+                P = P + sp.csr_matrix(2.0 * w_contact * (jac.T @ jac))
+                c = c + 2.0 * w_contact * (jac.T @ error)
+                contact_terms.append((jac, error))
+
         P = P + sp.diags(P_diag_extra)
 
         # Non-penetration rows (self-collision + terrain), numeric form:
@@ -1187,6 +1334,9 @@ class GenericInteractionRetargeter:
         for jac, error in foot_terms:
             residual = jac @ dqa_opt - error
             cost += self.foot_orientation_weight * float(residual @ residual)
+        for jac, error in contact_terms:
+            residual = jac @ dqa_opt + error
+            cost += self.scene_contact_weight * float(residual @ residual)
         if m:
             s_true = np.array([span for (_, _, span) in slack_rows]) * x[n:]
             cost += (self.penetration_slack_penalty / 2.0) * float((s_true ** 2).sum())

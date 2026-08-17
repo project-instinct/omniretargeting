@@ -239,6 +239,11 @@ class OmniRetargeter:
             ),
             metadata=dict(motion_data.metadata),
         )
+        self._attach_contact_targets(
+            scaled_motion_data,
+            scaled_terrain,
+            source_to_robot_scale if enable_scene_scaling else 1.0,
+        )
 
         if visualize_trajectory:
             self._visualize_trajectory(scaled_motion_data.positions, scaled_terrain)
@@ -302,6 +307,7 @@ class OmniRetargeter:
             terrain_sample_points=int(self.retargeting_config.get("terrain_sample_points", 100)),
             terrain_sample_seed=self.retargeting_config.get("terrain_sample_seed"),
             foot_orientation=self.retargeting_config.get("foot_orientation"),
+            scene_contact=self.retargeting_config.get("scene_contact"),
             source_target_names=self.valid_source_target_names,
             replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
             hard_penetration_constraint=penetration_resolver in ("hard_constraint", "hard_constraint_slack"),
@@ -420,6 +426,46 @@ class OmniRetargeter:
             quat_wxyz = -quat_wxyz
         return quat_wxyz
 
+    def _attach_contact_targets(
+        self,
+        motion_data: MotionData,
+        terrain,
+        scale: float,
+    ) -> None:
+        """Detect the source's scene contacts and anchor them, in place.
+
+        Runs once per motion rather than per frame: anchoring a contact needs
+        the whole interval, which a frame-at-a-time pass cannot see.
+        """
+        config = self.retargeting_config.get("scene_contact") or {}
+        if not config.get("enabled", False):
+            return
+
+        centres = motion_data.metadata.get("foot_sole_centres")
+        if not centres:
+            print("Warning: scene_contact is enabled but the source exposes no sole centres")
+            return
+
+        from omniretargeting.scene_contact import ContactSpec, infer_contact_targets
+
+        spec = ContactSpec(
+            distance_threshold=float(config.get("distance_threshold", 0.05)),
+            speed_threshold=float(config.get("speed_threshold", 0.6)),
+            min_frames=int(config.get("min_frames", 3)),
+            anchor_frames=int(config.get("anchor_frames", 3)),
+        )
+        scaled_centres = {side: np.asarray(pts, dtype=float) * scale for side, pts in centres.items()}
+        targets, normals, stats = infer_contact_targets(
+            scaled_centres, terrain, motion_data.framerate, spec
+        )
+        motion_data.metadata["contact_targets"] = targets
+        motion_data.metadata["contact_normals"] = normals
+        for name, entry in stats.items():
+            print(
+                f"[scene_contact] {name}: {entry['contact_frames']} contact frames "
+                f"in {entry['runs']} runs"
+            )
+
     def retarget_frame(self, frame: MotionFrame | np.ndarray, state: RetargetingStreamState) -> np.ndarray:
         positions = frame.positions if isinstance(frame, MotionFrame) else frame
         root_orientation = frame.root_orientation if isinstance(frame, MotionFrame) else None
@@ -463,6 +509,12 @@ class OmniRetargeter:
         foot_orientation_targets = (
             frame.metadata.get("foot_sole_rotations") if isinstance(frame, MotionFrame) else None
         )
+        contact_targets = (
+            frame.metadata.get("contact_targets") if isinstance(frame, MotionFrame) else None
+        )
+        contact_normals = (
+            frame.metadata.get("contact_normals") if isinstance(frame, MotionFrame) else None
+        )
 
         q_opt = state.retargeter.retarget_frame(
             mapped_source_targets,
@@ -473,6 +525,8 @@ class OmniRetargeter:
             object_points=object_points,
             root_translation=root_translation,
             foot_orientation_targets=foot_orientation_targets,
+            contact_targets=contact_targets,
+            contact_normals=contact_normals,
         )
         state.q_init = q_opt
         state.q_last = q_opt
