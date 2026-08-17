@@ -713,8 +713,8 @@
       }
     },
     "scene_contact": {
-      "enabled": false,
-      "weight": 50.0,
+      "enabled": true,
+      "weight": 200.0,
       "distance_threshold": 0.05,
       "speed_threshold": 0.6,
       "min_frames": 3,
@@ -738,7 +738,7 @@
         }
       }
     },
-    "penetration_resolver": "hard_constraint",
+    "penetration_resolver": "xyz_nudge",
     "foot_stabilization": {
       "enabled": true,
       "clearance": 0.01,
@@ -766,7 +766,8 @@
         "*shoulder*yaw*": 0.2,
         "*hip*yaw*": 0.2
       }
-    }
+    },
+    "penetration_slack": null
   },
   "default_joint_positions": {
     "T-Pose": {

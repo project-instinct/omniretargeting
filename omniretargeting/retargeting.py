@@ -378,6 +378,9 @@ class GenericInteractionRetargeter:
         self.penetration_hard_bound = float(ps.get("hard_bound", 0.03))
         self.penetration_slack_penalty = float(ps.get("slack_penalty", 1e5))
         self.base_position_tracking_weight = float(base_position_tracking_weight)
+        self.max_trust_region_retries = 6
+        self.trust_region_shrink = 0.4
+        self._solver_stats = {"solves": 0, "retries": 0, "failures": 0}
         self._setup_foot_orientation(foot_orientation)
         self._setup_scene_contact(scene_contact)
         if self.penetration_slack_enabled and self.penetration_hard_bound <= self.penetration_soft_tolerance:
@@ -1305,14 +1308,28 @@ class GenericInteractionRetargeter:
         lb = np.concatenate([self.q_a_lb - q_a_current, np.zeros(m)])
         ub = np.concatenate([self.q_a_ub - q_a_current, np.ones(m)])
 
-        # Solve (fallback: retry without the trust region, as before)
+        # Solve.  On failure, shrink the trust region and retry rather than
+        # dropping it: the QP is a linearization of a nonlinear problem, so a
+        # step taken without a trust region is unbounded in a model that is
+        # only valid nearby.  Dropping it used to fire on a fifth of all solves
+        # once an end-effector task was added, and the wild steps it produced
+        # were what kept those tasks from converging.
         P_csr = sp.csr_matrix(P)
+        step_size = float(self.step_size)
         x, ok = _solve_qp_clarabel(
-            P_csr, c, lb, ub, ge_rows, trust_region_dim=n, step_size=self.step_size
+            P_csr, c, lb, ub, ge_rows, trust_region_dim=n, step_size=step_size
         )
+        attempts = 0
+        while not ok and attempts < self.max_trust_region_retries:
+            attempts += 1
+            step_size *= self.trust_region_shrink
+            x, ok = _solve_qp_clarabel(
+                P_csr, c, lb, ub, ge_rows, trust_region_dim=n, step_size=step_size
+            )
+        self._solver_stats["solves"] += 1
+        self._solver_stats["retries"] += attempts
         if not ok:
-            x, ok = _solve_qp_clarabel(P_csr, c, lb, ub, ge_rows)
-        if not ok:
+            self._solver_stats["failures"] += 1
             return q, np.inf
 
         dqa_opt = x[:n]
