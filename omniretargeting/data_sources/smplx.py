@@ -183,9 +183,18 @@ class SmplxDataSource(DataSource):
             "foot_sole_template_vertices": template_vertices,
         }
 
-        centres = self._foot_sole_centres(sole_vertex_ids)
-        if centres:
-            result["foot_sole_centres"] = centres
+        try:
+            centres = self._foot_sole_centres(sole_vertex_ids)
+            if centres:
+                result["foot_sole_centres"] = centres
+            points = self._foot_sole_points(sole_vertex_ids)
+            if points:
+                result["foot_sole_points"] = points
+        finally:
+            # The full posed vertex set is large and nothing downstream needs it
+            # once the sole has been read off.  Freed here rather than by the
+            # first reader, so a second reader still gets to run.
+            self._posed_vertices_cache = None
         return result
 
     @staticmethod
@@ -204,6 +213,30 @@ class SmplxDataSource(DataSource):
         heights = np.asarray(template_vertices, dtype=float)[ids] @ np.asarray(sole_normal, dtype=float)
         take = max(4, int(round(band_fraction * len(ids))))
         return ids[np.argsort(heights)[:take]]
+
+    def _foot_sole_points(self, sole_vertex_ids: dict) -> dict:
+        """World positions of every sole band vertex, per frame.
+
+        The centre answers "where is the foot"; this answers "is any part of the
+        foot standing still".  They are not the same question, and using the
+        centre for both is wrong in a specific way: a foot planted through a
+        heel-strike to toe-off roll pivots about its contact patch, so the sole
+        centre translates at a fair speed while the part actually touching the
+        ground does not move at all.  On the source clip the sole centre never
+        drops below about 10 cm/s on any frame, which makes a plant test built
+        on it either vacuous or impossible to satisfy.
+        """
+        vertices = getattr(self, "_posed_vertices_cache", None)
+        if vertices is None:
+            return {}
+        try:
+            return {
+                side: np.asarray(vertices[:, ids, :], dtype=float)
+                for side, ids in sole_vertex_ids.items()
+            }
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: could not compute SMPL-X sole points: {exc}")
+            return {}
 
     def _foot_sole_centres(self, sole_vertex_ids: dict) -> dict:
         """World position of each foot's sole centre, per frame.
@@ -224,8 +257,6 @@ class SmplxDataSource(DataSource):
         except Exception as exc:  # noqa: BLE001
             print(f"Warning: could not compute SMPL-X sole centres: {exc}")
             return {}
-        finally:
-            self._posed_vertices_cache = None
         return centres
 
     def iter_frames(self):

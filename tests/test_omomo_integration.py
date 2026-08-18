@@ -69,6 +69,19 @@ class TestCaseLoader:
             raise ValueError(f"Unknown terrain type: {terrain_config['type']}")
     
     @staticmethod
+    def require_dataset(config: dict) -> None:
+        """Skip rather than fail when the OMOMO dataset is not on this machine.
+
+        The sibling tests in this file already guard their own hardcoded
+        ``/localhdd`` path this way; the config-driven cases were left to raise
+        FileNotFoundError, which reads as three broken tests on every machine
+        that does not happen to have the dataset mounted.
+        """
+        sequence_file = config.get("omomo_sequence_file")
+        if not sequence_file or not Path(sequence_file).exists():
+            pytest.skip(f"OMOMO dataset not available: {sequence_file}")
+
+    @staticmethod
     def load_omomo_data(config: dict) -> tuple:
         """Load OMOMO data source and motion data."""
         source = OmomoDataSource(
@@ -92,6 +105,7 @@ class TestOmomoSingleObject:
         
         # Load test case
         config = TestCaseLoader.load_config(test_case_path)
+        TestCaseLoader.require_dataset(config)
         print(f"\n=== Test Case: {config['name']} ===")
         print(f"Description: {config['description']}")
         

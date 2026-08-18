@@ -7,72 +7,140 @@
       "type": "smplx",
       "target_mapping": {
         "Pelvis": {
-            "robot_link": "base_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "base_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Hip": {
-            "robot_link": "l_hip_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_hip_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Hip": {
-            "robot_link": "r_hip_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_hip_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "Spine1": {
-            "robot_link": "torso_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "torso_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Knee": {
-            "robot_link": "l_calf_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_calf_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Knee": {
-            "robot_link": "r_calf_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_calf_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Ankle": {
-            "robot_link": "l_ankle_pitch_link",
-            "offset": [0.0, 0.0, 0.05]
+          "robot_link": "l_ankle_pitch_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.05
+          ]
         },
         "R_Ankle": {
-            "robot_link": "r_ankle_pitch_link",
-            "offset": [0.0, 0.0, 0.05]
+          "robot_link": "r_ankle_pitch_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.05
+          ]
         },
         "L_Foot": {
-            "robot_link": "l_ankle_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_ankle_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Foot": {
-            "robot_link": "r_ankle_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_ankle_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "Head": {
-            "robot_link": "head_pitch_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "head_pitch_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Shoulder": {
-            "robot_link": "l_shoulder_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_shoulder_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Shoulder": {
-            "robot_link": "r_shoulder_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_shoulder_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Elbow": {
-            "robot_link": "l_elbow_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_elbow_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Elbow": {
-            "robot_link": "r_elbow_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_elbow_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Wrist": {
-            "robot_link": "l_wrist_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_wrist_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Wrist": {
-            "robot_link": "r_wrist_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_wrist_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         }
       },
       "adapter_options": {
@@ -96,72 +164,140 @@
       "type": "omomo",
       "target_mapping": {
         "Pelvis": {
-            "robot_link": "base_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "base_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Hip": {
-            "robot_link": "l_hip_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_hip_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Hip": {
-            "robot_link": "r_hip_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_hip_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "Spine1": {
-            "robot_link": "torso_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "torso_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Knee": {
-            "robot_link": "l_calf_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_calf_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Knee": {
-            "robot_link": "r_calf_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_calf_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Ankle": {
-            "robot_link": "l_ankle_pitch_link",
-            "offset": [0.0, 0.0, 0.05]
+          "robot_link": "l_ankle_pitch_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.05
+          ]
         },
         "R_Ankle": {
-            "robot_link": "r_ankle_pitch_link",
-            "offset": [0.0, 0.0, 0.05]
+          "robot_link": "r_ankle_pitch_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.05
+          ]
         },
         "L_Foot": {
-            "robot_link": "l_ankle_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_ankle_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Foot": {
-            "robot_link": "r_ankle_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_ankle_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "Head": {
-            "robot_link": "head_pitch_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "head_pitch_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Shoulder": {
-            "robot_link": "l_shoulder_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_shoulder_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Shoulder": {
-            "robot_link": "r_shoulder_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_shoulder_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Elbow": {
-            "robot_link": "l_elbow_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_elbow_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Elbow": {
-            "robot_link": "r_elbow_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_elbow_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "L_Wrist": {
-            "robot_link": "l_wrist_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_wrist_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "R_Wrist": {
-            "robot_link": "r_wrist_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_wrist_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         }
       }
     },
@@ -170,72 +306,140 @@
       "type": "lafan1",
       "target_mapping": {
         "Hips": {
-            "robot_link": "base_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "base_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "LeftUpLeg": {
-            "robot_link": "l_hip_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_hip_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "RightUpLeg": {
-            "robot_link": "r_hip_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_hip_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "Spine1": {
-            "robot_link": "torso_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "torso_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "LeftLeg": {
-            "robot_link": "l_calf_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_calf_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "RightLeg": {
-            "robot_link": "r_calf_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_calf_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "LeftFoot": {
-            "robot_link": "l_ankle_pitch_link",
-            "offset": [0.0, 0.0, 0.05]
+          "robot_link": "l_ankle_pitch_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.05
+          ]
         },
         "RightFoot": {
-            "robot_link": "r_ankle_pitch_link",
-            "offset": [0.0, 0.0, 0.05]
+          "robot_link": "r_ankle_pitch_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.05
+          ]
         },
         "LeftArm": {
-            "robot_link": "l_shoulder_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_shoulder_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "LeftForeArm": {
-            "robot_link": "l_elbow_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_elbow_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "LeftHand": {
-            "robot_link": "l_wrist_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "l_wrist_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "RightArm": {
-            "robot_link": "r_shoulder_roll_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_shoulder_roll_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "RightForeArm": {
-            "robot_link": "r_elbow_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_elbow_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "RightHand": {
-            "robot_link": "r_wrist_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "r_wrist_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "Head": {
-            "robot_link": "head_pitch_link",
-            "offset": [0.0, 0.0, 0.0]
+          "robot_link": "head_pitch_link",
+          "offset": [
+            0.0,
+            0.0,
+            0.0
+          ]
         },
         "LeftToe": {
-            "robot_link": "l_ankle_roll_link",
-            "offset": [0.06, 0.0, 0.0]
+          "robot_link": "l_ankle_roll_link",
+          "offset": [
+            0.06,
+            0.0,
+            0.0
+          ]
         },
         "RightToe": {
-            "robot_link": "r_ankle_roll_link",
-            "offset": [0.06, 0.0, 0.0]
+          "robot_link": "r_ankle_roll_link",
+          "offset": [
+            0.06,
+            0.0,
+            0.0
+          ]
         }
       },
       "base_orientation": {
@@ -263,7 +467,10 @@
   },
   "retargeting": {
     "collision_detection_threshold": 0.1,
-    "solver_max_iter": {"first_frame": 50, "subsequent": 10},
+    "solver_max_iter": {
+      "first_frame": 50,
+      "subsequent": 10
+    },
     "terrain_sample_points": 100,
     "penetration_resolver": "hard_constraint",
     "foot_stabilization": {
@@ -292,6 +499,16 @@
         "*shoulder*roll*": 0.2,
         "*shoulder*yaw*": 0.2,
         "*hip*yaw*": 0.2
+      }
+    },
+    "effectors": {
+      "left": {
+        "body": "l_ankle_roll_link",
+        "role": "foot"
+      },
+      "right": {
+        "body": "r_ankle_roll_link",
+        "role": "foot"
       }
     }
   },

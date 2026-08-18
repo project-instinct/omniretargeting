@@ -114,13 +114,14 @@ class MotionData:
         # resampled is silently misaligned in time, and nothing downstream can
         # detect that: the arrays are still well formed, just describing
         # different instants.
-        centres = new_metadata.get("foot_sole_centres")
-        if isinstance(centres, dict):
-            new_metadata["foot_sole_centres"] = {
-                name: linear_interpolate(np.asarray(series), dst_indices, axis=0)
-                if getattr(series, "shape", (0,))[0] == T else series
-                for name, series in centres.items()
-            }
+        for key in ("foot_sole_centres", "foot_sole_points"):
+            series_by_name = new_metadata.get(key)
+            if isinstance(series_by_name, dict):
+                new_metadata[key] = {
+                    name: linear_interpolate(np.asarray(series), dst_indices, axis=0)
+                    if getattr(series, "shape", (0,))[0] == T else series
+                    for name, series in series_by_name.items()
+                }
 
         rotations = new_metadata.get("link_orientations")
         if isinstance(rotations, dict):

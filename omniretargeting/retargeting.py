@@ -239,6 +239,7 @@ class GenericInteractionRetargeter:
         base_position_tracking_weight: float = 0.0,
         link_orientation: Optional[Dict] = None,
         scene_contact: Optional[Dict] = None,
+        foot_penetration: Optional[Dict] = None,
         smooth_weight: float = 0.2,
     ):
         """Initialize the generic retargeter.
@@ -385,6 +386,7 @@ class GenericInteractionRetargeter:
         self._solver_stats = {"solves": 0, "retries": 0, "failures": 0}
         self._setup_link_orientation(link_orientation)
         self._setup_scene_contact(scene_contact)
+        self._setup_foot_penetration(foot_penetration)
         if self.penetration_slack_enabled and self.penetration_hard_bound <= self.penetration_soft_tolerance:
             raise ValueError(
                 f"penetration_slack.hard_bound ({self.penetration_hard_bound}) must be "
@@ -437,6 +439,47 @@ class GenericInteractionRetargeter:
                 n_replaced += 1
         if n_replaced > 0:
             print(f"Replaced {n_replaced} cylinder geom(s) with capsules for collision.")
+
+    def _build_smoothness_scale(self) -> np.ndarray:
+        """Per-coordinate factors that put the smoothness term in one unit.
+
+        ``q_a`` spans the whole of qpos when the floating base is optimised, so
+        summing its squared step mixes three base translations in metres, four
+        quaternion components that carry no unit at all, and the joint angles in
+        radians -- and then weights the sum with a single scalar.  A metre of
+        base travel and a radian of knee are not comparable quantities, and the
+        implied exchange rate between them was whatever the units happened to
+        give.
+
+        The common currency here is how far the change moves the robot.  A
+        radian at a joint sweeps a point at the end of the chain through roughly
+        one reach length, so reach converts angles to metres; a small rotation
+        of angle theta moves the quaternion's vector part by about theta/2, so
+        that group needs an extra factor of two.  Scales are expressed relative
+        to the joints, which leaves the tuned value of ``smooth_weight`` acting
+        on the joints exactly as before and changes only the base terms that
+        were mis-weighted.
+        """
+        model = self.robot_model
+        base_pos = model.body_pos[1] if model.nbody > 1 else np.zeros(3)
+        reach = 0.0
+        for body_id in range(1, model.nbody):
+            reach = max(reach, float(np.linalg.norm(model.body_pos[body_id] - base_pos)))
+        # Chains are articulated, so the sum of the offsets along one is a
+        # better reach estimate than the largest single offset; fall back to a
+        # metre when the model gives nothing useful.
+        if reach <= 1e-6:
+            reach = 1.0
+
+        scale = np.ones(self.nq_a, dtype=float)
+        if model.njnt and model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE:
+            free_qpos = np.arange(int(model.jnt_qposadr[0]), int(model.jnt_qposadr[0]) + 7)
+            for slot, qpos_index in enumerate(self.q_a_indices):
+                if qpos_index in free_qpos[:3]:
+                    scale[slot] = 1.0 / reach
+                elif qpos_index in free_qpos[3:]:
+                    scale[slot] = 2.0
+        return scale
 
     def _setup_robot_config(self):
         """Setup robot configuration parameters."""
@@ -506,6 +549,7 @@ class GenericInteractionRetargeter:
         # asks for a different pose from one frame to the next, and this is the
         # term that decides how much of that jump reaches the output.
         self.smooth_weight = float(getattr(self, "_smooth_weight", 0.2))
+        self.smooth_scale = self._build_smoothness_scale()
 
         # Per-joint regularization boost (constant across SQP iterations).
         # Modify Q_diag for specific joints (matching original MANUAL_COST logic).
@@ -828,6 +872,137 @@ class GenericInteractionRetargeter:
             residuals.append((jac, error))
 
         return residuals
+
+    def _setup_foot_penetration(self, config: Optional[Dict]) -> None:
+        """Resolve the foot non-penetration constraint.
+
+        Separate from the general terrain constraint because it is a different
+        problem.  The general one samples every collision geom against the
+        scene mesh and linearises each sample, which over blocky reconstructed
+        geometry is conservative enough to hold a flat sole eight centimetres
+        clear of the ground.  A sole is a plane resting on a locally flat patch,
+        so a handful of probe points against one plane says the same thing with
+        far better conditioning.
+
+        The sole probes are read off the foot's own collision geoms, so this
+        constrains the geometry that will actually collide in simulation rather
+        than a nominal point.
+        """
+        from omniretargeting.foot_frames import (
+            derive_sole_from_points,
+            sample_body_collision_points,
+        )
+
+        self.foot_penetration_specs: Dict[str, dict] = {}
+        self.foot_penetration_enabled = False
+        self.foot_penetration_tolerance = 0.0
+
+        if not config or not config.get("enabled", False):
+            return
+
+        effectors = config.get("effectors") or {}
+        if not effectors:
+            return
+
+        probes = int(config.get("probe_points", 6))
+        for side, spec in effectors.items():
+            body_name = spec.get("body")
+            if not body_name:
+                continue
+            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id < 0:
+                raise ValueError(
+                    f"foot_penetration effector {side!r} references body {body_name!r}, "
+                    "which is not present in the compiled model"
+                )
+            points = sample_body_collision_points(self.robot_model, body_id)
+            if points.shape[0] < 3:
+                continue
+            try:
+                sole = derive_sole_from_points(points)
+            except ValueError as exc:
+                print(f"Warning: foot_penetration could not read the sole of {body_name!r} ({exc})")
+                continue
+            # Keep the probes that sit on the sole plane; those are the ones
+            # that can reach the ground first.
+            heights = points @ sole.normal
+            band = points[np.argsort(heights)[: max(3, probes)]]
+            self.foot_penetration_specs[side] = {"body_id": int(body_id), "probes": band}
+
+        if self.foot_penetration_specs:
+            self.foot_penetration_enabled = True
+            self.foot_penetration_tolerance = float(config.get("tolerance_m", 0.001))
+
+    def _foot_penetration_rows(
+        self,
+        contact_normals: Optional[Dict[str, np.ndarray]],
+        T: Optional[np.ndarray] = None,
+    ) -> List[Tuple[np.ndarray, float]]:
+        """Half-space rows keeping each sole probe on or above the ground.
+
+        The supporting plane comes from the anchored contact normal when the
+        effector is in contact, which is what makes this work on a wall as well
+        as on a floor, and from a downward ray otherwise.  The ray is used in
+        preference to the mesh's own face normals because this scene is not
+        watertight and its winding is inconsistent, so a signed distance taken
+        from the nearest face is unreliable; a ray straight down does not care.
+        """
+        if not self.foot_penetration_enabled or self.terrain_mesh is None:
+            return []
+
+        if T is None:
+            T = self._build_transform_qdot_to_qvel_fast()
+
+        rows: List[Tuple[np.ndarray, float]] = []
+        up = np.array([0.0, 0.0, 1.0])
+        for side, spec in self.foot_penetration_specs.items():
+            body_id = spec["body_id"]
+            rotation = self.robot_data.xmat[body_id].reshape(3, 3)
+            world = self.robot_data.xpos[body_id] + spec["probes"] @ rotation.T
+
+            normal = None
+            if contact_normals is not None:
+                candidate = contact_normals.get(side)
+                if candidate is not None:
+                    candidate = np.asarray(candidate, dtype=float)
+                    if candidate.shape == (3,) and np.all(np.isfinite(candidate)):
+                        norm = np.linalg.norm(candidate)
+                        if norm > 1e-8:
+                            normal = candidate / norm
+
+            origins = world + up * 2.0
+            directions = np.tile(-up, (len(world), 1))
+            try:
+                hits, ray_ids, _ = self.terrain_mesh.ray.intersects_location(
+                    origins, directions, multiple_hits=False
+                )
+            except Exception:  # noqa: BLE001 - a ray backend may be unavailable
+                continue
+            if len(hits) == 0:
+                continue
+
+            for hit, probe_idx in zip(hits, np.asarray(ray_ids, dtype=int)):
+                point = world[probe_idx]
+                plane_normal = normal if normal is not None else up
+                offset = float(plane_normal @ (point - hit))
+                jac = self._point_jacobian_on_body(body_id, spec["probes"][probe_idx], T=T)
+                row = plane_normal @ jac
+                # plane_normal . (p + J dq - hit) >= -tolerance
+                rows.append((row, -self.foot_penetration_tolerance - offset))
+        return rows
+
+    def _point_jacobian_on_body(
+        self, body_id: int, local_offset: np.ndarray, T: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """Translational Jacobian of a body-fixed point, actuated columns."""
+        if T is None:
+            T = self._build_transform_qdot_to_qvel_fast()
+        rotation = self.robot_data.xmat[body_id].reshape(3, 3)
+        offset_world = rotation @ np.asarray(local_offset, dtype=float)
+        jac = self._calc_contact_jacobian_from_point(body_id, T=T)
+        if np.any(local_offset != 0.0):
+            jac = jac - self._skew(offset_world) @ self._body_angular_jacobian_full(body_id, T=T)
+        return jac[:, self.q_a_indices]
 
     def _body_angular_jacobian_full(self, body_id: int, T: Optional[np.ndarray] = None) -> np.ndarray:
         """World angular Jacobian of a body, in qpos coordinates, all columns."""
@@ -1255,7 +1430,7 @@ class GenericInteractionRetargeter:
         #   ||sqrt(W) (lap0 + J_L dqa - target)||^2          (Laplacian)
         #   + lambda_bone ||res + J_bone dqa||^2             (bone prior)
         #   + ||sqrt(Q_diag) (dqa + q_a)||^2                 (joint regularization)
-        #   + smooth_weight ||dqa - dqa_smooth||^2           (temporal smoothness)
+        #   + smooth_weight ||S (dqa - dqa_smooth)||^2       (temporal smoothness)
         #   + sum_i w_orient (dqa[i] + q[i] - target[i])^2   (base orientation)
         #   + (w_slack/2) sum((span * s_unit)^2)             (penetration slack)
         n = self.nq_a
@@ -1265,7 +1440,20 @@ class GenericInteractionRetargeter:
         target_lap_vec = target_laplacian.reshape(-1)
         r0 = lap0_vec - target_lap_vec
 
-        weights = np.ones(len(vertices)) * 10  # Laplacian weights (matching original laplacian_weights = 10)
+        # Laplacian weights (the original used a flat 10 on every vertex).
+        #
+        # The environment rows are normalised by how many of them there are.
+        # Under the flat weight, doubling terrain_sample_points doubled the
+        # total pull of the mesh-preservation term while every other task kept
+        # its weight, so a knob that should only control how finely the scene is
+        # described was quietly changing the relative priority of the whole
+        # objective: going from 100 to 200 samples moved the base by a median of
+        # 3.3 cm and up to 9.8 cm on the same clip.  Held against the robot's own
+        # vertex count, the scene contributes as much to mesh preservation as
+        # the body does however densely it happens to be sampled.
+        weights = np.ones(len(vertices)) * 10.0
+        if num_env_points > 0 and num_robot_points > 0:
+            weights[num_robot_points:] *= num_robot_points / float(num_env_points)
         w3 = np.repeat(weights, 3)
         Jw = J_L.multiply(w3[:, None])  # = W @ J_L (W diagonal)
 
@@ -1294,8 +1482,9 @@ class GenericInteractionRetargeter:
         dqa_smooth = None
         if q_last is not None:
             dqa_smooth = q_last[self.q_a_indices] - q_a_current
-            P_diag_extra = P_diag_extra + 2.0 * self.smooth_weight
-            c = c - 2.0 * self.smooth_weight * dqa_smooth
+            smooth_diag = self.smooth_weight * (self.smooth_scale ** 2)
+            P_diag_extra = P_diag_extra + 2.0 * smooth_diag
+            c = c - 2.0 * smooth_diag * dqa_smooth
 
         # Base orientation tracking cost: keep the base orientation close to
         # the target estimated from source target positions.
@@ -1388,6 +1577,7 @@ class GenericInteractionRetargeter:
         slack_rows: List[Tuple[np.ndarray, float, float]] = []
         if self.hard_penetration_constraint:
             hard_rows, slack_rows = self._compute_penetration_constraints(T=T_qvel)
+        hard_rows = hard_rows + self._foot_penetration_rows(contact_normals, T=T_qvel)
 
         # Extend variables with unit slacks s_unit in [0, 1] (slack s = span * s_unit)
         m = len(slack_rows)
@@ -1448,7 +1638,9 @@ class GenericInteractionRetargeter:
             cost += self.lambda_bone * float(rb @ rb)
         cost += float(self.Q_diag_modified @ ((dqa_opt + q_a_current) ** 2))
         if dqa_smooth is not None:
-            cost += self.smooth_weight * float(((dqa_opt - dqa_smooth) ** 2).sum())
+            cost += self.smooth_weight * float(
+                ((self.smooth_scale * (dqa_opt - dqa_smooth)) ** 2).sum()
+            )
         for qa_idx, diff in orient_terms:
             cost += orientation_weight * (dqa_opt[qa_idx] + diff) ** 2
         for qa_idx, diff in base_pos_terms:

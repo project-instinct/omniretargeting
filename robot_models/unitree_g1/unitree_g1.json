@@ -719,7 +719,7 @@
     "penetration_resolver": "xyz_nudge",
     "foot_stabilization": {
       "enabled": true,
-      "clearance": 0.01,
+      "clearance": 0.005,
       "surface_clearance": 0.005,
       "contact_clearance": 0.04,
       "contact_vertical_speed": 0.18,
@@ -765,6 +765,33 @@
     "smooth_weight": 4.0,
     "skeleton_matching": {
       "enabled": true
+    },
+    "foot_penetration": {
+      "enabled": true,
+      "tolerance_m": 0.001,
+      "probe_points": 6,
+      "effectors": {
+        "left": {
+          "body": "left_ankle_roll_link"
+        },
+        "right": {
+          "body": "right_ankle_roll_link"
+        }
+      }
+    },
+    "effectors": {
+      "left": {
+        "body": "left_ankle_roll_link",
+        "role": "foot"
+      },
+      "right": {
+        "body": "right_ankle_roll_link",
+        "role": "foot"
+      },
+      "torso": {
+        "body": "torso_link",
+        "role": "torso"
+      }
     }
   },
   "default_joint_positions": {

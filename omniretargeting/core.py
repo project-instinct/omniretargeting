@@ -309,6 +309,7 @@ class OmniRetargeter:
             terrain_sample_seed=self.retargeting_config.get("terrain_sample_seed"),
             link_orientation=self.retargeting_config.get("link_orientation"),
             scene_contact=self.retargeting_config.get("scene_contact"),
+            foot_penetration=self.retargeting_config.get("foot_penetration"),
             smooth_weight=float(self.retargeting_config.get("smooth_weight", 0.2)),
             source_target_names=self.valid_source_target_names,
             replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
@@ -759,6 +760,13 @@ class OmniRetargeter:
         leg_length = self._source_leg_length(positions, names, scaled_centres)
         effector_lengths = self._source_effector_lengths(motion_data, scale)
 
+        clouds = motion_data.metadata.get("foot_sole_points") or {}
+        scaled_clouds = {
+            side: np.asarray(pts, dtype=float) * scale
+            for side, pts in clouds.items()
+            if side in scaled_centres
+        }
+
         targets, normals, weights, stats = infer_contact_targets(
             scaled_centres,
             terrain,
@@ -766,6 +774,7 @@ class OmniRetargeter:
             spec,
             effector_lengths=effector_lengths,
             leg_length=leg_length,
+            effector_clouds=scaled_clouds or None,
         )
         motion_data.metadata["contact_targets"] = targets
         motion_data.metadata["contact_normals"] = normals
@@ -971,6 +980,19 @@ class OmniRetargeter:
             "xy_correction_gain": 1.0,
             "xy_smoothing_window": 5,
             "z_smoothing_window": 5,
+            # Seconds, not frames: the same motion resampled to a different rate
+            # should get the same lift curve.  Falls back to z_smoothing_window
+            # when the framerate is not known.
+            "lift_smoothing_time": 0.25,
+            # Ceiling on the lift, as a fraction of the robot's own leg.  The
+            # lift is there to clear a residue of a few millimetres left by the
+            # solve; a demand far beyond that is not penetration to be cleared
+            # but a frame the solver got wrong, usually because the motion asks
+            # the robot to reach somewhere its legs do not go.  Absorbing it
+            # silently floats the whole body off the source, and the smoothing
+            # spreads that across neighbouring frames.  Better to clamp, say so,
+            # and let the clip be judged.
+            "max_lift_fraction": 0.15,
             "contact_point_height_band": 0.01,
             "max_xy_correction": 0.08,
             "max_surface_correction": 0.08,
@@ -1020,18 +1042,10 @@ class OmniRetargeter:
         max_xy_correction = float(cfg["max_xy_correction"])
         vertical_speed_threshold = float(cfg["contact_vertical_speed"])
         contact_clearance = float(cfg["contact_clearance"])
-
-        positions, min_z = self._compute_foot_contact_series(stabilized, foot_specs, contact_band)
-        terrain_heights = self._compute_terrain_heights(terrain_mesh, positions[:, :, :2])
-        clearances = min_z - terrain_heights
-
-        lift_clearances = np.where(~wall_contact_mask, clearances, np.inf)
-        min_clearance = np.min(lift_clearances, axis=1)
-        base_lift = np.maximum(clearance_target - min_clearance, 0.0)
-        base_lift[~np.isfinite(min_clearance)] = 0.0
-        base_lift_smoothed = self._smooth_signal(base_lift, z_window)
-        base_lift = np.maximum(base_lift, base_lift_smoothed)
-        stabilized[:, 2] += base_lift
+        if framerate and framerate > 0:
+            lift_window = max(2.0, float(cfg["lift_smoothing_time"]) * float(framerate))
+        else:
+            lift_window = float(z_window)
 
         positions, min_z = self._compute_foot_contact_series(stabilized, foot_specs, contact_band)
         terrain_heights = self._compute_terrain_heights(terrain_mesh, positions[:, :, :2])
@@ -1070,26 +1084,60 @@ class OmniRetargeter:
                 corrections[oversized] *= (max_xy_correction / norms[oversized])[:, None]
             stabilized[:, :2] += corrections
 
-            positions, min_z = self._compute_foot_contact_series(stabilized, foot_specs, contact_band)
-            terrain_heights = self._compute_terrain_heights(terrain_mesh, positions[:, :, :2])
-            clearances = min_z - terrain_heights
-            lift_clearances = np.where(~wall_contact_mask, clearances, np.inf)
-            min_clearance = np.min(lift_clearances, axis=1)
-            residual_lift = np.maximum(clearance_target - min_clearance, 0.0)
-            residual_lift[~np.isfinite(min_clearance)] = 0.0
-            stabilized[:, 2] += residual_lift
-
-        stabilized, _ = self._apply_surface_collision_corrections(
+        stabilized, wall_contact_mask = self._apply_surface_collision_corrections(
             stabilized,
             terrain_mesh,
             foot_specs,
             cfg,
         )
 
+        # Lifting the body out of the ground is done once, here, after every
+        # correction that could move a sole in x, y or along a surface normal.
+        # An earlier pass followed by top-ups had to re-measure and re-add after
+        # each of those corrections, and each of those additions was a raw
+        # per-frame number: together they put a step of vertical noise into the
+        # base that the retargeting itself never produced.
+        #
+        # Measured once at the final pose, the requirement is exact.  A vertical
+        # translation moves every probe by the same amount and a downward ray
+        # from the raised probe lands on the same triangle, so clearance after a
+        # lift of l is clearance before plus l -- no iteration needed.
+        probe_clearances = self._foot_support_clearances(stabilized, terrain_mesh, foot_specs)
+        # A wall contact is exempted from being lifted toward its target
+        # clearance, since lifting does not move a foot away from a vertical
+        # surface.  It is not exempted from being lifted out of the floor:
+        # a foot may be against a wall and through the ground at the same time,
+        # and leaving it there is what let penetration survive this pass.
+        lift_clearances = np.where(~wall_contact_mask, probe_clearances, np.minimum(probe_clearances, 0.0))
+        min_clearance = np.min(lift_clearances, axis=1)
+        required_lift = np.maximum(clearance_target - min_clearance, 0.0)
+        required_lift[~np.isfinite(min_clearance)] = 0.0
+
+        max_lift = float(cfg["max_lift_fraction"]) * self._robot_leg_length()
+        beyond = required_lift > max_lift
+        if max_lift > 0.0 and np.any(beyond):
+            frames = np.flatnonzero(beyond)
+            print(
+                f"Foot stabilization: {len(frames)} frame(s) asked to be lifted more than "
+                f"{max_lift * 100:.1f} cm (up to {required_lift.max() * 100:.1f} cm at frame "
+                f"{int(np.argmax(required_lift))}); clamped.  These frames are left penetrating: "
+                "the solve did not reach the surface there, and lifting the body far enough to "
+                "clear it would move the whole motion off the source instead.  Frames: "
+                f"{frames[:20].tolist()}{' ...' if len(frames) > 20 else ''}"
+            )
+            required_lift = np.minimum(required_lift, max_lift)
+
+        base_lift = self._minimal_smooth_lift(required_lift, lift_window)
+        stabilized[:, 2] += base_lift
+
         if np.any(base_lift > 0) or np.any(active):
+            lifted = required_lift > 1e-6
             print(
                 "Applied foot stabilization: "
-                f"max base lift={base_lift.max():.4f}m, "
+                f"max base lift={base_lift.max():.4f}m "
+                f"(required {required_lift.max():.4f}m on "
+                f"{int(lifted.sum())}/{len(required_lift)} frames, "
+                f"median where needed {np.median(required_lift[lifted]) if lifted.any() else 0.0:.4f}m), "
                 f"contact frames={int(np.sum(contact_mask))}"
             )
 
@@ -1104,6 +1152,29 @@ class OmniRetargeter:
                 continue
             sample_points = self._collect_body_contact_points(body_id)
             if sample_points.size == 0:
+                # The name search can land on a link that carries no collision
+                # geometry at all -- on the G1 it matches the ankle pitch link,
+                # which has none, while the sole cylinders live one link further
+                # down on the ankle roll link.  Falling back to a single point
+                # at that link's origin silently reduces the whole stabilisation
+                # to one notional point and lets the actual sole pass through
+                # the ground.  Walk down the chain to the nearest descendant
+                # that has something to stand on.
+                descendant = self._nearest_collision_descendant(body_id)
+                if descendant is not None and descendant != body_id:
+                    resolved = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, descendant)
+                    original = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+                    print(
+                        f"[foot_stabilization] {side}: {original!r} carries no collision geometry; "
+                        f"using {resolved!r} instead"
+                    )
+                    body_id = descendant
+                    sample_points = self._collect_body_contact_points(body_id)
+            if sample_points.size == 0:
+                print(
+                    f"[foot_stabilization] {side}: no collision geometry found on the foot chain; "
+                    "stabilisation will act on the link origin only"
+                )
                 sample_points = np.zeros((1, 3), dtype=float)
             specs.append({
                 "side": side,
@@ -1113,6 +1184,103 @@ class OmniRetargeter:
                 "collision_points": self._select_collision_probe_points(sample_points),
             })
         return specs
+
+    def _declared_effector_bodies(self, role: Optional[str] = None) -> Dict[str, str]:
+        """Foot and torso bodies as the profile declares them.
+
+        Reads the shared ``retargeting.effectors`` block first, then falls back
+        to whatever the individual end-effector tasks named, so a profile that
+        predates the shared block still resolves without a keyword search.
+        """
+        shared = self.retargeting_config.get("effectors") or {}
+        declared: Dict[str, str] = {}
+        for side, entry in shared.items():
+            if not isinstance(entry, dict):
+                continue
+            if role is not None and entry.get("role", "foot") != role:
+                continue
+            if entry.get("body"):
+                declared[side] = entry["body"]
+        if declared:
+            return declared
+
+        for task in ("foot_penetration", "scene_contact", "link_orientation"):
+            effectors = (self.retargeting_config.get(task) or {}).get("effectors") or {}
+            for side, entry in effectors.items():
+                if not isinstance(entry, dict) or not entry.get("body"):
+                    continue
+                if role == "foot" and side not in ("left", "right"):
+                    continue
+                declared.setdefault(side, entry["body"])
+            if declared:
+                return declared
+        return declared
+
+    def _validate_foot_sides(self, resolved: Dict[str, int], guessed: bool) -> None:
+        """Refuse a foot assignment that is obviously wrong.
+
+        A keyword search over body names is a guess, and a wrong guess here is
+        silent and severe: on one robot in this repository searching for "l_"
+        matches the "ll_l" inside `r_ankle_roll_link`, so the left foot resolved
+        to the right leg and nothing downstream could tell. Better to stop and
+        ask for a declaration than to retarget onto the wrong leg.
+        """
+        names = {
+            side: mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            for side, body_id in resolved.items()
+            if body_id is not None and body_id >= 0
+        }
+        if len(names) < 2:
+            return
+        if names.get("left") == names.get("right"):
+            raise ValueError(
+                f"both feet resolved to the same body {names.get('left')!r}; "
+                "declare retargeting.effectors explicitly"
+            )
+        # A body carrying the other side's marker is the failure mode worth
+        # catching; a name carrying neither is fine and common.
+        for side, other in (("left", "right"), ("right", "left")):
+            name = (names.get(side) or "").lower()
+            claims_other = name.startswith(f"{other}_") or name.startswith(f"{other[0]}_")
+            claims_own = name.startswith(f"{side}_") or name.startswith(f"{side[0]}_")
+            if claims_other and not claims_own:
+                message = (
+                    f"the {side} foot resolved to {names[side]!r}, which names the {other} side"
+                )
+                if guessed:
+                    raise ValueError(
+                        message + "; declare retargeting.effectors explicitly rather than "
+                        "relying on a name search"
+                    )
+                print(f"Warning: {message}")
+
+    def _nearest_collision_descendant(self, body_id: int) -> Optional[int]:
+        """Closest body at or below ``body_id`` that carries collision geometry."""
+        def has_collision(bid: int) -> bool:
+            return any(
+                int(self.robot_model.geom_bodyid[g]) == bid
+                and (self.robot_model.geom_contype[g] or self.robot_model.geom_conaffinity[g])
+                for g in range(self.robot_model.ngeom)
+            )
+
+        if has_collision(body_id):
+            return body_id
+        frontier = [body_id]
+        seen = {body_id}
+        while frontier:
+            children = [
+                b
+                for b in range(self.robot_model.nbody)
+                if int(self.robot_model.body_parentid[b]) in frontier and b not in seen
+            ]
+            if not children:
+                return None
+            for child in children:
+                if has_collision(child):
+                    return child
+            seen.update(children)
+            frontier = children
+        return None
 
     def _resolve_foot_body_ids(self, cfg: Dict[str, Any]) -> Dict[str, int]:
         """Resolve left/right foot body ids from explicit config or robot body name search.
@@ -1130,7 +1298,16 @@ class OmniRetargeter:
                   right: "right_ankle_roll_link"
         """
         resolved = {}
+        # Prefer a declaration over a search.  The same foot body is already
+        # named by every end-effector task in the profile, and a keyword search
+        # is only ever a guess: on this robot "left" plus "ankle" matches the
+        # ankle pitch link, which carries no collision geometry at all, so the
+        # search silently produced a foot that could not be stood on.  Other
+        # robots here name the same part `ankle_link`, `foot_link` and
+        # `l_ankle_roll_link`, so no keyword set covers them.
         explicit = dict(cfg.get("body_names", {}) or {})
+        if not explicit:
+            explicit = self._declared_effector_bodies(role="foot")
 
         for side in ("left", "right"):
             body_id = -1
@@ -1146,6 +1323,7 @@ class OmniRetargeter:
 
             resolved[side] = body_id
 
+        self._validate_foot_sides(resolved, guessed=not explicit)
         return resolved
 
     def _body_name_to_id(self, body_name: str) -> int:
@@ -1351,6 +1529,56 @@ class OmniRetargeter:
                 heights[frame_idx, foot_idx] = compute_mesh_height_at_point(terrain_mesh, float(x), float(y))
         return heights
 
+    def _foot_support_clearances(
+        self,
+        motion: np.ndarray,
+        terrain_mesh: trimesh.Trimesh,
+        foot_specs: List[Dict[str, Any]],
+    ) -> np.ndarray:
+        """Smallest signed clearance of any sole point above the ground below it.
+
+        Sampling the ground at one representative point per foot and comparing
+        it against the lowest sole point mixes two different places: on blocky
+        or sloped terrain the lowest point of the sole can sit over a higher
+        piece of ground than the representative one, which reads as positive
+        clearance while that point is already through the surface.  Each probe
+        is therefore tested against the ground directly beneath itself.
+
+        A downward ray is used rather than a signed distance to the nearest
+        face because scanned scenes are rarely watertight and their winding is
+        often inconsistent, which makes face normals an unreliable guide to
+        which side of the surface a point is on.  A ray straight down does not
+        depend on that.
+        """
+        num_frames = len(motion)
+        clearances = np.full((num_frames, len(foot_specs)), np.inf)
+        down = np.array([0.0, 0.0, -1.0])
+        lift = float(terrain_mesh.bounds[1][2] - terrain_mesh.bounds[0][2]) + 1.0
+
+        for frame_idx, qpos in enumerate(motion):
+            self.robot_data.qpos[:] = qpos
+            mujoco.mj_forward(self.robot_model, self.robot_data)
+            for foot_idx, spec in enumerate(foot_specs):
+                body_id = spec["body_id"]
+                rot = np.asarray(self.robot_data.xmat[body_id], dtype=float).reshape(3, 3)
+                points = spec["sample_points"] @ rot.T + np.asarray(
+                    self.robot_data.xpos[body_id], dtype=float
+                )
+                origins = points + np.array([0.0, 0.0, lift])
+                try:
+                    hits, ray_ids, _ = terrain_mesh.ray.intersects_location(
+                        origins, np.tile(down, (len(points), 1)), multiple_hits=False
+                    )
+                except Exception:  # noqa: BLE001 - ray backend unavailable
+                    continue
+                if len(hits) == 0:
+                    continue
+                ray_ids = np.asarray(ray_ids, dtype=int)
+                clearances[frame_idx, foot_idx] = float(
+                    np.min(points[ray_ids, 2] - hits[:, 2])
+                )
+        return clearances
+
     def _apply_surface_collision_corrections(
         self,
         motion: np.ndarray,
@@ -1481,6 +1709,80 @@ class OmniRetargeter:
         if np.linalg.norm(correction) < 1e-9:
             return None, wall_contact
         return correction, wall_contact
+
+    @staticmethod
+    def _minimal_smooth_lift(required: np.ndarray, window: float) -> np.ndarray:
+        """Smoothest non-negative lift that is nowhere below what is required.
+
+        Solves
+
+            min  sum (l[t-1] - 2 l[t] + l[t+1])^2  +  mu * sum l[t]^2
+            s.t. l >= required
+
+        The inequality is what makes this usable as a penetration fix: any
+        low-pass of the requirement, causal or not, can dip below it and put the
+        sole back through the surface, so smoothing has to be constrained rather
+        than applied and hoped over.  The mu term pulls the lift to zero wherever
+        smoothness does not demand otherwise, which is what keeps the body on the
+        source trajectory -- holding a whole contact interval at its maximum, or
+        carrying a lift through frames that never needed one, is a deviation the
+        source never asked for.
+
+        mu is set from the window because a second-difference smoother responds
+        over a length of roughly mu^(-1/4); window is in frames, so callers that
+        care about framerate invariance should derive it from a time constant.
+        """
+        required = np.asarray(required, dtype=float).reshape(-1)
+        required = np.maximum(np.nan_to_num(required, nan=0.0, posinf=0.0, neginf=0.0), 0.0)
+        num_frames = required.shape[0]
+        if num_frames < 3 or not np.any(required > 0.0) or window <= 1.0:
+            return required
+
+        import clarabel
+        from scipy import sparse
+
+        # Second difference operator, rows t = 1 .. T-2.
+        rows = num_frames - 2
+        diag = np.ones(rows)
+        second_difference = sparse.diags(
+            [diag, -2.0 * diag, diag], offsets=[0, 1, 2], shape=(rows, num_frames)
+        ).tocsc()
+        mu = float(window) ** -4.0
+        # Objective is (1/2) l' P l with P = 2 (D'D + mu I).
+        P = 2.0 * (second_difference.T @ second_difference + mu * sparse.eye(num_frames))
+        q = np.zeros(num_frames)
+        # -l <= -required, and l <= max(required).  The upper bound is there
+        # because a fourth-order smoother rings: fitting a cluster of large
+        # requirements makes it overshoot slightly past the largest of them, and
+        # lifting the body higher than the motion ever needed is exactly the
+        # deviation from the source this formulation is trying to avoid.  The
+        # bound costs nothing in feasibility, since l = required satisfies it.
+        ceiling = float(required.max())
+        A = sparse.vstack(
+            [-sparse.eye(num_frames), sparse.eye(num_frames)], format="csc"
+        )
+        b = np.concatenate([-required, np.full(num_frames, ceiling)])
+
+        settings = clarabel.DefaultSettings()
+        settings.verbose = False
+        try:
+            solver = clarabel.DefaultSolver(
+                sparse.triu(P).tocsc(), q, A, b, [clarabel.NonnegativeConeT(2 * num_frames)], settings
+            )
+            solution = solver.solve()
+        except Exception as exc:  # pragma: no cover - solver availability
+            print(f"Warning: lift smoothing failed ({exc}); using the raw requirement")
+            return required
+        if solution.status not in (
+            clarabel.SolverStatus.Solved,
+            clarabel.SolverStatus.AlmostSolved,
+        ):
+            print(f"Warning: lift smoothing did not solve ({solution.status}); using the raw requirement")
+            return required
+
+        # The solver satisfies the constraint to a tolerance, and a tolerance is
+        # a penetration.  Clamp back onto the feasible side.
+        return np.clip(np.asarray(solution.x, dtype=float), required, ceiling)
 
     def _smooth_signal(self, values: np.ndarray, window: int) -> np.ndarray:
         """Apply edge-padded moving average smoothing to 1D or 2D arrays."""

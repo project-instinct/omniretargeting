@@ -102,9 +102,28 @@ class ContactSpec:
     # the subject.
     gap_floor: float = 0.005
 
-    # Fractions of sqrt(g * leg_length).
-    enter_speed_fraction: float = 0.19
-    leave_speed_fraction: float = 0.35
+    # Fractions of effector_length / sqrt(leg_length / g): how far the effector
+    # may travel, as a share of its own length, over the gravitational time of
+    # the leg.
+    #
+    # This used to be a fraction of sqrt(g * leg_length), the Froude scale of
+    # the gait.  Froude 0.19 is a sensible walking speed and a hopeless plant
+    # test: on a 0.97 m leg it admits 0.59 m/s, which lets the sole travel 85
+    # percent of its own length per gravitational time and still count as
+    # planted.  Measured on the source clip that gate marked frames whose sole
+    # was moving at a median of 25 cm/s as contact, with up to 13 cm of net
+    # travel inside a single "contact" interval.  Anchoring a target to a foot
+    # that is visibly still moving pulls the robot away from the source for the
+    # rest of the interval.
+    #
+    # The scale here is the one the question actually asks about: a foot is
+    # planted when it is not moving relative to its own size.
+    # Chosen by how far the source itself drifts away from an anchor placed at
+    # the start of an interval the gate admits: 1.6 cm at 0.20, which sits
+    # inside the contact task's own normal tolerance, against 3-4 cm at 0.30 and
+    # up to 13 cm under the gait-scale gate this replaced.
+    enter_speed_fraction: float = 0.20
+    leave_speed_fraction: float = 0.40
 
     min_frames: int = 3
     anchor_frames: int = 3
@@ -180,6 +199,7 @@ def infer_contact_targets(
     spec: Optional[ContactSpec] = None,
     effector_lengths: Optional[Dict[str, float]] = None,
     leg_length: Optional[float] = None,
+    effector_clouds: Optional[Dict[str, np.ndarray]] = None,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], dict]:
     """Anchor every contact interval of every effector to the scene.
 
@@ -209,14 +229,21 @@ def infer_contact_targets(
     weights: Dict[str, np.ndarray] = {}
     stats: dict = {}
 
-    speed_scale = (
-        float(np.sqrt(GRAVITY * leg_length))
-        if leg_length and leg_length > 1e-6
-        else None
+    # Gravitational time of the leg: the clock a plant test is measured against.
+    time_scale = (
+        float(np.sqrt(leg_length / GRAVITY)) if leg_length and leg_length > 1e-6 else None
     )
 
     for name, points in effector_points.items():
         points = np.asarray(points, dtype=float)
+        effector_length = (
+            float(effector_lengths[name])
+            if effector_lengths and effector_lengths.get(name)
+            else (float(leg_length) if leg_length else None)
+        )
+        speed_scale = (
+            effector_length / time_scale if time_scale and effector_length else None
+        )
         n_frames = len(points)
         target = np.full((n_frames, 3), np.nan)
         normal = np.full((n_frames, 3), np.nan)
@@ -229,7 +256,18 @@ def infer_contact_targets(
         # own leg.  Per-sample displacement would change under resampling of the
         # same continuous motion; this does not.
         if framerate and speed_scale:
-            step = np.linalg.norm(np.diff(points, axis=0), axis=1) * float(framerate)
+            # The speed of the slowest point on the effector, not the speed of
+            # its centre.  A foot rolling from heel to toe is planted the whole
+            # time, and its centre is moving the whole time; whichever point is
+            # against the ground is the one that is standing still, and taking
+            # the minimum finds it without having to know which one it is.
+            cloud = effector_clouds.get(name) if effector_clouds else None
+            tracked = (
+                np.asarray(cloud, dtype=float)
+                if cloud is not None and np.asarray(cloud).shape[0] == n_frames
+                else points[:, None, :]
+            )
+            step = np.linalg.norm(np.diff(tracked, axis=0), axis=-1).min(axis=-1) * float(framerate)
             speed = np.concatenate(([step[0] if len(step) else 0.0], step)) / speed_scale
             slow_enter = speed < spec.enter_speed_fraction
             slow_leave = speed > spec.leave_speed_fraction
@@ -249,16 +287,11 @@ def infer_contact_targets(
         )
         gap = np.maximum(distance - bias, 0.0)
 
-        reference = None
-        if effector_lengths and effector_lengths.get(name):
-            reference = float(effector_lengths[name])
-        elif leg_length:
-            reference = float(leg_length)
         enter_gap = spec.gap_floor + (
-            spec.enter_gap_fraction * reference if reference else 0.0
+            spec.enter_gap_fraction * effector_length if effector_length else 0.0
         )
         leave_gap = spec.gap_floor + (
-            spec.leave_gap_fraction * reference if reference else 0.0
+            spec.leave_gap_fraction * effector_length if effector_length else 0.0
         )
 
         state = hysteretic_state(
@@ -311,6 +344,14 @@ def infer_contact_targets(
             "float_bias": bias,
             "enter_gap": enter_gap,
             "leave_gap": leave_gap,
+            # In metres per second, so a gate that admits a moving foot is
+            # visible without rederiving the normalisation by hand.
+            "enter_speed": (
+                spec.enter_speed_fraction * speed_scale if speed_scale else float("inf")
+            ),
+            "leave_speed": (
+                spec.leave_speed_fraction * speed_scale if speed_scale else float("inf")
+            ),
             "median_confidence": float(np.median(weight[weight > 0])) if np.any(weight > 0) else 0.0,
         }
 

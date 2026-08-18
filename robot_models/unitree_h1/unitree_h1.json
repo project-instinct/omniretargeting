@@ -536,7 +536,10 @@
   },
   "retargeting": {
     "collision_detection_threshold": 0.1,
-    "solver_max_iter": {"first_frame": 50, "subsequent": 10},
+    "solver_max_iter": {
+      "first_frame": 50,
+      "subsequent": 10
+    },
     "terrain_sample_points": 120,
     "penetration_resolver": "hard_constraint",
     "foot_stabilization": {
@@ -565,6 +568,20 @@
         "*shoulder*roll*": 0.2,
         "*shoulder*yaw*": 0.2,
         "*hip*yaw*": 0.2
+      }
+    },
+    "effectors": {
+      "left": {
+        "body": "left_ankle_link",
+        "role": "foot"
+      },
+      "right": {
+        "body": "right_ankle_link",
+        "role": "foot"
+      },
+      "torso": {
+        "body": "torso_link",
+        "role": "torso"
       }
     }
   },
