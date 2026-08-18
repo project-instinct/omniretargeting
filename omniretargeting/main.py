@@ -10,6 +10,7 @@ import time
 from omniretargeting import OmniRetargeter
 from omniretargeting.robot_config import load_robot_config
 from omniretargeting.utils import load_smplx_trajectory, normalize_retargeted_output_path
+from omniretargeting.contact import stack_contact_tasks
 
 import contextlib
 import shutil
@@ -368,6 +369,42 @@ def create_flat_terrain(size=10.0):
     mesh.apply_translation([0, 0, -0.05])
     return mesh
 
+def extract_body_base_pose(urdf_path, trajectory, body_name):
+    """Extract a robot body's world pose from a MuJoCo qpos trajectory."""
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_path(str(urdf_path))
+    data = mujoco.MjData(model)
+    body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+    if body_id < 0:
+        raise ValueError(f"Body '{body_name}' not found in robot model: {urdf_path}")
+
+    base_pos = np.zeros((len(trajectory), 3), dtype=trajectory.dtype)
+    base_quat = np.zeros((len(trajectory), 4), dtype=trajectory.dtype)
+    for frame_idx, qpos in enumerate(trajectory):
+        data.qpos[:] = qpos
+        mujoco.mj_forward(model, data)
+        base_pos[frame_idx] = data.xpos[body_id]
+        base_quat[frame_idx] = data.xquat[body_id]
+
+    return base_pos, base_quat
+
+def extract_omomo_object_pose(motion_path, num_frames):
+    """Extract OMOMO object world pose from the source qpos if present."""
+    motion_data = np.load(motion_path, allow_pickle=True)
+    if "qpos" not in motion_data:
+        return None
+
+    qpos = motion_data["qpos"]
+    if qpos.ndim != 2 or qpos.shape[0] < num_frames or qpos.shape[1] < 43:
+        return None
+
+    # OMOMO stores the object rotation in the opposite convention from MuJoCo/Viser.
+    object_quat = np.array(qpos[:num_frames, 36:40], copy=True)
+    object_quat[:, 1:] *= -1.0
+    object_pos = qpos[:num_frames, 40:43]
+    return object_pos, object_quat
+
 def main():
     parser = argparse.ArgumentParser(description="OmniRetargeting CLI")
     parser.add_argument(
@@ -389,6 +426,8 @@ def main():
     parser.add_argument("--vis", action="store_true", help="Visualize the retargeted motion")
     parser.add_argument("--save-video", dest="save_video", default=None, help="Save retargeted motion video to file (e.g. /tmp/out.mp4). Uses offscreen rendering (set MUJOCO_GL=egl for headless).")
     parser.add_argument("--framerate", type=float, default=None, help="Framerate of the motion (optional, defaults to 30.0 or auto-detected)")
+    parser.add_argument("--output-base-link", default="torso_link",
+                        help="Robot body link used for saved base_pos_w/base_quat_w.")
     parser.add_argument("--replace-cylinders-with-capsules", dest="replace_cylinders_with_capsules", action="store_true", default=False,
                         help="Replace cylinder collision geoms with capsules to match IsaacLab/PhysX convention.")
     parser.add_argument("--penetration-resolver", choices=["hard_constraint", "xyz_nudge"], default=None,
@@ -460,10 +499,16 @@ def main():
     try:
         # Load SMPLX trajectory
         print(f"Loading SMPLX trajectory from {args.smplx_motion}...")
-        smplx_trajectory, smplx_orientations = load_smplx_trajectory(
+        contact_priority_enabled = bool(
+            (retargeting.get("end_effector_priority", {}) or {}).get("enabled", False)
+        )
+        loaded_motion = load_smplx_trajectory(
             smplx_file=Path(args.smplx_motion),
             smplx_model_directory=args.smplx_model_dir,
+            return_end_effectors=contact_priority_enabled,
         )
+        smplx_trajectory, smplx_orientations = loaded_motion[:2]
+        end_effector_markers = loaded_motion[2] if contact_priority_enabled else None
         
         # Try to detect framerate from SMPLX file if not provided
         framerate = args.framerate
@@ -480,6 +525,9 @@ def main():
                     elif "mocap_frame_rate" in smplx_data:
                         framerate = float(smplx_data["mocap_frame_rate"])
                         print(f"Detected mocap_frame_rate from file: {framerate}")
+                    elif "fps" in smplx_data:
+                        framerate = float(smplx_data["fps"])
+                        print(f"Detected fps from file: {framerate}")
             except Exception:
                 pass
         
@@ -509,11 +557,15 @@ def main():
         # Perform retargeting
         print("Retargeting motion...")
         enable_terrain_scaling = bool(args.output_scaled_terrain)
-        terrain_scale, retargeted_motion = retargeter.retarget_motion(
-            smplx_trajectory,
+        retarget_motion_kwargs = dict(
             framerate=framerate,
             visualize_trajectory=args.vis,
             enable_terrain_scaling=enable_terrain_scaling,
+        )
+        if end_effector_markers is not None:
+            retarget_motion_kwargs["end_effector_markers"] = end_effector_markers
+        terrain_scale, retargeted_motion = retargeter.retarget_motion(
+            smplx_trajectory, **retarget_motion_kwargs
         )
 
         if args.output_scaled_terrain:
@@ -528,15 +580,19 @@ def main():
         print(f"Saving output to {args.output}...")
         
         # Extract data for saving
-        # retargeted_motion shape: (T, 7 + DOF) -> [pos(3), quat(4), joints(DOF)]
+        # retargeted_motion shape: (T, 7 + DOF) -> [root pos(3), root quat(4), joints(DOF)]
         
         # Get joint names from robot model
         joint_names = retargeter.get_joint_names()
         
-        # Extract components
-        base_pos = retargeted_motion[:, :3]
-        base_quat = retargeted_motion[:, 3:7] # wxyz
+        # Extract components. The MuJoCo qpos root is pelvis; save torso_link as the exported base.
+        base_pos, base_quat = extract_body_base_pose(
+            robot_urdf_path,
+            retargeted_motion,
+            args.output_base_link,
+        )
         joint_pos = retargeted_motion[:, 7:]
+        object_pose = extract_omomo_object_pose(args.smplx_motion, len(retargeted_motion))
         
         # Convert quaternion to xyzw if needed (standard for many tools)
         # MuJoCo uses wxyz, but many other tools use xyzw.
@@ -549,13 +605,29 @@ def main():
         # ['framerate', 'joint_names', 'joint_pos', 'base_pos_w', 'base_quat_w']
         
         # Save as .npz with specific keys
-        np.savez(
-            args.output,
+        output_payload = dict(
             framerate=framerate,
+            # Preserve the exact MuJoCo generalized configuration.  The
+            # exported base_pos_w may refer to torso_link for downstream
+            # policy datasets and cannot be used as the floating-root pose
+            # without an inverse-FK conversion in viewers.
+            qpos=retargeted_motion,
             joint_names=np.array(joint_names),
             joint_pos=joint_pos,
             base_pos_w=base_pos,
-            base_quat_w=base_quat # Saving as wxyz (MuJoCo convention)
+            base_quat_w=base_quat, # Saving as wxyz (MuJoCo convention)
+            smplx_joints_w=smplx_trajectory * terrain_scale,
+        )
+        if object_pose is not None:
+            object_pos, object_quat = object_pose
+            output_payload["object_pos_w"] = object_pos
+            output_payload["object_quat_w"] = object_quat
+        output_payload.update(
+            stack_contact_tasks(getattr(retargeter, "last_end_effector_tasks", {}))
+        )
+        np.savez(
+            args.output,
+            **output_payload,
         )
         
         print(f"Done! Terrain scale used: {terrain_scale}")

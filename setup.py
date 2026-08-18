@@ -19,6 +19,7 @@ setup(
         "jinja2",
         "mujoco",
         "viser",
+        "mjviser @ git+https://github.com/mujocolab/mjviser@4ba054b9bdaf4f7604d6fa7a8b8c2f917daf43c2",
         "robot_descriptions",
         "yourdfpy",
         "cvxpy",
@@ -28,4 +29,9 @@ setup(
         "open3d",
         "pyvista",
     ],
+    entry_points={
+        "console_scripts": [
+            "omniretargeting-mjviser=omniretargeting.mjviser_viewer:main",
+        ],
+    },
 )

@@ -7,13 +7,22 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Union, Any
 import trimesh
 import mujoco
-import yourdfpy
+try:
+    import yourdfpy
+except ImportError:
+    yourdfpy = None
 from scipy.spatial.transform import Rotation
+from scipy.ndimage import gaussian_filter1d
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 
 from .utils import compute_mesh_height_at_point
+from .contact import SceneContactTask, infer_scene_contact_tasks
+from .trajectory_refinement import (
+    measure_scene_penetration,
+    refine_joint_trajectory,
+)
 
 
 class OmniRetargeter:
@@ -97,8 +106,14 @@ class OmniRetargeter:
         # Store the filtered joint mapping (only valid joints) for use in retargeter
         self.valid_joint_mapping = {name: joint_mapping[name] for name in self.valid_joint_names}
 
-        # Load robot URDF
-        self.robot_urdf = yourdfpy.URDF.load(str(robot_urdf_path), load_meshes=True)
+        # Load robot model.  URDF files are also parsed by yourdfpy for
+        # compatibility with older callers; MJCF files are consumed directly by
+        # MuJoCo and do not need a URDF scene graph.
+        self.robot_urdf = None
+        if self.robot_urdf_path.suffix.lower() == ".urdf":
+            if yourdfpy is None:
+                raise ImportError("yourdfpy is required when loading URDF robot models.")
+            self.robot_urdf = yourdfpy.URDF.load(str(robot_urdf_path), load_meshes=True)
         self.robot_model = mujoco.MjModel.from_xml_path(str(robot_urdf_path))
         self.robot_data = mujoco.MjData(self.robot_model)
 
@@ -227,6 +242,7 @@ class OmniRetargeter:
         framerate: float | None = None,
         visualize_trajectory: bool = True,
         enable_terrain_scaling: bool = False,
+        end_effector_markers: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
     ) -> Tuple[float, np.ndarray]:
         """
         Retarget SMPLX motion to the robot on the terrain.
@@ -237,6 +253,8 @@ class OmniRetargeter:
             enable_terrain_scaling: If True, estimate a terrain scale factor from the
                 SMPLX trajectory and retarget against a scaled terrain mesh. If False,
                 keep the original terrain mesh and use a scale factor of 1.0.
+            end_effector_markers: Optional SMPL-X palm/sole centers and body
+                surface samples, as returned by ``load_smplx_trajectory``.
 
         Returns:
             Tuple of (terrain_scale, retargeted_trajectory)
@@ -257,21 +275,133 @@ class OmniRetargeter:
         if base_translations is not None:
             processed_base_translations = base_translations * terrain_scale
 
+        retargeting_config = getattr(self, "retargeting_config", {})
+        end_effector_cfg = dict(
+            retargeting_config.get("end_effector_priority", {}) or {}
+        )
+        end_effector_tasks: Dict[str, SceneContactTask] = {}
+        if bool(end_effector_cfg.get("enabled", False)) and end_effector_markers:
+            processed_markers = {
+                name: {
+                    key: np.asarray(value, dtype=float) * terrain_scale
+                    for key, value in marker.items()
+                }
+                for name, marker in end_effector_markers.items()
+            }
+            end_effector_tasks = infer_scene_contact_tasks(
+                processed_markers,
+                scaled_terrain,
+                framerate=float(framerate or 30.0),
+                config=end_effector_cfg.get("contact_detection", {}),
+            )
+            contact_summary = ", ".join(
+                f"{name}={int(np.count_nonzero(task.contact_mask))}/{len(task.contact_mask)}"
+                for name, task in end_effector_tasks.items()
+            )
+            print(f"Inferred SMPL-X scene contacts (frames): {contact_summary}")
+        elif bool(end_effector_cfg.get("enabled", False)):
+            print(
+                "Contact-priority optimization requested, but no SMPL-X "
+                "end-effector markers were supplied; using whole-body retargeting."
+            )
+        self.last_end_effector_tasks = end_effector_tasks
+
         # Option Step:
         if visualize_trajectory:
             # visualize the processed_trajectory
             self._visualize_trajectory(processed_trajectory, scaled_terrain)
 
         # Step 4: Perform retargeting using the generic retargeting system
-        retargeted_motion = self._perform_retargeting(
-            processed_trajectory,
-            scaled_terrain,
+        retargeting_kwargs = dict(
             base_orientations=base_orientations,
             base_translations=processed_base_translations,
         )
+        if end_effector_tasks:
+            retargeting_kwargs["end_effector_tasks"] = end_effector_tasks
+        retargeted_motion = self._perform_retargeting(
+            processed_trajectory, scaled_terrain, **retargeting_kwargs
+        )
+        refinement_cfg = dict(
+            retargeting_config.get("trajectory_refinement", {}) or {}
+        )
+        if bool(refinement_cfg.get("enabled", False)) and end_effector_tasks:
+            penetration_cfg = dict(refinement_cfg.get("penetration", {}) or {})
+            report_penetration = bool(penetration_cfg.get("report", True))
+            before = (
+                measure_scene_penetration(
+                    self.robot_model,
+                    retargeted_motion,
+                    scaled_terrain,
+                    penetration_cfg,
+                )
+                if report_penetration
+                else None
+            )
+            retargeted_motion = refine_joint_trajectory(
+                self.robot_model,
+                retargeted_motion,
+                end_effector_tasks,
+                end_effector_cfg,
+                refinement_cfg,
+                scene_mesh=scaled_terrain,
+                framerate=float(framerate or 30.0),
+                source_root_positions=processed_trajectory[
+                    :,
+                    self.smplx_joint_indices.get(
+                        self.base_orientation_config.get(
+                            "root_position", "Spine3"
+                        ),
+                        0,
+                    ),
+                ],
+                source_joint_positions=processed_trajectory,
+                source_joint_names=self.smplx_joint_names,
+            )
+            if before is not None:
+                after = measure_scene_penetration(
+                    self.robot_model,
+                    retargeted_motion,
+                    scaled_terrain,
+                    penetration_cfg,
+                )
+                # Jerk is part of the refinement objective, so its improvement
+                # is not evidence of a good result.  Penetration is only ever
+                # penalized, which makes it the honest acceptance check.
+                for label, stats in (("before", before), ("after", after)):
+                    print(
+                        f"Scene penetration {label} refinement: "
+                        f"max={stats['max_depth'] * 100.0:.2f} cm, "
+                        f"mean={stats['mean_depth'] * 100.0:.2f} cm, "
+                        f"frames={stats['frames_penetrating']}/{stats['num_frames']}"
+                        + (
+                            f", worst={stats['worst_body']}@{stats['worst_frame']}"
+                            if stats["worst_body"]
+                            else ""
+                        )
+                    )
+                if after["max_depth"] > before["max_depth"] + 1e-4:
+                    print(
+                        "Scene penetration warning: refinement increased the "
+                        "worst penetration depth. Tighten "
+                        "trajectory_refinement.penetration.sigma or relax "
+                        "acceleration_sigma/jerk_sigma."
+                    )
+        retargeted_motion = self._apply_trajectory_smoothing(
+            retargeted_motion,
+            framerate=float(framerate or 30.0),
+        )
 
-        retargeting_config = getattr(self, "retargeting_config", {})
-        if retargeting_config.get("penetration_resolver", "hard_constraint") == "xyz_nudge":
+        foot_stabilization_cfg = dict(retargeting_config.get("foot_stabilization", {}) or {})
+        if end_effector_tasks and bool(foot_stabilization_cfg.get("enabled", False)):
+            print(
+                "Foot stabilization skipped: contact-priority retargeting already "
+                "anchors the feet to the scene, and the post-hoc ground lock would "
+                "move the base away from those anchors."
+            )
+        if not end_effector_tasks and (
+            retargeting_config.get("penetration_resolver", "hard_constraint") == "xyz_nudge"
+            or bool(foot_stabilization_cfg.get("enabled", False))
+        ):
             retargeted_motion = self._apply_foot_stabilization(
                 retargeted_motion,
                 scaled_terrain,
@@ -279,6 +409,69 @@ class OmniRetargeter:
             )
 
         return terrain_scale, retargeted_motion
+
+    def _apply_trajectory_smoothing(
+        self,
+        trajectory: np.ndarray,
+        framerate: float,
+    ) -> np.ndarray:
+        """Remove zero-mean framewise IK chatter without moving the root.
+
+        A symmetric Gaussian convolution is zero phase: it suppresses the
+        high-frequency redundant-joint solution switching without introducing
+        a time delay between the human and robot.  Its positive kernel also
+        avoids ringing around contact transitions.  Only scalar robot joints
+        are filtered.  Floating-base translation and orientation remain
+        exactly as solved, so scene alignment and base position cannot drift.
+        """
+        cfg = dict(
+            getattr(self, "retargeting_config", {}).get(
+                "trajectory_smoothing", {}
+            )
+            or {}
+        )
+        if not bool(cfg.get("enabled", False)) or len(trajectory) < 8:
+            return trajectory
+        sigma_frames = float(cfg.get("sigma_frames", 1.0))
+        if sigma_frames <= 0.0:
+            raise ValueError(
+                "trajectory_smoothing.sigma_frames must be positive, got "
+                f"{sigma_frames:g}."
+            )
+        joint_qpos_indices = []
+        for joint_id in range(self.robot_model.njnt):
+            joint_type = self.robot_model.jnt_type[joint_id]
+            if joint_type in (
+                mujoco.mjtJoint.mjJNT_HINGE,
+                mujoco.mjtJoint.mjJNT_SLIDE,
+            ):
+                qpos_index = int(self.robot_model.jnt_qposadr[joint_id])
+                if qpos_index >= 7:
+                    joint_qpos_indices.append(qpos_index)
+        if not joint_qpos_indices:
+            return trajectory
+
+        result = np.asarray(trajectory, dtype=float).copy()
+        result[:, joint_qpos_indices] = gaussian_filter1d(
+            result[:, joint_qpos_indices],
+            sigma=sigma_frames,
+            axis=0,
+            mode="nearest",
+        )
+
+        # The zero-phase filter can overshoot a saturated joint by a fraction
+        # of a degree.  Restore the model's exact scalar joint limits.
+        for joint_id in range(self.robot_model.njnt):
+            if not self.robot_model.jnt_limited[joint_id]:
+                continue
+            qpos_index = int(self.robot_model.jnt_qposadr[joint_id])
+            if qpos_index not in joint_qpos_indices:
+                continue
+            lower, upper = self.robot_model.jnt_range[joint_id]
+            result[:, qpos_index] = np.clip(
+                result[:, qpos_index], lower, upper
+            )
+        return result
 
     def _compute_terrain_scale(
         self,
@@ -389,6 +582,7 @@ class OmniRetargeter:
         scaled_terrain: trimesh.Trimesh,
         base_orientations: np.ndarray | None = None,
         base_translations: np.ndarray | None = None,
+        end_effector_tasks: Optional[Dict[str, SceneContactTask]] = None,
     ) -> np.ndarray:
         """Perform the actual motion retargeting using generic interaction mesh retargeting."""
         from .retargeting import GenericInteractionRetargeter
@@ -397,6 +591,14 @@ class OmniRetargeter:
         # Note: scaled_terrain is already scaled by _scale_terrain_mesh
         # CRITICAL: Pass only valid_joint_mapping to ensure consistent sizes
         # This ensures robot_points and human_joints have the same number of joints
+        preserve_root_z = bool(self.retargeting_config.get("preserve_root_z", False))
+        retargeter_kwargs: Dict[str, Any] = {}
+        if end_effector_tasks:
+            retargeter_kwargs["end_effector_config"] = self.retargeting_config.get(
+                "end_effector_priority", {}
+            )
+        if preserve_root_z:
+            retargeter_kwargs["preserve_root_z"] = True
         retargeter = GenericInteractionRetargeter(
             self.robot_model,
             self.robot_data,
@@ -408,28 +610,36 @@ class OmniRetargeter:
             valid_joint_names=self.valid_joint_names,  # CRITICAL: Pass ordered joint names for consistency
             replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
             hard_penetration_constraint=self.retargeting_config.get("penetration_resolver", "hard_constraint") == "hard_constraint",
+            **retargeter_kwargs,
         )
 
         # Retarget each frame
         retargeted_trajectory = []
         
-        # Initialize with a reasonable standing configuration
-        q_init = np.zeros(self.robot_model.nq)
-        q_init[3:7] = [1, 0, 0, 0]  # Identity quaternion (wxyz)
-        
-        # Set joint angles to mid-range to avoid limit violations
-        # This is safer than all zeros which might violate limits
-        for i in range(self.robot_model.njnt):
-            qpos_adr = self.robot_model.jnt_qposadr[i]
-            if qpos_adr >= 7:  # Skip floating base
-                joint_range = self.robot_model.jnt_range[i]
-                # Set to middle of range
-                q_init[qpos_adr] = (joint_range[0] + joint_range[1]) / 2.0
+        # Start from the model's nominal configuration.  Joint-range midpoints
+        # are not a neutral pose for humanoids (for G1 they bend the knees by
+        # about 1.4 rad), which previously forced the floating base downward to
+        # compensate for artificially shortened legs.
+        try:
+            q_init = np.asarray(self.robot_model.qpos0, dtype=float).copy()
+            if q_init.shape != (int(self.robot_model.nq),):
+                raise ValueError("invalid model qpos0 shape")
+        except (TypeError, ValueError):
+            # Lightweight unit-test models and third-party wrappers may not
+            # expose qpos0.  Preserve the historical zero initialization for
+            # those callers while real MuJoCo models use their neutral pose.
+            q_init = np.zeros(int(self.robot_model.nq), dtype=float)
+        if len(q_init) >= 7 and np.linalg.norm(q_init[3:7]) < 1e-8:
+            q_init[3:7] = [1, 0, 0, 0]  # Identity quaternion (wxyz)
+        root_position_name = self.base_orientation_config.get("root_position", "Pelvis")
+        root_position_idx = getattr(self, "smplx_joint_indices", {}).get(
+            root_position_name, 0
+        )
         
         # Initial height: Use processed (scaled) trajectory root height or default
         # Assuming joint 0 is root
         if len(processed_trajectory) > 0:
-            q_init[:3] = processed_trajectory[0, 0] # Start at first frame root pos
+            q_init[:3] = processed_trajectory[0, root_position_idx] # Start at first frame root pos
             # Maintain initial rotation (identity or from trajectory if available)
         else:
             q_init[2] = self.robot_height * 0.5  # Default height (Z coordinate)
@@ -442,8 +652,8 @@ class OmniRetargeter:
                 if base_translations is not None:
                     q_init[:3] = base_translations[frame_idx]
                 else:
-                    # Use SMPLX pelvis position as initial guess
-                    q_init[:3] = human_joints[0]
+                    # Use the configured root position as initial guess
+                    q_init[:3] = human_joints[root_position_idx]
 
                 # Initialize base orientation
                 if base_orientations is not None:
@@ -455,6 +665,11 @@ class OmniRetargeter:
                     if quat_xyzw is not None:
                         q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
             # For subsequent frames, q_init already contains the previous optimized configuration
+            if preserve_root_z:
+                if base_translations is not None:
+                    q_init[2] = base_translations[frame_idx, 2]
+                else:
+                    q_init[2] = human_joints[root_position_idx, 2]
             
             # Extract mapped joints using the proper indices
             # CRITICAL: The order MUST match valid_joint_names exactly
@@ -540,14 +755,55 @@ class OmniRetargeter:
 
             # Retarget frame with previous frame as reference for smoothness
             q_last = retargeted_trajectory[-1] if len(retargeted_trajectory) > 0 else None
-            q_opt = retargeter.retarget_frame(
-                mapped_joints, q_init, q_last=q_last, 
-                target_base_orientation=target_quat_wxyz
+            frame_kwargs: Dict[str, Any] = dict(
+                q_last=q_last,
+                target_base_orientation=target_quat_wxyz,
             )
+            if end_effector_tasks:
+                base_position_cfg = dict(
+                    self.retargeting_config.get("end_effector_priority", {}).get(
+                        "base_position_constraint", {}
+                    )
+                    or {}
+                )
+                if bool(base_position_cfg.get("enabled", False)):
+                    frame_kwargs["target_base_position"] = human_joints[
+                        root_position_idx
+                    ]
+                frame_kwargs["end_effector_targets"] = {}
+                for name, task in end_effector_tasks.items():
+                    target_payload = task.frame(frame_idx)
+                    target_payload["source_root_position"] = human_joints[
+                        root_position_idx
+                    ]
+                    frame_kwargs["end_effector_targets"][name] = target_payload
+                frame_kwargs["q_prev"] = (
+                    retargeted_trajectory[-2]
+                    if len(retargeted_trajectory) > 1
+                    else None
+                )
+                frame_kwargs["q_prevprev"] = (
+                    retargeted_trajectory[-3]
+                    if len(retargeted_trajectory) > 2
+                    else None
+                )
+                frame_kwargs["previous_human_joints"] = (
+                    processed_trajectory[frame_idx - 1, self.mapped_joint_indices]
+                    if frame_idx > 0
+                    else None
+                )
+                frame_kwargs["previous_previous_human_joints"] = (
+                    processed_trajectory[frame_idx - 2, self.mapped_joint_indices]
+                    if frame_idx > 1
+                    else None
+                )
+            q_opt = retargeter.retarget_frame(mapped_joints, q_init, **frame_kwargs)
+            if preserve_root_z:
+                q_opt[2] = q_init[2]
             retargeted_trajectory.append(q_opt)
 
             # Update initial guess for next frame (smooth trajectory)
-            q_init = q_opt
+            q_init = q_opt.copy()
 
         return np.array(retargeted_trajectory)
 
@@ -652,9 +908,16 @@ class OmniRetargeter:
             "wall_normal_z_threshold": 0.35,
             "wall_x_dominance_threshold": 0.5,
             "body_names": {},
+            "ground_lock": True,
+            "ground_lock_clearance": 0.0,
+            "ground_lock_body_tokens": ["ankle", "foot"],
+            "ground_lock_geom_groups": [2, 3],
+            "preserve_root_z": False,
         }
         cfg = dict(defaults)
         cfg.update(self.retargeting_config.get("foot_stabilization", {}) or {})
+        if bool(self.retargeting_config.get("preserve_root_z", False)):
+            cfg["preserve_root_z"] = True
         return cfg
 
     def _apply_foot_stabilization(
@@ -675,16 +938,26 @@ class OmniRetargeter:
             print("Foot stabilization skipped: no foot bodies could be resolved.")
             return retargeted_motion
 
+        ground_lock_specs = []
+        if bool(cfg.get("ground_lock", True)):
+            ground_lock_specs = self._build_foot_ground_lock_specs(cfg)
+            if not ground_lock_specs:
+                print("Foot ground lock skipped: no foot geoms could be resolved.")
+
         stabilized = np.array(retargeted_motion, copy=True)
+        preserve_root_z = bool(cfg.get("preserve_root_z", False))
+        original_root_z = stabilized[:, 2].copy()
         stabilized, wall_contact_mask = self._apply_surface_collision_corrections(
             stabilized,
             terrain_mesh,
             foot_specs,
             cfg,
         )
+        if preserve_root_z:
+            stabilized[:, 2] = original_root_z
 
         contact_band = float(cfg["contact_point_height_band"])
-        clearance_target = float(cfg["clearance"])
+        clearance_target = float(cfg.get("ground_lock_clearance", cfg["clearance"])) if ground_lock_specs else float(cfg["clearance"])
         z_window = int(cfg["z_smoothing_window"])
         xy_window = int(cfg["xy_smoothing_window"])
         min_contact_frames = int(cfg["min_contact_frames"])
@@ -694,7 +967,11 @@ class OmniRetargeter:
         vertical_speed_threshold = float(cfg["contact_vertical_speed"])
         contact_clearance = float(cfg["contact_clearance"])
 
-        positions, min_z = self._compute_foot_contact_series(stabilized, foot_specs, contact_band)
+        if ground_lock_specs:
+            positions, min_z = self._compute_foot_ground_lock_series(stabilized, ground_lock_specs, contact_band)
+            wall_contact_mask = np.zeros_like(min_z, dtype=bool)
+        else:
+            positions, min_z = self._compute_foot_contact_series(stabilized, foot_specs, contact_band)
         terrain_heights = self._compute_terrain_heights(terrain_mesh, positions[:, :, :2])
         clearances = min_z - terrain_heights
 
@@ -704,9 +981,15 @@ class OmniRetargeter:
         base_lift[~np.isfinite(min_clearance)] = 0.0
         base_lift_smoothed = self._smooth_signal(base_lift, z_window)
         base_lift = np.maximum(base_lift, base_lift_smoothed)
-        stabilized[:, 2] += base_lift
+        if preserve_root_z:
+            base_lift[:] = 0.0
+        else:
+            stabilized[:, 2] += base_lift
 
-        positions, min_z = self._compute_foot_contact_series(stabilized, foot_specs, contact_band)
+        if ground_lock_specs:
+            positions, min_z = self._compute_foot_ground_lock_series(stabilized, ground_lock_specs, contact_band)
+        else:
+            positions, min_z = self._compute_foot_contact_series(stabilized, foot_specs, contact_band)
         terrain_heights = self._compute_terrain_heights(terrain_mesh, positions[:, :, :2])
         clearances = min_z - terrain_heights
 
@@ -743,14 +1026,18 @@ class OmniRetargeter:
                 corrections[oversized] *= (max_xy_correction / norms[oversized])[:, None]
             stabilized[:, :2] += corrections
 
-            positions, min_z = self._compute_foot_contact_series(stabilized, foot_specs, contact_band)
+            if ground_lock_specs:
+                positions, min_z = self._compute_foot_ground_lock_series(stabilized, ground_lock_specs, contact_band)
+            else:
+                positions, min_z = self._compute_foot_contact_series(stabilized, foot_specs, contact_band)
             terrain_heights = self._compute_terrain_heights(terrain_mesh, positions[:, :, :2])
             clearances = min_z - terrain_heights
             lift_clearances = np.where(~wall_contact_mask, clearances, np.inf)
             min_clearance = np.min(lift_clearances, axis=1)
             residual_lift = np.maximum(clearance_target - min_clearance, 0.0)
             residual_lift[~np.isfinite(min_clearance)] = 0.0
-            stabilized[:, 2] += residual_lift
+            if not preserve_root_z:
+                stabilized[:, 2] += residual_lift
 
         stabilized, _ = self._apply_surface_collision_corrections(
             stabilized,
@@ -758,6 +1045,8 @@ class OmniRetargeter:
             foot_specs,
             cfg,
         )
+        if preserve_root_z:
+            stabilized[:, 2] = original_root_z
 
         if np.any(base_lift > 0) or np.any(active):
             print(
@@ -785,6 +1074,43 @@ class OmniRetargeter:
                 "sample_points": sample_points,
                 "collision_points": self._select_collision_probe_points(sample_points),
             })
+        return specs
+
+    def _build_foot_ground_lock_specs(self, cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Collect visible/collision foot geoms used for ground locking."""
+        body_tokens = tuple(str(token).lower() for token in cfg.get("ground_lock_body_tokens", ["ankle", "foot"]))
+        geom_groups = cfg.get("ground_lock_geom_groups", [2, 3])
+        geom_groups = set(int(group) for group in geom_groups) if geom_groups is not None else None
+
+        specs = []
+        for side, side_tokens in {
+            "left": ("left", "l_"),
+            "right": ("right", "r_"),
+        }.items():
+            geom_specs = []
+            for geom_id in range(self.robot_model.ngeom):
+                if geom_groups is not None and int(self.robot_model.geom_group[geom_id]) not in geom_groups:
+                    continue
+                body_id = int(self.robot_model.geom_bodyid[geom_id])
+                body_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
+                body_name_lower = body_name.lower()
+                if not any(token in body_name_lower for token in side_tokens):
+                    continue
+                if not any(token in body_name_lower for token in body_tokens):
+                    continue
+
+                sample_points = self._sample_geom_points_in_body_frame(geom_id)
+                if sample_points.size == 0:
+                    continue
+                geom_specs.append({
+                    "geom_id": geom_id,
+                    "body_id": body_id,
+                    "body_name": body_name,
+                    "sample_points": sample_points,
+                })
+
+            if geom_specs:
+                specs.append({"side": side, "geom_specs": geom_specs})
         return specs
 
     def _resolve_foot_body_ids(self, cfg: Dict[str, Any]) -> Dict[str, int]:
@@ -865,7 +1191,18 @@ class OmniRetargeter:
         geom_type = int(self.robot_model.geom_type[geom_id])
         size = np.asarray(self.robot_model.geom_size[geom_id], dtype=float)
 
-        if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+        if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh_id = int(self.robot_model.geom_dataid[geom_id])
+            if mesh_id < 0:
+                points_local = np.zeros((1, 3), dtype=float)
+            else:
+                vert_start = int(self.robot_model.mesh_vertadr[mesh_id])
+                vert_count = int(self.robot_model.mesh_vertnum[mesh_id])
+                points_local = np.asarray(
+                    self.robot_model.mesh_vert[vert_start : vert_start + vert_count],
+                    dtype=float,
+                )
+        elif geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
             radius = size[0]
             points_local = np.array([
                 [0.0, 0.0, -radius],
@@ -990,6 +1327,39 @@ class OmniRetargeter:
 
         return positions, min_z
 
+    def _compute_foot_ground_lock_series(
+        self,
+        motion: np.ndarray,
+        ground_lock_specs: List[Dict[str, Any]],
+        contact_band: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute support points from all configured visible/collision foot geoms."""
+        num_frames = len(motion)
+        num_feet = len(ground_lock_specs)
+        positions = np.zeros((num_frames, num_feet, 3), dtype=float)
+        min_z = np.zeros((num_frames, num_feet), dtype=float)
+
+        for frame_idx, qpos in enumerate(motion):
+            self.robot_data.qpos[:] = qpos
+            mujoco.mj_forward(self.robot_model, self.robot_data)
+
+            for foot_idx, spec in enumerate(ground_lock_specs):
+                world_points = []
+                for geom_spec in spec["geom_specs"]:
+                    body_id = geom_spec["body_id"]
+                    body_pos = np.asarray(self.robot_data.xpos[body_id], dtype=float)
+                    body_rot = np.asarray(self.robot_data.xmat[body_id], dtype=float).reshape(3, 3)
+                    world_points.append(geom_spec["sample_points"] @ body_rot.T + body_pos)
+                world_points = np.vstack(world_points)
+                point_z = world_points[:, 2]
+                frame_min_z = float(np.min(point_z))
+                support_mask = point_z <= frame_min_z + contact_band
+                support_points = world_points[support_mask]
+                positions[frame_idx, foot_idx] = np.mean(support_points, axis=0)
+                min_z[frame_idx, foot_idx] = frame_min_z
+
+        return positions, min_z
+
     def _compute_terrain_heights(self, terrain_mesh: trimesh.Trimesh, xy_points: np.ndarray) -> np.ndarray:
         """Compute terrain heights for a batch of XY positions."""
         heights = np.zeros(xy_points.shape[:2], dtype=float)
@@ -1018,6 +1388,7 @@ class OmniRetargeter:
         surface_clearance = float(cfg["surface_clearance"])
         max_surface_correction = float(cfg["max_surface_correction"])
         surface_iterations = max(int(cfg["surface_iterations"]), 1)
+        preserve_root_z = bool(cfg.get("preserve_root_z", False))
 
         stabilized = np.array(motion, copy=True)
         total_xy_shift = np.zeros(len(stabilized), dtype=float)
@@ -1067,6 +1438,9 @@ class OmniRetargeter:
                     pos = max((value for value in wall_x_corrections if value > 0.0), default=0.0)
                     neg = min((value for value in wall_x_corrections if value < 0.0), default=0.0)
                     correction[0] = pos if abs(pos) >= abs(neg) else neg
+
+                if preserve_root_z:
+                    correction[2] = 0.0
 
                 norm = np.linalg.norm(correction)
                 if norm > max_surface_correction and norm > 1e-12:

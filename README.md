@@ -260,6 +260,21 @@ python examples/advanced_usage.py
 pytest tests/
 ```
 
+## Viewing Retargeted Output with mjviser
+
+Install the package after syncing dependencies, then open any retargeted output:
+
+```bash
+omniretargeting-mjviser /path/to/retargeted_motion.npz \
+  --robot-config robot_models/unitree_g1/unitree_g1_instinctmj.json \
+  --terrain /path/to/scene_tsdf.obj
+```
+
+The viewer reads `base_pos_w`, `base_quat_w`, `joint_pos`, and `joint_names`
+from `.npz` outputs. If `object_pos_w/object_quat_w` are present, it can also
+show an object mesh via `--object-mesh`, or infer common OMOMO meshes from
+`~/Datasets/OMOMO/data/captured_objects`.
+
 ## API Reference
 
 ### `OmniRetargeter`
@@ -304,6 +319,29 @@ OmniRetargeting adapts the interaction mesh retargeting approach from the holoso
 4. **Optimization**: Uses SQP optimization with Laplacian deformation constraints
 5. **Collision Avoidance**: Terrain penetration constraints (not yet implemented; see TODO below)
 6. **Joint Limits**: Respects robot joint limits during optimization
+
+### Contact-priority hand/foot retargeting
+
+Robot profiles can enable `retargeting.end_effector_priority`. For raw SMPL-X
+motions, the loader samples stable hand and foot surface vertices, detects
+scene contact from distance and relative speed, and anchors every contiguous
+contact interval to the scene mesh.
+
+At each SQP iteration, a marker residual is linearized as
+`r_e(dq) = p_e(q) + J_e(q)dq - p_e*`. The solver then performs three convex
+problems in lexicographic order:
+
+1. minimize the normalized active-contact residual norm;
+2. constrain that norm to `(1 + relative_tolerance) * optimum + absolute_tolerance`
+   and minimize the non-contact hand/foot residual norm;
+3. constrain both higher-priority levels and minimize the whole-body
+   interaction-mesh, smoothness, orientation, and regularization objective.
+
+Unlike a large finite loss weight, these explicit optimum bounds preserve the
+declared priority up to the configured numerical tolerances. The generated
+`.npz` additionally stores `contact_names`, `contact_mask`,
+`contact_confidence`, `contact_targets_w`, and `end_effector_reference_w` for
+downstream robot policy training or evaluation.
 
 ## TODO / Limitations
 
