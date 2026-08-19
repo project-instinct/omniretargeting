@@ -1,6 +1,5 @@
 """Basic tests for omniretargeting package."""
 
-import json
 import os
 import subprocess
 import sys
@@ -8,15 +7,12 @@ import tempfile
 from dataclasses import dataclass
 import numpy as np
 import pytest
-import trimesh
 from pathlib import Path
 from unittest.mock import Mock, patch
-
 from scipy.spatial.transform import Rotation
 
-from omniretargeting.data_sources.base import DataSource, MotionData, MotionFrame, validate_motion_frame_positions, validate_motion_positions
 from omniretargeting.robot_config import load_robot_config
-from omniretargeting.main import export_scaled_objects, select_robot_source
+from omniretargeting.utils import validate_smplx_trajectory, compute_world_joint_orientations
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -25,8 +21,6 @@ SMPLX_MODEL_DIR = Path("/localhdd/Datasets/")
 ROBOT_PROFILE_CASES = (
     pytest.param("unitree_g1", REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json", id="g1"),
     pytest.param("unitree_h1", REPO_ROOT / "robot_models" / "unitree_h1" / "unitree_h1.json", id="h1"),
-    pytest.param("booster_k1", REPO_ROOT / "robot_models" / "booster_k1" / "booster_k1.json", id="booster-k1"),
-    pytest.param("hightorque_mini_pi_plus", REPO_ROOT / "robot_models" / "hightorque_mini_pi_plus" / "hightorque_mini_pi_plus.json", id="mini-pi-plus"),
 )
 COMMON_ALIGNMENT_JOINTS = (
     "Pelvis",
@@ -43,12 +37,6 @@ COMMON_ALIGNMENT_JOINTS = (
     "R_Elbow",
 )
 
-FLOATING_BASE_PROFILE_CASES = (
-    pytest.param("unitree_h1", REPO_ROOT / "robot_models" / "unitree_h1" / "unitree_h1.json", id="h1-floating"),
-    pytest.param("booster_k1", REPO_ROOT / "robot_models" / "booster_k1" / "booster_k1.json", id="booster-k1-floating"),
-    pytest.param("hightorque_mini_pi_plus", REPO_ROOT / "robot_models" / "hightorque_mini_pi_plus" / "hightorque_mini_pi_plus.json", id="mini-pi-plus-floating"),
-)
-
 @dataclass(frozen=True)
 class MotionCase:
     case_id: str
@@ -57,63 +45,31 @@ class MotionCase:
     terrain_path: Path
 
 
-def test_export_scaled_objects_scales_pose_translations_with_scene(tmp_path):
-    object_mesh = trimesh.creation.box(extents=[1.0, 1.0, 1.0])
-    motion_data = MotionData(
-        positions=np.zeros((2, 1, 3), dtype=float),
-        object_mesh=object_mesh,
-        metadata={
-            "object_name": "box",
-            "object_translations": np.array([[1.0, 2.0, 3.0], [-1.0, 0.5, 4.0]]),
-            "object_rotations": np.repeat(np.eye(3)[None, :, :], 2, axis=0),
-            "object_scales": np.array([0.5, 0.25]),
-        },
-    )
-
-    mesh_path, pose_path = export_scaled_objects(
-        motion_data,
-        tmp_path,
-        source_to_robot_scale=2.0,
-        apply_scene_scaling=True,
-    )
-
-    assert mesh_path.exists()
-    assert pose_path.exists()
-    poses = json.loads(pose_path.read_text())
-    assert poses[0]["translation"] == [2.0, 4.0, 6.0]
-    assert poses[1]["translation"] == [-2.0, 1.0, 8.0]
-    assert poses[0]["scale"] == 1.0
-    assert poses[1]["scale"] == 0.5
-
-
-ROBOT_MOTION_MATRIX_ROBOTS = (
-    ("g1", REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json"),
-    ("h1", REPO_ROOT / "robot_models" / "unitree_h1" / "unitree_h1.json"),
-    ("booster-k1", REPO_ROOT / "robot_models" / "booster_k1" / "booster_k1.json"),
-    ("mini-pi-plus", REPO_ROOT / "robot_models" / "hightorque_mini_pi_plus" / "hightorque_mini_pi_plus.json"),
-)
-
-ROBOT_MOTION_MATRIX_SCENES = (
-    ("amass-simplelab",
-     TEST_RESOURCES / "amass" / "140_02_stageii.npz",
-     TEST_RESOURCES / "terrain" / "simplelab_enlarged_noWall.stl"),
-    ("amass-wallflip",
-     TEST_RESOURCES / "amass" / "wall_flip_smplx_amass.npz",
-     TEST_RESOURCES / "terrain" / "wall_flip_scene.obj"),
-    ("amass-prox-sofa",
-     TEST_RESOURCES / "amass" / "PROX_1_smplx_amass.npz",
-     TEST_RESOURCES / "terrain" / "PROX_sofa.obj"),
-)
-
-MOTION_CASES = tuple(
+MOTION_CASES = (
     MotionCase(
-        case_id=f"{robot_id}-{scene_id}",
-        robot_profile=robot_profile,
-        motion_path=motion_path,
-        terrain_path=terrain_path,
-    )
-    for robot_id, robot_profile in ROBOT_MOTION_MATRIX_ROBOTS
-    for scene_id, motion_path, terrain_path in ROBOT_MOTION_MATRIX_SCENES
+        case_id="g1-amass-simplelab",
+        robot_profile=REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json",
+        motion_path=TEST_RESOURCES / "amass" / "140_02_stageii.npz",
+        terrain_path=TEST_RESOURCES / "terrain" / "simplelab_enlarged_noWall.stl",
+    ),
+    MotionCase(
+        case_id="h1-amass-simplelab",
+        robot_profile=REPO_ROOT / "robot_models" / "unitree_h1" / "unitree_h1.json",
+        motion_path=TEST_RESOURCES / "amass" / "140_02_stageii.npz",
+        terrain_path=TEST_RESOURCES / "terrain" / "simplelab_enlarged_noWall.stl",
+    ),
+    MotionCase(
+        case_id="g1-amass-wallflip",
+        robot_profile=REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json",
+        motion_path=TEST_RESOURCES / "amass" / "wall_flip_smplx_amass.npz",
+        terrain_path=TEST_RESOURCES / "terrain" / "wall_flip_scene.obj",
+    ),
+    MotionCase(
+        case_id="h1-amass-wallflip",
+        robot_profile=REPO_ROOT / "robot_models" / "unitree_h1" / "unitree_h1.json",
+        motion_path=TEST_RESOURCES / "amass" / "wall_flip_smplx_amass.npz",
+        terrain_path=TEST_RESOURCES / "terrain" / "wall_flip_scene.obj",
+    ),
 )
 
 
@@ -128,7 +84,8 @@ def _build_retargeter_kwargs(robot_config: dict, terrain_mesh_path: Path | str, 
         "terrain_mesh_path": terrain_mesh_path,
         "joint_mapping": dict(joint_mapping or robot_config["joint_mapping"]),
         "robot_height": robot_config.get("robot_height"),
-        "source_target_names": robot_config.get("source_target_names"),
+        "smplx_joint_names": robot_config.get("smplx_joint_names"),
+        "height_estimation": robot_config.get("height_estimation"),
         "base_orientation": robot_config.get("base_orientation"),
         "retargeting": robot_config.get("retargeting"),
     }
@@ -142,384 +99,156 @@ def _print_and_skip(reason: str) -> None:
 class TestUtils:
     """Test utility functions."""
 
-    def test_validate_motion_positions_valid(self):
-        positions = np.random.randn(8, 5, 3)
-        assert validate_motion_positions(positions) is True
+    def test_validate_smplx_trajectory_valid(self):
+        """Test validation of valid SMPLX trajectory."""
+        trajectory = np.random.randn(100, 22, 3)
+        assert validate_smplx_trajectory(trajectory) is True
 
-    def test_motion_data_validates_target_names(self):
-        positions = np.random.randn(8, 5, 3)
-        motion = MotionData(positions=positions, target_names=["a", "b", "c", "d", "e"], framerate=60.0)
-        assert motion.positions is positions
-        assert motion.framerate == 60.0
+    def test_validate_smplx_trajectory_invalid_shape(self):
+        """Test validation of invalid trajectory shape."""
+        trajectory = np.random.randn(100, 22)  # Missing coordinate dimension
+        assert validate_smplx_trajectory(trajectory) is False
 
-    def test_motion_data_rejects_mismatched_target_names(self):
-        with pytest.raises(ValueError, match="target_names"):
-            MotionData(positions=np.random.randn(8, 5, 3), target_names=["a"])
+    def test_validate_smplx_trajectory_nan_values(self):
+        """Test validation with NaN values."""
+        trajectory = np.random.randn(100, 22, 3)
+        trajectory[10, 5, 2] = np.nan
+        assert validate_smplx_trajectory(trajectory) is False
 
+    def test_validate_smplx_trajectory_inf_values(self):
+        """Test validation with infinite values."""
+        trajectory = np.random.randn(100, 22, 3)
+        trajectory[10, 5, 2] = np.inf
+        assert validate_smplx_trajectory(trajectory) is False
 
-    def test_validate_motion_frame_positions_valid(self):
-        positions = np.random.randn(5, 3)
-        assert validate_motion_frame_positions(positions) is True
-
-    def test_motion_frame_rejects_invalid_positions(self):
-        with pytest.raises(ValueError, match="MotionFrame.positions"):
-            MotionFrame(positions=np.random.randn(2, 5, 3))
-
-    def test_data_source_collects_frames(self):
-        class FakeSource(DataSource):
-            target_names = ["a", "b"]
-            framerate = 30.0
-            source_height = 1.8
-            metadata = {"source_type": "fake"}
-
-            def iter_frames(self):
-                yield MotionFrame(positions=np.zeros((2, 3)), root_translation=np.array([1.0, 0.0, 0.0]))
-                yield MotionFrame(positions=np.ones((2, 3)), root_translation=np.array([2.0, 0.0, 0.0]))
-
-        motion = FakeSource().load()
-        assert motion.positions.shape == (2, 2, 3)
-        assert motion.target_names == ["a", "b"]
-        assert motion.root_translations.shape == (2, 3)
-        assert motion.source_height == 1.8
-        assert motion.human_height == 1.8
-
-
-# TestOmniRetargeter removed - mock tests replaced with integration tests below
-
-class TestLaplacianEdgeWeights:
-    """Distance-dependent (exponential) Laplacian edge weights from TopoRetarget."""
-
-    @staticmethod
-    def _tetrahedron():
-        vertices = np.array(
-            [
-                [0.0, 0.0, 0.0],
-                [1.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0],
-                [0.0, 0.0, 1.0],
-            ]
+    def test_compute_world_joint_orientations(self):
+        """Test computation of world-frame joint orientations."""
+        num_frames = 10
+        num_joints = 22
+        
+        # Create synthetic SMPLX pose data
+        # Root orientation (axis-angle)
+        global_orient = np.random.randn(num_frames, 3) * 0.1
+        
+        # Full pose (axis-angle for all joints)
+        full_pose = np.random.randn(num_frames, num_joints, 3) * 0.1
+        
+        # Simple parent structure (linear chain for testing)
+        parents = np.arange(-1, num_joints - 1)
+        
+        # Compute orientations
+        orientations = compute_world_joint_orientations(
+            global_orient, full_pose, parents, num_body_joints=num_joints
         )
-        tetrahedra = np.array([[0, 1, 2, 3]])
-        return vertices, tetrahedra
+        
+        # Verify output shape
+        assert orientations.shape == (num_frames, num_joints, 4), \
+            f"Expected shape ({num_frames}, {num_joints}, 4), got {orientations.shape}"
+        
+        # Verify quaternions are normalized
+        norms = np.linalg.norm(orientations, axis=2)
+        assert np.allclose(norms, 1.0, atol=1e-6), \
+            "Quaternions should be normalized"
+        
+        # Verify no NaN or inf values
+        assert np.isfinite(orientations).all(), \
+            "Orientations contain NaN or inf values"
+        
+        # Verify root orientation matches global_orient
+        for t in range(num_frames):
+            root_quat = orientations[t, 0]
+            expected_rot = Rotation.from_rotvec(global_orient[t])
+            expected_quat = expected_rot.as_quat(scalar_first=True)
+            
+            # Quaternions q and -q represent the same rotation
+            assert np.allclose(root_quat, expected_quat, atol=1e-6) or \
+                   np.allclose(root_quat, -expected_quat, atol=1e-6), \
+                f"Root orientation mismatch at frame {t}"
 
-    def test_weights_are_row_normalized(self):
-        from omniretargeting.utils import (
-            calculate_exponential_edge_weights,
-            get_adjacency_list,
-        )
 
-        vertices, tetrahedra = self._tetrahedron()
-        adj_list = get_adjacency_list(tetrahedra, len(vertices))
+class TestOmniRetargeter:
+    """Test OmniRetargeter class (mocked for testing without real files)."""
 
-        edge_weights = calculate_exponential_edge_weights(vertices, adj_list, kappa=30.0)
+    @patch('omniretargeting.core.yourdfpy')
+    @patch('omniretargeting.core.mujoco')
+    @patch('omniretargeting.core.trimesh')
+    def test_initialization(self, mock_trimesh, mock_mujoco, mock_yourdfpy):
+        """Test OmniRetargeter initialization with mocked dependencies."""
+        from omniretargeting import OmniRetargeter
 
-        assert len(edge_weights) == len(vertices)
-        for i, weights in enumerate(edge_weights):
-            assert len(weights) == len(adj_list[i])
-            np.testing.assert_allclose(np.sum(weights), 1.0)
+        # Setup mocks
+        mock_urdf = Mock()
+        mock_yourdfpy.URDF.load.return_value = mock_urdf
 
-    def test_weights_favor_closer_neighbors(self):
-        from omniretargeting.utils import calculate_exponential_edge_weights
+        mock_model = Mock()
+        mock_model.nbody = 5
+        mock_model.ngeom = 0
+        mock_model.njnt = 3
+        mock_model.nq = 29  # Total qpos dimension (7 floating base + 22 joints)
+        mock_model.nv = 29  # Total qvel dimension
+        mock_data = Mock()
+        mock_mujoco.MjModel.from_xml_path.return_value = mock_model
+        mock_mujoco.MjData.return_value = mock_data
+        mock_mujoco.mj_resetData = Mock()
+        mock_mujoco.mj_forward = Mock()
+        body_names = ["world", "torso_link", "left_hip_yaw_link", "left_hip_link", "right_hip_link"]
+        mock_mujoco.mjtObj.mjOBJ_BODY = 1
+        mock_mujoco.mj_id2name.side_effect = lambda model, obj_type, i: body_names[i]
 
-        vertices = np.array(
-            [
-                [0.0, 0.0, 0.0],  # center vertex
-                [0.1, 0.0, 0.0],  # close neighbor
-                [1.0, 0.0, 0.0],  # far neighbor
-            ]
-        )
-        adj_list = [[1, 2], [0], [0]]
+        mock_mesh = Mock()
+        mock_trimesh.load.return_value = mock_mesh
 
-        edge_weights = calculate_exponential_edge_weights(vertices, adj_list, kappa=30.0)
-
-        assert edge_weights[0][0] > edge_weights[0][1]
-        expected_far = np.exp(-30.0 * 1.0)
-        expected_close = np.exp(-30.0 * 0.1)
-        np.testing.assert_allclose(
-            edge_weights[0],
-            [expected_close, expected_far] / (expected_close + expected_far),
-        )
-
-    def test_zero_kappa_recovers_uniform_weights(self):
-        from omniretargeting.utils import (
-            calculate_exponential_edge_weights,
-            get_adjacency_list,
-        )
-
-        vertices, tetrahedra = self._tetrahedron()
-        adj_list = get_adjacency_list(tetrahedra, len(vertices))
-
-        edge_weights = calculate_exponential_edge_weights(vertices, adj_list, kappa=0.0)
-
-        for i, weights in enumerate(edge_weights):
-            np.testing.assert_allclose(weights, np.ones(len(adj_list[i])) / len(adj_list[i]))
-
-    def test_weighted_matrix_matches_weighted_coordinates(self):
-        from omniretargeting.utils import (
-            calculate_exponential_edge_weights,
-            calculate_laplacian_coordinates,
-            calculate_laplacian_matrix,
-            get_adjacency_list,
+        # Test initialization - use correct SMPLX joint names
+        joint_mapping = {"Pelvis": "torso_link", "L_Hip": "left_hip_yaw_link"}
+        retargeter = OmniRetargeter(
+            robot_urdf_path="dummy.urdf",
+            terrain_mesh_path="dummy.obj",
+            joint_mapping=joint_mapping,
+            robot_height=1.6
         )
 
-        rng = np.random.default_rng(0)
-        vertices = rng.normal(size=(6, 3))
-        tetrahedra = np.array([[0, 1, 2, 3], [2, 3, 4, 5]])
-        adj_list = get_adjacency_list(tetrahedra, len(vertices))
-        edge_weights = calculate_exponential_edge_weights(vertices, adj_list, kappa=30.0)
+        assert retargeter.joint_mapping == joint_mapping
+        assert retargeter.robot_height == 1.6
 
-        coords = calculate_laplacian_coordinates(vertices, adj_list, edge_weights=edge_weights)
-        L = calculate_laplacian_matrix(vertices, adj_list, edge_weights=edge_weights)
+    def test_joint_mapping_validation(self):
+        """Test joint mapping validation."""
+        from omniretargeting import OmniRetargeter
 
-        np.testing.assert_allclose(L @ vertices, coords)
+        # Create a minimal retargeter instance for testing
+        with patch('omniretargeting.core.yourdfpy'), \
+             patch('omniretargeting.core.mujoco') as mock_mujoco, \
+             patch('omniretargeting.core.trimesh'):
 
-    def test_default_uniform_weighting_unchanged(self):
-        from omniretargeting.utils import (
-            calculate_laplacian_coordinates,
-            calculate_laplacian_matrix,
-            get_adjacency_list,
-        )
+            # Setup mock robot model
+            mock_model = Mock()
+            mock_model.nbody = 5
+            mock_model.ngeom = 0
+            mock_model.njnt = 3
+            mock_model.nq = 29  # Total qpos dimension
+            mock_model.nv = 29  # Total qvel dimension
+            mock_model.joint.side_effect = lambda i: Mock(name=f"joint_{i}")
+            mock_mujoco.MjModel.from_xml_path.return_value = mock_model
+            mock_mujoco.MjData.return_value = Mock()
+            mock_mujoco.mj_resetData = Mock()
+            mock_mujoco.mj_forward = Mock()
+            body_names = ["world", "torso_link", "left_hip_yaw_link", "left_hip_link", "right_hip_link"]
+            mock_mujoco.mjtObj.mjOBJ_BODY = 1
+            mock_mujoco.mj_id2name.side_effect = lambda model, obj_type, i: body_names[i]
 
-        vertices, tetrahedra = self._tetrahedron()
-        adj_list = get_adjacency_list(tetrahedra, len(vertices))
-
-        coords = calculate_laplacian_coordinates(vertices, adj_list, uniform_weight=True)
-        L = calculate_laplacian_matrix(vertices, adj_list, uniform_weight=True)
-
-        # Uniform Laplacian: delta_i = v_i - mean(neighbors)
-        np.testing.assert_allclose(L @ vertices, coords)
-        np.testing.assert_allclose(coords[0], vertices[0] - vertices[1:].mean(axis=0))
-
-    def test_invalid_weighting_scheme_rejected(self):
-        from omniretargeting.retargeting import GenericInteractionRetargeter
-
-        with pytest.raises(ValueError, match="laplacian_edge_weighting"):
-            GenericInteractionRetargeter(
-                Mock(), Mock(), Mock(), {}, 1.0, laplacian_edge_weighting="inverse-distance"
+            # Use correct SMPLX joint names
+            joint_mapping = {"Pelvis": "torso_link", "L_Hip": "left_hip_yaw_link"}
+            retargeter = OmniRetargeter(
+                robot_urdf_path="dummy.urdf",
+                terrain_mesh_path="dummy.obj",
+                joint_mapping=joint_mapping,
+                robot_height=1.6
             )
 
+            # Mock the get_joint_names method
+            retargeter.get_joint_names = Mock(return_value=["torso_link", "left_hip_yaw_link"])
 
-class TestBoneDirection:
-    """TopoRetarget bone-direction prior (Eq. 1-2, 8)."""
-
-    def test_parse_bone_chains_extracts_adjacent_triples(self):
-        from omniretargeting.retargeting import parse_bone_chains
-
-        names = ["Hips", "Spine", "L_Up", "L_Knee", "L_Foot", "R_Up", "R_Knee", "R_Foot"]
-        triples = parse_bone_chains(
-            [["L_Up", "L_Knee", "L_Foot"], ["R_Up", "R_Knee", "R_Foot"], ["Hips", "Spine"]],
-            names,
-        )
-        # Each 3-target leg chain yields one adjacent pair; the 2-target torso
-        # chain defines a bone but no adjacent pair.
-        assert triples == [(2, 3, 4), (5, 6, 7)]
-
-    def test_parse_bone_chains_rejects_unmapped_target(self):
-        from omniretargeting.retargeting import parse_bone_chains
-
-        with pytest.raises(ValueError, match="not a mapped source target"):
-            parse_bone_chains([["A", "B", "C"]], ["A", "B"])
-
-    def test_parse_bone_chains_rejects_short_chain(self):
-        from omniretargeting.retargeting import parse_bone_chains
-
-        with pytest.raises(ValueError, match="at least 2 targets"):
-            parse_bone_chains([["A"]], ["A"])
-
-    def test_bone_direction_targets_math(self):
-        from omniretargeting.retargeting import compute_bone_direction_targets
-
-        # Chain (0->1->2): bone k along +x, bone l along +y
-        points = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 2.0, 0.0]])
-        targets = compute_bone_direction_targets(points, [(0, 1, 2)])
-        np.testing.assert_allclose(targets, np.array([1.0, -1.0, 0.0]))
-
-    def test_bone_jacobian_matches_finite_difference(self):
-        from omniretargeting.retargeting import (
-            compute_bone_direction_targets,
-            compute_bone_direction_residual_and_jacobian,
-        )
-
-        rng = np.random.default_rng(2)
-        n_targets, nq_a = 4, 5
-        points = rng.normal(size=(n_targets, 3)) + np.array([0.0, 0.0, 2.0])
-        J_V = rng.normal(size=(3 * n_targets, nq_a))
-        triples = [(0, 1, 2), (1, 2, 3)]
-        targets = compute_bone_direction_targets(rng.normal(size=(n_targets, 3)) + 2.0, triples)
-
-        res0, J = compute_bone_direction_residual_and_jacobian(points, J_V, triples, targets)
-
-        dq = rng.normal(scale=1e-6, size=nq_a)
-        points_perturbed = points + (J_V @ dq).reshape(n_targets, 3)
-        res1, _ = compute_bone_direction_residual_and_jacobian(points_perturbed, J_V, triples, targets)
-
-        np.testing.assert_allclose(res1, res0 + J @ dq, rtol=1e-4, atol=1e-8)
-
-    def test_bone_direction_requires_chains_when_enabled(self):
-        from omniretargeting.retargeting import GenericInteractionRetargeter
-
-        with pytest.raises(ValueError, match="requires 'chains'"):
-            GenericInteractionRetargeter(
-                Mock(), Mock(), Mock(), {"Pelvis": "pelvis"}, 1.0,
-                bone_direction={"enabled": True},
-            )
-
-    def test_bone_direction_rejects_unmapped_chain_target(self):
-        from omniretargeting.retargeting import GenericInteractionRetargeter
-
-        with pytest.raises(ValueError, match="bone_direction chain target"):
-            GenericInteractionRetargeter(
-                Mock(), Mock(), Mock(), {"Pelvis": "pelvis"}, 1.0,
-                bone_direction={"enabled": True, "chains": [["Pelvis", "A", "B"]]},
-            )
-
-    def test_bone_direction_rejects_chains_without_pairs(self):
-        from omniretargeting.retargeting import GenericInteractionRetargeter
-
-        with pytest.raises(ValueError, match="no adjacent bone pairs"):
-            GenericInteractionRetargeter(
-                Mock(), Mock(), Mock(), {"A": "a", "B": "b"}, 1.0,
-                source_target_names=["A", "B"],
-                bone_direction={"enabled": True, "chains": [["A", "B"]]},
-            )
-
-
-class TestPenetrationSlack:
-    """TopoRetarget slack penetration handling (Eq. 8)."""
-
-    @staticmethod
-    def _bare_retargeter(**attrs):
-        from omniretargeting.retargeting import GenericInteractionRetargeter
-
-        r = GenericInteractionRetargeter.__new__(GenericInteractionRetargeter)
-        r.penetration_slack_enabled = False
-        r.penetration_tolerance = 1e-3
-        r.penetration_soft_tolerance = 1e-3
-        r.penetration_hard_bound = 0.03
-        r.penetration_slack_penalty = 1e5
-        for k, v in attrs.items():
-            setattr(r, k, v)
-        return r
-
-    def test_hard_only_constraint_by_default(self):
-        r = self._bare_retargeter()
-        hard_rows, slack_row = r._penetration_constraint_terms(np.array([1.0]), 0.005)
-
-        assert len(hard_rows) == 1
-        assert slack_row is None
-
-    def test_slack_allows_soft_violation_within_hard_bound(self):
-        from scipy import sparse as sp
-        from omniretargeting.retargeting import _solve_qp_clarabel
-
-        r = self._bare_retargeter(penetration_slack_enabled=True)
-        # 5 mm existing penetration: soft tolerance (1 mm) must be violated,
-        # but the hard bound (30 mm) must still hold.
-        hard_rows, slack_row = r._penetration_constraint_terms(np.array([1.0]), -0.005)
-
-        assert len(hard_rows) == 1
-        assert slack_row is not None
-        Ja, rhs_soft, span = slack_row
-
-        # Recreate the QP row the retargeter builds for this pair, with dqa
-        # pinned at 0: min (w_s/2)(span*s_unit)^2
-        #   s.t. Ja*dqa + span*s_unit >= rhs_soft, Ja*dqa >= rhs_hard, 0<=s_unit<=1
-        w_s = r.penetration_slack_penalty
-        P = sp.csr_matrix(np.diag([0.0, w_s * span ** 2]))
-        c = np.zeros(2)
-        lb = np.array([0.0, 0.0])  # dqa pinned at 0 via bounds
-        ub = np.array([0.0, 1.0])
-        ge_rows = [
-            (np.array([Ja[0], span]), rhs_soft),
-            (np.array([Ja[0], 0.0]), hard_rows[0][1]),
-        ]
-        x, ok = _solve_qp_clarabel(P, c, lb, ub, ge_rows)
-        assert ok
-        s = span * x[1]
-
-        # Soft violation exactly compensated: phi + s = -tau -> s = 0.005 - 0.001
-        np.testing.assert_allclose(s, 0.004, rtol=1e-4)
-        assert s <= 0.03 - 0.001 + 1e-9
-
-    def test_hard_bound_must_exceed_soft_tolerance(self):
-        from omniretargeting.retargeting import GenericInteractionRetargeter
-
-        with pytest.raises(ValueError, match="hard_bound"):
-            GenericInteractionRetargeter(
-                Mock(), Mock(), Mock(), {"Pelvis": "pelvis"}, 1.0,
-                hard_penetration_constraint=True,
-                penetration_slack={"soft_tolerance": 0.03, "hard_bound": 0.001},
-            )
-
-    def test_slack_requires_hard_penetration_constraint(self):
-        from omniretargeting.retargeting import GenericInteractionRetargeter
-
-        with pytest.raises(ValueError, match="requires hard_penetration_constraint"):
-            GenericInteractionRetargeter(
-                Mock(), Mock(), Mock(), {"Pelvis": "pelvis"}, 1.0,
-                penetration_slack={"soft_tolerance": 0.001},
-            )
-
-
-def test_load_robot_config_nested_source_profile(tmp_path):
-    urdf_path = tmp_path / "robot.urdf"
-    urdf_path.write_text("<robot name='dummy'/>")
-    config_path = tmp_path / "profile.json"
-    config_path.write_text(
-        json.dumps(
-            {
-                "name": "nested",
-                "robot": {"urdf_path": "robot.urdf", "height": 1.2},
-                "retargeting": {"solver": {"terrain_sample_points": 7}},
-                "active_source": "smplx_default",
-                "source": [
-                    {
-                        "name": "smplx_default",
-                        "type": "smplx",
-                        "target_names": ["Pelvis", "Head"],
-                        "target_mapping": {"Pelvis": "base_link"},
-                        "height_estimation": {"head_target": "Head", "foot_targets": ["Pelvis"]},
-                        "base_orientation": {"pelvis": "Pelvis", "spine": "Head"},
-                        "adapter_options": {
-                            "model_directory": "/localhdd/Datasets/",
-                            "betas": [0.0, 0.0],
-                            "gender": "neutral",
-                        },
-                    }
-                ],
-            }
-        )
-    )
-
-    config = load_robot_config(config_path)
-
-    assert config["urdf_path"] == str(urdf_path.resolve())
-    assert config["robot_height"] == 1.2
-    assert config["joint_mapping"] == {"Pelvis": "base_link"}
-    assert config["source_target_names"] == ["Pelvis", "Head"]
-    assert config["height_estimation"] == {"head_target": "Head", "foot_targets": ["Pelvis"]}
-    assert config["base_orientation"] == {"pelvis": "Pelvis", "spine": "Head"}
-    assert config["retargeting"]["terrain_sample_points"] == 7
-    assert config["selected_source"]["adapter_options"]["model_directory"] == "/localhdd/Datasets/"
-
-
-@pytest.mark.parametrize("_profile_name,profile_path", ROBOT_PROFILE_CASES)
-def test_robot_profile_mappings_are_source_local(_profile_name, profile_path):
-    raw = json.loads(profile_path.read_text())
-
-    assert "active_source" not in raw
-    assert "joint_mapping" not in raw
-    assert raw.get("source")
-    source_types = {source.get("type") for source in raw["source"]}
-    assert {"smplx", "omomo"}.issubset(source_types)
-    for source in raw["source"]:
-        assert isinstance(source.get("target_mapping"), dict)
-        assert source["target_mapping"]
-
-    config = load_robot_config(profile_path)
-    assert config["joint_mapping"] == config["selected_source"]["target_mapping"]
-    assert select_robot_source(config, "omomo")["type"] == "omomo"
-    assert select_robot_source(config, "smplx")["type"] == "smplx"
+            missing_joints = retargeter.validate_joint_mapping()
+            assert len(missing_joints) == 0  # All joints should be found
 
 
 class TestPackageImport:
@@ -588,18 +317,14 @@ class TestRealDataIntegration:
                 "omniretargeting.main",
                 "--robot-config",
                 str(motion_case.robot_profile),
-                "--model-dir",
+                "--smplx_model_dir",
                 str(SMPLX_MODEL_DIR),
-                "--motion",
+                "--smplx_motion",
                 str(motion_case.motion_path),
                 "--terrain",
                 str(motion_case.terrain_path),
                 "--output",
                 str(output_path),
-                "--penetration-resolver",
-                "xyz_nudge",
-                "--output-scaled-terrain",
-                "/tmp/scaled_terrain.stl",
             ]
             
             # Main script will normalize the output path
@@ -663,43 +388,84 @@ class TestRealDataIntegration:
                 expected_output_path.unlink()
 
 
-def test_retarget_motion_uses_identity_source_to_robot_scale_by_default():
+def test_retarget_motion_uses_identity_terrain_scale_by_default():
     from omniretargeting import OmniRetargeter
 
     original_terrain_copy = Mock(name="original_terrain_copy")
     scaled_terrain = Mock(name="scaled_terrain")
-    source_positions = np.ones((2, 22, 3), dtype=float)
+    processed_trajectory = np.full((2, 22, 3), 7.0, dtype=float)
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
     retargeter.terrain_mesh = Mock()
     retargeter.terrain_mesh.copy.return_value = original_terrain_copy
-    retargeter._compute_source_to_robot_scale = Mock(return_value=2.5)
+    retargeter._compute_terrain_scale = Mock(return_value=2.5)
     retargeter._scale_terrain_mesh = Mock(return_value=scaled_terrain)
-    retargeter.retarget_stream = Mock(return_value=iter([np.array([1.0, 2.0, 3.0])]))
-    retargeter.retargeting_config = {}
+    retargeter._process_smplx_trajectory = Mock(return_value=processed_trajectory)
+    retargeter._perform_retargeting = Mock(return_value=np.array([[1.0, 2.0, 3.0]]))
     retargeter._visualize_trajectory = Mock()
 
-    source_to_robot_scale, retargeted_motion = retargeter.retarget_motion(
-        source_positions,
+    smplx_trajectory = np.ones((2, 22, 3), dtype=float)
+
+    terrain_scale, retargeted_motion = retargeter.retarget_motion(
+        smplx_trajectory,
         visualize_trajectory=False,
         enable_terrain_scaling=False,
     )
 
-    assert source_to_robot_scale == 1.0
+    assert terrain_scale == 1.0
     assert isinstance(retargeted_motion, np.ndarray)
-    retargeter._compute_source_to_robot_scale.assert_not_called()
+    retargeter._compute_terrain_scale.assert_not_called()
     retargeter._scale_terrain_mesh.assert_not_called()
     retargeter.terrain_mesh.copy.assert_called_once_with()
-    retargeter.retarget_stream.assert_called_once()
-    assert retargeter.retarget_stream.call_args.kwargs["scaled_terrain"] is original_terrain_copy
+    retargeter._process_smplx_trajectory.assert_called_once_with(smplx_trajectory, 1.0)
+    retargeter._perform_retargeting.assert_called_once_with(
+        processed_trajectory,
+        original_terrain_copy,
+        base_orientations=None,
+        base_translations=None,
+    )
 
 
-# test_retarget_motion_applies_source_to_robot_scale_when_enabled removed - replaced with integration test
+def test_retarget_motion_applies_terrain_scale_when_enabled():
+    from omniretargeting import OmniRetargeter
+
+    scaled_terrain = Mock(name="scaled_terrain")
+    processed_trajectory = np.full((2, 22, 3), 9.0, dtype=float)
+
+    retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter.terrain_mesh = Mock()
+    retargeter._compute_terrain_scale = Mock(return_value=2.5)
+    retargeter._scale_terrain_mesh = Mock(return_value=scaled_terrain)
+    retargeter._process_smplx_trajectory = Mock(return_value=processed_trajectory)
+    retargeter._perform_retargeting = Mock(return_value=np.array([[4.0, 5.0, 6.0]]))
+    retargeter._visualize_trajectory = Mock()
+
+    smplx_trajectory = np.ones((2, 22, 3), dtype=float)
+
+    terrain_scale, retargeted_motion = retargeter.retarget_motion(
+        smplx_trajectory,
+        visualize_trajectory=False,
+        enable_terrain_scaling=True,
+    )
+
+    assert terrain_scale == 2.5
+    assert isinstance(retargeted_motion, np.ndarray)
+    retargeter._compute_terrain_scale.assert_called_once_with(smplx_trajectory)
+    retargeter._scale_terrain_mesh.assert_called_once_with(2.5)
+    retargeter._process_smplx_trajectory.assert_called_once_with(smplx_trajectory, 2.5)
+    retargeter._perform_retargeting.assert_called_once_with(
+        processed_trajectory,
+        scaled_terrain,
+        base_orientations=None,
+        base_translations=None,
+    )
+
 
 def test_retarget_motion_applies_foot_stabilization_for_xyz_nudge():
     from omniretargeting import OmniRetargeter
 
     original_terrain_copy = Mock(name="original_terrain_copy")
+    processed_trajectory = np.full((2, 22, 3), 7.0, dtype=float)
     raw_motion = np.array([[1.0, 2.0, 3.0]])
     stabilized_motion = np.array([[1.5, 2.5, 3.5]])
 
@@ -707,208 +473,64 @@ def test_retarget_motion_applies_foot_stabilization_for_xyz_nudge():
     retargeter.terrain_mesh = Mock()
     retargeter.terrain_mesh.copy.return_value = original_terrain_copy
     retargeter.retargeting_config = {"penetration_resolver": "xyz_nudge"}
-    retargeter._compute_source_to_robot_scale = Mock(return_value=2.5)
+    retargeter._compute_terrain_scale = Mock(return_value=2.5)
     retargeter._scale_terrain_mesh = Mock()
-    retargeter.retarget_stream = Mock(return_value=iter(raw_motion))
+    retargeter._process_smplx_trajectory = Mock(return_value=processed_trajectory)
+    retargeter._perform_retargeting = Mock(return_value=raw_motion)
     retargeter._apply_foot_stabilization = Mock(return_value=stabilized_motion)
     retargeter._visualize_trajectory = Mock()
 
-    source_positions = np.ones((2, 22, 3), dtype=float)
+    smplx_trajectory = np.ones((2, 22, 3), dtype=float)
 
-    source_to_robot_scale, retargeted_motion = retargeter.retarget_motion(
-        source_positions,
+    terrain_scale, retargeted_motion = retargeter.retarget_motion(
+        smplx_trajectory,
         framerate=60.0,
         visualize_trajectory=False,
         enable_terrain_scaling=False,
     )
 
-    assert source_to_robot_scale == 1.0
+    assert terrain_scale == 1.0
     assert retargeted_motion is stabilized_motion
-    retargeter._apply_foot_stabilization.assert_called_once()
-    stabilization_args = retargeter._apply_foot_stabilization.call_args
-    np.testing.assert_array_equal(stabilization_args.args[0], raw_motion)
-    assert stabilization_args.args[1] is original_terrain_copy
-    assert stabilization_args.kwargs["framerate"] == 60.0
+    retargeter._apply_foot_stabilization.assert_called_once_with(
+        raw_motion,
+        original_terrain_copy,
+        framerate=60.0,
+    )
 
 
 def test_retarget_motion_skips_foot_stabilization_for_hard_constraint():
     from omniretargeting import OmniRetargeter
 
     original_terrain_copy = Mock(name="original_terrain_copy")
+    processed_trajectory = np.full((2, 22, 3), 7.0, dtype=float)
     raw_motion = np.array([[1.0, 2.0, 3.0]])
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
     retargeter.terrain_mesh = Mock()
     retargeter.terrain_mesh.copy.return_value = original_terrain_copy
     retargeter.retargeting_config = {"penetration_resolver": "hard_constraint"}
-    retargeter._compute_source_to_robot_scale = Mock(return_value=2.5)
+    retargeter._compute_terrain_scale = Mock(return_value=2.5)
     retargeter._scale_terrain_mesh = Mock()
-    retargeter.retarget_stream = Mock(return_value=iter(raw_motion))
+    retargeter._process_smplx_trajectory = Mock(return_value=processed_trajectory)
+    retargeter._perform_retargeting = Mock(return_value=raw_motion)
     retargeter._apply_foot_stabilization = Mock()
     retargeter._visualize_trajectory = Mock()
 
-    source_positions = np.ones((2, 22, 3), dtype=float)
+    smplx_trajectory = np.ones((2, 22, 3), dtype=float)
 
-    source_to_robot_scale, retargeted_motion = retargeter.retarget_motion(
-        source_positions,
+    terrain_scale, retargeted_motion = retargeter.retarget_motion(
+        smplx_trajectory,
         framerate=60.0,
         visualize_trajectory=False,
         enable_terrain_scaling=False,
     )
 
-    assert source_to_robot_scale == 1.0
-    np.testing.assert_array_equal(retargeted_motion, raw_motion)
+    assert terrain_scale == 1.0
+    assert retargeted_motion is raw_motion
     retargeter._apply_foot_stabilization.assert_not_called()
 
 
-
-def test_retarget_motion_uses_base_inputs_as_root_pose_arrays():
-    from omniretargeting import OmniRetargeter
-
-    base_orientations = np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=float), (1, 1))
-    base_translations = np.full((1, 3), 2.0, dtype=float)
-    motion_data = MotionData(
-        positions=np.zeros((1, 2, 3), dtype=float),
-        target_names=["Pelvis", "Head"],
-        root_orientations=np.tile(np.array([1.0, 0.0, 0.0, 0.0], dtype=float), (1, 1)),
-        root_translations=np.zeros((1, 3), dtype=float),
-        framerate=30.0,
-        metadata={"source_type": "test"},
-    )
-
-    captured = {}
-    scaled_terrain = Mock()
-
-    retargeter = OmniRetargeter.__new__(OmniRetargeter)
-    retargeter._coerce_motion_data = Mock(return_value=motion_data)
-    retargeter._resolve_source_to_robot_scale = Mock(return_value=1.0)
-    retargeter.terrain_mesh = Mock()
-    retargeter.terrain_mesh.copy.return_value = scaled_terrain
-    retargeter.retargeting_config = {"penetration_resolver": "hard_constraint"}
-
-    def fake_retarget_stream(motion, scaled_terrain=None):
-        captured["motion"] = motion
-        captured["terrain"] = scaled_terrain
-        return [np.zeros(7, dtype=float)]
-
-    retargeter.retarget_stream = Mock(side_effect=fake_retarget_stream)
-
-    retargeter.retarget_motion(
-        motion_data,
-        base_orientations=base_orientations,
-        base_translations=base_translations,
-        visualize_trajectory=False,
-    )
-
-    assert captured["terrain"] is scaled_terrain
-    np.testing.assert_array_equal(captured["motion"].root_orientations, base_orientations)
-    np.testing.assert_array_equal(captured["motion"].root_translations, base_translations)
-    assert "use_explicit_root_orientation" not in captured["motion"].metadata
-    assert "use_explicit_root_translation" not in captured["motion"].metadata
-
-
-def test_retarget_frame_uses_root_pose_for_frame_zero_init_when_present():
-    from omniretargeting.core import RetargetingStreamState
-    from omniretargeting import OmniRetargeter
-
-    estimated_quat_wxyz = np.array([0.1, 0.2, 0.3, 0.9], dtype=float)
-    estimated_quat_wxyz /= np.linalg.norm(estimated_quat_wxyz)
-    mapped_targets = np.arange(12, dtype=float).reshape(4, 3)
-    q_result = np.arange(7, dtype=float)
-
-    inner_retargeter = Mock()
-    inner_retargeter.retarget_frame.return_value = q_result
-
-    retargeter = OmniRetargeter.__new__(OmniRetargeter)
-    retargeter.retargeting_config = {}
-    retargeter._estimate_base_orientation_from_joints = Mock(return_value=estimated_quat_wxyz)
-    retargeter._extract_mapped_source_targets = Mock(return_value=mapped_targets)
-
-    state = RetargetingStreamState(
-        retargeter=inner_retargeter,
-        q_init=np.zeros(7, dtype=float),
-        q_last=None,
-        last_estimated_quat=None,
-        frame_idx=0,
-        scaled_terrain=Mock(),
-    )
-
-    root_translation = np.array([1.0, 2.0, 3.0], dtype=float)
-    root_orientation = Rotation.from_rotvec([0.0, 0.0, np.pi / 2.0]).as_quat(scalar_first=True)
-    frame = MotionFrame(
-        positions=np.zeros((4, 3), dtype=float),
-        root_orientation=root_orientation,
-        root_translation=root_translation,
-    )
-
-    result = retargeter.retarget_frame(frame, state)
-
-    expected_init_wxyz = root_orientation
-    expected_target_wxyz = estimated_quat_wxyz
-
-    call_args = inner_retargeter.retarget_frame.call_args
-    np.testing.assert_array_equal(call_args.args[0], mapped_targets)
-    np.testing.assert_allclose(call_args.args[1][:3], root_translation)
-    np.testing.assert_allclose(call_args.args[1][3:7], expected_init_wxyz)
-    assert call_args.kwargs["q_last"] is None
-    np.testing.assert_allclose(call_args.kwargs["target_base_orientation"], expected_target_wxyz)
-    np.testing.assert_allclose(state.last_estimated_quat, estimated_quat_wxyz)
-    assert state.frame_idx == 1
-    np.testing.assert_array_equal(state.q_init, q_result)
-    np.testing.assert_array_equal(state.q_last, q_result)
-    np.testing.assert_array_equal(result, q_result)
-
-
-def test_retarget_frame_falls_back_to_estimated_root_pose_when_absent():
-    from omniretargeting.core import RetargetingStreamState
-    from omniretargeting import OmniRetargeter
-
-    estimated_quat_wxyz = np.array([0.3, -0.2, 0.1, 0.9], dtype=float)
-    estimated_quat_wxyz /= np.linalg.norm(estimated_quat_wxyz)
-    positions = np.array(
-        [[10.0, 11.0, 12.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
-        dtype=float,
-    )
-    mapped_targets = np.arange(12, dtype=float).reshape(4, 3)
-    previous_q = np.ones(7, dtype=float)
-    q_result = np.arange(7, dtype=float) + 10.0
-
-    inner_retargeter = Mock()
-    inner_retargeter.retarget_frame.return_value = q_result
-
-    retargeter = OmniRetargeter.__new__(OmniRetargeter)
-    retargeter.retargeting_config = {}
-    retargeter._estimate_base_orientation_from_joints = Mock(return_value=estimated_quat_wxyz)
-    retargeter._extract_mapped_source_targets = Mock(return_value=mapped_targets)
-
-    state = RetargetingStreamState(
-        retargeter=inner_retargeter,
-        q_init=np.zeros(7, dtype=float),
-        q_last=previous_q,
-        last_estimated_quat=np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
-        frame_idx=0,
-        scaled_terrain=Mock(),
-    )
-
-    frame = MotionFrame(positions=positions)
-    result = retargeter.retarget_frame(frame, state)
-
-    expected_target_wxyz = estimated_quat_wxyz
-
-    call_args = inner_retargeter.retarget_frame.call_args
-    np.testing.assert_array_equal(call_args.args[0], mapped_targets)
-    np.testing.assert_allclose(call_args.args[1][:3], positions[0])
-    np.testing.assert_allclose(call_args.args[1][3:7], expected_target_wxyz)
-    np.testing.assert_array_equal(call_args.kwargs["q_last"], previous_q)
-    np.testing.assert_allclose(call_args.kwargs["target_base_orientation"], expected_target_wxyz)
-    np.testing.assert_allclose(state.last_estimated_quat, estimated_quat_wxyz)
-    assert state.frame_idx == 1
-    np.testing.assert_array_equal(state.q_init, q_result)
-    np.testing.assert_array_equal(state.q_last, q_result)
-    np.testing.assert_array_equal(result, q_result)
-
-
-def test_create_stream_state_passes_hard_penetration_constraint():
+def test_perform_retargeting_passes_hard_penetration_constraint():
     from omniretargeting import OmniRetargeter
     from unittest.mock import patch
 
@@ -916,32 +538,29 @@ def test_create_stream_state_passes_hard_penetration_constraint():
     robot_model.nq = 7
     robot_model.njnt = 0
     robot_data = Mock()
+    processed_trajectory = np.zeros((0, 22, 3), dtype=float)
     scaled_terrain = Mock()
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
     retargeter.robot_model = robot_model
     retargeter.robot_data = robot_data
-    retargeter.valid_source_to_robot_link_mapping = {"Pelvis": "pelvis"}
+    retargeter.valid_joint_mapping = {"Pelvis": "pelvis"}
     retargeter.robot_height = 1.0
     retargeter.retargeting_config = {
         "collision_detection_threshold": 0.2,
         "terrain_sample_points": 123,
         "replace_cylinders_with_capsules": True,
-        "penetration_resolver": "hard_constraint_slack",
-        "laplacian_edge_weighting": "exponential",
-        "laplacian_distance_decay": 15.0,
-        "bone_direction": {"enabled": True, "chains": [["Pelvis", "A", "B"]]},
-        "penetration_slack": {"soft_tolerance": 0.002, "hard_bound": 0.04, "slack_penalty": 5e4},
+        "penetration_resolver": "xyz_nudge",
     }
-    retargeter.valid_source_target_names = ["Pelvis"]
+    retargeter.valid_joint_names = ["Pelvis"]
     retargeter.base_orientation_config = {}
 
     with patch("omniretargeting.retargeting.GenericInteractionRetargeter") as retargeter_cls:
         retargeter_instance = Mock()
         retargeter_cls.return_value = retargeter_instance
-        state = retargeter.create_stream_state(scaled_terrain=scaled_terrain)
+        result = retargeter._perform_retargeting(processed_trajectory, scaled_terrain)
 
-    assert state.retargeter is retargeter_instance
+    assert result.shape == (0,)
     retargeter_cls.assert_called_once_with(
         robot_model,
         robot_data,
@@ -950,97 +569,10 @@ def test_create_stream_state_passes_hard_penetration_constraint():
         1.0,
         collision_detection_threshold=0.2,
         terrain_sample_points=123,
-        terrain_sample_seed=None,
-        link_orientation=None,
-        scene_contact=None,
-        foot_penetration=None,
-        smooth_weight=0.2,
-        source_target_names=["Pelvis"],
+        valid_joint_names=["Pelvis"],
         replace_cylinders_with_capsules=True,
-        hard_penetration_constraint=True,
-        joint_regularization_boost=None,
-        laplacian_edge_weighting="exponential",
-        laplacian_distance_decay=15.0,
-        bone_direction={"enabled": True, "chains": [["Pelvis", "A", "B"]]},
-        penetration_slack={"soft_tolerance": 0.002, "hard_bound": 0.04, "slack_penalty": 5e4},
-        base_position_tracking_weight=0.0,
+        hard_penetration_constraint=False,
     )
-
-
-def test_create_stream_state_ignores_slack_params_for_non_slack_resolver():
-    from omniretargeting import OmniRetargeter
-    from unittest.mock import patch
-
-    retargeter = OmniRetargeter.__new__(OmniRetargeter)
-    retargeter.robot_model = Mock(nq=7, njnt=0)
-    retargeter.robot_data = Mock()
-    retargeter.valid_source_to_robot_link_mapping = {"Pelvis": "pelvis"}
-    retargeter.robot_height = 1.0
-    retargeter.retargeting_config = {
-        "penetration_resolver": "hard_constraint",
-        "penetration_slack": {"soft_tolerance": 0.002},
-    }
-    retargeter.valid_source_target_names = ["Pelvis"]
-    retargeter.base_orientation_config = {}
-
-    with patch("omniretargeting.retargeting.GenericInteractionRetargeter") as retargeter_cls:
-        retargeter_cls.return_value = Mock()
-        retargeter.create_stream_state(scaled_terrain=Mock())
-
-    assert retargeter_cls.call_args.kwargs["hard_penetration_constraint"] is True
-    assert retargeter_cls.call_args.kwargs["penetration_slack"] is None
-
-
-def test_create_stream_state_rejects_unknown_penetration_resolver():
-    from omniretargeting import OmniRetargeter
-
-    retargeter = OmniRetargeter.__new__(OmniRetargeter)
-    retargeter.robot_model = Mock(nq=7, njnt=0)
-    retargeter.robot_data = Mock()
-    retargeter.valid_source_to_robot_link_mapping = {"Pelvis": "pelvis"}
-    retargeter.robot_height = 1.0
-    retargeter.retargeting_config = {"penetration_resolver": "soft_constraint"}
-    retargeter.valid_source_target_names = ["Pelvis"]
-    retargeter.base_orientation_config = {}
-
-    with pytest.raises(ValueError, match="penetration_resolver"):
-        retargeter.create_stream_state(scaled_terrain=Mock())
-
-
-def test_create_stream_state_passes_base_position_tracking_weight():
-    from omniretargeting import OmniRetargeter
-    from unittest.mock import patch
-
-    retargeter = OmniRetargeter.__new__(OmniRetargeter)
-    retargeter.robot_model = Mock(nq=7, njnt=0)
-    retargeter.robot_data = Mock()
-    retargeter.valid_source_to_robot_link_mapping = {"Pelvis": "pelvis"}
-    retargeter.robot_height = 1.0
-    retargeter.retargeting_config = {"base_position_tracking_weight": 42.0}
-    retargeter.valid_source_target_names = ["Pelvis"]
-    retargeter.base_orientation_config = {}
-
-    with patch("omniretargeting.retargeting.GenericInteractionRetargeter") as retargeter_cls:
-        retargeter_cls.return_value = Mock()
-        retargeter.create_stream_state(scaled_terrain=Mock())
-
-    assert retargeter_cls.call_args.kwargs["base_position_tracking_weight"] == 42.0
-
-
-def test_base_position_tracking_weight_default_is_zero():
-    from omniretargeting.retargeting import GenericInteractionRetargeter
-
-    retargeter = GenericInteractionRetargeter.__new__(GenericInteractionRetargeter)
-    retargeter.penetration_slack_enabled = False
-    retargeter.hard_penetration_constraint = False
-    retargeter.bone_direction_enabled = False
-    retargeter.Q_diag_modified = np.ones(10)
-    retargeter.q_a_indices = np.arange(10)
-    retargeter.q_a_lb = -np.ones(10) * 1e6
-    retargeter.q_a_ub = np.ones(10) * 1e6
-    retargeter.base_position_tracking_weight = 0.0
-
-    assert retargeter.base_position_tracking_weight == 0.0
 
 @pytest.mark.parametrize(("robot_name", "profile_path"), ROBOT_PROFILE_CASES)
 def test_tpose_retargeting_alignment(robot_name: str, profile_path: Path):
@@ -1092,7 +624,7 @@ def test_tpose_retargeting_alignment(robot_name: str, profile_path: Path):
     joints_world = pelvis_world + offsets
     
     # Create trajectory: (T, J, 3) - single frame
-    source_positions = joints_world[np.newaxis, :, :]  # Shape: (1, 22, 3)
+    smplx_trajectory = joints_world[np.newaxis, :, :]  # Shape: (1, 22, 3)
     
     # ==========================================
     # Setup test environment
@@ -1126,28 +658,19 @@ def test_tpose_retargeting_alignment(robot_name: str, profile_path: Path):
         print(f"T-Pose Retargeting Test ({robot_name})")
         print("="*60)
         
-        # The synthetic trajectory uses the full 22-joint SMPLX layout, so declare
-        # the full skeleton as source_target_names (production gets these from the
-        # DataSource). Otherwise source_target_names falls back to the mapped
-        # subset, mapped indices point at the wrong joints, and base_orientation
-        # cannot find Spine1 (the robot maps its waist to Spine2, not Spine1).
-        from omniretargeting.data_sources.smplx import DEFAULT_SMPLX_TARGET_NAMES
-
-        retargeter_kwargs = _build_retargeter_kwargs(robot_config, terrain_path, joint_mapping)
-        retargeter_kwargs["source_target_names"] = list(DEFAULT_SMPLX_TARGET_NAMES)
-        retargeter = OmniRetargeter(**retargeter_kwargs)
+        retargeter = OmniRetargeter(**_build_retargeter_kwargs(robot_config, terrain_path, joint_mapping))
         assert sorted(retargeter.validate_joint_mapping()) == []
         
-        print(f"Input SMPLX trajectory shape: {source_positions.shape}")
-        print(f"Mapped source targets: {len(retargeter.mapped_source_target_indices)}")
+        print(f"Input SMPLX trajectory shape: {smplx_trajectory.shape}")
+        print(f"Mapped joints: {len(retargeter.mapped_joint_indices)}")
         
         # Run retargeting (no visualization)
-        source_to_robot_scale, retargeted_motion = retargeter.retarget_motion(
-            source_positions,
+        terrain_scale, retargeted_motion = retargeter.retarget_motion(
+            smplx_trajectory,
             visualize_trajectory=False
         )
         
-        print(f"Source-to-robot scale: {source_to_robot_scale:.4f}")
+        print(f"Terrain scale: {terrain_scale:.4f}")
         print(f"Retargeted motion shape: {retargeted_motion.shape}")
         
         # ==========================================
@@ -1167,27 +690,25 @@ def test_tpose_retargeting_alignment(robot_name: str, profile_path: Path):
         # Get robot link positions for mapped joints
         robot_positions = []
         target_positions = []
-        checked_joints = []
-
-        for smplx_name, mapping_value in joint_mapping.items():
-            # Profile target_mapping values may be dicts: {"robot_link": ..., "offset": ...}
-            robot_link_name = mapping_value["robot_link"] if isinstance(mapping_value, dict) else mapping_value
-
+        
+        for smplx_name, robot_link_name in joint_mapping.items():
             # Get SMPLX joint index
-            smplx_idx = retargeter.source_target_indices.get(smplx_name)
+            smplx_idx = retargeter.smplx_joint_indices.get(smplx_name)
             if smplx_idx is None:
                 continue
-
-            # Get robot link position (mj_name2id returns -1 for unknown bodies)
-            body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, robot_link_name)
-            if body_id < 0:
-                continue
-
+            
             # Get target position (scaled)
-            target_pos = source_positions[0, smplx_idx] * source_to_robot_scale
+            target_pos = smplx_trajectory[0, smplx_idx] * terrain_scale
             target_positions.append(target_pos)
-            robot_positions.append(data.xpos[body_id].copy())
-            checked_joints.append((smplx_name, robot_link_name))
+            
+            # Get robot link position
+            try:
+                body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, robot_link_name)
+                robot_pos = data.xpos[body_id].copy()
+                robot_positions.append(robot_pos)
+            except Exception as e:
+                print(f"Warning: Could not get position for {robot_link_name}: {e}")
+                continue
         
         robot_positions = np.array(robot_positions)
         target_positions = np.array(target_positions)
@@ -1205,8 +726,9 @@ def test_tpose_retargeting_alignment(robot_name: str, profile_path: Path):
         print(f"Max distance: {max_distance:.4f} m")
         print(f"Min distance: {distances.min():.4f} m")
         print("\nPer-joint distances:")
-        for i, (smplx_name, robot_link_name) in enumerate(checked_joints):
-            print(f"  {smplx_name:12s} -> {robot_link_name:25s}: {distances[i]:.4f} m")
+        for i, (smplx_name, robot_link_name) in enumerate(joint_mapping.items()):
+            if i < len(distances):
+                print(f"  {smplx_name:12s} -> {robot_link_name:25s}: {distances[i]:.4f} m")
         print("-"*60)
         
         # Test assertion: mean distance should be < 1.0m for now
@@ -1234,22 +756,3 @@ def test_tpose_retargeting_alignment(robot_name: str, profile_path: Path):
         # Cleanup temporary terrain file
         if os.path.exists(terrain_path):
             os.remove(terrain_path)
-
-@pytest.mark.parametrize(("robot_name", "profile_path"), FLOATING_BASE_PROFILE_CASES)
-def test_robot_profile_has_floating_base(robot_name: str, profile_path: Path):
-    import mujoco
-
-    robot_config = _load_robot_profile(profile_path)
-    from omniretargeting.utils import load_robot_urdf_with_floating_base
-    model = load_robot_urdf_with_floating_base(str(robot_config["urdf_path"]))
-
-    assert model.njnt > 0
-    joint_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, 0)
-    joint_type = int(model.jnt_type[0])
-
-    message = "%s should expose a floating base as the first joint, got %s type=%s" % (
-        robot_name,
-        joint_name,
-        joint_type,
-    )
-    assert joint_type == int(mujoco.mjtJoint.mjJNT_FREE), message

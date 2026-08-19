@@ -173,11 +173,6 @@ cankao/
 # URDF straight off disk.
 robot_models/*/*_floating.urdf
 
-# Scratch diagnostics from interactive sessions. The maintained diagnostic
-# lives in scripts/diagnose_foot_pose.py.
-check_sole.py
-check_contact.py
-
 # RLCR loop state is per-session working data, not project source.
 .humanize/rlcr/
 .humanize/.pending-session-id

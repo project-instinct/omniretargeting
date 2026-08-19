@@ -15,8 +15,7 @@ import numpy as np
 from omniretargeting import OmniRetargeter
 from omniretargeting.main import create_flat_terrain, extract_omomo_object_pose
 from omniretargeting.robot_config import load_robot_config
-from omniretargeting.data_sources.smplx import load_smplx_trajectory
-from omniretargeting.utils import normalize_retargeted_output_path
+from omniretargeting.utils import load_smplx_trajectory, normalize_retargeted_output_path
 
 
 _WORKER: dict[str, object] = {}

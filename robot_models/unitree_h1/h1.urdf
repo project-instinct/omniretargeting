@@ -1,5 +1,17 @@
 <?xml version="1.0" encoding="utf-8"?>
 <robot name="h1_description">
+  <mujoco>
+    <compiler meshdir="./" discardvisual="false"/>
+  </mujoco>
+
+
+  <!-- [CAUTION] uncomment when convert to mujoco -->
+  <link name="world"></link>
+  <joint name="floating_base_joint" type="floating">
+    <parent link="world" />
+    <child link="pelvis" />
+  </joint>
+
 
   <link name="pelvis">
     <inertial>

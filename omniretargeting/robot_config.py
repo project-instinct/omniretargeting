@@ -2,79 +2,25 @@
 
 from __future__ import annotations
 
-import importlib
 import json
 from pathlib import Path
 from typing import Any, Dict
 
-_PYTHON_PKG_PREFIX = "package://"
-
-
-def _resolve_path(value: str | None, config_dir: Path) -> str | None:
-    if not value:
-        return value
-    if value.startswith(_PYTHON_PKG_PREFIX):
-        rest = value[len(_PYTHON_PKG_PREFIX):]
-        package_name, _, subpath = rest.partition("/")
-        mod = importlib.import_module(package_name)
-        if mod.__file__ is None:
-            raise ValueError(f"Package '{package_name}' has no __file__; cannot resolve path.")
-        resolved = (Path(mod.__file__).parent / subpath).resolve()
-    else:
-        path = Path(value)
-        if not path.is_absolute():
-            path = (config_dir / path).resolve()
-        resolved = path
-
-    if not resolved.exists():
-        raise FileNotFoundError(f"URDF file not found at resolved path: {resolved}")
-    return str(resolved)
-
-
-def _ensure_dict(value: Any, name: str) -> dict[str, Any]:
-    if value is None:
-        return {}
-    if not isinstance(value, dict):
-        raise ValueError(f"Robot config '{name}' must be a JSON object.")
-    return dict(value)
-
-
-def _normalize_source_entry(entry: dict[str, Any]) -> dict[str, Any]:
-    source = dict(entry)
-    if "target_names" not in source and "joint_names" in source:
-        source["target_names"] = source["joint_names"]
-    if "target_mapping" not in source and "joint_mapping" in source:
-        source["target_mapping"] = source["joint_mapping"]
-    return source
-
-
-def _select_source(config: dict[str, Any]) -> dict[str, Any]:
-    sources = config.get("source") or []
-    if not isinstance(sources, list):
-        raise ValueError("Robot config 'source' must be a JSON array.")
-    if not sources:
-        return {}
-
-    normalized = []
-    for source in sources:
-        if not isinstance(source, dict):
-            raise ValueError("Robot config 'source' entries must be JSON objects.")
-        normalized.append(_normalize_source_entry(source))
-    config["source"] = normalized
-
-    active_source = config.get("active_source")
-    if active_source is None:
-        return normalized[0]
-
-    matches = [s for s in normalized if s.get("name") == active_source]
-    if not matches:
-        matches = [s for s in normalized if s.get("type") == active_source]
-    if len(matches) != 1:
-        raise ValueError(f"Robot config active_source '{active_source}' does not select exactly one source entry.")
-    return matches[0]
-
 
 def load_robot_config(config_path: str | Path) -> Dict[str, Any]:
+    """
+    Load robot configuration from JSON.
+
+    Supported top-level keys:
+    - name: Optional profile name
+    - urdf_path: Optional path to URDF (relative paths resolved from config dir)
+    - joint_mapping: Required mapping of SMPLX joint names to robot body names
+    - robot_height: Optional explicit robot height
+    - smplx_joint_names: Optional custom SMPLX joint ordering
+    - height_estimation: Optional config forwarded to OmniRetargeter
+    - base_orientation: Optional config forwarded to OmniRetargeter
+    - retargeting: Optional config forwarded to GenericInteractionRetargeter
+    """
     path = Path(config_path)
     with path.open("r", encoding="utf-8") as f:
         raw = json.load(f)
@@ -82,47 +28,16 @@ def load_robot_config(config_path: str | Path) -> Dict[str, Any]:
     if not isinstance(raw, dict):
         raise ValueError(f"Robot config at {path} must be a JSON object.")
 
+    if "joint_mapping" not in raw or not isinstance(raw["joint_mapping"], dict) or not raw["joint_mapping"]:
+        raise ValueError("Robot config must contain non-empty 'joint_mapping'.")
+
     config = dict(raw)
-    robot = _ensure_dict(config.get("robot"), "robot")
-    retargeting = _ensure_dict(config.get("retargeting"), "retargeting")
-    selected_source = _select_source(config)
-
-    if "solver" in retargeting:
-        solver = _ensure_dict(retargeting.get("solver"), "retargeting.solver")
-        merged_retargeting = {k: v for k, v in retargeting.items() if k != "solver"}
-        merged_retargeting.update(solver)
-        retargeting = merged_retargeting
-
-    config["robot"] = robot
-    config["retargeting"] = retargeting
-    config["selected_source"] = selected_source
-
-    urdf_path = robot.get("urdf_path", config.get("urdf_path"))
+    urdf_path = config.get("urdf_path")
     if urdf_path:
-        config["urdf_path"] = _resolve_path(urdf_path, path.parent)
-
-    robot_height = robot.get("height", config.get("robot_height"))
-    if robot_height is not None:
-        config["robot_height"] = robot_height
-
-    target_mapping = selected_source.get("target_mapping", config.get("joint_mapping"))
-    if not isinstance(target_mapping, dict) or not target_mapping:
-        raise ValueError("Robot config must contain non-empty 'joint_mapping' or selected source 'target_mapping'.")
-    config["joint_mapping"] = target_mapping
-    config["target_mapping"] = target_mapping
-
-    target_names = selected_source.get("target_names", config.get("source_target_names"))
-    if target_names is not None:
-        config["source_target_names"] = target_names
-
-    for key in ("height_estimation", "base_orientation"):
-        if key in selected_source:
-            config[key] = selected_source[key]
-        elif key in config:
-            pass  # already present at top level from the raw JSON
-
-    source_options = selected_source.get("adapter_options")
-    if source_options is not None and not isinstance(source_options, dict):
-        raise ValueError("Robot config source 'adapter_options' must be a JSON object.")
+        urdf = Path(urdf_path)
+        if not urdf.is_absolute():
+            urdf = (path.parent / urdf).resolve()
+        config["urdf_path"] = str(urdf)
 
     return config
+

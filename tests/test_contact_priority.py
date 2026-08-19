@@ -26,8 +26,7 @@ from omniretargeting.trajectory_refinement import (
     measure_scene_penetration,
     refine_joint_trajectory,
 )
-from omniretargeting.utils import _densify_smplx_frame_gaps
-from omniretargeting.data_sources.smplx import load_smplx_trajectory
+from omniretargeting.utils import _densify_smplx_frame_gaps, load_smplx_trajectory
 
 
 ANKLE_ARM_XML = """

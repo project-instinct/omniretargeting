@@ -4,30 +4,28 @@ from __future__ import annotations
 
 import numpy as np
 import mujoco
-import clarabel
+import cvxpy as cp
 from scipy import sparse as sp
 from scipy.spatial import Delaunay
 from scipy.spatial.transform import Rotation
 import trimesh
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from pathlib import Path
-import fnmatch
+import yourdfpy
 
 from .utils import (
+    load_terrain_mesh,
     sample_points_on_mesh,
+    scale_mesh,
     compute_mesh_height_at_point,
+    validate_smplx_trajectory,
     transform_points_local_to_world,
     get_adjacency_list,
-    calculate_exponential_edge_weights,
     calculate_laplacian_coordinates,
     calculate_laplacian_matrix,
 )
-from .data_sources.base import validate_motion_positions
 
 
-# Module-level helpers shared with trajectory_refinement. Ported from the
-# contact-priority line so whole-trajectory refinement can reuse the same
-# target transforms and joint-limit resolution as the framewise solver.
 def _transform_swing_target(
     tracking_position: np.ndarray,
     source_root_position: np.ndarray | None,
@@ -51,6 +49,7 @@ def _transform_swing_target(
     robot_root_target[2] += float(robot_root_z_offset)
     return robot_root_target + float(morphology_scale) * (target - source_root)
 
+
 def _clamp_target_to_reach(
     target: np.ndarray,
     reach_origin: np.ndarray,
@@ -72,6 +71,7 @@ def _clamp_target_to_reach(
     if distance <= float(max_reach) or distance <= 1e-10:
         return result
     return origin + delta * (float(max_reach) / distance)
+
 
 def _apply_configured_joint_limits(
     model: mujoco.MjModel,
@@ -118,187 +118,6 @@ def _apply_configured_joint_limits(
     return result_lower, result_upper
 
 
-def parse_bone_chains(
-    chains: List[List[str]],
-    source_target_names: List[str],
-) -> List[Tuple[int, int, int]]:
-    """Convert bone chains of source target names into adjacent bone-pair triples.
-
-    Each chain [t0, t1, t2, ...] defines bones (t0->t1), (t1->t2), ... along the
-    chain (TopoRetarget Sec. 3.2: bones follow the same limb/finger). Adjacent
-    bone pairs AB are consecutive bones, stored as index triples (a, b, c)
-    meaning bone k = (a->b) and bone l = (b->c). Chains of length 2 define a
-    bone but contribute no adjacent pair.
-
-    Args:
-        chains: List of chains, each a list of source target names.
-        source_target_names: Ordered mapped source target names.
-
-    Returns:
-        List of (a, b, c) index triples into the mapped target arrays.
-
-    Raises:
-        ValueError: If a chain has fewer than 2 targets or names an unmapped target.
-    """
-    index = {name: i for i, name in enumerate(source_target_names)}
-    triples: List[Tuple[int, int, int]] = []
-    for chain in chains:
-        if len(chain) < 2:
-            raise ValueError(f"bone_direction chain must list at least 2 targets, got {chain}")
-        for name in chain:
-            if name not in index:
-                raise ValueError(
-                    f"bone_direction chain target '{name}' is not a mapped source target. "
-                    f"Available targets: {source_target_names}"
-                )
-        idx = [index[name] for name in chain]
-        for i in range(len(idx) - 2):
-            triples.append((idx[i], idx[i + 1], idx[i + 2]))
-    return triples
-
-
-def compute_bone_direction_targets(
-    points: np.ndarray,
-    triples: List[Tuple[int, int, int]],
-    eps: float = 1e-8,
-) -> np.ndarray:
-    """Source-side relative bone directions (d_k - d_l) per adjacent bone triple.
-
-    d_k is the unit vector from keypoint a to keypoint b (TopoRetarget Eq. 1).
-    Directions are expressed in the world frame: source and robot world frames
-    are aligned by the retargeting pipeline, so relative directions are directly
-    comparable (the paper uses wrist-attached frames for the same purpose).
-
-    Args:
-        points: (N, 3) source target positions (mapped order).
-        triples: Adjacent bone triples (a, b, c) from parse_bone_chains.
-        eps: Lower bound for segment lengths when normalizing.
-
-    Returns:
-        (3 * len(triples),) stacked (d_k - d_l) vectors.
-    """
-    targets = np.zeros(3 * len(triples))
-    for p, (a, b, c) in enumerate(triples):
-        e_k = points[b] - points[a]
-        e_l = points[c] - points[b]
-        d_k = e_k / max(np.linalg.norm(e_k), eps)
-        d_l = e_l / max(np.linalg.norm(e_l), eps)
-        targets[3 * p: 3 * p + 3] = d_k - d_l
-    return targets
-
-
-def compute_bone_direction_residual_and_jacobian(
-    robot_points: np.ndarray,
-    J_V: np.ndarray,
-    triples: List[Tuple[int, int, int]],
-    targets: np.ndarray,
-    eps: float = 1e-8,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Robot-side bone-direction residual and its Jacobian w.r.t. dqa.
-
-    For bone (a->b) with segment e = p_b - p_a, L = ||e||, d = e / L:
-        dd/dq = (I - d d^T) / L @ (J_b - J_a)
-    For an adjacent pair (k, l) the residual is (d_k - d_l) - target and its
-    Jacobian is Jd_k - Jd_l, so residual(q + dq) ~= res + J @ dqa.
-
-    Args:
-        robot_points: (N, 3) current robot link point positions (mapped order).
-        J_V: (3N, nq_a) stacked translational Jacobians (same order).
-        triples: Adjacent bone triples (a, b, c).
-        targets: (3P,) source-side (d_k - d_l) from compute_bone_direction_targets.
-        eps: Lower bound for segment lengths when normalizing.
-
-    Returns:
-        (res, J): residual (3P,) and Jacobian (3P, nq_a).
-    """
-    n_pairs = len(triples)
-    res = np.zeros(3 * n_pairs)
-    J = np.zeros((3 * n_pairs, J_V.shape[1]))
-    eye3 = np.eye(3)
-    for p, (a, b, c) in enumerate(triples):
-        J_a, J_b, J_c = J_V[3 * a: 3 * a + 3], J_V[3 * b: 3 * b + 3], J_V[3 * c: 3 * c + 3]
-        e_k = robot_points[b] - robot_points[a]
-        e_l = robot_points[c] - robot_points[b]
-        L_k = max(np.linalg.norm(e_k), eps)
-        L_l = max(np.linalg.norm(e_l), eps)
-        d_k = e_k / L_k
-        d_l = e_l / L_l
-        Jd_k = (eye3 - np.outer(d_k, d_k)) / L_k @ (J_b - J_a)
-        Jd_l = (eye3 - np.outer(d_l, d_l)) / L_l @ (J_c - J_b)
-        res[3 * p: 3 * p + 3] = (d_k - d_l) - targets[3 * p: 3 * p + 3]
-        J[3 * p: 3 * p + 3] = Jd_k - Jd_l
-    return res, J
-
-
-def _solve_qp_clarabel(
-    P: sp.spmatrix,
-    c: np.ndarray,
-    lb: np.ndarray,
-    ub: np.ndarray,
-    ge_rows: Optional[List[Tuple[np.ndarray, float]]] = None,
-    trust_region_dim: Optional[int] = None,
-    step_size: Optional[float] = None,
-) -> Tuple[Optional[np.ndarray], bool]:
-    """Solve a small dense QP directly with CLARABEL (no CVXPY overhead).
-
-        min  0.5 x' P x + c' x
-        s.t. lb <= x <= ub
-             a' x >= h            for each (a, h) in ge_rows
-             ||x[:trust_region_dim]||_2 <= step_size   (if both given)
-
-    This is the exact same KKT system CVXPY sends to CLARABEL for the
-    per-iteration SQP subproblem (same solver, same default settings), but
-    assembled with numpy/scipy directly: the Laplacian error definition
-    ``lap_var = lap0 + J_L @ dqa`` is substituted into the objective, so the
-    problem keeps only ``len(c)`` scalar variables instead of carrying the
-    3*num_vertices auxiliary ``lap_var`` variables plus equality constraints.
-
-    Returns:
-        (x, True) on Solved/AlmostSolved, (None, False) otherwise.
-    """
-    n = len(c)
-    A_parts = [sp.vstack([sp.eye(n, format="csc"), -sp.eye(n, format="csc")], format="csc")]
-    b_parts = [np.concatenate([ub, -lb])]
-    n_nonneg = 2 * n
-
-    if ge_rows:
-        A_parts.append(sp.csr_matrix(np.vstack([-np.asarray(a, dtype=float).ravel() for a, _ in ge_rows])))
-        b_parts.append(np.array([-h for _, h in ge_rows], dtype=float))
-        n_nonneg += len(ge_rows)
-
-    A = sp.vstack(A_parts, format="csc")
-    b = np.concatenate(b_parts)
-    cones = [clarabel.NonnegativeConeT(n_nonneg)]
-
-    if trust_region_dim is not None and step_size is not None:
-        d = int(trust_region_dim)
-        A_soc = sp.vstack(
-            [
-                sp.csr_matrix((1, n)),
-                sp.hstack([-sp.eye(d, format="csc"), sp.csr_matrix((d, n - d))], format="csc"),
-            ],
-            format="csc",
-        )
-        A = sp.vstack([A, A_soc], format="csc")
-        b = np.concatenate([b, [float(step_size)], np.zeros(d)])
-        cones.append(clarabel.SecondOrderConeT(d + 1))
-
-    settings = clarabel.DefaultSettings()
-    settings.verbose = False
-
-    try:
-        P_sym = sp.triu((P + P.T) * 0.5, format="csc")
-        solver = clarabel.DefaultSolver(P_sym, np.asarray(c, dtype=float), A, b, cones, settings)
-        sol = solver.solve()
-    except Exception as e:
-        print(f"WARNING: CLARABEL QP solve raised: {e}")
-        return None, False
-
-    if sol.status in (clarabel.SolverStatus.Solved, clarabel.SolverStatus.AlmostSolved):
-        return np.asarray(sol.x, dtype=float).ravel(), True
-    return None, False
-
-
 class GenericInteractionRetargeter:
     """
     Generic interaction mesh retargeter that works with any robot and terrain.
@@ -312,7 +131,7 @@ class GenericInteractionRetargeter:
         robot_model: mujoco.MjModel,
         robot_data: mujoco.MjData,
         terrain_mesh: trimesh.Trimesh,
-        joint_mapping: Dict[str, str | Dict[str, object]],
+        joint_mapping: Dict[str, str],
         robot_height: float,
         q_a_init_idx: int = -7,
         step_size: float = 0.2,
@@ -320,20 +139,11 @@ class GenericInteractionRetargeter:
         foot_sticking_tolerance: float = 1e-3,
         collision_detection_threshold: float = 0.1,
         terrain_sample_points: int = 100,
-        terrain_sample_seed: Optional[int] = None,
-        source_target_names: Optional[List[str]] = None,
+        valid_joint_names: Optional[List[str]] = None,
         replace_cylinders_with_capsules: bool = False,
         hard_penetration_constraint: bool = False,
-        joint_regularization_boost: Optional[Dict] = None,
-        laplacian_edge_weighting: str = "uniform",
-        laplacian_distance_decay: float = 30.0,
-        bone_direction: Optional[Dict] = None,
-        penetration_slack: Optional[Dict] = None,
-        base_position_tracking_weight: float = 0.0,
-        link_orientation: Optional[Dict] = None,
-        scene_contact: Optional[Dict] = None,
-        foot_penetration: Optional[Dict] = None,
-        smooth_weight: float = 0.2,
+        preserve_root_z: bool = False,
+        end_effector_config: Optional[Dict[str, Any]] = None,
     ):
         """Initialize the generic retargeter.
 
@@ -341,10 +151,7 @@ class GenericInteractionRetargeter:
             robot_model: MuJoCo model of the robot
             robot_data: MuJoCo data for the robot
             terrain_mesh: Terrain mesh (already scaled if needed)
-            joint_mapping: Mapping from source target names to robot link names.
-                Each value is either a string (link name, zero offset) or a dict
-                with keys ``link`` (robot link name) and ``offset`` (optional
-                3-element local-frame offset vector [dx, dy, dz], default [0,0,0]).
+            joint_mapping: Mapping from SMPLX joint names to robot link names
             robot_height: Height of the robot
             q_a_init_idx: Index where optimization variables start
             step_size: Trust region size for SQP
@@ -352,9 +159,7 @@ class GenericInteractionRetargeter:
             foot_sticking_tolerance: Tolerance for foot sticking
             collision_detection_threshold: Distance threshold for collision detection
             terrain_sample_points: Number of sampled terrain points for interaction mesh
-            terrain_sample_seed: Seed for the terrain surface draw. Leave unset for the
-                historical non-reproducible behaviour; set it to compare runs.
-            source_target_names: Ordered source target names to ensure consistent ordering
+            valid_joint_names: Ordered list of joint names to ensure consistent ordering
             replace_cylinders_with_capsules: If True, replace all cylinder collision geoms
                 with capsules before computing penetration constraints. This matches
                 IsaacLab/PhysX convention where ``replace_cylinders_with_capsules=True``
@@ -363,131 +168,36 @@ class GenericInteractionRetargeter:
             hard_penetration_constraint: If True, enforce penetration
                 constraints inside the optimizer. If False, skip them so
                 outer post-processing can handle contact correction.
-            laplacian_edge_weighting: Weighting scheme for the interaction-mesh
-                Laplacian edges. "uniform" (default) keeps the original
-                OmniRetarget behavior (every neighbor weighted equally).
-                "exponential" uses the distance-dependent weights from
-                TopoRetarget (arXiv:2606.16272, Eq. 5): w_ij ∝ exp(-kappa * d_ij),
-                computed once on the source configuration per frame and reused
-                for the robot-side Laplacian.
-            laplacian_distance_decay: Spatial decay factor kappa used when
-                laplacian_edge_weighting == "exponential" (paper uses 30 for
-                meter-scale data).
-            bone_direction: Optional dict enabling the TopoRetarget bone-direction
-                prior (Eq. 1-2, 8). Keys:
-                - enabled (bool, default False)
-                - chains (list of source-target-name chains, required when enabled;
-                  bones are consecutive pairs along each chain)
-                - lambda_warm (float, paper 1.0): warm-init bone weight
-                - lambda_smooth (float, paper 2.5): warm-init temporal weight
-                - lambda_bone (float, paper 0.1): refinement-stage bone weight
-                - warm_init (bool, default True): run the Eq. (2) pre-solve per frame
-                - warm_init_iters (int, default 3): warm-stage SQP iterations
-            penetration_slack: Optional dict of TopoRetarget slack parameters
-                (Eq. 8), used in place of the single hard penetration tolerance.
-                Providing this dict enables the slack mode, so it requires
-                hard_penetration_constraint=True (i.e. penetration_resolver
-                "hard_constraint_slack"). Keys:
-                - soft_tolerance (float, paper 0.001): tau, soft penetration margin
-                - hard_bound (float, paper 0.03): b, hard penetration backstop
-                - slack_penalty (float, paper 1e5): w_s, quadratic slack penalty
+            preserve_root_z: If True, keep qpos[2] out of the SQP variables so
+                root height is supplied by the caller and not changed by IK.
+            end_effector_config: Optional contact-aware hand/foot task
+                configuration.  When enabled, contact, swing end-effector and
+                whole-body objectives are solved lexicographically.
         """
         self.robot_model = robot_model
         self.robot_data = robot_data
         self.terrain_mesh = terrain_mesh
+        self.joint_mapping = joint_mapping  # This should already be filtered to valid joints only
         self.robot_height = robot_height
         self.hard_penetration_constraint = hard_penetration_constraint
-        self.joint_regularization_boost = joint_regularization_boost
-        if laplacian_edge_weighting not in ("uniform", "exponential"):
-            raise ValueError(
-                f"Unknown laplacian_edge_weighting '{laplacian_edge_weighting}'. "
-                "Expected 'uniform' or 'exponential'."
-            )
-        self.laplacian_edge_weighting = laplacian_edge_weighting
-        self.laplacian_distance_decay = float(laplacian_distance_decay)
-
-        # ---- Parse target mapping (supports mixed string/dict values) ----
-        # Extract link names and optional local-frame offsets for each source target.
-        # Format: {target_name: "link_name"} or {target_name: {"robot_link": "link_name", "offset": [dx,dy,dz]}}
-        self.joint_mapping: Dict[str, str] = {}
-        self.target_offset_map: Dict[str, np.ndarray] = {}
-        for target_name, value in joint_mapping.items():
-            if isinstance(value, dict):
-                link_name = value["robot_link"]
-                offset = np.asarray(value.get("offset", [0.0, 0.0, 0.0]), dtype=float).reshape(3)
-                self.joint_mapping[target_name] = link_name
-                self.target_offset_map[target_name] = offset
-            else:
-                self.joint_mapping[target_name] = value
-                self.target_offset_map[target_name] = np.zeros(3, dtype=float)
-
-        # CRITICAL: Store ordered source target names to ensure consistent ordering.
-        # This ensures source_target_positions[i] matches robot_points[i] for all i.
-        if source_target_names is not None:
-            self.source_target_names = source_target_names
-            # Verify that source_target_names matches joint_mapping keys.
-            if set(self.source_target_names) != set(joint_mapping.keys()):
+        self.end_effector_config = dict(end_effector_config or {})
+        
+        # CRITICAL: Store ordered joint names to ensure consistent ordering
+        # This ensures human_joints[i] matches robot_points[i] for all i
+        if valid_joint_names is not None:
+            self.valid_joint_names = valid_joint_names
+            # Verify that valid_joint_names matches joint_mapping keys
+            if set(self.valid_joint_names) != set(joint_mapping.keys()):
                 raise ValueError(
-                    f"source_target_names ({set(self.source_target_names)}) "
+                    f"valid_joint_names ({set(self.valid_joint_names)}) "
                     f"does not match joint_mapping keys ({set(joint_mapping.keys())})"
                 )
         else:
             # Fallback: use dictionary insertion order (Python 3.7+)
-            self.source_target_names = list(joint_mapping.keys())
-
-        # ---- Bone-direction prior config (TopoRetarget Eq. 1-2, 8; default off) ----
-        bd = bone_direction or {}
-        self.bone_direction_enabled = bool(bd.get("enabled", False))
-        self.bone_triples: List[Tuple[int, int, int]] = []
-        self.lambda_warm = float(bd.get("lambda_warm", 1.0))
-        self.lambda_smooth = float(bd.get("lambda_smooth", 2.5))
-        self.lambda_bone = float(bd.get("lambda_bone", 0.1))
-        self.bone_warm_init = bool(bd.get("warm_init", True))
-        self.bone_warm_init_iters = int(bd.get("warm_init_iters", 3))
-        if self.bone_direction_enabled:
-            chains = bd.get("chains")
-            if not chains:
-                raise ValueError(
-                    "bone_direction.enabled=True requires 'chains': a list of "
-                    "source-target-name chains defining bones along each limb."
-                )
-            self.bone_triples = parse_bone_chains(chains, self.source_target_names)
-            if not self.bone_triples:
-                raise ValueError(
-                    "bone_direction chains produced no adjacent bone pairs; "
-                    "at least one chain must contain 3 or more targets."
-                )
-
-        # ---- Penetration slack parameters (TopoRetarget Eq. 8) ----
-        # Enabled by passing this dict (i.e. penetration_resolver ==
-        # "hard_constraint_slack"); it modifies how the hard-constraint
-        # penetration resolver builds its QP constraints.
-        if penetration_slack is not None and not self.hard_penetration_constraint:
-            raise ValueError(
-                "penetration_slack requires hard_penetration_constraint=True "
-                "(penetration_resolver 'hard_constraint_slack')."
-            )
-        ps = penetration_slack or {}
-        self.penetration_slack_enabled = penetration_slack is not None
-        self.penetration_soft_tolerance = float(ps.get("soft_tolerance", 1e-3))
-        self.penetration_hard_bound = float(ps.get("hard_bound", 0.03))
-        self.penetration_slack_penalty = float(ps.get("slack_penalty", 1e5))
-        self.base_position_tracking_weight = float(base_position_tracking_weight)
-        self._smooth_weight = float(smooth_weight)
-        self.max_trust_region_retries = 6
-        self.trust_region_shrink = 0.4
-        self._solver_stats = {"solves": 0, "retries": 0, "failures": 0}
-        self._setup_link_orientation(link_orientation)
-        self._setup_scene_contact(scene_contact)
-        self._setup_foot_penetration(foot_penetration)
-        if self.penetration_slack_enabled and self.penetration_hard_bound <= self.penetration_soft_tolerance:
-            raise ValueError(
-                f"penetration_slack.hard_bound ({self.penetration_hard_bound}) must be "
-                f"greater than soft_tolerance ({self.penetration_soft_tolerance})."
-            )
-
-        # Validate that all mapped robot links exist.
-        # This is a final safety check - fail fast if links are missing.
+            self.valid_joint_names = list(joint_mapping.keys())
+        
+        # Validate that all joints in mapping exist in robot
+        # This is a final safety check - fail fast if joints are missing
         self._validate_joint_mapping()
 
         # Retargeting parameters
@@ -497,9 +207,7 @@ class GenericInteractionRetargeter:
         self.foot_sticking_tolerance = foot_sticking_tolerance
         self.collision_detection_threshold = collision_detection_threshold
         self.terrain_sample_points = int(terrain_sample_points)
-        self.terrain_sample_seed = (
-            None if terrain_sample_seed is None else int(terrain_sample_seed)
-        )
+        self.preserve_root_z = bool(preserve_root_z)
 
         # Apply cylinder → capsule replacement if requested
         if replace_cylinders_with_capsules:
@@ -507,6 +215,14 @@ class GenericInteractionRetargeter:
 
         # Setup robot configuration
         self._setup_robot_config()
+
+        # Resolve robot palm/sole markers after q_a_indices are available.
+        self._setup_end_effectors()
+
+        # Resolve morphology-aware bone-direction tasks.  End-effector IK
+        # fixes hand/foot positions but otherwise leaves the elbow/knee branch
+        # ambiguous; these tasks select the branch observed in the source.
+        self._setup_pose_bones()
 
         # Setup terrain interaction
         self._setup_terrain_interaction()
@@ -533,47 +249,6 @@ class GenericInteractionRetargeter:
         if n_replaced > 0:
             print(f"Replaced {n_replaced} cylinder geom(s) with capsules for collision.")
 
-    def _build_smoothness_scale(self) -> np.ndarray:
-        """Per-coordinate factors that put the smoothness term in one unit.
-
-        ``q_a`` spans the whole of qpos when the floating base is optimised, so
-        summing its squared step mixes three base translations in metres, four
-        quaternion components that carry no unit at all, and the joint angles in
-        radians -- and then weights the sum with a single scalar.  A metre of
-        base travel and a radian of knee are not comparable quantities, and the
-        implied exchange rate between them was whatever the units happened to
-        give.
-
-        The common currency here is how far the change moves the robot.  A
-        radian at a joint sweeps a point at the end of the chain through roughly
-        one reach length, so reach converts angles to metres; a small rotation
-        of angle theta moves the quaternion's vector part by about theta/2, so
-        that group needs an extra factor of two.  Scales are expressed relative
-        to the joints, which leaves the tuned value of ``smooth_weight`` acting
-        on the joints exactly as before and changes only the base terms that
-        were mis-weighted.
-        """
-        model = self.robot_model
-        base_pos = model.body_pos[1] if model.nbody > 1 else np.zeros(3)
-        reach = 0.0
-        for body_id in range(1, model.nbody):
-            reach = max(reach, float(np.linalg.norm(model.body_pos[body_id] - base_pos)))
-        # Chains are articulated, so the sum of the offsets along one is a
-        # better reach estimate than the largest single offset; fall back to a
-        # metre when the model gives nothing useful.
-        if reach <= 1e-6:
-            reach = 1.0
-
-        scale = np.ones(self.nq_a, dtype=float)
-        if model.njnt and model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE:
-            free_qpos = np.arange(int(model.jnt_qposadr[0]), int(model.jnt_qposadr[0]) + 7)
-            for slot, qpos_index in enumerate(self.q_a_indices):
-                if qpos_index in free_qpos[:3]:
-                    scale[slot] = 1.0 / reach
-                elif qpos_index in free_qpos[3:]:
-                    scale[slot] = 2.0
-        return scale
-
     def _setup_robot_config(self):
         """Setup robot configuration parameters."""
         self.nq = self.robot_model.nq
@@ -588,10 +263,15 @@ class GenericInteractionRetargeter:
         start_idx = 7 + self.q_a_init_idx
         start_idx = int(np.clip(start_idx, 0, self.nq))
         self.q_a_indices = np.arange(start_idx, self.nq)
+        if self.preserve_root_z and 2 in self.q_a_indices:
+            self.q_a_indices = self.q_a_indices[self.q_a_indices != 2]
         self.nq_a = len(self.q_a_indices)
         
         print(f"Robot config: nq={self.nq}, nv={self.nv}, nq_a={self.nq_a}")
-        print(f"q_a_indices range: {self.q_a_indices.min()} to {self.q_a_indices.max()}")
+        if self.nq_a > 0:
+            print(f"q_a_indices range: {self.q_a_indices.min()} to {self.q_a_indices.max()}")
+        if self.preserve_root_z:
+            print("Root z is fixed: qpos[2] is not optimized.")
 
         # Joint limits
         joint_names = [self.robot_model.joint(i).name for i in range(self.robot_model.njnt)]
@@ -616,16 +296,19 @@ class GenericInteractionRetargeter:
                 full_lower_limits[qpos_adr] = self.robot_model.jnt_range[i, 0]
                 full_upper_limits[qpos_adr] = self.robot_model.jnt_range[i, 1]
 
-        self.q_a_lb = full_lower_limits[self.q_a_indices]
-        self.q_a_ub = full_upper_limits[self.q_a_indices]
+        self.q_a_lb, self.q_a_ub = _apply_configured_joint_limits(
+            self.robot_model,
+            self.q_a_indices,
+            full_lower_limits[self.q_a_indices],
+            full_upper_limits[self.q_a_indices],
+            self.end_effector_config.get("joint_posture_limits"),
+        )
 
-        # Joint cost weights - configurable per-robot via joint_regularization_boost
-        boost_cfg = self.joint_regularization_boost or {}
-        default_weight = float(boost_cfg.get("default", 1e-3))
-        self.Q_diag = np.ones(self.nq_a) * default_weight
-
+        # Joint cost weights - small regularization to prevent extreme angles
+        # Floating base (first 7 DOF) gets very small weight, joints get moderate weight
+        self.Q_diag = np.ones(self.nq_a) * 1e-3  # Small default regularization (matching original)
+        
         # Reduce weight for floating base to allow free movement
-        base_weight = float(boost_cfg.get("base", 0.001))
         base_indices_in_qa = []
         for base_idx in range(7):
             if base_idx in self.q_a_indices:
@@ -634,669 +317,1071 @@ class GenericInteractionRetargeter:
                     base_indices_in_qa.append(idx_in_qa[0])
         
         if len(base_indices_in_qa) > 0:
-            self.Q_diag[base_indices_in_qa] = base_weight
+            self.Q_diag[base_indices_in_qa] = 0.001  # Very small weight for base
         
-        # Temporal smoothness of the actuated step.  Configurable because the
-        # right value depends on what else is pulling on the solve: an
-        # end-effector task that switches on and off across a contact boundary
-        # asks for a different pose from one frame to the next, and this is the
-        # term that decides how much of that jump reaches the output.
-        self.smooth_weight = float(getattr(self, "_smooth_weight", 0.2))
-        self.smooth_scale = self._build_smoothness_scale()
+        # Store smoothness weight (matching original: 0.2)
+        self.smooth_weight = 0.2
 
-        # Per-joint regularization boost (constant across SQP iterations).
-        # Modify Q_diag for specific joints (matching original MANUAL_COST logic).
-        Q_diag_modified = self.Q_diag.copy()
-        boost_joints = (self.joint_regularization_boost or {}).get("joints") or {}
-        for i in range(self.robot_model.njnt):
-            joint_name = self.robot_model.joint(i).name
-            if not joint_name:
+    def _setup_end_effectors(self) -> None:
+        """Resolve configured robot palm/sole markers.
+
+        Offsets are expressed in the corresponding MuJoCo body frame.  A
+        contact task may expose several surface points (for example heel,
+        toe, and sole corners); at every SQP iteration we select the point
+        closest to the human-derived scene anchor.  This avoids incorrectly
+        forcing the ankle or wrist joint centre onto the scene surface.
+        """
+        cfg = self.end_effector_config
+        self.end_effector_enabled = bool(cfg.get("enabled", False))
+        self.end_effectors: Dict[str, Dict[str, Any]] = {}
+        if not self.end_effector_enabled:
+            return
+
+        specs = dict(cfg.get("effectors", {}) or {})
+        for name, raw_spec in specs.items():
+            spec = dict(raw_spec or {})
+            body_name = spec.get("robot_body")
+            if not body_name:
+                raise ValueError(
+                    f"End-effector '{name}' is missing required 'robot_body'."
+                )
+            body_id = mujoco.mj_name2id(
+                self.robot_model, mujoco.mjtObj.mjOBJ_BODY, str(body_name)
+            )
+            if body_id < 0:
+                raise ValueError(
+                    f"End-effector '{name}' refers to missing robot body "
+                    f"'{body_name}'."
+                )
+
+            reach_reference_body = spec.get("reach_reference_body")
+            reach_reference_body_id = -1
+            if reach_reference_body:
+                reach_reference_body_id = mujoco.mj_name2id(
+                    self.robot_model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    str(reach_reference_body),
+                )
+                if reach_reference_body_id < 0:
+                    raise ValueError(
+                        f"End-effector '{name}' refers to missing reach reference "
+                        f"body '{reach_reference_body}'."
+                    )
+
+            tracking_offset = np.asarray(
+                spec.get("tracking_offset", [0.0, 0.0, 0.0]), dtype=float
+            ).reshape(3)
+            contact_offsets = np.asarray(
+                spec.get("contact_offsets", [tracking_offset.tolist()]), dtype=float
+            )
+            if contact_offsets.ndim == 1:
+                contact_offsets = contact_offsets[None, :]
+            if contact_offsets.ndim != 2 or contact_offsets.shape[1] != 3:
+                raise ValueError(
+                    f"End-effector '{name}' contact_offsets must have shape (K, 3)."
+                )
+
+            self.end_effectors[name] = {
+                "body_name": str(body_name),
+                "body_id": int(body_id),
+                "tracking_offset": tracking_offset,
+                "contact_offsets": contact_offsets,
+                "track_orientation": bool(spec.get("track_orientation", False)),
+                "track_swing_heading": bool(
+                    spec.get("track_swing_heading", False)
+                ),
+                "track_swing_orientation": bool(
+                    spec.get("track_swing_orientation", False)
+                ),
+                "orientation_sigma": float(
+                    spec.get(
+                        "orientation_sigma",
+                        cfg.get("orientation_sigma", np.deg2rad(7.5)),
+                    )
+                ),
+                "max_orientation_step": float(
+                    spec.get("max_orientation_step", np.deg2rad(6.0))
+                ),
+                "contact_sigma": float(
+                    spec.get("contact_sigma", cfg.get("contact_sigma", 0.025))
+                ),
+                "swing_sigma": float(
+                    spec.get("swing_sigma", cfg.get("swing_sigma", 0.06))
+                ),
+                "swing_morphology_scale": float(
+                    spec.get(
+                        "swing_morphology_scale",
+                        cfg.get("swing_morphology_scale", 1.0),
+                    )
+                ),
+                "preserve_world_target": bool(
+                    spec.get("preserve_world_target", False)
+                ),
+                "reach_reference_body_id": int(reach_reference_body_id),
+                "reach_reference_offset": np.asarray(
+                    spec.get("reach_reference_offset", [0.0, 0.0, 0.0]),
+                    dtype=float,
+                ).reshape(3),
+                "max_swing_reach": (
+                    None
+                    if spec.get("max_swing_reach") is None
+                    else float(spec["max_swing_reach"])
+                ),
+            }
+
+        if not self.end_effectors:
+            raise ValueError(
+                "end_effector_priority is enabled but no effectors were configured."
+            )
+        print(
+            "Contact-priority end effectors: "
+            + ", ".join(
+                f"{name}->{spec['body_name']}" for name, spec in self.end_effectors.items()
+            )
+        )
+
+    def _setup_pose_bones(self) -> None:
+        """Cache robot bone lengths for source/robot direction matching."""
+        pose_cfg = dict(self.end_effector_config.get("pose_direction", {}) or {})
+        self.pose_direction_enabled = bool(pose_cfg.get("enabled", True))
+        self.pose_direction_sigma = max(float(pose_cfg.get("sigma", 0.12)), 1e-6)
+        self.pose_arm_weight = max(float(pose_cfg.get("arm_weight", 1.0)), 0.0)
+        self.pose_leg_weight = max(float(pose_cfg.get("leg_weight", 1.0)), 0.0)
+        self.pose_max_direction_step = max(
+            float(pose_cfg.get("max_direction_step", np.deg2rad(6.0))), 1e-6
+        )
+        self.pose_min_direction_step = max(
+            float(pose_cfg.get("min_direction_step", np.deg2rad(1.5))), 1e-6
+        )
+        self.pose_direction_step_margin = max(
+            float(pose_cfg.get("direction_step_margin", np.deg2rad(1.0))), 0.0
+        )
+        self.pose_velocity_sigma = max(
+            float(pose_cfg.get("velocity_sigma", 0.035)), 1e-6
+        )
+        self.pose_acceleration_enabled = bool(
+            pose_cfg.get("acceleration_enabled", False)
+        )
+        self.pose_acceleration_sigma = max(
+            float(pose_cfg.get("acceleration_sigma", 0.03)), 1e-6
+        )
+        raw_edges = pose_cfg.get(
+            "edges",
+            [
+                ["Spine3", "L_Shoulder"],
+                ["L_Shoulder", "L_Elbow"],
+                ["L_Elbow", "L_Wrist"],
+                ["Spine3", "R_Shoulder"],
+                ["R_Shoulder", "R_Elbow"],
+                ["R_Elbow", "R_Wrist"],
+                ["Spine3", "Spine1"],
+                ["Pelvis", "L_Hip"],
+                ["L_Hip", "L_Knee"],
+                ["L_Knee", "L_Ankle"],
+                ["Pelvis", "R_Hip"],
+                ["R_Hip", "R_Knee"],
+                ["R_Knee", "R_Ankle"],
+            ],
+        )
+        self.pose_bones: List[Tuple[str, str, float]] = []
+        if not self.pose_direction_enabled:
+            return
+
+        current_qpos = self.robot_data.qpos.copy()
+        self.robot_data.qpos[:] = self.robot_model.qpos0
+        mujoco.mj_forward(self.robot_model, self.robot_data)
+        for edge in raw_edges:
+            if len(edge) != 2:
+                raise ValueError(f"pose_direction edge must have two names, got {edge}.")
+            parent_name, child_name = str(edge[0]), str(edge[1])
+            if parent_name not in self.joint_mapping or child_name not in self.joint_mapping:
                 continue
-            joint_name_lower = joint_name.lower()
-            for pattern, boost_value in boost_joints.items():
-                if fnmatch.fnmatch(joint_name_lower, pattern.lower()):
-                    qpos_adr = self.robot_model.jnt_qposadr[i]
-                    if qpos_adr in self.q_a_indices:
-                        idx_in_qa = np.where(self.q_a_indices == qpos_adr)[0]
-                        if len(idx_in_qa) > 0:
-                            Q_diag_modified[idx_in_qa[0]] = max(
-                                Q_diag_modified[idx_in_qa[0]], float(boost_value)
+            parent_id = mujoco.mj_name2id(
+                self.robot_model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                self.joint_mapping[parent_name],
+            )
+            child_id = mujoco.mj_name2id(
+                self.robot_model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                self.joint_mapping[child_name],
+            )
+            length = float(
+                np.linalg.norm(
+                    self.robot_data.xpos[child_id] - self.robot_data.xpos[parent_id]
+                )
+            )
+            if length > 1e-4:
+                self.pose_bones.append((parent_name, child_name, length))
+        self.robot_data.qpos[:] = current_qpos
+        mujoco.mj_forward(self.robot_model, self.robot_data)
+        print(f"Pose-direction bones: {len(self.pose_bones)}")
+
+    def _build_pose_direction_residual(
+        self,
+        dqa: cp.Variable,
+        robot_positions: Mapping[str, np.ndarray],
+        robot_jacobian: np.ndarray,
+        target_human_joints: Optional[np.ndarray],
+    ) -> Optional[cp.Expression]:
+        """Match robot bone directions to SMPL-X, independent of morphology."""
+        if (
+            not self.pose_direction_enabled
+            or not self.pose_bones
+            or target_human_joints is None
+        ):
+            return None
+        target_human_joints = np.asarray(target_human_joints, dtype=float)
+        name_to_index = {
+            name: index for index, name in enumerate(self.valid_joint_names)
+        }
+        terms: List[cp.Expression] = []
+        for parent_name, child_name, robot_length in self.pose_bones:
+            parent_idx = name_to_index[parent_name]
+            child_idx = name_to_index[child_name]
+            human_vector = (
+                target_human_joints[child_idx] - target_human_joints[parent_idx]
+            )
+            human_length = float(np.linalg.norm(human_vector))
+            if human_length < 1e-8:
+                continue
+            target_direction = human_vector / human_length
+            robot_vector = (
+                robot_positions[child_name] - robot_positions[parent_name]
+            )
+            vector_jacobian = (
+                robot_jacobian[3 * child_idx : 3 * child_idx + 3]
+                - robot_jacobian[3 * parent_idx : 3 * parent_idx + 3]
+            )
+            is_leg = any(
+                token in parent_name or token in child_name
+                for token in ("Hip", "Knee", "Ankle")
+            )
+            direction_weight = (
+                self.pose_leg_weight if is_leg else self.pose_arm_weight
+            )
+            terms.append(
+                np.sqrt(direction_weight)
+                * (
+                    (robot_vector + vector_jacobian @ dqa) / robot_length
+                    - target_direction
+                )
+                / self.pose_direction_sigma
+            )
+        return cp.hstack(terms) if terms else None
+
+    def _build_pose_direction_constraints(
+        self,
+        dqa: cp.Variable,
+        robot_positions: Mapping[str, np.ndarray],
+        robot_jacobian: np.ndarray,
+        last_directions: Mapping[Tuple[str, str], np.ndarray],
+        direction_step_limits: Mapping[Tuple[str, str], float],
+    ) -> List[cp.Constraint]:
+        """Bound visible bone rotation between output frames."""
+        if not self.pose_direction_enabled or not last_directions:
+            return []
+        name_to_index = {
+            name: index for index, name in enumerate(self.valid_joint_names)
+        }
+        constraints: List[cp.Constraint] = []
+        for parent_name, child_name, _ in self.pose_bones:
+            edge = (parent_name, child_name)
+            if edge not in last_directions:
+                continue
+            parent_idx = name_to_index[parent_name]
+            child_idx = name_to_index[child_name]
+            vector = robot_positions[child_name] - robot_positions[parent_name]
+            length = float(np.linalg.norm(vector))
+            if length < 1e-8:
+                continue
+            direction = vector / length
+            vector_jacobian = (
+                robot_jacobian[3 * child_idx : 3 * child_idx + 3]
+                - robot_jacobian[3 * parent_idx : 3 * parent_idx + 3]
+            )
+            direction_jacobian = (
+                np.eye(3) - np.outer(direction, direction)
+            ) @ vector_jacobian / length
+            constraints.append(
+                cp.norm(
+                    direction
+                    + direction_jacobian @ dqa
+                    - np.asarray(last_directions[edge], dtype=float),
+                    2,
+                )
+                <= float(
+                    direction_step_limits.get(
+                        edge, self.pose_max_direction_step
+                    )
+                )
+            )
+        return constraints
+
+    def _pose_direction_step_limits(
+        self,
+        target_human_joints: Optional[np.ndarray],
+        previous_human_joints: Optional[np.ndarray],
+    ) -> Dict[Tuple[str, str], float]:
+        """Set bone speed limits from the captured per-frame bone motion."""
+        limits: Dict[Tuple[str, str], float] = {}
+        if target_human_joints is None or previous_human_joints is None:
+            return limits
+        name_to_index = {
+            name: index for index, name in enumerate(self.valid_joint_names)
+        }
+        current = np.asarray(target_human_joints, dtype=float)
+        previous = np.asarray(previous_human_joints, dtype=float)
+        for parent_name, child_name, _ in self.pose_bones:
+            parent_idx = name_to_index[parent_name]
+            child_idx = name_to_index[child_name]
+            current_vector = current[child_idx] - current[parent_idx]
+            previous_vector = previous[child_idx] - previous[parent_idx]
+            current_norm = float(np.linalg.norm(current_vector))
+            previous_norm = float(np.linalg.norm(previous_vector))
+            if current_norm < 1e-8 or previous_norm < 1e-8:
+                continue
+            source_step = float(
+                np.arccos(
+                    np.clip(
+                        np.dot(current_vector, previous_vector)
+                        / (current_norm * previous_norm),
+                        -1.0,
+                        1.0,
+                    )
+                )
+            )
+            limits[(parent_name, child_name)] = float(
+                np.clip(
+                    source_step + self.pose_direction_step_margin,
+                    self.pose_min_direction_step,
+                    self.pose_max_direction_step,
+                )
+            )
+        return limits
+
+    def _build_pose_velocity_residual(
+        self,
+        dqa: cp.Variable,
+        robot_positions: Mapping[str, np.ndarray],
+        robot_jacobian: np.ndarray,
+        target_human_joints: Optional[np.ndarray],
+        previous_human_joints: Optional[np.ndarray],
+        last_directions: Mapping[Tuple[str, str], np.ndarray],
+    ) -> Optional[cp.Expression]:
+        """Track captured bone-direction velocity instead of chasing frames."""
+        if (
+            target_human_joints is None
+            or previous_human_joints is None
+            or not last_directions
+        ):
+            return None
+        name_to_index = {
+            name: index for index, name in enumerate(self.valid_joint_names)
+        }
+        current_human = np.asarray(target_human_joints, dtype=float)
+        previous_human = np.asarray(previous_human_joints, dtype=float)
+        terms: List[cp.Expression] = []
+        for parent_name, child_name, _ in self.pose_bones:
+            edge = (parent_name, child_name)
+            if edge not in last_directions:
+                continue
+            parent_idx = name_to_index[parent_name]
+            child_idx = name_to_index[child_name]
+            human_current = current_human[child_idx] - current_human[parent_idx]
+            human_previous = previous_human[child_idx] - previous_human[parent_idx]
+            human_current /= max(float(np.linalg.norm(human_current)), 1e-10)
+            human_previous /= max(float(np.linalg.norm(human_previous)), 1e-10)
+            desired_direction = np.asarray(last_directions[edge]) + (
+                human_current - human_previous
+            )
+            desired_direction /= max(
+                float(np.linalg.norm(desired_direction)), 1e-10
+            )
+
+            robot_vector = robot_positions[child_name] - robot_positions[parent_name]
+            robot_length = float(np.linalg.norm(robot_vector))
+            if robot_length < 1e-8:
+                continue
+            robot_direction = robot_vector / robot_length
+            vector_jacobian = (
+                robot_jacobian[3 * child_idx : 3 * child_idx + 3]
+                - robot_jacobian[3 * parent_idx : 3 * parent_idx + 3]
+            )
+            direction_jacobian = (
+                np.eye(3) - np.outer(robot_direction, robot_direction)
+            ) @ vector_jacobian / robot_length
+            terms.append(
+                (robot_direction + direction_jacobian @ dqa - desired_direction)
+                / self.pose_velocity_sigma
+            )
+        return cp.hstack(terms) if terms else None
+
+    def _build_pose_acceleration_residual(
+        self,
+        dqa: cp.Variable,
+        robot_positions: Mapping[str, np.ndarray],
+        robot_jacobian: np.ndarray,
+        target_human_joints: Optional[np.ndarray],
+        previous_human_joints: Optional[np.ndarray],
+        previous_previous_human_joints: Optional[np.ndarray],
+        last_directions: Mapping[Tuple[str, str], np.ndarray],
+        previous_directions: Mapping[Tuple[str, str], np.ndarray],
+    ) -> Optional[cp.Expression]:
+        """Match second differences of visible robot and human bone directions.
+
+        Position-only IK can alternate between redundant elbow, wrist, knee and
+        ankle solutions while hitting every per-frame target.  Matching the
+        captured bone acceleration removes that alternating mode without
+        low-pass filtering away deliberate fast human motion.
+        """
+        if (
+            not self.pose_acceleration_enabled
+            or target_human_joints is None
+            or previous_human_joints is None
+            or previous_previous_human_joints is None
+            or not last_directions
+            or not previous_directions
+        ):
+            return None
+        name_to_index = {
+            name: index for index, name in enumerate(self.valid_joint_names)
+        }
+        human_current = np.asarray(target_human_joints, dtype=float)
+        human_previous = np.asarray(previous_human_joints, dtype=float)
+        human_previous_previous = np.asarray(
+            previous_previous_human_joints, dtype=float
+        )
+        terms: List[cp.Expression] = []
+        for parent_name, child_name, _ in self.pose_bones:
+            edge = (parent_name, child_name)
+            if edge not in last_directions or edge not in previous_directions:
+                continue
+            parent_idx = name_to_index[parent_name]
+            child_idx = name_to_index[child_name]
+
+            human_directions = []
+            for joints in (
+                human_current,
+                human_previous,
+                human_previous_previous,
+            ):
+                direction = joints[child_idx] - joints[parent_idx]
+                direction /= max(float(np.linalg.norm(direction)), 1e-10)
+                human_directions.append(direction)
+            human_acceleration = (
+                human_directions[0]
+                - 2.0 * human_directions[1]
+                + human_directions[2]
+            )
+            desired_direction = (
+                2.0 * np.asarray(last_directions[edge], dtype=float)
+                - np.asarray(previous_directions[edge], dtype=float)
+                + human_acceleration
+            )
+            desired_direction /= max(
+                float(np.linalg.norm(desired_direction)), 1e-10
+            )
+
+            robot_vector = (
+                robot_positions[child_name] - robot_positions[parent_name]
+            )
+            robot_length = float(np.linalg.norm(robot_vector))
+            if robot_length < 1e-8:
+                continue
+            robot_direction = robot_vector / robot_length
+            vector_jacobian = (
+                robot_jacobian[3 * child_idx : 3 * child_idx + 3]
+                - robot_jacobian[3 * parent_idx : 3 * parent_idx + 3]
+            )
+            direction_jacobian = (
+                np.eye(3) - np.outer(robot_direction, robot_direction)
+            ) @ vector_jacobian / robot_length
+            terms.append(
+                (
+                    robot_direction
+                    + direction_jacobian @ dqa
+                    - desired_direction
+                )
+                / self.pose_acceleration_sigma
+            )
+        return cp.hstack(terms) if terms else None
+
+    def _point_position_and_jacobian(
+        self, body_id: int, local_point: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Return a body-fixed point position and Jacobian w.r.t. ``dqa``."""
+        local_point = np.asarray(local_point, dtype=float).reshape(3)
+        rotation = self.robot_data.xmat[body_id].reshape(3, 3)
+        position = self.robot_data.xpos[body_id] + rotation @ local_point
+        jacobian_full = self._calc_contact_jacobian_from_point(body_id, local_point)
+        valid_indices = self.q_a_indices[self.q_a_indices < jacobian_full.shape[1]]
+        jacobian = jacobian_full[:, valid_indices]
+        if jacobian.shape[1] < self.nq_a:
+            padded = np.zeros((3, self.nq_a), dtype=float)
+            padded[:, : jacobian.shape[1]] = jacobian
+            jacobian = padded
+        return position, jacobian
+
+    def _body_angular_jacobian(self, body_id: int) -> np.ndarray:
+        """Return world angular-velocity Jacobian w.r.t. optimized qpos."""
+        jacobian_position = np.zeros((3, self.robot_model.nv), dtype=float)
+        jacobian_rotation = np.zeros((3, self.robot_model.nv), dtype=float)
+        mujoco.mj_jacBody(
+            self.robot_model,
+            self.robot_data,
+            jacobian_position,
+            jacobian_rotation,
+            int(body_id),
+        )
+        jacobian_full = jacobian_rotation @ self._build_transform_qdot_to_qvel_fast()
+        valid_indices = self.q_a_indices[self.q_a_indices < jacobian_full.shape[1]]
+        jacobian = jacobian_full[:, valid_indices]
+        if jacobian.shape[1] < self.nq_a:
+            padded = np.zeros((3, self.nq_a), dtype=float)
+            padded[:, : jacobian.shape[1]] = jacobian
+            jacobian = padded
+        return jacobian
+
+    def _build_end_effector_objectives(
+        self,
+        dqa: cp.Variable,
+        targets: Optional[Mapping[str, Mapping[str, Any]]],
+        last_rotations: Optional[Mapping[str, np.ndarray]] = None,
+    ) -> Tuple[
+        Optional[cp.Expression],
+        Optional[cp.Expression],
+        Optional[cp.Expression],
+        List[cp.Constraint],
+        int,
+        int,
+        int,
+    ]:
+        """Linearise contact and swing tracking objectives for one SQP step.
+
+        Contact and swing expressions are deliberately returned separately so
+        the caller can solve them lexicographically.  The normalization by a
+        metric tolerance ``sigma`` makes each squared residual dimensionless.
+        """
+        if not self.end_effector_enabled or not targets:
+            return None, None, None, [], 0, 0, 0
+
+        contact_terms: List[cp.Expression] = []
+        swing_terms: List[cp.Expression] = []
+        swing_orientation_terms: List[cp.Expression] = []
+        contact_constraints: List[cp.Constraint] = []
+        for name, target_data in targets.items():
+            if name not in self.end_effectors:
+                continue
+            spec = self.end_effectors[name]
+            body_id = spec["body_id"]
+            confidence = float(np.clip(target_data.get("confidence", 1.0), 0.0, 1.0))
+            forward_direction = target_data.get("forward_direction")
+            up_direction = target_data.get("up_direction")
+
+            if bool(target_data.get("contact", False)):
+                target = np.asarray(target_data["contact_position"], dtype=float).reshape(3)
+                candidates = []
+                for offset in spec["contact_offsets"]:
+                    position, jacobian = self._point_position_and_jacobian(body_id, offset)
+                    candidates.append((np.linalg.norm(position - target), position, jacobian))
+                _, position, jacobian = min(candidates, key=lambda item: item[0])
+                sigma = max(float(spec["contact_sigma"]), 1e-6)
+                # Keep every detected contact in the primary level. Confidence
+                # only ranks contacts within that same priority level.
+                weight = max(confidence, 0.25)
+                residual = position + jacobian @ dqa - target
+                contact_terms.append(np.sqrt(weight) * residual / sigma)
+                surface_normal = np.asarray(
+                    target_data.get("surface_normal", [0.0, 0.0, 1.0]),
+                    dtype=float,
+                ).reshape(3)
+                normal_norm = float(np.linalg.norm(surface_normal))
+                if normal_norm > 1e-8:
+                    surface_normal /= normal_norm
+                    normal_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "contact_normal_tolerance", 0.005
                             )
-                    break
-        self.Q_diag_modified = Q_diag_modified
+                        ),
+                        0.0,
+                    )
+                    # The inferred normal is oriented from the scene toward
+                    # the source SMPL-X surface. Keep the robot marker on that
+                    # same side of the contact plane.
+                    contact_constraints.append(
+                        surface_normal @ residual >= -normal_tolerance
+                    )
+
+                    if spec.get("track_orientation", False) and forward_direction is not None:
+                        forward = np.asarray(forward_direction, dtype=float).reshape(3)
+                        orientation_up = np.asarray(
+                            up_direction
+                            if up_direction is not None
+                            else surface_normal,
+                            dtype=float,
+                        ).reshape(3)
+                        orientation_up /= max(
+                            float(np.linalg.norm(orientation_up)), 1e-10
+                        )
+                        # The contact detector has already verified that the
+                        # captured sole is compatible with the surface.  Track
+                        # the captured rigid foot frame rather than replacing
+                        # its pitch/roll with a noisy mesh-triangle normal.
+                        forward -= orientation_up * float(
+                            np.dot(orientation_up, forward)
+                        )
+                        forward_norm = float(np.linalg.norm(forward))
+                        if forward_norm > 1e-8:
+                            forward /= forward_norm
+                            lateral = np.cross(orientation_up, forward)
+                            lateral /= max(float(np.linalg.norm(lateral)), 1e-10)
+                            forward = np.cross(lateral, orientation_up)
+                            target_rotation = np.column_stack(
+                                [forward, lateral, orientation_up]
+                            )
+                            current_rotation = self.robot_data.xmat[body_id].reshape(
+                                3, 3
+                            )
+                            rotation_error = Rotation.from_matrix(
+                                target_rotation @ current_rotation.T
+                            ).as_rotvec()
+                            angular_jacobian = self._body_angular_jacobian(body_id)
+                            orientation_sigma = max(
+                                float(
+                                    spec.get(
+                                        "orientation_sigma",
+                                        self.end_effector_config.get(
+                                            "orientation_sigma", np.deg2rad(7.5)
+                                        ),
+                                    )
+                                ),
+                                1e-6,
+                            )
+                            contact_terms.append(
+                                np.sqrt(weight)
+                                * (angular_jacobian @ dqa - rotation_error)
+                                / orientation_sigma
+                            )
+            else:
+                target = np.asarray(target_data["tracking_position"], dtype=float).reshape(3)
+                source_root_position = target_data.get("source_root_position")
+                swing_morphology_scale = float(spec["swing_morphology_scale"])
+                root_z_offset = float(
+                    (
+                        self.end_effector_config.get(
+                            "base_position_constraint", {}
+                        )
+                        or {}
+                    ).get("z_offset", 0.0)
+                )
+                # Contact positions remain exact world-space constraints.
+                # Swing targets follow the registered robot root and may also
+                # be scaled root-relatively for morphology.  Root registration
+                # still applies when morphology_scale == 1.0.
+                target = _transform_swing_target(
+                    target,
+                    source_root_position,
+                    root_z_offset,
+                    swing_morphology_scale,
+                    bool(spec["preserve_world_target"]),
+                )
+                reach_body_id = int(spec["reach_reference_body_id"])
+                if reach_body_id >= 0:
+                    reach_rotation = self.robot_data.xmat[reach_body_id].reshape(3, 3)
+                    reach_origin = (
+                        self.robot_data.xpos[reach_body_id]
+                        + reach_rotation @ spec["reach_reference_offset"]
+                    )
+                    target = _clamp_target_to_reach(
+                        target,
+                        reach_origin,
+                        spec["max_swing_reach"],
+                    )
+                position, jacobian = self._point_position_and_jacobian(
+                    body_id, spec["tracking_offset"]
+                )
+                sigma = max(float(spec["swing_sigma"]), 1e-6)
+                residual = position + jacobian @ dqa - target
+                swing_terms.append(residual / sigma)
+                if (
+                    spec.get("track_orientation", False)
+                    and spec.get("track_swing_orientation", False)
+                    and forward_direction is not None
+                    and up_direction is not None
+                ):
+                    target_up = np.asarray(up_direction, dtype=float).reshape(3)
+                    target_up /= max(float(np.linalg.norm(target_up)), 1e-10)
+                    target_forward = np.asarray(forward_direction, dtype=float).reshape(3)
+                    target_forward -= target_up * float(
+                        np.dot(target_up, target_forward)
+                    )
+                    forward_norm = float(np.linalg.norm(target_forward))
+                    if forward_norm > 1e-8:
+                        target_forward /= forward_norm
+                        target_lateral = np.cross(target_up, target_forward)
+                        target_lateral /= max(
+                            float(np.linalg.norm(target_lateral)), 1e-10
+                        )
+                        target_forward = np.cross(target_lateral, target_up)
+                        target_rotation = np.column_stack(
+                            [target_forward, target_lateral, target_up]
+                        )
+                        current_rotation = self.robot_data.xmat[body_id].reshape(3, 3)
+                        rotation_error = Rotation.from_matrix(
+                            target_rotation @ current_rotation.T
+                        ).as_rotvec()
+                        angular_jacobian = self._body_angular_jacobian(body_id)
+                        orientation_sigma = max(float(spec["orientation_sigma"]), 1e-6)
+                        swing_orientation_terms.append(
+                            (angular_jacobian @ dqa - rotation_error)
+                            / orientation_sigma
+                        )
+                elif (
+                    spec.get("track_orientation", False)
+                    and spec.get("track_swing_heading", False)
+                    and forward_direction is not None
+                ):
+                    target_forward = np.asarray(forward_direction, dtype=float).reshape(3)
+                    target_forward[2] = 0.0
+                    current_rotation = self.robot_data.xmat[body_id].reshape(3, 3)
+                    current_forward = current_rotation[:, 0].copy()
+                    current_forward[2] = 0.0
+                    target_norm = float(np.linalg.norm(target_forward))
+                    current_norm = float(np.linalg.norm(current_forward))
+                    if target_norm > 1e-8 and current_norm > 1e-8:
+                        target_forward /= target_norm
+                        current_forward /= current_norm
+                        yaw_error = float(
+                            np.arctan2(
+                                np.cross(current_forward, target_forward)[2],
+                                np.dot(current_forward, target_forward),
+                            )
+                        )
+                        angular_jacobian = self._body_angular_jacobian(body_id)
+                        orientation_sigma = max(float(spec["orientation_sigma"]), 1e-6)
+                        swing_orientation_terms.append(
+                            cp.hstack([angular_jacobian[2] @ dqa - yaw_error])
+                            / orientation_sigma
+                        )
+
+            # This is a physical angular-velocity bound, not a soft smoothing
+            # term.  It prevents a newly activated contact from rotating an
+            # already stable foot when simultaneous human anchors are not
+            # exactly feasible for the robot's morphology.
+            if (
+                spec.get("track_orientation", False)
+                and last_rotations is not None
+                and name in last_rotations
+            ):
+                current_rotation = self.robot_data.xmat[body_id].reshape(3, 3)
+                rotation_since_last = Rotation.from_matrix(
+                    current_rotation @ np.asarray(last_rotations[name]).T
+                ).as_rotvec()
+                angular_jacobian = self._body_angular_jacobian(body_id)
+                max_orientation_step = max(
+                    float(spec.get("max_orientation_step", np.deg2rad(6.0))),
+                    1e-6,
+                )
+                contact_constraints.append(
+                    cp.norm(rotation_since_last + angular_jacobian @ dqa, 2)
+                    <= max_orientation_step
+                )
+
+        contact_residual = cp.hstack(contact_terms) if contact_terms else None
+        swing_residual = cp.hstack(swing_terms) if swing_terms else None
+        swing_orientation_residual = (
+            cp.hstack(swing_orientation_terms)
+            if swing_orientation_terms
+            else None
+        )
+        # A foot pose is one SE(3) task: translating the sole marker and
+        # rotating its rigid frame are coupled by the ankle kinematics.  When
+        # requested, optimize both in one dimensionless Pareto level using the
+        # configured metre/radian sigmas.  Separating them lexicographically
+        # makes the orientation level inherit an already saturated ankle and
+        # can leave the toe axis tens of degrees from the captured foot.
+        if (
+            bool(self.end_effector_config.get("combine_swing_foot_pose", False))
+            and swing_residual is not None
+            and swing_orientation_residual is not None
+        ):
+            swing_residual = cp.hstack(
+                [swing_residual, swing_orientation_residual]
+            )
+            swing_orientation_residual = None
+        return (
+            contact_residual,
+            swing_residual,
+            swing_orientation_residual,
+            contact_constraints,
+            len(contact_terms),
+            len(swing_terms),
+            len(swing_orientation_terms),
+        )
     
     def _validate_joint_mapping(self):
-        """Validate that all mapped robot links exist. Raise error if any are missing.
+        """Validate that all joints in mapping exist in robot. Raise error if any are missing."""
+        # Get all body names from robot
+        robot_bodies = set()
+        for i in range(self.robot_model.nbody):
+            body_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, i)
+            if body_name:
+                robot_bodies.add(body_name)
         
-        This method now delegates to the shared utility function in utils.py.
-        """
-        from .utils import validate_robot_joint_mapping
-        validate_robot_joint_mapping(
-            self.robot_model,
-            self.joint_mapping,
-            raise_on_missing=True
-        )
+        # Check all mapped bodies exist
+        missing_bodies = []
+        for joint_name, link_name in self.joint_mapping.items():
+            if link_name not in robot_bodies:
+                missing_bodies.append((joint_name, link_name))
+        
+        if missing_bodies:
+            raise ValueError(
+                f"The following robot links from joint_mapping were not found in URDF: {missing_bodies}. "
+                f"Please check your joint_mapping. Available bodies: {sorted(list(robot_bodies))[:10]}..."
+            )
 
     def _setup_terrain_interaction(self):
         """Setup terrain interaction parameters."""
         # Sample points on terrain for interaction mesh
-        self.terrain_points = sample_points_on_mesh(
-            self.terrain_mesh, self.terrain_sample_points, seed=self.terrain_sample_seed
-        )
-
-        # Conservative bounding-sphere radius per geom, used to skip terrain
-        # proximity queries for geoms that provably cannot be within
-        # collision_detection_threshold of the terrain. Computed from the
-        # (possibly cylinder->capsule replaced) geom types, so it must not be
-        # cached before _replace_cylinders_with_capsules runs.
-        self._geom_bounding_radii = np.array(
-            [self._geom_bounding_radius(gi) for gi in range(self.robot_model.ngeom)]
-        )
-
-    def _geom_bounding_radius(self, geom_id: int) -> float:
-        """Conservative world-space bounding-sphere radius of one geom."""
-        m = self.robot_model
-        geom_type = m.geom_type[geom_id]
-        size = m.geom_size[geom_id]
-        if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
-            return float(size[0])
-        if geom_type in (mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_CYLINDER):
-            # radius + half-length (conservative for cylinder, exact for capsule)
-            return float(size[0] + size[1])
-        if geom_type == mujoco.mjtGeom.mjGEOM_BOX:
-            return float(np.linalg.norm(size[:3]))
-        # Other types (mesh, ...): fall back to MuJoCo's bounding radius; if
-        # unavailable, return inf so the geom is never prefiltered away.
-        rbound = float(m.geom_rbound[geom_id])
-        return rbound if rbound > 0 else np.inf
+        self.terrain_points = sample_points_on_mesh(self.terrain_mesh, self.terrain_sample_points)
 
 
-    def create_interaction_mesh(
-        self,
-        source_target_positions: np.ndarray,
-        terrain_points: np.ndarray,
-        object_points: Optional[np.ndarray] = None,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def create_interaction_mesh(self, human_joints: np.ndarray, terrain_points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Create interaction mesh from source target positions, terrain points, and optional object points.
+        Create interaction mesh from human joints and terrain points.
 
         Args:
-            source_target_positions: Source target positions (N, 3)
+            human_joints: Human joint positions (N, 3)
             terrain_points: Terrain surface points (M, 3)
-            object_points: Optional object surface points (K, 3)
 
         Returns:
             Tuple of (vertices, tetrahedra)
         """
-        # Combine source targets, terrain points, and object points.
-        vertices = [source_target_positions, terrain_points]
-        if object_points is not None and len(object_points) > 0:
-            vertices.append(object_points)
-        vertices = np.vstack(vertices)
+        # Combine human joints and terrain points
+        vertices = np.vstack([human_joints, terrain_points])
 
         # Create Delaunay triangulation
         tri = Delaunay(vertices)
 
         return vertices, tri.simplices
 
-    def _setup_link_orientation(self, config: Optional[Dict]) -> None:
-        """Resolve the link orientation task from the robot profile.
-
-        Left disabled unless a profile asks for it, so existing profiles keep
-        their behaviour. Bodies are resolved once here rather than per frame,
-        and a missing body is an error at construction instead of a silently
-        skipped objective at frame two hundred.
-        """
-        from omniretargeting.foot_frames import parse_body_to_sole
-
-        self.link_orientation_specs: Dict[str, dict] = {}
-        self.link_orientation_weight = 0.0
-        self.link_orientation_relative_to_root = False
-        self.link_orientation_enabled = False
-
-        if not config or not config.get("enabled", False):
-            return
-
-        # A weight that multiplies a squared rotation vector is a number whose
-        # meaning depends on the units of that vector, so it cannot be carried
-        # from one setup to another.  Expressed as a tolerance it can: the
-        # weight is priority / tolerance^2, which makes the tolerance the
-        # angular error the task is content to leave, and the priority a
-        # dimensionless statement about how this task ranks against others.
-        # A bare `weight` is still honoured, for configurations written before
-        # this existed.
-        priority = float(config.get("priority", 1.0))
-        tolerance_deg = config.get("tolerance_deg")
-        if config.get("weight") is not None:
-            weight = float(config["weight"])
-        elif tolerance_deg is not None:
-            tolerance = np.radians(float(tolerance_deg))
-            if tolerance <= 0.0:
-                raise ValueError("link_orientation tolerance_deg must be positive")
-            weight = priority / (tolerance ** 2)
-        else:
-            weight = 0.0
-        if weight <= 0.0:
-            return
-
-        effectors = config.get("effectors") or {}
-        if not effectors:
-            raise ValueError("link_orientation is enabled but declares no effectors")
-
-        # The body carrying the free joint is the root the residual is taken
-        # relative to. Body 0 is always the world.
-        free_joints = [
-            j for j in range(self.robot_model.njnt)
-            if self.robot_model.jnt_type[j] == mujoco.mjtJoint.mjJNT_FREE
-        ]
-        if len(free_joints) != 1:
-            raise ValueError(
-                f"link_orientation expects exactly one free joint, found {len(free_joints)}"
-            )
-        self.root_body_id = int(self.robot_model.jnt_bodyid[free_joints[0]])
-
-        for side, spec in effectors.items():
-            body_name = spec.get("body")
-            if not body_name:
-                raise ValueError(f"link_orientation effector {side!r} is missing 'body'")
-            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-            if body_id < 0:
-                raise ValueError(
-                    f"link_orientation effector {side!r} references body {body_name!r}, "
-                    "which is not present in the compiled model"
-                )
-            self.link_orientation_specs[side] = {
-                "body_name": body_name,
-                "body_id": int(body_id),
-                "body_to_sole": parse_body_to_sole(spec.get("body_to_sole"), f"{side} foot"),
-            }
-
-        self.link_orientation_weight = weight
-        self.link_orientation_relative_to_root = bool(config.get("relative_to_root", False))
-        self.link_orientation_enabled = True
-
-    def _setup_scene_contact(self, config: Optional[Dict]) -> None:
-        """Resolve the contact task, which pins an effector onto the scene.
-
-        Separate from the orientation task because they constrain different
-        degrees of freedom: orientation fixes how the sole is tilted, contact
-        fixes where it sits.  Together they give the full foot pose, which is
-        what preserving an interaction requires.
-        """
-        self.scene_contact_specs: Dict[str, dict] = {}
-        self.scene_contact_weight = 0.0
-        self.scene_contact_normal_weight = 1.0
-        self.scene_contact_tangential_weight = 0.05
-        self.scene_contact_enabled = False
-
-        if not config or not config.get("enabled", False):
-            return
-
-        # Same reparameterisation as the orientation task: tolerances in metres
-        # rather than a bare weight on squared metres.  The normal tolerance is
-        # how far off the surface a plant may sit; the tangential one is how far
-        # it may sit from where the source planted it, and it is deliberately
-        # the looser of the two, because a robot with different proportions
-        # cannot occupy the source's exact contact location and should not be
-        # asked to.
-        priority = float(config.get("priority", 1.0))
-        effectors = config.get("effectors") or {}
-        if config.get("weight") is not None:
-            weight = float(config["weight"])
-            normal_weight = float(config.get("normal_weight", 1.0))
-            tangential_weight = float(config.get("tangential_weight", 0.05))
-        else:
-            normal_tolerance = float(config.get("normal_tolerance_m", 0.045))
-            tangential_tolerance = float(config.get("tangential_tolerance_m", 0.20))
-            if normal_tolerance <= 0.0 or tangential_tolerance <= 0.0:
-                raise ValueError("scene_contact tolerances must be positive")
-            weight = priority
-            normal_weight = 1.0 / (normal_tolerance ** 2)
-            tangential_weight = 1.0 / (tangential_tolerance ** 2)
-        if weight <= 0.0 or not effectors:
-            return
-
-        for side, spec in effectors.items():
-            body_name = spec.get("body")
-            if not body_name:
-                raise ValueError(f"scene_contact effector {side!r} is missing 'body'")
-            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-            if body_id < 0:
-                raise ValueError(
-                    f"scene_contact effector {side!r} references body {body_name!r}, "
-                    "which is not present in the compiled model"
-                )
-            self.scene_contact_specs[side] = {
-                "body_id": int(body_id),
-                "sole_offset": np.asarray(spec.get("sole_offset", [0.0, 0.0, 0.0]), dtype=float),
-            }
-
-        self.scene_contact_weight = weight
-        self.scene_contact_normal_weight = normal_weight
-        self.scene_contact_tangential_weight = tangential_weight
-        self.scene_contact_enabled = True
-
-    def _scene_contact_residuals(
-        self,
-        targets: Optional[Dict[str, np.ndarray]],
-        T: Optional[np.ndarray] = None,
-        normals: Optional[Dict[str, np.ndarray]] = None,
-        blend: Optional[Dict[str, float]] = None,
-    ) -> List[Tuple[np.ndarray, np.ndarray]]:
-        """Residuals pinning each contacting sole point onto the scene.
-
-        The normal and tangential directions are weighted separately, and by
-        default the tangential one is weighted far lower.  Contact means the
-        sole is *on the surface*; it does not mean the robot's sole is at the
-        exact world position the human's sole occupied.  Those are different
-        requirements, and demanding the second is not achievable: the robot's
-        limb proportions differ from the scaled source, which leaves every
-        mapped target several centimetres from its source position regardless
-        of what the foot does.  Insisting on the full 3D position would spend
-        that irreducible mismatch fighting the rest of the body, while the
-        component that actually decides whether the foot is planted is the one
-        along the surface normal.
-
-        The tangential term is retained at low weight because it is what
-        discourages the plant from sliding along the surface within a contact
-        interval.
-
-        Returns ``(J, e)`` pairs such that the term to minimise is
-        ``weight * ||J @ dqa + e||^2``, already weighted per direction.
-        """
-        if not self.scene_contact_enabled or not targets:
-            return []
-
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
-
-        residuals: List[Tuple[np.ndarray, np.ndarray]] = []
-        for side, spec in self.scene_contact_specs.items():
-            target = targets.get(side)
-            if target is None:
-                continue
-            target = np.asarray(target, dtype=float)
-            if target.shape != (3,) or not np.all(np.isfinite(target)):
-                continue
-
-            body_id = spec["body_id"]
-            rotation = self.robot_data.xmat[body_id].reshape(3, 3)
-            offset_world = rotation @ spec["sole_offset"]
-            position = self.robot_data.xpos[body_id] + offset_world
-
-            # Both Jacobians are assembled unsliced and reduced together at the
-            # end; the actuated set is not guaranteed to span every column.
-            jac = self._calc_contact_jacobian_from_point(body_id, T=T)
-            if np.any(spec["sole_offset"] != 0.0):
-                # Same cross term the positional targets already use: the point
-                # rides on the body, so rotating the body moves it too.
-                jac = jac - self._skew(offset_world) @ self._body_angular_jacobian_full(body_id, T=T)
-            jac = jac[:, self.q_a_indices]
-            error = position - target
-
-            normal = None if normals is None else normals.get(side)
-            if normal is not None:
-                normal = np.asarray(normal, dtype=float)
-                norm = np.linalg.norm(normal)
-                if np.all(np.isfinite(normal)) and norm > 1e-8:
-                    normal = normal / norm
-                    along = np.outer(normal, normal)
-                    # M = sqrt(w_n) P_n + sqrt(w_t) P_t, so that ||M r||^2 is
-                    # w_n (n.r)^2 + w_t |r_tangential|^2 exactly, because the
-                    # two projectors are orthogonal.
-                    metric = (
-                        np.sqrt(self.scene_contact_normal_weight) * along
-                        + np.sqrt(self.scene_contact_tangential_weight) * (np.eye(3) - along)
-                    )
-                    jac = metric @ jac
-                    error = metric @ error
-
-            # Ease the task in and out across the interval boundaries. Scaling
-            # both sides by sqrt(b) makes the assembled term b * w * ||.||^2.
-            if blend is not None:
-                b = float(blend.get(side, 1.0))
-                if b <= 0.0:
-                    continue
-                if b < 1.0:
-                    root = np.sqrt(b)
-                    jac = jac * root
-                    error = error * root
-
-            residuals.append((jac, error))
-
-        return residuals
-
-    def _setup_foot_penetration(self, config: Optional[Dict]) -> None:
-        """Resolve the foot non-penetration constraint.
-
-        Separate from the general terrain constraint because it is a different
-        problem.  The general one samples every collision geom against the
-        scene mesh and linearises each sample, which over blocky reconstructed
-        geometry is conservative enough to hold a flat sole eight centimetres
-        clear of the ground.  A sole is a plane resting on a locally flat patch,
-        so a handful of probe points against one plane says the same thing with
-        far better conditioning.
-
-        The sole probes are read off the foot's own collision geoms, so this
-        constrains the geometry that will actually collide in simulation rather
-        than a nominal point.
-        """
-        from omniretargeting.foot_frames import (
-            derive_sole_from_points,
-            sample_body_collision_points,
-        )
-
-        self.foot_penetration_specs: Dict[str, dict] = {}
-        self.foot_penetration_enabled = False
-        self.foot_penetration_tolerance = 0.0
-
-        if not config or not config.get("enabled", False):
-            return
-
-        effectors = config.get("effectors") or {}
-        if not effectors:
-            return
-
-        probes = int(config.get("probe_points", 6))
-        for side, spec in effectors.items():
-            body_name = spec.get("body")
-            if not body_name:
-                continue
-            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-            if body_id < 0:
-                raise ValueError(
-                    f"foot_penetration effector {side!r} references body {body_name!r}, "
-                    "which is not present in the compiled model"
-                )
-            points = sample_body_collision_points(self.robot_model, body_id)
-            if points.shape[0] < 3:
-                continue
-            try:
-                sole = derive_sole_from_points(points)
-            except ValueError as exc:
-                print(f"Warning: foot_penetration could not read the sole of {body_name!r} ({exc})")
-                continue
-            # Keep the probes that sit on the sole plane; those are the ones
-            # that can reach the ground first.
-            heights = points @ sole.normal
-            band = points[np.argsort(heights)[: max(3, probes)]]
-            self.foot_penetration_specs[side] = {"body_id": int(body_id), "probes": band}
-
-        if self.foot_penetration_specs:
-            self.foot_penetration_enabled = True
-            self.foot_penetration_tolerance = float(config.get("tolerance_m", 0.001))
-
-    def _foot_penetration_rows(
-        self,
-        contact_normals: Optional[Dict[str, np.ndarray]],
-        T: Optional[np.ndarray] = None,
-    ) -> List[Tuple[np.ndarray, float]]:
-        """Half-space rows keeping each sole probe on or above the ground.
-
-        The supporting plane comes from the anchored contact normal when the
-        effector is in contact, which is what makes this work on a wall as well
-        as on a floor, and from a downward ray otherwise.  The ray is used in
-        preference to the mesh's own face normals because this scene is not
-        watertight and its winding is inconsistent, so a signed distance taken
-        from the nearest face is unreliable; a ray straight down does not care.
-        """
-        if not self.foot_penetration_enabled or self.terrain_mesh is None:
-            return []
-
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
-
-        rows: List[Tuple[np.ndarray, float]] = []
-        up = np.array([0.0, 0.0, 1.0])
-        for side, spec in self.foot_penetration_specs.items():
-            body_id = spec["body_id"]
-            rotation = self.robot_data.xmat[body_id].reshape(3, 3)
-            world = self.robot_data.xpos[body_id] + spec["probes"] @ rotation.T
-
-            normal = None
-            if contact_normals is not None:
-                candidate = contact_normals.get(side)
-                if candidate is not None:
-                    candidate = np.asarray(candidate, dtype=float)
-                    if candidate.shape == (3,) and np.all(np.isfinite(candidate)):
-                        norm = np.linalg.norm(candidate)
-                        if norm > 1e-8:
-                            normal = candidate / norm
-
-            origins = world + up * 2.0
-            directions = np.tile(-up, (len(world), 1))
-            try:
-                hits, ray_ids, _ = self.terrain_mesh.ray.intersects_location(
-                    origins, directions, multiple_hits=False
-                )
-            except Exception:  # noqa: BLE001 - a ray backend may be unavailable
-                continue
-            if len(hits) == 0:
-                continue
-
-            for hit, probe_idx in zip(hits, np.asarray(ray_ids, dtype=int)):
-                point = world[probe_idx]
-                plane_normal = normal if normal is not None else up
-                offset = float(plane_normal @ (point - hit))
-                jac = self._point_jacobian_on_body(body_id, spec["probes"][probe_idx], T=T)
-                row = plane_normal @ jac
-                # plane_normal . (p + J dq - hit) >= -tolerance
-                rows.append((row, -self.foot_penetration_tolerance - offset))
-        return rows
-
-    def _point_jacobian_on_body(
-        self, body_id: int, local_offset: np.ndarray, T: Optional[np.ndarray] = None
-    ) -> np.ndarray:
-        """Translational Jacobian of a body-fixed point, actuated columns."""
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
-        rotation = self.robot_data.xmat[body_id].reshape(3, 3)
-        offset_world = rotation @ np.asarray(local_offset, dtype=float)
-        jac = self._calc_contact_jacobian_from_point(body_id, T=T)
-        if np.any(local_offset != 0.0):
-            jac = jac - self._skew(offset_world) @ self._body_angular_jacobian_full(body_id, T=T)
-        return jac[:, self.q_a_indices]
-
-    def _body_angular_jacobian_full(self, body_id: int, T: Optional[np.ndarray] = None) -> np.ndarray:
-        """World angular Jacobian of a body, in qpos coordinates, all columns."""
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
-        p_W = self.robot_data.xpos[int(body_id)].astype(np.float64).reshape(3, 1)
-        Jp = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
-        Jr = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
-        mujoco.mj_jac(self.robot_model, self.robot_data, Jp, Jr, p_W, int(body_id))
-        return Jr @ T
-
-    def _body_angular_jacobian(self, body_id: int, T: Optional[np.ndarray] = None) -> np.ndarray:
-        """World angular Jacobian of a body, restricted to the actuated columns."""
-        return self._body_angular_jacobian_full(body_id, T=T)[:, self.q_a_indices]
-
-    def _link_orientation_residuals(
-        self,
-        targets: Optional[Dict[str, np.ndarray]],
-        T: Optional[np.ndarray] = None,
-        source_root_rot: Optional[np.ndarray] = None,
-    ) -> List[Tuple[np.ndarray, np.ndarray]]:
-        """Root-relative orientation residuals, one per configured link.
-
-        The residual is expressed relative to the floating base rather than in
-        the world.  The actuated index set includes the base degrees of
-        freedom, and the base carries almost no regularization, so a
-        world-frame foot residual is cheapest to satisfy by rolling the whole
-        robot.  Taking the residual relative to the root removes that
-        shortcut: rotating the base moves target and current together and
-        cannot reduce the error.  Base attitude stays the job of the existing
-        base orientation objective.
-
-        Returns a list of ``(J, e)`` with ``J`` of shape (3, nq_a), such that
-        the term to minimise is ``weight * ||J @ dqa - e||^2``.
-        """
-        if not self.link_orientation_enabled or not targets:
-            return []
-
-        from scipy.spatial.transform import Rotation
-
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
-
-        root_rot = self.robot_data.xmat[self.root_body_id].reshape(3, 3)
-        root_jac = self._body_angular_jacobian(self.root_body_id, T=T)
-
-        residuals: List[Tuple[np.ndarray, np.ndarray]] = []
-        for side, spec in self.link_orientation_specs.items():
-            target_world = targets.get(side)
-            if target_world is None:
-                continue
-            target_world = np.asarray(target_world, dtype=float)
-            if target_world.shape != (3, 3):
-                raise ValueError(f"link orientation target for {side!r} must be a 3x3 rotation")
-
-            current_world = self.robot_data.xmat[spec["body_id"]].reshape(3, 3) @ spec["body_to_sole"]
-
-            # Error and Jacobian must describe the same quantity.  Two
-            # consistent choices exist and they optimise different things:
-            #
-            # world:    the link's world orientation matches the source's world
-            #           orientation.  This is what "the foot points where the
-            #           person's foot pointed" means, and it is what a viewer
-            #           judges.  The floating base can in principle be rotated
-            #           to satisfy it, so the base orientation objective is what
-            #           bounds that; measured here the pelvis moves by under a
-            #           degree when this term is enabled.
-            # relative: the link's orientation relative to its own root matches
-            #           the source's relative to its own root.  Rotating the
-            #           base cannot satisfy it at all, but it inherits whatever
-            #           error the base already has -- with a pelvis ten degrees
-            #           out, the world sole orientation lands seven degrees out
-            #           even when the relative term is fully satisfied.
-            #
-            # World is the default because it targets the quantity that was
-            # wrong in the first place.  An earlier version mixed the two: a
-            # world-frame error against a relative Jacobian, which only
-            # converged because the base happened to track closely.
-            if self.link_orientation_relative_to_root:
-                source_root = root_rot if source_root_rot is None else source_root_rot
-                error = Rotation.from_matrix(
-                    (source_root.T @ target_world) @ (root_rot.T @ current_world).T
-                ).as_rotvec()
-                jac = root_rot.T @ (self._body_angular_jacobian(spec["body_id"], T=T) - root_jac)
-            else:
-                error = Rotation.from_matrix(target_world @ current_world.T).as_rotvec()
-                jac = self._body_angular_jacobian(spec["body_id"], T=T)
-            residuals.append((jac, error))
-
-        return residuals
-
     def retarget_frame(
         self,
-        source_target_positions: np.ndarray,
+        human_joints: np.ndarray,
         q_init: np.ndarray,
         max_iter: int = 10,
         q_last: Optional[np.ndarray] = None,
+        q_prev: Optional[np.ndarray] = None,
+        q_prevprev: Optional[np.ndarray] = None,
+        previous_human_joints: Optional[np.ndarray] = None,
+        previous_previous_human_joints: Optional[np.ndarray] = None,
         target_base_orientation: Optional[np.ndarray] = None,
-        object_points: Optional[np.ndarray] = None,
-        root_translation: Optional[np.ndarray] = None,
-        link_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
-        contact_targets: Optional[Dict[str, np.ndarray]] = None,
-        contact_normals: Optional[Dict[str, np.ndarray]] = None,
-        contact_weights: Optional[Dict[str, float]] = None,
+        target_base_position: Optional[np.ndarray] = None,
+        end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> np.ndarray:
         """
-        Retarget a single frame of source target positions to robot motion.
+        Retarget a single frame of human motion to robot motion.
 
         Args:
-            source_target_positions: Mapped source target positions (N, 3)
+            human_joints: Human joint positions (N, 3)
             q_init: Initial robot configuration
             max_iter: Maximum optimization iterations
             q_last: Configuration at previous time step (for smoothness)
-            object_points: Optional object surface points (K, 3)
-            root_translation: Optional source root translation (3,) for base
-                position tracking.
 
         Returns:
             Optimized robot configuration
         """
-        # self.terrain_points are sampled from the terrain mesh passed to this retargeter.
-        # The caller owns any batch scaling before constructing the stream state.
-        terrain_points = self.terrain_points
+        # Note: self.terrain_points are sampled from self.terrain_mesh
+        # In core.py, self.terrain_mesh is already the *scaled* terrain mesh passed to __init__
+        # So we don't need to apply terrain_scale again here.
+        # We use self.terrain_points directly.
+        scaled_terrain_points = self.terrain_points 
 
         # Create interaction mesh
-        vertices, tetrahedra = self.create_interaction_mesh(
-            source_target_positions, terrain_points, object_points
-        )
+        vertices, tetrahedra = self.create_interaction_mesh(human_joints, scaled_terrain_points)
 
         # Create adjacency list
         adj_list = get_adjacency_list(tetrahedra, len(vertices))
 
-        # Distance-dependent edge weights (TopoRetarget Eq. 5), computed once on
-        # the source configuration and reused for the robot-side Laplacian.
-        # None means uniform weighting (original OmniRetarget behavior).
-        if self.laplacian_edge_weighting == "exponential":
-            edge_weights = calculate_exponential_edge_weights(
-                vertices, adj_list, kappa=self.laplacian_distance_decay
-            )
-        else:
-            edge_weights = None
-
         # Calculate target Laplacian coordinates
-        # CRITICAL: Use the same weighting scheme as the matrix computation in
-        # optimization so target_laplacian and lap0 stay consistent.
-        target_laplacian = calculate_laplacian_coordinates(
-            vertices, adj_list, uniform_weight=True, edge_weights=edge_weights
-        )
-
-        # Laplacian matrix and its 3D Kronecker lift are constant for this
-        # frame: with uniform weights they depend only on adj_list, and with
-        # exponential weights on the precomputed source-frame edge_weights —
-        # never on the robot vertex positions that change per SQP iteration.
-        L = calculate_laplacian_matrix(vertices, adj_list, uniform_weight=True, edge_weights=edge_weights)
-        L = sp.csr_matrix(L)  # calculate_laplacian_matrix always returns dense
-        Kron = sp.kron(L, sp.eye(3, format="csr"), format="csr")
-
-        # Source-side relative bone directions (TopoRetarget Eq. 1), constant
-        # across the SQP iterations for this frame.
-        bone_targets = None
-        if self.bone_direction_enabled:
-            bone_targets = compute_bone_direction_targets(source_target_positions, self.bone_triples)
+        # CRITICAL: Use uniform_weight=True to match the matrix computation in optimization
+        # This ensures target_laplacian and lap0 use the same weighting scheme
+        target_laplacian = calculate_laplacian_coordinates(vertices, adj_list, uniform_weight=True)
 
         # Perform optimization
         q_opt = self._optimize_configuration(
             q_init.copy(),
             target_laplacian,
-            L,
-            Kron,
-            terrain_points,
+            adj_list,
+            scaled_terrain_points,
+            target_human_joints=human_joints,
             max_iter=max_iter,
             q_last=q_last,
+            q_prev=q_prev,
+            q_prevprev=q_prevprev,
+            previous_human_joints=previous_human_joints,
+            previous_previous_human_joints=previous_previous_human_joints,
             target_base_orientation=target_base_orientation,
-            object_points=object_points,
-            bone_targets=bone_targets,
-            root_translation=root_translation,
-            link_orientation_targets=link_orientation_targets,
-            contact_targets=contact_targets,
-            contact_normals=contact_normals,
-            contact_weights=contact_weights,
+            target_base_position=target_base_position,
+            end_effector_targets=end_effector_targets,
+        )
+        direction_step_limits = self._pose_direction_step_limits(
+            human_joints, previous_human_joints
+        )
+        q_opt = self._project_pose_direction_step(
+            q_opt, q_last, direction_step_limits
+        )
+        return self._project_actuated_temporal_step(
+            q_opt, q_last, q_prev, q_prevprev
         )
 
-        return q_opt
+    def _project_actuated_temporal_step(
+        self,
+        q_candidate: np.ndarray,
+        q_last: Optional[np.ndarray],
+        q_prev: Optional[np.ndarray],
+        q_prevprev: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Exactly enforce output velocity, acceleration, and jerk bounds."""
+        temporal_cfg = dict(self.end_effector_config.get("temporal", {}) or {})
+        if q_last is None or not bool(temporal_cfg.get("enabled", False)):
+            return q_candidate
+        actuated = np.flatnonzero(np.arange(self.robot_model.nq) >= 7)
+        if len(actuated) == 0:
+            return q_candidate
+
+        max_step = max(float(temporal_cfg.get("max_joint_step", 0.06)), 1e-8)
+        lower = np.full(len(actuated), -max_step)
+        upper = np.full(len(actuated), max_step)
+        if q_prev is not None:
+            previous_step = q_last[actuated] - q_prev[actuated]
+            max_acceleration = max(
+                float(temporal_cfg.get("max_joint_acceleration_step", 0.015)),
+                1e-8,
+            )
+            lower = np.maximum(lower, previous_step - max_acceleration)
+            upper = np.minimum(upper, previous_step + max_acceleration)
+            if q_prevprev is not None and bool(
+                temporal_cfg.get("hard_jerk_enabled", False)
+            ):
+                previous_previous_step = (
+                    q_prev[actuated] - q_prevprev[actuated]
+                )
+                previous_acceleration = previous_step - previous_previous_step
+                max_jerk = max(
+                    float(temporal_cfg.get("max_joint_jerk_step", 0.005)),
+                    1e-8,
+                )
+                lower = np.maximum(
+                    lower,
+                    previous_step + previous_acceleration - max_jerk,
+                )
+                upper = np.minimum(
+                    upper,
+                    previous_step + previous_acceleration + max_jerk,
+                )
+
+        proposed_step = q_candidate[actuated] - q_last[actuated]
+        projected = np.asarray(q_candidate, dtype=float).copy()
+        projected[actuated] = q_last[actuated] + np.clip(
+            proposed_step, lower, upper
+        )
+        return projected
+
+    def _project_pose_direction_step(
+        self,
+        q_candidate: np.ndarray,
+        q_last: Optional[np.ndarray],
+        direction_step_limits: Mapping[Tuple[str, str], float],
+    ) -> np.ndarray:
+        """Enforce the nonlinear bone-angle bound after the SQP solve."""
+        if (
+            q_last is None
+            or not self.pose_direction_enabled
+            or not self.pose_bones
+        ):
+            return q_candidate
+
+        def directions(qpos: np.ndarray) -> np.ndarray:
+            self.robot_data.qpos[:] = qpos
+            mujoco.mj_forward(self.robot_model, self.robot_data)
+            result = []
+            for parent_name, child_name, _ in self.pose_bones:
+                parent_id = mujoco.mj_name2id(
+                    self.robot_model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    self.joint_mapping[parent_name],
+                )
+                child_id = mujoco.mj_name2id(
+                    self.robot_model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    self.joint_mapping[child_name],
+                )
+                vector = (
+                    self.robot_data.xpos[child_id]
+                    - self.robot_data.xpos[parent_id]
+                )
+                result.append(vector / max(float(np.linalg.norm(vector)), 1e-10))
+            return np.asarray(result)
+
+        last_directions = directions(q_last)
+
+        step_limits = np.asarray(
+            [
+                direction_step_limits.get(
+                    (parent_name, child_name), self.pose_max_direction_step
+                )
+                for parent_name, child_name, _ in self.pose_bones
+            ],
+            dtype=float,
+        )
+
+        def maximum_ratio(qpos: np.ndarray) -> float:
+            candidate_directions = directions(qpos)
+            cosines = np.clip(
+                np.sum(last_directions * candidate_directions, axis=1),
+                -1.0,
+                1.0,
+            )
+            return float(np.max(np.arccos(cosines) / step_limits))
+
+        if maximum_ratio(q_candidate) <= 1.001:
+            return q_candidate
+
+        delta = np.asarray(q_candidate, dtype=float) - np.asarray(q_last, dtype=float)
+        lower, upper = 0.0, 1.0
+        best = np.asarray(q_last, dtype=float).copy()
+        for _ in range(24):
+            alpha = 0.5 * (lower + upper)
+            trial = np.asarray(q_last, dtype=float) + alpha * delta
+            trial[3:7] /= max(float(np.linalg.norm(trial[3:7])), 1e-12)
+            if np.dot(trial[3:7], q_last[3:7]) < 0.0:
+                trial[3:7] *= -1.0
+            if maximum_ratio(trial) <= 1.0:
+                best = trial
+                lower = alpha
+            else:
+                upper = alpha
+        return best
 
     def _optimize_configuration(
         self,
         q_init: np.ndarray,
         target_laplacian: np.ndarray,
-        L: sp.spmatrix,
-        Kron: sp.spmatrix,
+        adj_list: List[List[int]],
         terrain_points: np.ndarray,
+        target_human_joints: Optional[np.ndarray] = None,
         max_iter: int = 10,
         q_last: Optional[np.ndarray] = None,
+        q_prev: Optional[np.ndarray] = None,
+        q_prevprev: Optional[np.ndarray] = None,
+        previous_human_joints: Optional[np.ndarray] = None,
+        previous_previous_human_joints: Optional[np.ndarray] = None,
         target_base_orientation: Optional[np.ndarray] = None,
-        object_points: Optional[np.ndarray] = None,
-        bone_targets: Optional[np.ndarray] = None,
-        root_translation: Optional[np.ndarray] = None,
-        link_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
-        contact_targets: Optional[Dict[str, np.ndarray]] = None,
-        contact_normals: Optional[Dict[str, np.ndarray]] = None,
-        contact_weights: Optional[Dict[str, float]] = None,
+        target_base_position: Optional[np.ndarray] = None,
+        end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> np.ndarray:
         """
         Optimize robot configuration using SQP with interaction mesh constraints.
@@ -1304,113 +1389,77 @@ class GenericInteractionRetargeter:
         Args:
             q_init: Initial configuration
             target_laplacian: Target Laplacian coordinates
-            L: Per-frame Laplacian matrix (constant across SQP iterations)
-            Kron: Per-frame kron(L, eye(3)) (constant across SQP iterations)
+            adj_list: Mesh adjacency list
             terrain_points: Terrain contact points
             max_iter: Maximum iterations
             q_last: Configuration at previous time step (for smoothness)
-            bone_targets: Optional source-side relative bone directions for the
-                bone-direction prior (from compute_bone_direction_targets)
-            root_translation: Optional source root translation (3,) for base
-                position tracking.
 
         Returns:
             Optimized configuration
         """
         q = q_init.copy()
-
-        # Warm-init stage (TopoRetarget Eq. 2): refine the initial guess toward
-        # the source's relative bone directions before the main refinement.
-        if self.bone_direction_enabled and bone_targets is not None and self.bone_warm_init:
-            q = self._warm_init_bone_direction(q, bone_targets, q_last)
-
         last_cost = np.inf
+        
+        import sys
+        # Enable debug for first few frames to see the pattern
+        debug = not hasattr(sys, '_omni_frame_count')
+        if not hasattr(sys, '_omni_frame_count'):
+            sys._omni_frame_count = 0
+        
+        frame_num = sys._omni_frame_count
+        sys._omni_frame_count += 1
+        
+        # Debug first 5 frames to see the pattern
+        show_debug = frame_num < 5
+
+        if show_debug:
+            print(f"\n=== Frame {frame_num} Optimization ===")
+            print(f"q_init[:10]: {q_init[:10]}")
+            if q_last is not None:
+                print(f"q_last[:10]: {q_last[:10]}")
+                print(f"Has q_last: True")
+            else:
+                print(f"Has q_last: False")
 
         for iteration in range(max_iter):
             # Single optimization step
             q_new, cost = self._single_optimization_step(
                 q,
                 target_laplacian,
-                L,
-                Kron,
+                adj_list,
                 terrain_points,
-                q_last=q_last,
-                target_base_orientation=target_base_orientation,
-                object_points=object_points,
-                bone_targets=bone_targets,
-                root_translation=root_translation,
-                link_orientation_targets=link_orientation_targets,
-                contact_targets=contact_targets,
-                contact_normals=contact_normals,
-                contact_weights=contact_weights,
+                target_human_joints,
+                q_last,
+                q_prev,
+                q_prevprev,
+                previous_human_joints,
+                previous_previous_human_joints,
+                target_base_orientation,
+                target_base_position,
+                end_effector_targets,
             )
+            
+            if show_debug and iteration < 3:
+                print(f"  Iter {iteration}: cost={cost:.4f}, |dq|={np.linalg.norm(q_new - q):.6f}, status={'OK' if cost < np.inf else 'FAIL'}")
 
-            # Solver failure at this linearization point: an identical retry
-            # cannot help, so stop instead of burning the remaining iterations.
             if not np.isfinite(cost):
+                if show_debug:
+                    print(f"  Stopping SQP at iteration {iteration}: convex subproblem failed.")
                 break
 
-            # Accept the step before testing convergence.  The step that meets
-            # the tolerance is still an improvement, so breaking ahead of the
-            # assignment would discard it and return the previous iterate.
-            converged = abs(cost - last_cost) < 1e-6
+            # Check convergence
+            if abs(cost - last_cost) < 1e-6:
+                if show_debug:
+                    print(f"  Converged at iteration {iteration}")
+                break
+
             q = q_new
             last_cost = cost
-            if converged:
-                break
-
-        return q
-
-    def _warm_init_bone_direction(
-        self,
-        q_init: np.ndarray,
-        bone_targets: np.ndarray,
-        q_last: Optional[np.ndarray] = None,
-    ) -> np.ndarray:
-        """Warm-init SQP stage from TopoRetarget Eq. (2).
-
-        Refines the initial guess toward the source's relative bone directions:
-            min  lambda_warm * E_bone(q) + lambda_smooth * ||q - q_ref||^2
-        where q_ref is the previous frame's configuration (or q_init for the
-        first frame). Runs a small QP for ``bone_warm_init_iters`` iterations
-        and returns the refined configuration (input is not modified).
-        """
-        q = q_init.copy()
-        q_ref = q_last if q_last is not None else q_init
-        ref_a = q_ref[self.q_a_indices]
-
-        n = self.nq_a
-        for _ in range(self.bone_warm_init_iters):
-            self.robot_data.qpos[:] = q
-            mujoco.mj_forward(self.robot_model, self.robot_data)
-            J_V, p_V, _ = self._compute_robot_jacobians(q)
-            robot_points = np.array([p_V[name] for name in self.source_target_names])
-            res, J = compute_bone_direction_residual_and_jacobian(
-                robot_points, J_V, self.bone_triples, bone_targets
-            )
-
-            q_a_current = q[self.q_a_indices]
-            # min lambda_warm * ||res + J dqa||^2 + lambda_smooth * ||dqa + q_a - ref_a||^2
-            P = 2.0 * self.lambda_warm * (J.T @ J) + 2.0 * self.lambda_smooth * np.eye(n)
-            c = 2.0 * self.lambda_warm * (J.T @ res) + 2.0 * self.lambda_smooth * (q_a_current - ref_a)
-
-            dqa_opt, ok = _solve_qp_clarabel(
-                sp.csr_matrix(P),
-                c,
-                lb=self.q_a_lb - q_a_current,
-                ub=self.q_a_ub - q_a_current,
-                trust_region_dim=n,
-                step_size=self.step_size,
-            )
-            if not ok:
-                break
-
-            q[self.q_a_indices] = q_a_current + dqa_opt
-            # Keep the base quaternion a valid unit quaternion between iterations
-            quat = q[3:7]
-            norm = np.linalg.norm(quat)
-            if norm > 1e-12:
-                q[3:7] = quat / norm
+        
+        if show_debug:
+            print(f"Final cost: {last_cost:.4f}")
+            print(f"Final q[:10]: {q[:10]}")
+            print(f"Total change: {np.linalg.norm(q - q_init):.6f}")
 
         return q
 
@@ -1418,37 +1467,27 @@ class GenericInteractionRetargeter:
         self,
         q: np.ndarray,
         target_laplacian: np.ndarray,
-        L: sp.spmatrix,
-        Kron: sp.spmatrix,
+        adj_list: List[List[int]],
         terrain_points: np.ndarray,
+        target_human_joints: Optional[np.ndarray] = None,
         q_last: Optional[np.ndarray] = None,
+        q_prev: Optional[np.ndarray] = None,
+        q_prevprev: Optional[np.ndarray] = None,
+        previous_human_joints: Optional[np.ndarray] = None,
+        previous_previous_human_joints: Optional[np.ndarray] = None,
         target_base_orientation: Optional[np.ndarray] = None,
-        object_points: Optional[np.ndarray] = None,
-        bone_targets: Optional[np.ndarray] = None,
-        root_translation: Optional[np.ndarray] = None,
-        link_orientation_targets: Optional[Dict[str, np.ndarray]] = None,
-        contact_targets: Optional[Dict[str, np.ndarray]] = None,
-        contact_normals: Optional[Dict[str, np.ndarray]] = None,
-        contact_weights: Optional[Dict[str, float]] = None,
+        target_base_position: Optional[np.ndarray] = None,
+        end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Single SQP optimization step.
 
-        The QP is assembled directly and solved with CLARABEL (see
-        _solve_qp_clarabel): the auxiliary Laplacian variables are substituted
-        out, leaving a small QP in dqa (plus optional penetration slack).
-
         Args:
             q: Current configuration
             target_laplacian: Target Laplacian coordinates
-            L: Per-frame Laplacian matrix (constant across SQP iterations)
-            Kron: Per-frame kron(L, eye(3)) (constant across SQP iterations)
+            adj_list: Mesh adjacency list
             terrain_points: Terrain contact points
             q_last: Configuration at previous time step (for smoothness)
-            bone_targets: Optional source-side relative bone directions for the
-                bone-direction prior (from compute_bone_direction_targets)
-            root_translation: Optional source root translation (3,) for base
-                position tracking.
 
         Returns:
             Tuple of (optimized_config, cost)
@@ -1457,133 +1496,304 @@ class GenericInteractionRetargeter:
         self.robot_data.qpos[:] = q
         mujoco.mj_forward(self.robot_model, self.robot_data)
 
-        # qdot->qvel transform depends only on q; build once per iteration.
-        T_qvel = self._build_transform_qdot_to_qvel_fast()
+        # Compute Jacobians for mapped joints
+        J_V, p_V, _ = self._compute_robot_jacobians(q)
 
-        # Compute Jacobians for mapped robot link points.
-        J_V, p_V, _ = self._compute_robot_jacobians(q, T=T_qvel)
-
-        # CRITICAL: Ensure robot_points are in the SAME ORDER as source_target_positions passed to retarget_frame.
-        # The order MUST match: source_target_positions[i] corresponds to robot_points[i] for all i.
-        source_target_names_ordered = self.source_target_names
-
-        # CRITICAL: Verify that p_V has all source targets in the correct order.
-        if set(source_target_names_ordered) != set(p_V.keys()):
-            missing = set(source_target_names_ordered) - set(p_V.keys())
-            extra = set(p_V.keys()) - set(source_target_names_ordered)
+        # Create Laplacian matrices
+        # CRITICAL: Ensure robot_points are in the SAME ORDER as human_joints passed to retarget_frame
+        # The order MUST match: human_joints[i] corresponds to robot_points[i] for all i
+        # 
+        # Order flow:
+        #   1. In core.py: valid_joint_names is built by iterating joint_mapping.keys() in order
+        #   2. In core.py: mapped_joints = human_joints[mapped_joint_indices] where mapped_joint_indices
+        #      corresponds to valid_joint_names[i] for each i
+        #   3. In core.py: valid_joint_mapping preserves valid_joint_names order
+        #   4. Here: self.joint_mapping IS valid_joint_mapping (passed from core.py)
+        #   5. Here: robot_points built by iterating self.joint_mapping.keys() which matches valid_joint_names
+        #   6. J_V stacked by iterating self.joint_mapping.keys() in the same order
+        #
+        # So: human_joints[i] (from valid_joint_names[i]) should match robot_points[i] (from joint_mapping.keys()[i])
+        # CRITICAL: Use self.valid_joint_names to ensure consistent ordering
+        joint_names_ordered = self.valid_joint_names
+        
+        # CRITICAL: Verify that p_V has all joints in the correct order
+        if set(joint_names_ordered) != set(p_V.keys()):
+            missing = set(joint_names_ordered) - set(p_V.keys())
+            extra = set(p_V.keys()) - set(joint_names_ordered)
             raise RuntimeError(
-                f"Source target mismatch: p_V has different targets than joint_mapping. "
+                f"Joint mismatch: p_V has different joints than joint_mapping. "
                 f"Missing from p_V: {missing}, Extra in p_V: {extra}"
             )
-
-        robot_points = np.array([p_V[target_name] for target_name in source_target_names_ordered])
-
+        
+        robot_points = []
+        for joint_name in joint_names_ordered:
+            robot_points.append(p_V[joint_name])
+        
+        robot_points = np.array(robot_points)
+        
+        # Debug: Print order for first frame to verify
+        import sys
+        if not hasattr(sys, '_omni_joint_order_printed'):
+            print(f"\n=== Joint Order Verification ===")
+            print(f"Joint mapping order: {joint_names_ordered}")
+            print(f"p_V keys order: {list(p_V.keys())}")
+            print(f"First 3 robot points correspond to: {joint_names_ordered[:3]}")
+            sys._omni_joint_order_printed = True
+        
         # CRITICAL: Validate that sizes match exactly
-        expected_num_targets = len(source_target_names_ordered)
-        if len(robot_points) != expected_num_targets:
+        expected_num_joints = len(joint_names_ordered)
+        if len(robot_points) != expected_num_joints:
             raise ValueError(
-                f"Size mismatch: robot_points has {len(robot_points)} targets, "
-                f"but expected {expected_num_targets} targets from joint_mapping.keys()."
+                f"Size mismatch: robot_points has {len(robot_points)} joints, "
+                f"but expected {expected_num_joints} joints from joint_mapping.keys()."
             )
-        if J_V.shape[0] != 3 * expected_num_targets:
+        if J_V.shape[0] != 3 * expected_num_joints:
             raise ValueError(
-                f"Jacobian dimension mismatch: J_V has {J_V.shape[0]//3} targets, "
-                f"but expected {expected_num_targets} targets from joint_mapping. "
-                f"J_V shape: {J_V.shape}, expected rows: {3 * expected_num_targets}"
+                f"Jacobian dimension mismatch: J_V has {J_V.shape[0]//3} joints, "
+                f"but expected {expected_num_joints} joints from joint_mapping. "
+                f"J_V shape: {J_V.shape}, expected rows: {3 * expected_num_joints}"
             )
-        # Combine all environment points (terrain + objects) as locked vertices
-        env_points_list = [terrain_points]
-        if object_points is not None and len(object_points) > 0:
-            env_points_list.append(object_points)
-        all_env_points = np.vstack(env_points_list)
-
+        if len(robot_points) != J_V.shape[0] // 3:
+            raise ValueError(
+                f"Size mismatch between robot_points ({len(robot_points)}) and J_V ({J_V.shape[0]//3} joints)."
+            )
         if len(robot_points) == 0:
-            if len(all_env_points) == 0:
-                raise ValueError("Both robot_points and environment points are empty")
-            vertices = all_env_points
-            print("WARNING: No robot points found! Only using environment points.")
+            # Handle empty robot points to avoid vstack error
+            if len(terrain_points) == 0:
+                # Both empty, raise error as we can't do anything
+                raise ValueError("Both robot_points and terrain_points are empty")
+            vertices = terrain_points
+            print("WARNING: No robot points found! Only using terrain points.")
         else:
-            vertices = np.vstack([robot_points, all_env_points])
+            vertices = np.vstack([robot_points, terrain_points])
 
+        # CRITICAL: Use uniform_weight=True to match target_laplacian computation
+        # This ensures consistent Laplacian computation between target and current
+        L = calculate_laplacian_matrix(vertices, adj_list, uniform_weight=True)
+        if not sp.issparse(L):
+            L = sp.csr_matrix(L)
+
+        # Kron shape: (3*num_vertices, 3*num_vertices)
+        Kron = sp.kron(L, sp.eye(3, format="csr"), format="csr")
+        
+        # J_V shape: (3*num_joints, nq_a) - stacked Jacobians for each mapped joint
+        # BUT Kron expects input vector of size 3*num_vertices (where vertices = mapped_joints + terrain_points)
+        # J_V maps joint velocities (dqa) to velocities of mapped_joints (and 0 for terrain points)
+        
+        # We need to construct a full Jacobian J_full of shape (3*num_vertices, nq_a)
+        # The top part corresponds to robot_points (mapped joints), bottom part (terrain) is zeros
+        
         num_robot_points = len(robot_points)
-        num_env_points = len(all_env_points)
-
+        num_terrain_points = len(terrain_points)
+        num_vertices = num_robot_points + num_terrain_points
+        
+        # Verify sizes match
+        if J_V.shape[0] != 3 * num_robot_points:
+             # This can happen if p_V has different number of points than J_V's stack
+             # But they come from the same loop, so they should match
+             print(f"Warning: J_V rows ({J_V.shape[0]}) != 3 * num_robot_points ({3*num_robot_points})")
+        
         # Construct full Jacobian for all vertices
-        # Top part: J_V (robot points), Bottom part: 0 (environment points, static)
+        # Top part: J_V (robot points), Bottom part: 0 (terrain points, static)
         J_full_vertices = sp.vstack([
             sp.csr_matrix(J_V),  # Jacobians for robot points
-            sp.csr_matrix((3 * num_env_points, self.nq_a))  # Zeros for environment points (terrain + objects)
+            sp.csr_matrix((3 * num_terrain_points, self.nq_a)) # Zeros for terrain points
         ])
-
-        # J_L maps dqa to Laplacian-coordinate deltas: (3*V, nq_a)
+        
+        # Now J_L = Kron @ J_full_vertices
+        # Kron: (3*V, 3*V)
+        # J_full_vertices: (3*V, nq_a)
+        # Result J_L: (3*V, nq_a)
         J_L = Kron @ J_full_vertices
 
-        # ---- Assemble the QP in dqa (+ optional penetration slack vars) ----
-        # Objective terms (matching the previous CVXPY formulation exactly):
-        #   ||sqrt(W) (lap0 + J_L dqa - target)||^2          (Laplacian)
-        #   + lambda_bone ||res + J_bone dqa||^2             (bone prior)
-        #   + ||sqrt(Q_diag) (dqa + q_a)||^2                 (joint regularization)
-        #   + smooth_weight ||S (dqa - dqa_smooth)||^2       (temporal smoothness)
-        #   + sum_i w_orient (dqa[i] + q[i] - target[i])^2   (base orientation)
-        #   + (w_slack/2) sum((span * s_unit)^2)             (penetration slack)
-        n = self.nq_a
-        q_a_current = q[self.q_a_indices]
+        # Setup optimization problem
+        dqa = cp.Variable(len(self.q_a_indices), name="dqa")
+        lap_var = cp.Variable(3 * len(vertices), name="laplacian")
 
+        # Constraints
+        constraints = []
+        
+        # CRITICAL: Linear equality constraint matching original implementation
+        # This defines: lap_var = lap0_vec + J_L @ dqa
+        # Original uses: J_L[:, self.q_a_indices] @ dqa - lap_var == -lap0_vec
+        # Rearranged: lap_var == lap0_vec + J_L @ dqa
         lap0_vec = (L @ vertices).reshape(-1)
         target_lap_vec = target_laplacian.reshape(-1)
-        r0 = lap0_vec - target_lap_vec
+        
+        # Note: J_L already has columns only for q_a_indices (from J_V construction)
+        # But original slices again, so we match that exactly
+        constraints.append(cp.Constant(J_L) @ dqa - lap_var == -lap0_vec)
 
-        # Laplacian weights (the original used a flat 10 on every vertex).
-        #
-        # The environment rows are normalised by how many of them there are.
-        # Under the flat weight, doubling terrain_sample_points doubled the
-        # total pull of the mesh-preservation term while every other task kept
-        # its weight, so a knob that should only control how finely the scene is
-        # described was quietly changing the relative priority of the whole
-        # objective: going from 100 to 200 samples moved the base by a median of
-        # 3.3 cm and up to 9.8 cm on the same clip.  Held against the robot's own
-        # vertex count, the scene contributes as much to mesh preservation as
-        # the body does however densely it happens to be sampled.
-        weights = np.ones(len(vertices)) * 10.0
-        if num_env_points > 0 and num_robot_points > 0:
-            weights[num_robot_points:] *= num_robot_points / float(num_env_points)
-        w3 = np.repeat(weights, 3)
-        Jw = J_L.multiply(w3[:, None])  # = W @ J_L (W diagonal)
+        # Joint limits
+        q_a_current = q[self.q_a_indices]
+        constraints.extend([
+            dqa >= (self.q_a_lb - q_a_current),
+            dqa <= (self.q_a_ub - q_a_current),
+        ])
 
-        P = 2.0 * (Jw.T @ J_L)
-        c = 2.0 * (Jw.T @ r0)
+        temporal_cfg = dict(self.end_effector_config.get("temporal", {}) or {})
+        if q_last is not None and bool(temporal_cfg.get("enabled", False)):
+            actuated_qa = np.flatnonzero(self.q_a_indices >= 7)
+            if len(actuated_qa):
+                actuated_qpos = self.q_a_indices[actuated_qa]
+                new_actuated = q_a_current[actuated_qa] + dqa[actuated_qa]
+                last_actuated = q_last[actuated_qpos]
+                max_joint_step = max(
+                    float(temporal_cfg.get("max_joint_step", 0.15)), 1e-6
+                )
+                constraints.extend(
+                    [
+                        new_actuated - last_actuated <= max_joint_step,
+                        last_actuated - new_actuated <= max_joint_step,
+                    ]
+                )
+                if q_prev is not None:
+                    previous_step = last_actuated - q_prev[actuated_qpos]
+                    new_step = new_actuated - last_actuated
+                    max_acceleration_step = max(
+                        float(
+                            temporal_cfg.get("max_joint_acceleration_step", 0.12)
+                        ),
+                        1e-6,
+                    )
+                    constraints.extend(
+                        [
+                            new_step - previous_step <= max_acceleration_step,
+                            previous_step - new_step <= max_acceleration_step,
+                        ]
+                    )
+                    if q_prevprev is not None and bool(
+                        temporal_cfg.get("hard_jerk_enabled", False)
+                    ):
+                        previous_previous_step = (
+                            q_prev[actuated_qpos]
+                            - q_prevprev[actuated_qpos]
+                        )
+                        previous_acceleration = (
+                            previous_step - previous_previous_step
+                        )
+                        new_acceleration = new_step - previous_step
+                        max_jerk_step = max(
+                            float(
+                                temporal_cfg.get("max_joint_jerk_step", 0.005)
+                            ),
+                            1e-8,
+                        )
+                        constraints.extend(
+                            [
+                                new_acceleration - previous_acceleration
+                                <= max_jerk_step,
+                                previous_acceleration - new_acceleration
+                                <= max_jerk_step,
+                            ]
+                        )
 
-        # Bone-direction prior (TopoRetarget Eq. 1, refinement-stage weight):
-        # keep relative directions of adjacent bones close to the source's.
-        bone_res = None
-        bone_J = None
-        if self.bone_direction_enabled and bone_targets is not None:
-            bone_res, bone_J = compute_bone_direction_residual_and_jacobian(
-                robot_points, J_V, self.bone_triples, bone_targets
+            base_qa = [
+                int(np.where(self.q_a_indices == index)[0][0])
+                for index in (0, 1, 2)
+                if index in self.q_a_indices
+            ]
+            if len(base_qa) == 3:
+                new_base = q_a_current[base_qa] + dqa[base_qa]
+                max_base_step = max(
+                    float(temporal_cfg.get("max_base_step", 0.05)), 1e-6
+                )
+                constraints.extend(
+                    [
+                        new_base - q_last[:3] <= max_base_step,
+                        q_last[:3] - new_base <= max_base_step,
+                    ]
+                )
+
+        # The interaction-mesh Laplacian is nearly translation invariant.  An
+        # explicit morphology-aware base envelope prevents infeasible hand/foot
+        # targets from dragging the floating base away from the source actor.
+        base_position_obj = None
+        base_cfg = dict(
+            self.end_effector_config.get("base_position_constraint", {}) or {}
+        )
+        if target_base_position is not None and bool(base_cfg.get("enabled", False)):
+            base_target = np.asarray(target_base_position, dtype=float).reshape(3).copy()
+            base_target[2] += float(base_cfg.get("z_offset", 0.0))
+            max_xy_error = max(float(base_cfg.get("max_xy_error", 0.08)), 0.0)
+            max_z_error = max(float(base_cfg.get("max_z_error", 0.12)), 0.0)
+
+            base_new_components = []
+            for qpos_idx in (0, 1, 2):
+                if qpos_idx in self.q_a_indices:
+                    qa_idx = int(np.where(self.q_a_indices == qpos_idx)[0][0])
+                    base_new_components.append(q[qpos_idx] + dqa[qa_idx])
+                else:
+                    base_new_components.append(cp.Constant(float(q[qpos_idx])))
+            base_new = cp.hstack(base_new_components)
+            if bool(base_cfg.get("hard_constraints", True)):
+                constraints.append(
+                    cp.norm(base_new[:2] - base_target[:2], 2) <= max_xy_error
+                )
+                constraints.extend(
+                    [
+                        base_new[2] - base_target[2] <= max_z_error,
+                        base_target[2] - base_new[2] <= max_z_error,
+                    ]
+                )
+            xy_scale = max(max_xy_error, 1e-6)
+            z_scale = max(max_z_error, 1e-6)
+            base_position_obj = (
+                cp.sum_squares((base_new[:2] - base_target[:2]) / xy_scale)
+                + cp.square((base_new[2] - base_target[2]) / z_scale)
             )
-            P = P + 2.0 * self.lambda_bone * sp.csr_matrix(bone_J.T @ bone_J)
-            c = c + 2.0 * self.lambda_bone * (bone_J.T @ bone_res)
 
-        # Joint regularization cost (keep joints near zero/neutral).
-        # Q_diag_modified is precomputed once in _setup_robot_config.
-        # All diagonal Hessian contributions are collected into one vector and
-        # added once below (scalar += on sparse matrices is not portable).
-        P_diag_extra = 2.0 * self.Q_diag_modified
-        c = c + 2.0 * self.Q_diag_modified * q_a_current
+        # Non-penetration constraints (self-collision + terrain)
+        if self.hard_penetration_constraint:
+            penetration_constraints = self._compute_penetration_constraints(q, dqa)
+            constraints.extend(penetration_constraints)
 
-        # Smoothness cost: use previous frame's velocity, not current guess
-        dqa_smooth = None
+        # Trust region
+        constraints.append(cp.SOC(self.step_size, dqa))
+
+        # Whole-body objective (the lowest level of the hierarchy).
+        weights = np.ones(len(vertices)) * 10  # Laplacian weights (matching original laplacian_weights = 10)
+        sqrt_w3 = np.sqrt(np.repeat(weights, 3))
+        
+        # Minimize: ||lap_var - target_lap_vec||^2
+        # where lap_var = lap0_vec + J_L @ dqa (from constraint)
+        body_obj = cp.sum_squares(cp.multiply(sqrt_w3, lap_var - target_lap_vec))
+        if base_position_obj is not None:
+            body_obj += float(base_cfg.get("centering_weight", 5.0)) * base_position_obj
+        
+        # Joint regularization cost (keep joints near zero/neutral)
+        # Matching original: Q_diag cost uses q_a_n_last (last optimized at current time step)
+        # In our case, q_a_current = q[self.q_a_indices] which is the current guess
+        Qd = np.asarray(self.Q_diag, dtype=float).reshape(-1)
+        
+        # Modify Q_diag for specific joints (matching original MANUAL_COST logic)
+        Q_diag_modified = Qd.copy()
+        for i in range(self.robot_model.njnt):
+            joint_name = self.robot_model.joint(i).name
+            if joint_name:
+                joint_name_lower = joint_name.lower()
+                # Strong regularization for joints prone to 180° flips
+                if ('waist' in joint_name_lower or 'torso' in joint_name_lower or 
+                    ('hip' in joint_name_lower and 'yaw' in joint_name_lower)):
+                    qpos_adr = self.robot_model.jnt_qposadr[i]
+                    if qpos_adr in self.q_a_indices:
+                        idx_in_qa = np.where(self.q_a_indices == qpos_adr)[0]
+                        if len(idx_in_qa) > 0:
+                            Q_diag_modified[idx_in_qa[0]] = 0.2  # Strong regularization (matching original MANUAL_COST)
+        
+        # Q_diag cost: ||sqrt(Q_diag) * (dqa + q_a_current)||^2
+        # This matches original: cp.sum_squares(cp.multiply(np.sqrt(Qd), dqa + q_a_n_last))
+        body_obj += cp.sum_squares(cp.multiply(np.sqrt(Q_diag_modified), dqa + q_a_current))
+
+        # Smoothness cost (matching original implementation exactly)
+        # CRITICAL FIX: Use previous frame's velocity, not current guess
         if q_last is not None:
-            dqa_smooth = q_last[self.q_a_indices] - q_a_current
-            smooth_diag = self.smooth_weight * (self.smooth_scale ** 2)
-            P_diag_extra = P_diag_extra + 2.0 * smooth_diag
-            c = c - 2.0 * smooth_diag * dqa_smooth
-
-        # Base orientation tracking cost: keep the base orientation close to
-        # the target estimated from source target positions.
-        orientation_weight = 5.0  # Strong preference to maintain orientation
-        orient_terms: List[Tuple[int, float]] = []
-        base_pos_terms: List[Tuple[int, float]] = []
+            q_a_current = q[self.q_a_indices]  # Current guess at this SQP iteration
+            dqa_smooth = q_last[self.q_a_indices] - q_a_current  # Velocity from prev frame to current guess
+            body_obj += self.smooth_weight * cp.sum_squares(dqa - dqa_smooth)
+        
+        # Base orientation tracking cost
+        # Keep the base orientation close to the target (estimated from human joints)
         if target_base_orientation is not None and 3 in self.q_a_indices:
             # Find quaternion indices in q_a_indices
             quat_indices_in_qa = []
@@ -1592,180 +1802,509 @@ class GenericInteractionRetargeter:
                     idx_in_qa = np.where(self.q_a_indices == quat_idx)[0]
                     if len(idx_in_qa) > 0:
                         quat_indices_in_qa.append(idx_in_qa[0])
-
+            
             if len(quat_indices_in_qa) == 4:
+                # Target quaternion in wxyz (MuJoCo convention)
+                quat_target_wxyz = target_base_orientation
                 quat_current = q[3:7]  # Current quaternion
+                
+                # Add cost to keep quaternion close to target
+                orientation_weight = 5.0  # Strong preference to maintain orientation
                 for i, qa_idx in enumerate(quat_indices_in_qa):
-                    diff = float(quat_current[i] - target_base_orientation[i])
-                    P_diag_extra[qa_idx] += 2.0 * orientation_weight
-                    c[qa_idx] += 2.0 * orientation_weight * diff
-                    orient_terms.append((qa_idx, diff))
+                    target_val = quat_target_wxyz[i]
+                    current_val = quat_current[i]
+                    # Penalize deviation: (q_new - target)^2 = (q_current + dqa - target)^2
+                    body_obj += orientation_weight * cp.square(dqa[qa_idx] + current_val - target_val)
 
-        # Base position tracking cost: keep the floating-base x-y origin close
-        # to the source root translation when it is available. This compensates
-        # for the loss of global x-y anchoring that happens with distance-
-        # weighted Laplacian edges (TopoRetarget), where static terrain
-        # vertices receive very low weights. We intentionally skip Z so the
-        # optimizer can still respect the robot's leg kinematics and terrain
-        # penetration constraints.
-        if root_translation is not None and self.base_position_tracking_weight > 0.0:
-            w_pos = self.base_position_tracking_weight
-            for pos_idx in [0, 1]:
-                if pos_idx in self.q_a_indices:
-                    idx_in_qa = int(np.where(self.q_a_indices == pos_idx)[0][0])
-                    diff = float(q_a_current[idx_in_qa] - root_translation[pos_idx])
-                    # Add 2*w to the diagonal and 2*w*diff to the linear term
-                    # so the QP cost is w * (dqa[idx] + diff)^2.
-                    P_diag_extra[idx_in_qa] += 2.0 * w_pos
-                    c[idx_in_qa] += 2.0 * w_pos * diff
-                    base_pos_terms.append((idx_in_qa, diff))
+        last_end_effector_rotations: Dict[str, np.ndarray] = {}
+        last_pose_directions: Dict[Tuple[str, str], np.ndarray] = {}
+        previous_pose_directions: Dict[Tuple[str, str], np.ndarray] = {}
+        if q_last is not None and (
+            self.end_effector_enabled or self.pose_direction_enabled
+        ):
+            current_qpos = self.robot_data.qpos.copy()
+            self.robot_data.qpos[:] = q_last
+            mujoco.mj_forward(self.robot_model, self.robot_data)
+            for name, spec in self.end_effectors.items():
+                if spec.get("track_orientation", False):
+                    last_end_effector_rotations[name] = self.robot_data.xmat[
+                        spec["body_id"]
+                    ].reshape(3, 3).copy()
+            for parent_name, child_name, _ in self.pose_bones:
+                parent_id = mujoco.mj_name2id(
+                    self.robot_model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    self.joint_mapping[parent_name],
+                )
+                child_id = mujoco.mj_name2id(
+                    self.robot_model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    self.joint_mapping[child_name],
+                )
+                vector = (
+                    self.robot_data.xpos[child_id]
+                    - self.robot_data.xpos[parent_id]
+                )
+                vector_norm = float(np.linalg.norm(vector))
+                if vector_norm > 1e-8:
+                    last_pose_directions[(parent_name, child_name)] = (
+                        vector / vector_norm
+                    )
+            self.robot_data.qpos[:] = current_qpos
+            mujoco.mj_forward(self.robot_model, self.robot_data)
 
-        # Foot sole orientation, root-relative.  Unlike the base orientation
-        # term this is not diagonal in the actuated coordinates: rotating a
-        # sole couples the whole leg chain, so it contributes a dense rank-3
-        # block rather than per-index entries.
-        foot_terms: List[Tuple[np.ndarray, np.ndarray, float]] = []
-        if self.link_orientation_enabled and link_orientation_targets:
-            w_foot = self.link_orientation_weight
-            source_root_rot = None
-            if target_base_orientation is not None:
-                root_quat = np.asarray(target_base_orientation, dtype=float)
-                if (
-                    root_quat.shape == (4,)
-                    and np.isfinite(root_quat).all()
-                    and np.linalg.norm(root_quat) > 1e-8
-                ):
-                    source_root_rot = Rotation.from_quat(
-                        root_quat / np.linalg.norm(root_quat), scalar_first=True
-                    ).as_matrix()
-            residual_terms = self._link_orientation_residuals(
-                link_orientation_targets, T=T_qvel, source_root_rot=source_root_rot
+        if q_prev is not None and self.pose_direction_enabled:
+            current_qpos = self.robot_data.qpos.copy()
+            self.robot_data.qpos[:] = q_prev
+            mujoco.mj_forward(self.robot_model, self.robot_data)
+            for parent_name, child_name, _ in self.pose_bones:
+                parent_id = mujoco.mj_name2id(
+                    self.robot_model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    self.joint_mapping[parent_name],
+                )
+                child_id = mujoco.mj_name2id(
+                    self.robot_model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    self.joint_mapping[child_name],
+                )
+                vector = (
+                    self.robot_data.xpos[child_id]
+                    - self.robot_data.xpos[parent_id]
+                )
+                vector_norm = float(np.linalg.norm(vector))
+                if vector_norm > 1e-8:
+                    previous_pose_directions[(parent_name, child_name)] = (
+                        vector / vector_norm
+                    )
+            self.robot_data.qpos[:] = current_qpos
+            mujoco.mj_forward(self.robot_model, self.robot_data)
+
+        (
+            contact_residual,
+            swing_residual,
+            swing_orientation_residual,
+            endpoint_contact_constraints,
+            num_contacts,
+            num_swings,
+            num_swing_orientations,
+        ) = (
+            self._build_end_effector_objectives(
+                dqa, end_effector_targets, last_end_effector_rotations
             )
-            # Divided by the number of links so that declaring a third effector
-            # does not silently raise this task's standing against the others.
-            w_foot = self.link_orientation_weight / max(len(residual_terms), 1)
-            for jac, error in residual_terms:
-                P = P + sp.csr_matrix(2.0 * w_foot * (jac.T @ jac))
-                c = c - 2.0 * w_foot * (jac.T @ error)
-                foot_terms.append((jac, error, w_foot))
-
-        # Scene contact: pin the sole point onto the anchored surface point.
-        contact_terms: List[Tuple[np.ndarray, np.ndarray, float]] = []
-        if self.scene_contact_enabled and contact_targets:
-            contact_residuals = self._scene_contact_residuals(
-                contact_targets, T=T_qvel, normals=contact_normals, blend=contact_weights
-            )
-            w_contact = self.scene_contact_weight / max(len(contact_residuals), 1)
-            for jac, error in contact_residuals:
-                P = P + sp.csr_matrix(2.0 * w_contact * (jac.T @ jac))
-                c = c + 2.0 * w_contact * (jac.T @ error)
-                contact_terms.append((jac, error, w_contact))
-
-        P = P + sp.diags(P_diag_extra)
-
-        # Non-penetration rows (self-collision + terrain), numeric form:
-        # hard_rows: (Ja, rhs) meaning Ja @ dqa >= rhs
-        # slack_rows: (Ja, rhs_soft, span) adding span * s_unit_i to the row
-        hard_rows: List[Tuple[np.ndarray, float]] = []
-        slack_rows: List[Tuple[np.ndarray, float, float]] = []
-        if self.hard_penetration_constraint:
-            hard_rows, slack_rows = self._compute_penetration_constraints(T=T_qvel)
-        hard_rows = hard_rows + self._foot_penetration_rows(contact_normals, T=T_qvel)
-
-        # Extend variables with unit slacks s_unit in [0, 1] (slack s = span * s_unit)
-        m = len(slack_rows)
-        if m:
-            slack_diag = np.array([
-                self.penetration_slack_penalty * span ** 2 for (_, _, span) in slack_rows
-            ])
-            P = sp.block_diag([P, sp.diags(slack_diag)], format="lil")
-            c = np.concatenate([c, np.zeros(m)])
-
-        num_vars = n + m
-        ge_rows: List[Tuple[np.ndarray, float]] = []
-        for Ja, rhs in hard_rows:
-            a = np.zeros(num_vars)
-            a[:n] = Ja
-            ge_rows.append((a, rhs))
-        for i, (Ja, rhs_soft, span) in enumerate(slack_rows):
-            a = np.zeros(num_vars)
-            a[:n] = Ja
-            a[n + i] = span
-            ge_rows.append((a, rhs_soft))
-
-        lb = np.concatenate([self.q_a_lb - q_a_current, np.zeros(m)])
-        ub = np.concatenate([self.q_a_ub - q_a_current, np.ones(m)])
-
-        # Solve.  On failure, shrink the trust region and retry rather than
-        # dropping it: the QP is a linearization of a nonlinear problem, so a
-        # step taken without a trust region is unbounded in a model that is
-        # only valid nearby.  Dropping it used to fire on a fifth of all solves
-        # once an end-effector task was added, and the wild steps it produced
-        # were what kept those tasks from converging.
-        P_csr = sp.csr_matrix(P)
-        step_size = float(self.step_size)
-        x, ok = _solve_qp_clarabel(
-            P_csr, c, lb, ub, ge_rows, trust_region_dim=n, step_size=step_size
         )
-        attempts = 0
-        while not ok and attempts < self.max_trust_region_retries:
-            attempts += 1
-            step_size *= self.trust_region_shrink
-            x, ok = _solve_qp_clarabel(
-                P_csr, c, lb, ub, ge_rows, trust_region_dim=n, step_size=step_size
+        constraints.extend(endpoint_contact_constraints)
+        pose_direction_residual = self._build_pose_direction_residual(
+            dqa,
+            p_V,
+            J_V,
+            target_human_joints,
+        )
+        pose_velocity_residual = self._build_pose_velocity_residual(
+            dqa,
+            p_V,
+            J_V,
+            target_human_joints,
+            previous_human_joints,
+            last_pose_directions,
+        )
+        if pose_velocity_residual is not None:
+            pose_direction_residual = (
+                cp.hstack([pose_direction_residual, pose_velocity_residual])
+                if pose_direction_residual is not None
+                else pose_velocity_residual
             )
-        self._solver_stats["solves"] += 1
-        self._solver_stats["retries"] += attempts
-        if not ok:
-            self._solver_stats["failures"] += 1
+        pose_acceleration_residual = self._build_pose_acceleration_residual(
+            dqa,
+            p_V,
+            J_V,
+            target_human_joints,
+            previous_human_joints,
+            previous_previous_human_joints,
+            last_pose_directions,
+            previous_pose_directions,
+        )
+        if pose_acceleration_residual is not None:
+            pose_direction_residual = (
+                cp.hstack(
+                    [pose_direction_residual, pose_acceleration_residual]
+                )
+                if pose_direction_residual is not None
+                else pose_acceleration_residual
+            )
+        direction_step_limits = self._pose_direction_step_limits(
+            target_human_joints, previous_human_joints
+        )
+        constraints.extend(
+            self._build_pose_direction_constraints(
+                dqa,
+                p_V,
+                J_V,
+                last_pose_directions,
+                direction_step_limits,
+            )
+        )
+        temporal_residual = None
+        if q_last is not None and q_prev is not None:
+            actuated_qa = np.flatnonzero(self.q_a_indices >= 7)
+            if len(actuated_qa):
+                actuated_qpos = self.q_a_indices[actuated_qa]
+                new_step = (
+                    q_a_current[actuated_qa]
+                    + dqa[actuated_qa]
+                    - q_last[actuated_qpos]
+                )
+                previous_step = (
+                    q_last[actuated_qpos] - q_prev[actuated_qpos]
+                )
+                new_acceleration = new_step - previous_step
+                acceleration_sigma = max(
+                    float(temporal_cfg.get("acceleration_sigma", 0.015)),
+                    1e-8,
+                )
+                temporal_terms: List[cp.Expression] = [
+                    new_acceleration / acceleration_sigma
+                ]
+                if q_prevprev is not None:
+                    previous_acceleration = previous_step - (
+                        q_prev[actuated_qpos] - q_prevprev[actuated_qpos]
+                    )
+                    jerk_sigma = max(
+                        float(temporal_cfg.get("jerk_sigma", 0.01)), 1e-8
+                    )
+                    temporal_terms.append(
+                        (new_acceleration - previous_acceleration) / jerk_sigma
+                    )
+                temporal_residual = cp.hstack(temporal_terms)
+
+        # Acceleration/jerk is a null-space preference, not a motion task.
+        # Keeping it in the final whole-body level preserves the previously
+        # locked contact, swing and limb-direction optima while selecting the
+        # least oscillatory joint solution among their redundant IK solutions.
+        temporal_weight = float(
+            self.end_effector_config.get("temporal_weight", 0.02)
+        )
+        if temporal_residual is not None and temporal_weight > 0.0:
+            body_obj += temporal_weight * cp.sum_squares(temporal_residual)
+
+        hierarchy_enabled = bool(
+            self.end_effector_enabled
+            and self.end_effector_config.get("hierarchy", True)
+            and (
+                contact_residual is not None
+                or swing_residual is not None
+                or swing_orientation_residual is not None
+                or pose_direction_residual is not None
+            )
+        )
+        if not hierarchy_enabled:
+            # Weighted fallback is useful for ablations, but the default is the
+            # hierarchy below because finite weights cannot guarantee priority.
+            endpoint_weight = float(self.end_effector_config.get("weighted_scale", 1.0))
+            if contact_residual is not None:
+                body_obj += endpoint_weight * cp.sum_squares(contact_residual)
+            if swing_residual is not None:
+                body_obj += endpoint_weight * cp.sum_squares(swing_residual)
+            if swing_orientation_residual is not None:
+                body_obj += endpoint_weight * cp.sum_squares(
+                    swing_orientation_residual
+                )
+            if pose_direction_residual is not None:
+                body_obj += float(
+                    self.end_effector_config.get("pose_direction_weight", 10.0)
+                ) * cp.sum_squares(pose_direction_residual)
+        
+        import sys
+        show_solver_debug = hasattr(sys, '_omni_frame_count') and sys._omni_frame_count <= 5
+        
+        try:
+            active_constraints = list(constraints)
+
+            def solve_stage(stage_obj: cp.Expression, stage_name: str) -> cp.Problem:
+                nonlocal active_constraints
+                stage_problem = cp.Problem(cp.Minimize(stage_obj), active_constraints)
+
+                def run_solver(candidate: cp.Problem) -> None:
+                    try:
+                        candidate.solve(solver=cp.CLARABEL, verbose=False)
+                    except cp.error.SolverError:
+                        pass
+                    if candidate.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                        candidate.solve(
+                            solver=cp.SCS,
+                            verbose=False,
+                            eps=float(self.end_effector_config.get("solver_tolerance", 1e-4)),
+                            max_iters=int(
+                                self.end_effector_config.get("solver_max_iterations", 20000)
+                            ),
+                        )
+
+                run_solver(stage_problem)
+                if (
+                    stage_problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                    and not hierarchy_enabled
+                ):
+                    if show_solver_debug:
+                        print(
+                            f"    {stage_name} solve failed: {stage_problem.status}, "
+                            "trying without SOC..."
+                        )
+                    active_constraints = [
+                        constraint
+                        for constraint in active_constraints
+                        if not isinstance(constraint, cp.constraints.second_order.SOC)
+                    ]
+                    stage_problem = cp.Problem(cp.Minimize(stage_obj), active_constraints)
+                    run_solver(stage_problem)
+                return stage_problem
+
+            if hierarchy_enabled:
+                relative_tolerance = max(
+                    float(self.end_effector_config.get("priority_relative_tolerance", 0.01)),
+                    0.0,
+                )
+                absolute_tolerance = max(
+                    float(self.end_effector_config.get("priority_absolute_tolerance", 1e-4)),
+                    0.0,
+                )
+                tie_break = float(self.end_effector_config.get("tie_break_regularization", 1e-8))
+
+                if contact_residual is not None:
+                    contact_level = cp.norm(contact_residual, 2)
+                    contact_problem = solve_stage(
+                        contact_level + tie_break * cp.sum_squares(dqa), "contact"
+                    )
+                    if contact_problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                        return q, np.inf
+                    contact_optimum = max(float(contact_level.value), 0.0)
+                    contact_bound = (
+                        (1.0 + relative_tolerance) * contact_optimum
+                        + absolute_tolerance
+                    )
+                    active_constraints.append(contact_level <= contact_bound)
+
+                if swing_residual is not None:
+                    swing_level = cp.norm(swing_residual, 2)
+                    swing_problem = solve_stage(
+                        swing_level + tie_break * cp.sum_squares(dqa), "swing"
+                    )
+                    if swing_problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                        return q, np.inf
+                    swing_optimum = max(float(swing_level.value), 0.0)
+                    swing_relative_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "swing_priority_relative_tolerance",
+                                relative_tolerance,
+                            )
+                        ),
+                        0.0,
+                    )
+                    swing_absolute_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "swing_priority_absolute_tolerance",
+                                absolute_tolerance,
+                            )
+                        ),
+                        0.0,
+                    )
+                    swing_bound = (
+                        (1.0 + swing_relative_tolerance) * swing_optimum
+                        + swing_absolute_tolerance
+                    )
+                    active_constraints.append(swing_level <= swing_bound)
+
+                if swing_orientation_residual is not None:
+                    swing_orientation_level = cp.norm(
+                        swing_orientation_residual, 2
+                    )
+                    swing_orientation_problem = solve_stage(
+                        swing_orientation_level
+                        + tie_break * cp.sum_squares(dqa),
+                        "swing-orientation",
+                    )
+                    if swing_orientation_problem.status not in (
+                        cp.OPTIMAL,
+                        cp.OPTIMAL_INACCURATE,
+                    ):
+                        return q, np.inf
+                    swing_orientation_optimum = max(
+                        float(swing_orientation_level.value), 0.0
+                    )
+                    orientation_relative_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "orientation_priority_relative_tolerance",
+                                relative_tolerance,
+                            )
+                        ),
+                        0.0,
+                    )
+                    orientation_absolute_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "orientation_priority_absolute_tolerance",
+                                absolute_tolerance,
+                            )
+                        ),
+                        0.0,
+                    )
+                    active_constraints.append(
+                        swing_orientation_level
+                        <= (1.0 + orientation_relative_tolerance)
+                        * swing_orientation_optimum
+                        + orientation_absolute_tolerance
+                    )
+
+                if pose_direction_residual is not None:
+                    pose_level = cp.norm(pose_direction_residual, 2)
+                    pose_problem = solve_stage(
+                        pose_level + tie_break * cp.sum_squares(dqa),
+                        "pose-direction",
+                    )
+                    if pose_problem.status not in (
+                        cp.OPTIMAL,
+                        cp.OPTIMAL_INACCURATE,
+                    ):
+                        return q, np.inf
+                    pose_optimum = max(float(pose_level.value), 0.0)
+                    pose_relative_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "pose_priority_relative_tolerance", 0.02
+                            )
+                        ),
+                        0.0,
+                    )
+                    pose_absolute_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "pose_priority_absolute_tolerance", 0.04
+                            )
+                        ),
+                        0.0,
+                    )
+                    active_constraints.append(
+                        pose_level
+                        <= (1.0 + pose_relative_tolerance) * pose_optimum
+                        + pose_absolute_tolerance
+                    )
+
+                problem = solve_stage(body_obj, "whole-body")
+                if show_solver_debug:
+                    print(
+                        f"    hierarchy tasks: contact={num_contacts}, "
+                        f"swing={num_swings}, "
+                        f"swing_orientation={num_swing_orientations}, "
+                        f"pose_bones={len(self.pose_bones)}"
+                    )
+            else:
+                problem = solve_stage(body_obj, "weighted")
+
+            if (
+                problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                and show_solver_debug
+            ):
+                print(f"    Final solve status: {problem.status}")
+
+            if problem.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                dqa_opt = np.asarray(dqa.value, dtype=float).reshape(-1)
+                # First-order SQP guarantees only hold inside the trust
+                # region.  Conic solvers may return an OPTIMAL_INACCURATE
+                # point with constraint violations, so enforce the radius and
+                # safety-critical base envelope explicitly before applying it.
+                if hierarchy_enabled:
+                    base_translation_qa = []
+                    if (
+                        target_base_position is not None
+                        and bool(base_cfg.get("enabled", False))
+                    ):
+                        base_target = np.asarray(
+                            target_base_position, dtype=float
+                        ).reshape(3).copy()
+                        base_target[2] += float(base_cfg.get("z_offset", 0.0))
+                        proposed_base = q[:3].copy()
+                        for qpos_idx in (0, 1, 2):
+                            if qpos_idx in self.q_a_indices:
+                                qa_idx = int(
+                                    np.where(self.q_a_indices == qpos_idx)[0][0]
+                                )
+                                base_translation_qa.append(qa_idx)
+                                proposed_base[qpos_idx] += dqa_opt[qa_idx]
+
+                        xy_delta = proposed_base[:2] - base_target[:2]
+                        xy_norm = float(np.linalg.norm(xy_delta))
+                        max_xy_error = max(
+                            float(base_cfg.get("max_xy_error", 0.08)), 0.0
+                        )
+                        if xy_norm > max_xy_error:
+                            proposed_base[:2] = base_target[:2] + (
+                                max_xy_error / max(xy_norm, 1e-12)
+                            ) * xy_delta
+                        max_z_error = max(
+                            float(base_cfg.get("max_z_error", 0.12)), 0.0
+                        )
+                        proposed_base[2] = np.clip(
+                            proposed_base[2],
+                            base_target[2] - max_z_error,
+                            base_target[2] + max_z_error,
+                        )
+                        for qpos_idx in (0, 1, 2):
+                            if qpos_idx in self.q_a_indices:
+                                qa_idx = int(
+                                    np.where(self.q_a_indices == qpos_idx)[0][0]
+                                )
+                                dqa_opt[qa_idx] = proposed_base[qpos_idx] - q[qpos_idx]
+
+                    fixed_norm_sq = float(
+                        np.sum(np.square(dqa_opt[base_translation_qa]))
+                    )
+                    free_indices = np.array(
+                        [
+                            idx
+                            for idx in range(len(dqa_opt))
+                            if idx not in base_translation_qa
+                        ],
+                        dtype=int,
+                    )
+                    remaining_radius = np.sqrt(
+                        max(self.step_size**2 - fixed_norm_sq, 0.0)
+                    )
+                    free_norm = float(np.linalg.norm(dqa_opt[free_indices]))
+                    if free_norm > remaining_radius:
+                        dqa_opt[free_indices] *= remaining_radius / max(
+                            free_norm, 1e-12
+                        )
+                cost = float(problem.value)
+
+                q_opt = q.copy()
+                q_opt[self.q_a_indices] = dqa_opt + q_a_current
+                
+                # CRITICAL FIX: Normalize quaternion with sign continuity to prevent frame-to-frame jumps
+                quat_new = q_opt[3:7]
+                quat_new = quat_new / (np.linalg.norm(quat_new) + 1e-12)
+                
+                # Ensure quaternion sign continuity with previous frame (if available)
+                if q_last is not None:
+                    quat_prev = q_last[3:7]
+                    # If dot product is negative, quaternions are in opposite hemispheres
+                    # Flip sign to ensure continuity
+                    if np.dot(quat_new, quat_prev) < 0:
+                        quat_new = -quat_new
+                
+                q_opt[3:7] = quat_new
+
+                return q_opt, cost
+            else:
+                if show_solver_debug:
+                    print(f"    SOLVER FAILED: {problem.status}")
+                return q, np.inf
+
+        except Exception as e:
+            if show_solver_debug:
+                print(f"    EXCEPTION: {e}")
             return q, np.inf
-
-        dqa_opt = x[:n]
-
-        # Objective value in the original residual form (same value CVXPY's
-        # problem.value reported), used for the SQP convergence check.
-        r = r0 + J_L @ dqa_opt
-        cost = float(w3 @ (r ** 2))
-        if bone_res is not None:
-            rb = bone_res + bone_J @ dqa_opt
-            cost += self.lambda_bone * float(rb @ rb)
-        cost += float(self.Q_diag_modified @ ((dqa_opt + q_a_current) ** 2))
-        if dqa_smooth is not None:
-            cost += self.smooth_weight * float(
-                ((self.smooth_scale * (dqa_opt - dqa_smooth)) ** 2).sum()
-            )
-        for qa_idx, diff in orient_terms:
-            cost += orientation_weight * (dqa_opt[qa_idx] + diff) ** 2
-        for qa_idx, diff in base_pos_terms:
-            cost += self.base_position_tracking_weight * (dqa_opt[qa_idx] + diff) ** 2
-        for jac, error, term_weight in foot_terms:
-            residual = jac @ dqa_opt - error
-            cost += term_weight * float(residual @ residual)
-        for jac, error, term_weight in contact_terms:
-            residual = jac @ dqa_opt + error
-            cost += term_weight * float(residual @ residual)
-        if m:
-            s_true = np.array([span for (_, _, span) in slack_rows]) * x[n:]
-            cost += (self.penetration_slack_penalty / 2.0) * float((s_true ** 2).sum())
-
-        q_opt = q.copy()
-        q_opt[self.q_a_indices] = dqa_opt + q_a_current
-
-        # CRITICAL FIX: Normalize quaternion with sign continuity to prevent frame-to-frame jumps
-        quat_new = q_opt[3:7]
-        quat_new = quat_new / (np.linalg.norm(quat_new) + 1e-12)
-
-        # Ensure quaternion sign continuity with previous frame (if available)
-        if q_last is not None:
-            quat_prev = q_last[3:7]
-            # If dot product is negative, quaternions are in opposite hemispheres
-            # Flip sign to ensure continuity
-            if np.dot(quat_new, quat_prev) < 0:
-                quat_new = -quat_new
-
-        q_opt[3:7] = quat_new
-
-        return q_opt, cost
 
     def _build_transform_qdot_to_qvel_fast(self, use_world_omega=True):
         """
@@ -1828,29 +2367,16 @@ class GenericInteractionRetargeter:
 
         return T
 
-    def _skew(self, v: np.ndarray) -> np.ndarray:
-        """Return 3x3 skew-symmetric matrix of vector v."""
-        return np.array([
-            [0.0, -v[2],  v[1]],
-            [v[2],  0.0, -v[0]],
-            [-v[1],  v[0],  0.0],
-        ], dtype=float)
-
-    def _calc_contact_jacobian_from_point(self, body_idx: int, p_body: np.ndarray = None, input_world=False, T: Optional[np.ndarray] = None):
+    def _calc_contact_jacobian_from_point(self, body_idx: int, p_body: np.ndarray = None, input_world=False):
         """
         Translational Jacobian J(q) (3 x nq) such that
         v_point_world = J(q) @ qdot.
 
         Fast analytic version: J_qdot = J_v @ T(q)
-
-        Args:
-            T: Optional precomputed qdot->qvel transform. Built here if not
-                provided; callers computing many Jacobians at one configuration
-                should build it once and pass it in.
         """
         if p_body is None:
             p_body = np.zeros(3)
-
+            
         p_body = np.asarray(p_body, dtype=float).reshape(3)
 
         # 1) Make sure kinematics are current once
@@ -1870,70 +2396,40 @@ class GenericInteractionRetargeter:
         Jr = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
         mujoco.mj_jac(self.robot_model, self.robot_data, Jp, Jr, p_W, int(body_idx))  # Jp = J_v
 
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
+        T = self._build_transform_qdot_to_qvel_fast()
 
         return Jp @ T
 
-    def _compute_robot_jacobians(self, q: np.ndarray, T: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict[str, np.ndarray], None]:
-        """Compute Jacobians for mapped robot link points in world frame.
-
+    def _compute_robot_jacobians(self, q: np.ndarray) -> Tuple[np.ndarray, Dict[str, np.ndarray], None]:
+        """Compute Jacobians for robot joints in world frame.
+        
         Args:
             q: Robot configuration
-            T: Optional precomputed qdot->qvel transform (built here if None)
-
+            
         Returns:
             Tuple of (J_V, p_dict, None):
-                - J_V: Stacked Jacobians (3*num_targets, nq_a)
-                - p_dict: Dictionary of robot link point positions keyed by source target name
+                - J_V: Stacked Jacobians (3*num_joints, nq_a)
+                - p_dict: Dictionary of positions for each joint
                 - None: Placeholder for compatibility
         """
         J_dict = {}
         p_dict = {}
 
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
-
-        for target_name, link_name in self.joint_mapping.items():
+        for joint_name, link_name in self.joint_mapping.items():
             try:
                 body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, link_name)
 
                 # Get position in world frame
                 pos = self.robot_data.xpos[body_id].copy()
 
-                # Compute base Jacobian for body origin (3 x nq)
-                J_base = self._calc_contact_jacobian_from_point(body_id, T=T)
-
-                # Apply offset from merged target_mapping (if non-zero)
-                offset = self.target_offset_map.get(target_name)
-                if offset is not None and np.any(offset != 0):
-                    o_local = offset
-                    R_WB = self.robot_data.xmat[body_id].reshape(3, 3)
-                    o_world = R_WB @ o_local
-                    pos = pos + o_world  # p_target = p_body + R @ o_local
-
-                    # Rotational Jacobian Jr (3 x nq) for the cross-term correction
-                    p_WB = self.robot_data.xpos[body_id]
-                    p_W = p_WB.astype(np.float64).reshape(3, 1)
-                    Jp = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
-                    Jr = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
-                    mujoco.mj_jac(self.robot_model, self.robot_data, Jp, Jr, p_W, int(body_id))
-                    Jr_world = Jr @ T  # rotational Jacobian in world frame (3 x nq)
-                    # Cross-term: -skew(o_world) @ Jr_world
-                    # Derivation: d/dt(p_body + R @ o_local)
-                    #   = v_body + ω × o_world
-                    #   = v_body - o_world × ω
-                    #   = v_body - skew(o_world) @ ω
-                    # J_full = J_base - skew(o_world) @ Jr_world
-                    J_full = J_base - self._skew(o_world) @ Jr_world
-                else:
-                    J_full = J_base
+                # Compute Jacobian in world frame
+                J_full = self._calc_contact_jacobian_from_point(body_id)
 
                 # Extract optimized part (J_full is already in qpos coordinates)
                 valid_indices = self.q_a_indices[self.q_a_indices < J_full.shape[1]]
                 if len(valid_indices) < len(self.q_a_indices):
                     print(
-                        f"Warning: Truncating indices for source target {target_name}. "
+                        f"Warning: Truncating indices for joint {joint_name}. "
                         f"J width: {J_full.shape[1]}, Max idx: {self.q_a_indices.max()}"
                     )
 
@@ -1945,28 +2441,28 @@ class GenericInteractionRetargeter:
                     J_pad[:, :J_reduced.shape[1]] = J_reduced
                     J_reduced = J_pad
                     
-                J_dict[target_name] = J_reduced
-                p_dict[target_name] = pos
+                J_dict[joint_name] = J_reduced
+                p_dict[joint_name] = pos
 
             except Exception as e:
-                # CRITICAL: All mapped targets should resolve to robot links (validated in __init__).
+                # CRITICAL: All joints should exist (validated in __init__), so this is unexpected
                 # Raise error instead of skipping to ensure size consistency
-                build_error_msg = (
-                    f"Failed to compute Jacobian for source target '{target_name}' -> link '{link_name}'. "
+                raise RuntimeError(
+                    f"Failed to compute Jacobian for joint '{joint_name}' -> link '{link_name}'. "
                     f"This should not happen if joint_mapping was validated. Error: {e}"
-                )
-                raise RuntimeError(build_error_msg) from e
+                ) from e
 
-        # Stack Jacobians in the SAME ORDER as source_target_names to match source_target_positions order.
+        # Stack Jacobians in the SAME ORDER as valid_joint_names to match human_joints order
         # This is critical for correct Laplacian matching!
-        source_target_names_ordered = self.source_target_names
-        num_targets = len(source_target_names_ordered)
+        # CRITICAL: Use self.valid_joint_names to ensure consistent ordering
+        joint_names_ordered = self.valid_joint_names
+        num_joints = len(joint_names_ordered)
         
-        if num_targets > 0:
-            J_V = np.zeros((3 * num_targets, self.nq_a))
-            for i, target_name in enumerate(source_target_names_ordered):
-                if target_name in J_dict:
-                    J = J_dict[target_name]
+        if num_joints > 0:
+            J_V = np.zeros((3 * num_joints, self.nq_a))
+            for i, joint_name in enumerate(joint_names_ordered):
+                if joint_name in J_dict:
+                    J = J_dict[joint_name]
                     # Ensure J has the correct shape (3, nq_a)
                     if J.shape != (3, self.nq_a):
                         if J.shape[1] > self.nq_a:
@@ -1977,11 +2473,11 @@ class GenericInteractionRetargeter:
                             J = J_pad
                     J_V[3 * i:3 * (i + 1), :] = J
                 else:
-                    # CRITICAL: All targets should exist (validated in __init__), so this is unexpected.
+                    # CRITICAL: All joints should exist (validated in __init__), so this is unexpected
                     raise RuntimeError(
-                        f"Jacobian for source target '{target_name}' not found in J_dict. "
+                        f"Jacobian for joint '{joint_name}' not found in J_dict. "
                         f"This should not happen if joint_mapping was validated. "
-                        f"Available targets in J_dict: {list(J_dict.keys())}"
+                        f"Available joints in J_dict: {list(J_dict.keys())}"
                     )
         else:
             J_V = np.zeros((0, self.nq_a))
@@ -2014,13 +2510,7 @@ class GenericInteractionRetargeter:
         m.geom_margin[:] = threshold
 
         # Run collision detection
-        try:
-            mujoco.mj_collision(m, d)
-        except mujoco.FatalError:
-            # Box-box or other geom pairs can exceed mjMAXCONPAIR (8 contacts).
-            # Fall back to brute-force pairwise distance checks.
-            m.geom_margin[:] = self._saved_margins
-            return self._brute_force_candidate_pairs(threshold)
+        mujoco.mj_collision(m, d)
 
         # Collect unique candidate pairs
         candidates = set()
@@ -2036,34 +2526,14 @@ class GenericInteractionRetargeter:
 
         return candidates
 
-    def _brute_force_candidate_pairs(self, threshold: float) -> set:
-        """Fallback: enumerate all geom pairs via mj_geomDistance."""
-        m, d = self.robot_model, self.robot_data
-        ngeom = m.ngeom
-        fromto = np.zeros(6, dtype=float)
-        candidates = set()
-        for i in range(ngeom):
-            if m.geom_contype[i] == 0 and m.geom_conaffinity[i] == 0:
-                continue
-            for j in range(i + 1, ngeom):
-                if m.geom_contype[j] == 0 and m.geom_conaffinity[j] == 0:
-                    continue
-                if m.geom_bodyid[i] == m.geom_bodyid[j]:
-                    continue
-                dist = mujoco.mj_geomDistance(m, d, i, j, threshold, fromto)
-                if dist <= threshold:
-                    candidates.add((i, j))
-        return candidates
-
     def _compute_jacobian_for_contact_relative(
-        self,
-        geom1_id: int,
-        geom2_id: int,
+        self, 
+        geom1_id: int, 
+        geom2_id: int, 
         geom1_name: str,
         geom2_name: str,
-        fromto: np.ndarray,
-        dist: float,
-        T: Optional[np.ndarray] = None,
+        fromto: np.ndarray, 
+        dist: float
     ) -> np.ndarray:
         """
         Compute relative contact Jacobian for a geometry pair.
@@ -2101,8 +2571,8 @@ class GenericInteractionRetargeter:
         body2_id = self.robot_model.geom_bodyid[geom2_id]
 
         # Compute Jacobians for both contact points (in world frame)
-        J_bodyA = self._calc_contact_jacobian_from_point(body1_id, pos1, input_world=True, T=T)
-        J_bodyB = self._calc_contact_jacobian_from_point(body2_id, pos2, input_world=True, T=T)
+        J_bodyA = self._calc_contact_jacobian_from_point(body1_id, pos1, input_world=True)
+        J_bodyB = self._calc_contact_jacobian_from_point(body2_id, pos2, input_world=True)
 
         # Compute relative Jacobian
         Jc = J_bodyA - J_bodyB
@@ -2110,40 +2580,9 @@ class GenericInteractionRetargeter:
         # Project onto contact normal
         return nhat_BA_W @ Jc
 
-    def _penetration_constraint_terms(
-        self,
-        Ja: np.ndarray,
-        dist: float,
-    ) -> Tuple[List[Tuple[np.ndarray, float]], Optional[Tuple[np.ndarray, float, float]]]:
-        """Linearized non-penetration row(s) for one queried contact pair.
-
-        Returns ``(hard_rows, slack_row)`` where every row is numeric:
-        - ``hard_rows``: list of ``(Ja, rhs)`` meaning ``Ja @ dqa >= rhs``.
-          Default (slack disabled): single hard row ``phi >= -penetration_tolerance``.
-        - ``slack_row``: TopoRetarget slack mode (Eq. 8) soft row
-          ``(Ja, rhs_soft, span)`` meaning ``Ja @ dqa + span * s_unit >= rhs_soft``
-          with ``0 <= s_unit <= 1``; the caller adds the ``w_s/2 * s^2`` objective
-          term. The hard backstop ``phi >= -b`` is included in ``hard_rows``.
-
-        The slack is parameterized as ``s = span * s_unit`` with
-        ``span = b - tau`` and ``s_unit`` in [0, 1] — mathematically identical
-        to optimizing ``s`` in meters, but avoids the ill-conditioned
-        5e4-scale quadratic that stalls CLARABEL when ``s`` is optimized
-        directly.
+    def _compute_penetration_constraints(self, q: np.ndarray, dqa: cp.Variable) -> List[cp.Constraint]:
         """
-        if not self.penetration_slack_enabled:
-            return [(Ja, -dist - self.penetration_tolerance)], None
-
-        span = self.penetration_hard_bound - self.penetration_soft_tolerance
-        hard_row = (Ja, -dist - self.penetration_hard_bound)
-        slack_row = (Ja, -dist - self.penetration_soft_tolerance, span)
-        return [hard_row], slack_row
-
-    def _compute_penetration_constraints(
-        self, T: Optional[np.ndarray] = None
-    ) -> Tuple[List[Tuple[np.ndarray, float]], List[Tuple[np.ndarray, float, float]]]:
-        """
-        Compute penetration constraint rows for robot-robot and robot-terrain contacts.
+        Compute penetration constraints for robot-robot and robot-terrain contacts.
 
         Two sources of constraints are combined:
         1. **Self-collision** – MuJoCo's built-in collision detection finds pairs of
@@ -2159,18 +2598,12 @@ class GenericInteractionRetargeter:
         collision pipeline cannot detect robot-terrain contacts.  We handle them
         analytically using the trimesh proximity query and the robot's
         translational Jacobian.
-
-        Precondition: kinematics must already be current (the caller runs
-        mj_forward with the current configuration first).
-
-        Returns:
-            (hard_rows, slack_rows): numeric rows; see _penetration_constraint_terms.
         """
-        hard_rows: List[Tuple[np.ndarray, float]] = []
-        slack_rows: List[Tuple[np.ndarray, float, float]] = []
+        constraints = []
 
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
+        # Ensure kinematics are current
+        self.robot_data.qpos[:] = q
+        mujoco.mj_forward(self.robot_model, self.robot_data)
 
         m, d = self.robot_model, self.robot_data
         threshold = float(self.collision_detection_threshold)
@@ -2193,46 +2626,38 @@ class GenericInteractionRetargeter:
             dist = mujoco.mj_geomDistance(m, d, g1, g2, threshold, fromto)
             if dist <= threshold:
                 J_rel = self._compute_jacobian_for_contact_relative(
-                    g1, g2, self._geom_names[g1], self._geom_names[g2], fromto, dist, T=T
+                    g1, g2, self._geom_names[g1], self._geom_names[g2], fromto, dist
                 )
                 Ja = J_rel[self.q_a_indices]
-                hard, slack = self._penetration_constraint_terms(Ja, dist)
-                hard_rows.extend(hard)
-                if slack is not None:
-                    slack_rows.append(slack)
+                rhs = -dist - self.penetration_tolerance
+                constraints.append(Ja @ dqa >= rhs)
 
         # ------------------------------------------------------------------
         # 2) Robot-terrain penetration constraints (via trimesh proximity)
         # ------------------------------------------------------------------
-        terrain_hard, terrain_slack = self._compute_terrain_penetration_constraints(
-            threshold, T=T
+        constraints.extend(
+            self._compute_terrain_penetration_constraints(q, dqa, threshold)
         )
-        hard_rows.extend(terrain_hard)
-        slack_rows.extend(terrain_slack)
 
-        return hard_rows, slack_rows
+        return constraints
 
     def _compute_terrain_penetration_constraints(
-        self, threshold: float, T: Optional[np.ndarray] = None
-    ) -> Tuple[List[Tuple[np.ndarray, float]], List[Tuple[np.ndarray, float, float]]]:
+        self, q: np.ndarray, dqa: cp.Variable, threshold: float
+    ) -> List[cp.Constraint]:
         """
-        Compute non-penetration rows between robot geoms and the terrain trimesh.
+        Compute non-penetration constraints between robot geoms and the
+        terrain trimesh.
 
         Samples points on the actual surface of each collision geom based on
         its shape, then checks each point for penetration with the terrain.
         This avoids the limitation of only checking the geom center which can
         miss penetration when the geom has large extent.
 
-        **Prefilter**: a geom is only sampled if its center is within
-        ``threshold + bounding_radius`` of the terrain surface. Every surface
-        point of a skipped geom is provably farther than ``threshold`` from the
-        terrain, so the per-point distance check below would discard it anyway
-        — the emitted rows are identical, but the expensive closest-point query
-        runs on far fewer points.
-
-        **Trade-off**: Only primitive geom types (sphere, box, capsule,
-        cylinder) are fully supported with surface sampling. Other geom types
-        (mesh, heightfield, etc.) fall back to only checking the center point.
+        **Trade-off**: This approach samples points on robot collision geoms
+        for checking against the external terrain trimesh. Only primitive geom
+        types (sphere, box, capsule, cylinder) are fully supported with surface
+        sampling. Other geom types (mesh, heightfield, etc.) fall back to only
+        checking the center point.
 
         For each sampled point that is close to or inside the terrain, we add
         the linear constraint:
@@ -2244,14 +2669,7 @@ class GenericInteractionRetargeter:
         - n   is the outward terrain surface normal at the closest point,
         - J_a is the translational Jacobian of the geom's body at the sampled
           point (columns for the actuated DOFs only),
-        - tol is ``self.penetration_tolerance`` (or the TopoRetarget soft/hard
-          slack bounds when ``penetration_slack`` is enabled).
-
-        Precondition: kinematics must already be current (mj_forward done by
-        the caller).
-
-        Returns:
-            (hard_rows, slack_rows): numeric rows; see _penetration_constraint_terms.
+        - tol is ``self.penetration_tolerance``.
         """
         import trimesh as _trimesh
 
@@ -2367,36 +2785,18 @@ class GenericInteractionRetargeter:
                 # just return the center point as a fallback
                 return np.array([geom_pos])
 
-        hard_rows: List[Tuple[np.ndarray, float]] = []
-        slack_rows: List[Tuple[np.ndarray, float, float]] = []
+        constraints: list = []
         m, d = self.robot_model, self.robot_data
 
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
-
-        # Collision-enabled geoms (skip purely visual geoms)
-        coll_geoms = [
-            gi for gi in range(m.ngeom)
-            if not (m.geom_contype[gi] == 0 and m.geom_conaffinity[gi] == 0)
-        ]
-        if not coll_geoms:
-            return hard_rows, slack_rows
-
-        # Prefilter geoms by bounding sphere: a geom can only contribute a
-        # constraint if some surface point is within `threshold` of the terrain,
-        # i.e. if center_dist - bounding_radius <= threshold.
-        centers = np.array([d.geom_xpos[gi] for gi in coll_geoms])
-        _, center_dists, _ = _trimesh.proximity.closest_point(self.terrain_mesh, centers)
-        kept_geoms = [
-            gi
-            for gi, center_dist in zip(coll_geoms, center_dists)
-            if center_dist - self._geom_bounding_radii[gi] <= threshold
-        ]
-
-        # Collect world-frame sample points on the surface of every kept geom
+        # Collect world-frame sample points on the surface of every collision geom
+        # Sample points based on actual geom shape instead of just checking center
         all_points = []
         all_geom_info = []
-        for gi in kept_geoms:
+        for gi in range(m.ngeom):
+            # Skip purely visual geoms with no collision flags
+            if m.geom_contype[gi] == 0 and m.geom_conaffinity[gi] == 0:
+                continue
+
             # Get current geom pose in world frame
             pos = d.geom_xpos[gi].copy()
             rot_mat = d.geom_xmat[gi].reshape(3, 3).copy()
@@ -2412,10 +2812,10 @@ class GenericInteractionRetargeter:
 
             for pt in points:
                 all_points.append(pt)
-                all_geom_info.append(gi)
+                all_geom_info.append((gi, pt))
 
         if len(all_points) == 0:
-            return hard_rows, slack_rows
+            return constraints
 
         all_points = np.array(all_points)  # (N, 3)
 
@@ -2424,7 +2824,7 @@ class GenericInteractionRetargeter:
             self.terrain_mesh, all_points
         )
 
-        for k, gi in enumerate(all_geom_info):
+        for k, (gi, query_pt) in enumerate(all_geom_info):
             if dists[k] > threshold:
                 continue
 
@@ -2432,7 +2832,6 @@ class GenericInteractionRetargeter:
             # closest_pts[k] is on the terrain surface; query_pt is the
             # point on the geom surface. We define "above" as the direction
             # of the terrain face normal.
-            query_pt = all_points[k]
             surface_pt = closest_pts[k]
 
             # Face normal from terrain mesh
@@ -2451,57 +2850,95 @@ class GenericInteractionRetargeter:
             # Translational Jacobian for this geom's body at the query point
             body_id = m.geom_bodyid[gi]
             J_full = self._calc_contact_jacobian_from_point(
-                body_id, query_pt, input_world=True, T=T
+                body_id, query_pt, input_world=True
             )
             # Project onto terrain normal -> 1-D Jacobian
             J_n = face_normal @ J_full  # (nq,)
             Ja = J_n[self.q_a_indices]
 
-            hard, slack = self._penetration_constraint_terms(Ja, signed_dist)
-            hard_rows.extend(hard)
-            if slack is not None:
-                slack_rows.append(slack)
+            # Constraint: J_a @ dqa >= -(signed_dist - tolerance)
+            rhs = -signed_dist - self.penetration_tolerance
+            constraints.append(Ja @ dqa >= rhs)
 
-        return hard_rows, slack_rows
+        return constraints
 
 
-def retarget_source_to_robot(
-    source_positions: np.ndarray,
+def retarget_smplx_to_robot(
+    smplx_trajectory: np.ndarray,
     robot_urdf_path: Path,
     terrain_mesh_path: Path,
     joint_mapping: Dict[str, str],
     robot_height: Optional[float] = None,
-    source_target_names: Optional[List[str]] = None,
 ) -> Tuple[float, np.ndarray]:
     """
-    High-level function to retarget source target positions to any robot on any terrain.
+    High-level function to retarget SMPLX trajectory to any robot on any terrain.
 
     Args:
-        source_positions: Source target positions (T, N, 3)
+        smplx_trajectory: SMPLX joint positions (T, J, 3)
         robot_urdf_path: Path to robot URDF
         terrain_mesh_path: Path to terrain mesh
-        joint_mapping: Mapping from source target names to robot links
+        joint_mapping: Mapping from SMPLX joints to robot links
         robot_height: Robot height override
-        source_target_names: Ordered source target names for source_positions
 
     Returns:
-        Tuple of (source_to_robot_scale, retargeted_trajectory)
+        Tuple of (terrain_scale, retargeted_trajectory)
     """
     # Validate inputs
-    if not validate_motion_positions(source_positions):
-        raise ValueError("Invalid source position trajectory format")
+    if not validate_smplx_trajectory(smplx_trajectory):
+        raise ValueError("Invalid SMPLX trajectory format")
 
+    # Load robot
+    robot_urdf = yourdfpy.URDF.load(str(robot_urdf_path), load_meshes=True)
+    robot_model = mujoco.MjModel.from_xml_path(str(robot_urdf_path))
+    robot_data = mujoco.MjData(robot_model)
+
+    # Detect robot height if not provided
+    if robot_height is None:
+        robot_height = 1.6  # Default humanoid height
+
+    # Load terrain
+    terrain_mesh = load_terrain_mesh(terrain_mesh_path)
+
+    # Compute terrain scaling
     from .core import OmniRetargeter
-
-    retargeter = OmniRetargeter(
+    temp_retargeter = OmniRetargeter(
         robot_urdf_path=robot_urdf_path,
         terrain_mesh_path=terrain_mesh_path,
         joint_mapping=joint_mapping,
-        robot_height=robot_height,
-        source_target_names=source_target_names,
+        robot_height=robot_height
     )
-    return retargeter.retarget_motion(
-        source_positions,
-        visualize_trajectory=False,
-        enable_terrain_scaling=True,
+    terrain_scale = temp_retargeter._compute_terrain_scale(smplx_trajectory)
+
+    # Scale terrain
+    scaled_terrain = scale_mesh(terrain_mesh, terrain_scale)
+
+    # Initialize retargeter with scaled terrain
+    retargeter = GenericInteractionRetargeter(
+        robot_model, robot_data, scaled_terrain, joint_mapping, robot_height
     )
+
+    # Retarget each frame
+    retargeted_trajectory = []
+    q_init = np.zeros(robot_model.nq)
+    q_init[3:7] = [1, 0, 0, 0]  # Identity quaternion
+    q_init[6] = robot_height * 0.5  # Initial height
+    q_last = None
+
+    for frame_idx, human_joints in enumerate(smplx_trajectory):
+        # Extract mapped joints
+        mapped_indices = []  # TODO: Map joint names to indices
+        if len(mapped_indices) == 0:
+            # Fallback: use first few joints
+            mapped_joints = human_joints[:len(joint_mapping)]
+        else:
+            mapped_joints = human_joints[mapped_indices]
+
+        # Retarget frame
+        q_opt = retargeter.retarget_frame(mapped_joints, q_init, terrain_scale, q_last=q_last)
+        retargeted_trajectory.append(q_opt)
+
+        # Update initial guess for next frame
+        q_last = q_opt.copy()
+        q_init = q_opt
+
+    return terrain_scale, np.array(retargeted_trajectory)

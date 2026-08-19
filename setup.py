@@ -10,31 +10,25 @@ setup(
     install_requires=[
         # Core dependencies from holosoma_retargeting
         "numpy==2.3.5",
+        "torch",
         "tqdm",
         "scipy",
         "matplotlib",
         "trimesh",
+        "smplx",
         "jinja2",
-        # Due to mujoco `strippath` default value in URDF parsing updated, `strippath=false` by default.
-        "mujoco>=3.7.0",
+        "mujoco",
         "viser",
         "mjviser @ git+https://github.com/mujocolab/mjviser@4ba054b9bdaf4f7604d6fa7a8b8c2f917daf43c2",
         "robot_descriptions",
         "yourdfpy",
-        "clarabel",
+        "cvxpy",
         "libigl",
         "tyro",
-        "imageio[ffmpeg]",
         # Additional dependencies for generic mesh processing
         "open3d",
         "pyvista",
     ],
-    extras_require={
-        "smplx": ["smplx", "torch"],
-        "all": ["smplx", "torch"],
-        "dev": ["mypy", "ruff", "pytest", "black"],
-        "test": ["pytest", "pytest-cov"],
-    },
     entry_points={
         "console_scripts": [
             "omniretargeting-mjviser=omniretargeting.mjviser_viewer:main",

@@ -14,7 +14,6 @@ from mjviser import ViserMujocoScene
 
 from omniretargeting.main import DEFAULT_ROBOT_CONFIG_PATH
 from omniretargeting.robot_config import load_robot_config
-from omniretargeting.utils import load_robot_urdf_with_floating_base
 
 
 SUPPORTED_MOTION_SUFFIXES = (".npz", ".npy")
@@ -263,11 +262,21 @@ def _run_viewer(
     contact_targets: np.ndarray | None = None,
     contact_normals: np.ndarray | None = None,
     contact_forwards: np.ndarray | None = None,
+    effector_references: np.ndarray | None = None,
+    effector_ups: np.ndarray | None = None,
     smplx_joints: np.ndarray | None = None,
 ) -> None:
     data = mujoco.MjData(model)
     duration = qpos.shape[0] / framerate
     server = viser.ViserServer(port=args.port, label="OmniRetargeting mjviser playback")
+    # World-space motions are often several metres away from the origin.  A
+    # Viser client otherwise starts at the origin as well, which can place the
+    # camera inside an opaque terrain mesh and make a valid scene look empty.
+    # Aim new clients at the first robot pose while keeping a useful oblique
+    # overview; users can still orbit or enable camera tracking afterwards.
+    initial_root = np.asarray(qpos[0, :3], dtype=float)
+    server.initial_camera.look_at = tuple(initial_root + np.array([0.0, 0.0, -0.25]))
+    server.initial_camera.position = tuple(initial_root + np.array([2.5, -2.5, 1.5]))
     scene = ViserMujocoScene(server, model, num_envs=1)
     # mjviser defaults to shifting every robot body by -root_position so the
     # tracked body stays at the origin.  Custom world-space overlays (terrain,
@@ -327,8 +336,11 @@ def _run_viewer(
             )
             contact_handles.append(handle)
             axis_handles = (None, None)
-            if contact_normals is not None and contact_forwards is not None:
-                normal = contact_normals[0, effector_idx]
+            orientation_ups = (
+                effector_ups if effector_ups is not None else contact_normals
+            )
+            if orientation_ups is not None and contact_forwards is not None:
+                normal = orientation_ups[0, effector_idx]
                 forward = contact_forwards[0, effector_idx]
                 normal_norm = float(np.linalg.norm(normal))
                 if normal_norm > 1e-8 and np.all(np.isfinite(forward)):
@@ -337,23 +349,31 @@ def _run_viewer(
                     forward_norm = float(np.linalg.norm(forward))
                     if forward_norm > 1e-8:
                         forward = forward / forward_norm
+                        axis_origin = (
+                            effector_references[0, effector_idx]
+                            if effector_references is not None
+                            else contact_targets[0, effector_idx]
+                        )
+                        axis_visible = name.endswith("_hand") or bool(
+                            contact_mask[0, effector_idx]
+                        )
                         forward_handle = server.scene.add_line_segments(
-                            f"/contact_targets/{name}_forward",
+                            f"/smplx_effector_frame/{name}_forward",
                             points=np.array(
-                                [[contact_targets[0, effector_idx], contact_targets[0, effector_idx] + 0.16 * forward]]
+                                [[axis_origin, axis_origin + 0.16 * forward]]
                             ),
                             colors=(30, 255, 80),
                             line_width=5.0,
-                            visible=bool(contact_mask[0, effector_idx]),
+                            visible=axis_visible,
                         )
                         normal_handle = server.scene.add_line_segments(
-                            f"/contact_targets/{name}_normal",
+                            f"/smplx_effector_frame/{name}_palm_normal",
                             points=np.array(
-                                [[contact_targets[0, effector_idx], contact_targets[0, effector_idx] + 0.12 * normal]]
+                                [[axis_origin, axis_origin + 0.12 * normal]]
                             ),
                             colors=(255, 235, 40),
                             line_width=5.0,
-                            visible=bool(contact_mask[0, effector_idx]),
+                            visible=axis_visible,
                         )
                         axis_handles = (forward_handle, normal_handle)
             contact_axis_handles.append(axis_handles)
@@ -469,9 +489,12 @@ def _run_viewer(
             handle.visible = bool(contact_mask[idx, effector_idx])
             forward_handle, normal_handle = contact_axis_handles[effector_idx]
             if forward_handle is not None and normal_handle is not None:
+                orientation_ups = (
+                    effector_ups if effector_ups is not None else contact_normals
+                )
                 normal = (
-                    (1.0 - alpha) * contact_normals[idx, effector_idx]
-                    + alpha * contact_normals[next_idx, effector_idx]
+                    (1.0 - alpha) * orientation_ups[idx, effector_idx]
+                    + alpha * orientation_ups[next_idx, effector_idx]
                 )
                 normal = normal / max(float(np.linalg.norm(normal)), 1e-10)
                 forward = (
@@ -480,10 +503,23 @@ def _run_viewer(
                 )
                 forward = forward - normal * float(np.dot(normal, forward))
                 forward = forward / max(float(np.linalg.norm(forward)), 1e-10)
-                forward_handle.points = np.array([[origin, origin + 0.16 * forward]])
-                normal_handle.points = np.array([[origin, origin + 0.12 * normal]])
-                forward_handle.visible = bool(contact_mask[idx, effector_idx])
-                normal_handle.visible = bool(contact_mask[idx, effector_idx])
+                axis_origin = origin
+                if effector_references is not None:
+                    axis_origin = (
+                        (1.0 - alpha) * effector_references[idx, effector_idx]
+                        + alpha * effector_references[next_idx, effector_idx]
+                    )
+                forward_handle.points = np.array(
+                    [[axis_origin, axis_origin + 0.16 * forward]]
+                )
+                normal_handle.points = np.array(
+                    [[axis_origin, axis_origin + 0.12 * normal]]
+                )
+                axis_visible = contact_names[effector_idx].endswith(
+                    "_hand"
+                ) or bool(contact_mask[idx, effector_idx])
+                forward_handle.visible = axis_visible
+                normal_handle.visible = axis_visible
 
         if human_points_handle is not None and human_bones_handle is not None:
             human_points = (
@@ -568,13 +604,7 @@ def run(args: argparse.Namespace) -> None:
     motion_file = _resolve_motion_file(_resolve_path(args.motion_path))
     terrain_mesh = None if args.no_terrain or args.terrain is None else trimesh.load(_resolve_path(args.terrain), force="mesh")
     model_path = _model_path_from_args(args)
-    if Path(model_path).suffix.lower() == ".urdf":
-        # A URDF has no free joint until one is added, and the saved motion is a
-        # floating-base trajectory.  Loading it the same way the retargeter does
-        # keeps the qpos layout the motion was written against.
-        model = load_robot_urdf_with_floating_base(Path(model_path))
-    else:
-        model = mujoco.MjModel.from_xml_path(model_path)
+    model = mujoco.MjModel.from_xml_path(model_path)
     qpos, object_pos, object_quat, framerate = _load_motion(
         model, motion_file, args.root_z_offset
     )
@@ -584,6 +614,8 @@ def run(args: argparse.Namespace) -> None:
     contact_targets = None
     contact_normals = None
     contact_forwards = None
+    effector_references = None
+    effector_ups = None
     smplx_joints = None
     if motion_file.suffix == ".npz":
         with np.load(motion_file, allow_pickle=True) as payload:
@@ -599,6 +631,14 @@ def run(args: argparse.Namespace) -> None:
                 if "end_effector_forward_w" in payload:
                     contact_forwards = np.asarray(
                         payload["end_effector_forward_w"], dtype=float
+                    )
+                if "end_effector_reference_w" in payload:
+                    effector_references = np.asarray(
+                        payload["end_effector_reference_w"], dtype=float
+                    )
+                if "end_effector_up_w" in payload:
+                    effector_ups = np.asarray(
+                        payload["end_effector_up_w"], dtype=float
                     )
             if "smplx_joints_w" in payload:
                 smplx_joints = np.asarray(payload["smplx_joints_w"], dtype=float)
@@ -617,6 +657,8 @@ def run(args: argparse.Namespace) -> None:
         contact_targets=contact_targets,
         contact_normals=contact_normals,
         contact_forwards=contact_forwards,
+        effector_references=effector_references,
+        effector_ups=effector_ups,
         smplx_joints=smplx_joints,
     )
 

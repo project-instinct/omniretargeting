@@ -5,148 +5,14 @@ from __future__ import annotations
 import numpy as np
 from pathlib import Path
 from typing import Dict, Tuple, Optional
+import smplx
+import torch
 import trimesh
 from scipy.spatial.transform import Rotation
+import os
+import re
 import mujoco
-
-
-def linear_interpolate(
-    array: np.ndarray,
-    indices: np.ndarray,
-    axis: int = 0,
-) -> np.ndarray:
-    """Linearly interpolate *array* at fractional *indices* along *axis*.
-
-    Parameters
-    ----------
-    array:
-        Source array of any shape.
-    indices:
-        1-D array of float indices into *axis* (must be in [0, N-1]
-        where N = array.shape[axis]).
-    axis:
-        The axis along which to interpolate.
-
-    Returns
-    -------
-    np.ndarray
-        Array whose shape equals ``array.shape`` with ``array.shape[axis]``
-        replaced by ``len(indices)``.
-    """
-    axis = axis % array.ndim
-    n = array.shape[axis]
-    indices = np.asarray(indices, dtype=np.float64)
-
-    lo = np.clip(np.floor(indices).astype(int), 0, n - 1)
-    hi = np.clip(lo + 1, 0, n - 1)
-    frac = indices - lo
-
-    # Reshape frac for broadcasting: length-M along *axis*, size-1 elsewhere.
-    shape = [1] * array.ndim
-    shape[axis] = len(indices)
-    frac = frac.reshape(shape)
-
-    return np.take(array, lo, axis=axis) * (1 - frac) + np.take(array, hi, axis=axis) * frac
-
-
-def _rotvec_to_quat(rotvec: np.ndarray) -> np.ndarray:
-    """Axis-angle (..., 3) -> quaternion (..., 4) in wxyz order."""
-    original_shape = rotvec.shape[:-1]
-    flat = rotvec.reshape(-1, 3)
-    angle = np.linalg.norm(flat, axis=-1, keepdims=True)
-    safe_angle = np.where(angle > 1e-10, angle, np.ones_like(angle))
-    axis_normed = flat / safe_angle
-    half = angle / 2
-    w = np.cos(half)
-    xyz = axis_normed * np.sin(half)
-    near_zero = (angle < 1e-10).squeeze(-1)
-    w[near_zero] = 1.0
-    xyz[near_zero] = 0.0
-    quat = np.concatenate([w, xyz], axis=-1)
-    return quat.reshape(*original_shape, 4)
-
-
-def _quat_to_rotvec(quat: np.ndarray) -> np.ndarray:
-    """Quaternion (..., 4) in wxyz order -> axis-angle (..., 3)."""
-    original_shape = quat.shape[:-1]
-    flat = quat.reshape(-1, 4)
-    flat = np.where(flat[:, :1] < 0, -flat, flat)
-    w = np.clip(flat[:, 0:1], -1.0, 1.0)
-    xyz = flat[:, 1:4]
-    half_angle = np.arccos(w)
-    angle = 2 * half_angle
-    sin_half = np.sin(half_angle)
-    safe_sin = np.where(sin_half > 1e-10, sin_half, np.ones_like(sin_half))
-    axis_normed = xyz / safe_sin
-    rotvec = axis_normed * angle
-    near_zero = (sin_half < 1e-10).squeeze(-1)
-    rotvec[near_zero] = 0.0
-    return rotvec.reshape(*original_shape, 3)
-
-
-def slerp_interpolate(
-    array: np.ndarray,
-    indices: np.ndarray,
-    axis: int = 0,
-) -> np.ndarray:
-    """Spherical linear interpolation for wxyz quaternion arrays at fractional *indices*.
-
-    Parameters
-    ----------
-    array:
-        Array of wxyz quaternion data.  The last dimension must be 4
-        and *axis* selects the time/sequence dimension.  E.g. shape
-        ``(T, 4)`` for a single rotation track or ``(T, J, 4)`` for
-        *J* joints.
-    indices:
-        1-D array of float indices into *axis* (in ``[0, N-1]``).
-    axis:
-        The axis along which to interpolate (the "time" axis).
-
-    Returns
-    -------
-    np.ndarray
-        wxyz quaternion array with ``array.shape[axis]`` replaced by
-        ``len(indices)``, same dtype.
-    """
-    assert array.shape[-1] == 4, f"Last dimension must be 4 (wxyz quaternion), got {array.shape[-1]}"
-    axis = axis % array.ndim
-    n = array.shape[axis]
-    indices = np.asarray(indices, dtype=np.float64)
-
-    lo = np.clip(np.floor(indices).astype(int), 0, n - 1)
-    hi = np.clip(lo + 1, 0, n - 1)
-    frac = indices - lo
-
-    q0 = np.take(array, lo, axis=axis)
-    q1 = np.take(array, hi, axis=axis)
-
-    # Shortest-path: flip q1 when dot < 0
-    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
-    q1 = np.where(dot < 0, -q1, q1)
-    dot = np.abs(dot)
-
-    shape = [1] * q0.ndim
-    shape[axis] = len(indices)
-    frac = frac.reshape(shape)
-
-    dot = np.clip(dot, -1.0, 1.0)
-    theta = np.arccos(dot)
-    sin_theta = np.sin(theta)
-
-    near_parallel = (sin_theta < 1e-10)
-    safe_sin_theta = np.where(near_parallel, np.ones_like(sin_theta), sin_theta)
-
-    s0 = np.sin((1 - frac) * theta) / safe_sin_theta
-    s1 = np.sin(frac * theta) / safe_sin_theta
-
-    s0 = np.where(near_parallel, 1 - frac, s0)
-    s1 = np.where(near_parallel, frac, s1)
-
-    result_quat = s0 * q0 + s1 * q1
-    result_quat = result_quat / np.linalg.norm(result_quat, axis=-1, keepdims=True)
-
-    return result_quat
+import xml.etree.ElementTree as ET
 
 
 def load_terrain_mesh(mesh_path: Path) -> trimesh.Trimesh:
@@ -214,15 +80,9 @@ def transform_mesh(mesh: trimesh.Trimesh,
     return transformed_mesh
 
 
-def sample_points_on_mesh(
-    mesh: trimesh.Trimesh, num_points: int, seed: Optional[int] = None
-) -> np.ndarray:
-    """Sample points uniformly on the surface of a mesh.
-
-    Passing ``seed`` makes the draw reproducible across processes, which is a
-    prerequisite for comparing two retargeting runs against each other.
-    """
-    points, _ = trimesh.sample.sample_surface(mesh, num_points, seed=seed)
+def sample_points_on_mesh(mesh: trimesh.Trimesh, num_points: int) -> np.ndarray:
+    """Sample points uniformly on the surface of a mesh."""
+    points, _ = trimesh.sample.sample_surface(mesh, num_points)
     return points
 
 
@@ -304,6 +164,32 @@ def align_terrain_to_coordinates(mesh: trimesh.Trimesh,
     return aligned_mesh, transformation
 
 
+def validate_smplx_trajectory(trajectory: np.ndarray) -> bool:
+    """Validate SMPLX trajectory format."""
+    if len(trajectory.shape) != 3:
+        return False
+
+    num_frames, num_joints, num_coords = trajectory.shape
+
+    if num_coords != 3:
+        return False
+
+    if num_frames == 0 or num_joints == 0:
+        return False
+
+    # Check for NaN or infinite values
+    if not np.isfinite(trajectory).all():
+        return False
+
+    return True
+
+
+def extract_smplx_joint_positions(trajectory: np.ndarray,
+                                joint_indices: list) -> np.ndarray:
+    """Extract specific joint positions from SMPLX trajectory."""
+    return trajectory[:, joint_indices, :]
+
+
 def convert_quaternion_format(quaternions: np.ndarray,
                             input_format: str = 'wxyz',
                             output_format: str = 'xyzw') -> np.ndarray:
@@ -340,50 +226,7 @@ def get_adjacency_list(tetrahedra, num_vertices):
     return [list(s) for s in adj]
 
 
-def calculate_exponential_edge_weights(
-    vertices: np.ndarray,
-    adj_list: list[list[int]],
-    kappa: float = 30.0,
-):
-    """
-    Distance-dependent adjacency weights from TopoRetarget (arXiv:2606.16272), Eq. (5).
-
-    For each edge (i, j): w_tilde_ij = exp(-kappa * ||v_i - v_j||), then
-    row-normalized so that sum_j w_ij = 1 for every vertex i.
-
-    Per the paper, these weights are computed once on the *source* configuration
-    and reused unchanged for the robot-side Laplacian computation.
-
-    Args:
-        vertices (np.ndarray): (N, 3) array of source vertex positions.
-        adj_list (list of lists): Adjacency list for the mesh.
-        kappa (float): Spatial decay factor (paper uses 30 for meter-scale data).
-
-    Returns:
-        list of np.ndarray: edge_weights[i] holds the normalized weights for the
-            neighbors of vertex i, aligned with the order of adj_list[i].
-    """
-    edge_weights = []
-    for i in range(len(vertices)):
-        neighbors_indices = adj_list[i]
-        if len(neighbors_indices) > 0:
-            neighbor_positions = vertices[neighbors_indices]
-            distances = np.linalg.norm(vertices[i] - neighbor_positions, axis=1)
-            weights = np.exp(-kappa * distances)
-            weights = weights / np.sum(weights)
-            edge_weights.append(weights)
-        else:
-            edge_weights.append(np.zeros(0))
-    return edge_weights
-
-
-def calculate_laplacian_coordinates(
-    vertices: np.ndarray,
-    adj_list: list[list[int]],
-    epsilon: float = 1e-6,
-    uniform_weight: bool = True,
-    edge_weights: list[np.ndarray] | None = None,
-):
+def calculate_laplacian_coordinates(vertices, adj_list, epsilon=1e-6, uniform_weight=True):
     """
     Calculates the Laplacian coordinates for each vertex in the mesh.
 
@@ -392,9 +235,6 @@ def calculate_laplacian_coordinates(
         adj_list (list of lists): Adjacency list for the mesh.
         epsilon (float): Small value to prevent division by zero.
         uniform_weight (bool): Whether to use uniform weights.
-        edge_weights (list of np.ndarray, optional): Precomputed per-edge weights
-            (e.g. from calculate_exponential_edge_weights), aligned with adj_list.
-            Overrides uniform_weight when provided.
 
     Returns:
         np.ndarray: (N, 3) array of Laplacian coordinates.
@@ -406,13 +246,11 @@ def calculate_laplacian_coordinates(
         if len(neighbors_indices) > 0:
             vi = vertices[i]
             neighbor_positions = vertices[neighbors_indices]
+            distances = np.linalg.norm(vi - neighbor_positions, axis=1)
 
-            if edge_weights is not None:
-                weights = edge_weights[i]
-            elif uniform_weight:
-                weights = np.ones_like(neighbor_positions[:, 0])
+            if uniform_weight:
+                weights = np.ones_like(distances)
             else:
-                distances = np.linalg.norm(vi - neighbor_positions, axis=1)
                 weights = 1.0 / (1.5 * distances + epsilon)
 
             sum_of_weights = np.sum(weights)
@@ -423,13 +261,7 @@ def calculate_laplacian_coordinates(
     return laplacian
 
 
-def calculate_laplacian_matrix(
-    vertices: np.ndarray,
-    adj_list: list[list[int]],
-    epsilon: float = 1e-6,
-    uniform_weight: bool = True,
-    edge_weights: list[np.ndarray] | None = None,
-):
+def calculate_laplacian_matrix(vertices, adj_list, epsilon=1e-6, uniform_weight=True):
     """
     Calculates the Laplacian matrix for the mesh with optional weight schemes.
 
@@ -438,9 +270,6 @@ def calculate_laplacian_matrix(
         adj_list (list of lists): Adjacency list for the mesh.
         epsilon (float): Small value to prevent division by zero.
         uniform_weight (bool): If True, use uniform weights; if False, use distance-based weights.
-        edge_weights (list of np.ndarray, optional): Precomputed per-edge weights
-            (e.g. from calculate_exponential_edge_weights), aligned with adj_list.
-            Overrides uniform_weight when provided.
 
     Returns:
         np.ndarray: (N, N) Laplacian matrix.
@@ -451,9 +280,7 @@ def calculate_laplacian_matrix(
     for i in range(N):
         neighbors_indices = adj_list[i]
         if len(neighbors_indices) > 0:
-            if edge_weights is not None:
-                weights = edge_weights[i]
-            elif uniform_weight:
+            if uniform_weight:
                 weights = np.ones(len(neighbors_indices)) / len(neighbors_indices)
             else:
                 vi = vertices[i]
@@ -471,324 +298,56 @@ def calculate_laplacian_matrix(
     return laplacian_matrix
 
 
-def estimate_body_height(
-    positions: np.ndarray,
-    target_names: list[str],
-    *,
-    head_joint: str = "Head",
-    foot_joints: tuple[str, str] = ("L_Foot", "R_Foot"),
-    head_top_offset: float = 0.12,
-    fallback_height: float = 1.75,
-    min_height: float = 1.4,
-    max_height: float = 2.2,
-) -> float | None:
-    """Estimate human height from joint positions by finding the head-to-foot distance.
-
-    Estimates height from the maximum head-to-foot Z-distance across all frames,
-    clipped to [*min_height*, *max_height*].  If named joints are not found in
-    *target_names*, returns *fallback_height*.  If *positions* is empty or
-    ``None``, returns ``None``.
-
-    Args:
-        positions: Joint positions array of shape ``(T, J, 3)``.
-        target_names: List of joint names corresponding to the J axis.
-        head_joint: Name of the head joint in *target_names*.
-        foot_joints: Names of the two foot joints in *target_names*.
-        head_top_offset: Additional offset to add for the top of the head.
-        fallback_height: Height to return if named joints are not found.
-        min_height: Minimum valid height for clipping.
-        max_height: Maximum valid height for clipping.
-
-    Returns:
-        Estimated height in meters, or ``None`` if *positions* is empty or ``None``.
+def compute_world_joint_orientations(
+    global_orient: np.ndarray,
+    full_pose: np.ndarray,
+    parents: np.ndarray,
+    num_body_joints: int = 22,
+) -> np.ndarray:
     """
-    if positions is None or len(positions) == 0:
-        return None
-
-    try:
-        head_idx = target_names.index(head_joint)
-    except ValueError:
-        return fallback_height
-
-    if head_idx >= positions.shape[1]:
-        return fallback_height
-
-    foot_indices: list[int] = []
-    for fn in foot_joints:
-        try:
-            idx = target_names.index(fn)
-            if idx < positions.shape[1]:
-                foot_indices.append(idx)
-        except ValueError:
-            pass
-
-    if not foot_indices:
-        return fallback_height
-
-    try:
-        head_positions = positions[:, head_idx, 2]
-        feet_positions = np.min(positions[:, foot_indices, 2], axis=1)
-        per_frame_height = np.abs(head_positions - feet_positions) + head_top_offset
-        estimated_height = float(np.max(per_frame_height))
-        return float(np.clip(estimated_height, min_height, max_height))
-    except (IndexError, TypeError):
-        return fallback_height
-
-
-def validate_robot_joint_mapping(
-    robot_model,
-    joint_mapping: dict,
-    raise_on_missing: bool = False
-) -> list:
-    """
-    Validate that robot links in joint_mapping exist in the robot model.
-    
-    This is a shared utility to avoid code duplication between OmniRetargeter
-    and GenericInteractionRetargeter.
+    Compute world-frame joint orientations from SMPLX pose parameters.
     
     Args:
-        robot_model: MuJoCo model of the robot
-        joint_mapping: Dictionary mapping source target names to robot link (body) names
-        raise_on_missing: If True, raise ValueError when missing links are found.
-                         If False, return list of missing links.
+        global_orient: Root orientation in axis-angle format, shape (T, 3)
+        full_pose: Full pose parameters in axis-angle format, shape (T, J_total, 3)
+        parents: Parent indices for kinematic tree, shape (J_total,)
+        num_body_joints: Number of body joints to return (default 22)
     
     Returns:
-        List of missing robot link names (empty if all exist)
-    
-    Raises:
-        ValueError: If raise_on_missing=True and missing links are found
-    
-    Note:
-        joint_mapping maps source target names to robot BODY (link) names,
-        not joint names. This function checks for body names in the URDF.
+        Joint orientations as quaternions (wxyz format), shape (T, J, 4)
     """
-    robot_bodies = set()
-    for i in range(robot_model.nbody):
-        body_name = mujoco.mj_id2name(robot_model, mujoco.mjtObj.mjOBJ_BODY, i)
-        if body_name:
-            robot_bodies.add(body_name)
+    num_frames = global_orient.shape[0]
+    num_joints = min(full_pose.shape[1], num_body_joints)
     
-    mapped_bodies = set(
-        v["robot_link"] if isinstance(v, dict) else v
-        for v in joint_mapping.values()
-    )
-    missing_bodies = mapped_bodies - robot_bodies
+    # Output: quaternions in wxyz format
+    joint_orientations = np.zeros((num_frames, num_joints, 4))
     
-    if missing_bodies and raise_on_missing:
-        missing_list = sorted(list(missing_bodies))
-        available_sample = sorted(list(robot_bodies))[:10]
-        raise ValueError(
-            f"The following robot links from joint_mapping were not found in URDF: {missing_list}. "
-            f"Please check your joint_mapping. Available bodies (first 10): {available_sample}..."
-        )
-    
-    return sorted(list(missing_bodies))
-
-
-def create_flat_terrain(size: float = 10.0, height: float = 0.0, n_points: int = 4) -> trimesh.Trimesh:
-    """
-    Create a flat plane terrain mesh with minimal triangulation.
-    
-    Args:
-        size: Side length of the square plane (meters)
-        height: Z-coordinate of the plane
-        n_points: Number of points per side (minimum 2)
-    
-    Returns:
-        Trimesh object representing the flat terrain
-    """
-    if n_points < 2:
-        raise ValueError("n_points must be at least 2")
-    
-    # Create grid of vertices
-    x = np.linspace(-size/2, size/2, n_points)
-    y = np.linspace(-size/2, size/2, n_points)
-    xx, yy = np.meshgrid(x, y)
-    
-    vertices = np.stack([
-        xx.flatten(),
-        yy.flatten(),
-        np.full(n_points * n_points, height)
-    ], axis=1)
-    
-    # Create triangular faces
-    faces = []
-    for i in range(n_points - 1):
-        for j in range(n_points - 1):
-            # Two triangles per grid cell
-            v0 = i * n_points + j
-            v1 = i * n_points + (j + 1)
-            v2 = (i + 1) * n_points + j
-            v3 = (i + 1) * n_points + (j + 1)
+    for frame_idx in range(num_frames):
+        # Store rotations for this frame
+        frame_rotations = []
+        
+        for joint_idx in range(num_joints):
+            if joint_idx == 0:
+                # Root joint: use global_orient directly
+                rot = Rotation.from_rotvec(global_orient[frame_idx])
+            else:
+                # Other joints: multiply parent's world rotation by local rotation
+                parent_idx = parents[joint_idx]
+                if parent_idx >= 0 and parent_idx < len(frame_rotations):
+                    parent_rot = frame_rotations[parent_idx]
+                    local_rot = Rotation.from_rotvec(full_pose[frame_idx, joint_idx])
+                    rot = parent_rot * local_rot
+                else:
+                    # Fallback: use local rotation as world rotation
+                    rot = Rotation.from_rotvec(full_pose[frame_idx, joint_idx])
             
-            faces.append([v0, v1, v2])
-            faces.append([v1, v3, v2])
+            frame_rotations.append(rot)
+            # Store as quaternion in wxyz format (scalar_first=True)
+            joint_orientations[frame_idx, joint_idx] = rot.as_quat(scalar_first=True)
     
-    return trimesh.Trimesh(vertices=vertices, faces=faces)
+    return joint_orientations
 
 
-def resolve_robot_height(config: dict, model: "mujoco.MjModel", data: "mujoco.MjData") -> float:
-    """Get robot height from config dict, falling back to MuJoCo geom detection.
-
-    Checks ``robot_height`` key in *config* first; if absent, calls
-    :func:`detect_robot_height` as a fallback.
-    """
-    height = config.get("robot_height")
-    if height is not None:
-        return float(height)
-    return detect_robot_height(model, data)
-
-
-def detect_robot_height(model: "mujoco.MjModel", data: "mujoco.MjData") -> float:
-    """Detect robot height from MuJoCo geom extents (includes head casing, etc.).
-
-    Shared by core.py, and the ``_visualize.py`` scripts to avoid code duplication.
-    Prefer :func:`resolve_robot_height` at call sites that already have a config dict.
-    """
-    mujoco.mj_resetData(model, data)
-    if model.njnt > 0 and model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE and model.nq >= 7:
-        data.qpos[3:7] = [1, 0, 0, 0]
-    mujoco.mj_forward(model, data)
-
-    min_z = float("inf")
-    max_z = float("-inf")
-    for geom_idx in range(model.ngeom):
-        z = float(data.geom_xpos[geom_idx][2])
-        geom_size = model.geom_size[geom_idx]
-        geom_type = model.geom_type[geom_idx]
-        if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
-            r = float(geom_size[0])
-            min_z = min(min_z, z - r); max_z = max(max_z, z + r)
-        elif geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
-            r = float(geom_size[0]); hh = float(geom_size[1])
-            min_z = min(min_z, z - hh - r); max_z = max(max_z, z + hh + r)
-        elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
-            hs = float(geom_size[2])
-            min_z = min(min_z, z - hs); max_z = max(max_z, z + hs)
-        else:
-            min_z = min(min_z, z); max_z = max(max_z, z)
-    height = float(max_z - min_z)
-    if height < 0.3 or height > 3.0:
-        return 1.6
-    return height
-
-
-import re
-
-
-def _strip_xml_comments(xml_str: str) -> str:
-    """Remove XML comments from a string."""
-    return re.sub(r"<!--.*?-->", "", xml_str, flags=re.DOTALL)
-
-
-def _has_floating_joint(xml_str: str) -> bool:
-    """Return True if the URDF XML already contains a floating joint."""
-    return 'type="floating"' in _strip_xml_comments(xml_str)
-
-
-def _find_urdf_root_body(xml_str: str) -> str:
-    """Find the root body name in a URDF XML string.
-
-    The root body is the link that is never a ``<child>`` of any joint.
-    """
-    import xml.etree.ElementTree as ET
-
-    root = ET.fromstring(xml_str)
-    links: set[str] = set()
-    children: set[str] = set()
-
-    for link in root.findall("link"):
-        name = link.get("name")
-        if name:
-            links.add(name)
-
-    for joint in root.findall("joint"):
-        child = joint.find("child")
-        if child is not None:
-            child_name = child.get("link")
-            if child_name:
-                children.add(child_name)
-
-    root_candidates = links - children
-    root_candidates.discard("world")
-
-    if not root_candidates:
-        for link in root.findall("link"):
-            name = link.get("name")
-            if name and name != "world":
-                return name
-        raise ValueError("No root body found in URDF — cannot inject floating joint.")
-
-    return sorted(root_candidates)[0]
-
-
-def _inject_floating_joint(xml_str: str) -> str:
-    """Inject a world link and floating joint into a URDF XML string."""
-    import xml.etree.ElementTree as ET
-
-    root_body = _find_urdf_root_body(xml_str)
-    root = ET.fromstring(xml_str)
-
-    has_world = any(
-        link.get("name") == "world" for link in root.findall("link")
-    )
-
-    if not has_world:
-        root.insert(0, ET.Element("link", name="world"))
-
-    floating_joint = ET.Element("joint", name="floating_base", type="floating")
-    ET.SubElement(floating_joint, "parent", link="world")
-    ET.SubElement(floating_joint, "child", link=root_body)
-
-    world_idx = None
-    for i, elem in enumerate(root):
-        if elem.tag == "link" and elem.get("name") == "world":
-            world_idx = i
-            break
-
-    if world_idx is not None:
-        root.insert(world_idx + 1, floating_joint)
-    else:
-        root.insert(0, floating_joint)
-
-    return ET.tostring(root, encoding="unicode")
-
-
-def load_robot_urdf_with_floating_base(urdf_path: str | Path) -> "mujoco.MjModel":
-    """Load a URDF into a MuJoCo model, auto-injecting a floating joint if missing.
-
-    MuJoCo treats a URDF's base link as fixed to the world unless there is a
-    ``<joint type="floating">`` connecting a world reference to the base.
-    This function detects when a floating joint is absent and injects one
-    automatically, so callers always receive a free-floating model.
-
-    Args:
-        urdf_path: Path to the URDF file. Relative mesh paths inside the URDF
-                   are resolved relative to the URDF directory.
-
-    Returns:
-        A MuJoCo ``MjModel`` that is guaranteed to have a floating base joint
-        as the first joint.
-    """
-    import os
-
-    urdf_path = Path(urdf_path)
-    xml_str = urdf_path.read_text(encoding="utf-8")
-
-    if not _has_floating_joint(xml_str):
-        xml_str = _inject_floating_joint(xml_str)
-
-    old_cwd = os.getcwd()
-    try:
-        os.chdir(str(urdf_path.parent))
-        return mujoco.MjModel.from_xml_string(xml_str)
-    finally:
-        os.chdir(old_cwd)
-
-
-# SMPL-X end-effector marker sampling and frame densification. Ported from
-# the contact-priority line; consumed by contact inference and by callers that
-# need hand/foot surface samples rather than joint positions alone.
 def _farthest_point_sample_indices(points: np.ndarray, max_samples: int) -> np.ndarray:
     """Select deterministic, spatially distributed points from a template part."""
     points = np.asarray(points, dtype=float)
@@ -1115,3 +674,642 @@ def _densify_smplx_frame_gaps(
         else np.asarray(dense_hand, dtype=np.asarray(pose_hand).dtype),
         np.asarray(dense_ids, dtype=ids.dtype),
     )
+
+
+def load_smplx_trajectory(
+    smplx_file: Path,
+    smplx_model_directory: Optional[str] = None,
+    gender: str = "neutral",
+    return_meta: bool = False,
+    return_end_effectors: bool = False,
+    end_effector_samples: int = 32,
+) -> tuple:
+    """
+    Load SMPLX trajectory from file.
+    
+    Handles:
+    - Standard .npy files with pre-computed joint positions
+    - Pre-processed .npz files with 'global_joint_positions' key
+    - Raw SMPLX-NG .npz files (e.g., stageii.npz) with SMPLX parameters
+    
+    For raw SMPLX-NG files, requires smplx_model_directory to perform forward kinematics.
+    
+    Args:
+        smplx_file: Path to trajectory file (.npy or .npz)
+        smplx_model_directory: Path to SMPLX model files (required for raw SMPLX-NG files and orientation computation)
+        gender: Gender for SMPLX model ('neutral', 'male', 'female')
+        return_meta: If True, also return root orientation and translation.
+        return_end_effectors: If True, return semantic hand/foot centers and
+            compact SMPL-X surface samples for scene-contact inference.
+        end_effector_samples: Maximum number of coherent surface samples per
+            end effector.
+    
+    Returns:
+        Tuple beginning with ``(positions, orientations)``.  ``return_meta``
+        appends ``(root_orient, trans)`` and ``return_end_effectors`` appends a
+        marker dictionary.
+        
+        If return_meta=False (default):
+            - positions: Joint positions array of shape (T, J, 3)
+            - orientations: Joint orientations as quaternions (wxyz), shape (T, J, 4)
+                           Returns None if orientations cannot be computed (e.g., .npy files)
+        
+        If return_meta=True:
+            - positions: Joint positions array of shape (T, J, 3)
+            - orientations: Joint orientations as quaternions (wxyz), shape (T, J, 4)
+                           Returns None if orientations cannot be computed
+            - root_orient: Root orientation parameters in axis-angle format, shape (T, 3) or None
+            - trans: Translation parameters, shape (T, 3) or None
+    """
+    def pack_result(joints, orientations, root_orient, trans, end_effectors):
+        result = [joints, orientations]
+        if return_meta:
+            result.extend([root_orient, trans])
+        if return_end_effectors:
+            result.append(end_effectors)
+        return tuple(result)
+
+    if smplx_file.suffix == ".npy":
+        joints = np.load(smplx_file, allow_pickle=True)
+        # Cannot compute orientations from positions only
+        print("Warning: Cannot compute orientations from .npy file (positions only). Returning None for orientations.")
+        end_effectors = _fallback_end_effector_markers(joints) if return_end_effectors else None
+        return pack_result(joints, None, None, None, end_effectors)
+
+    smplx_data = np.load(smplx_file, allow_pickle=True)
+
+    if isinstance(smplx_data, np.lib.npyio.NpzFile) and "human_joints" in smplx_data:
+        joints = smplx_data["human_joints"]
+        print("Warning: Cannot compute orientations from OMOMO human_joints. Returning None for orientations.")
+        end_effectors = _fallback_end_effector_markers(joints) if return_end_effectors else None
+        return pack_result(joints, None, None, None, end_effectors)
+
+    if isinstance(smplx_data, np.lib.npyio.NpzFile) and "global_joint_positions" in smplx_data:
+        joints = smplx_data["global_joint_positions"]
+        root_orient = smplx_data["root_orient"] if "root_orient" in smplx_data else None
+        trans = smplx_data["trans"] if "trans" in smplx_data else None
+        
+        # Try to compute orientations if we have the necessary data
+        orientations = None
+        if "full_pose" in smplx_data and smplx_model_directory is not None and root_orient is not None:
+            # Load body model to get parent structure
+            body_model = smplx.create(
+                smplx_model_directory,
+                "smplx",
+                gender=gender,
+                use_pca=False,
+            )
+            full_pose = smplx_data["full_pose"]
+            if isinstance(full_pose, np.ndarray) and len(full_pose.shape) == 2:
+                # Reshape from (T, J*3) to (T, J, 3)
+                full_pose = full_pose.reshape(full_pose.shape[0], -1, 3)
+            
+            orientations = compute_world_joint_orientations(
+                root_orient,
+                full_pose,
+                body_model.parents.cpu().numpy(),
+                num_body_joints=22,
+            )
+        else:
+            print("Warning: Cannot compute orientations from .npz file (missing full_pose, root_orient, or model directory). Returning None for orientations.")
+        
+        end_effectors = _fallback_end_effector_markers(joints) if return_end_effectors else None
+        return pack_result(joints, orientations, root_orient, trans, end_effectors)
+
+    # Raw SMPLX-NG file - need to run forward kinematics
+    body_model = smplx.create(
+        smplx_model_directory,
+        "smplx",
+        gender=str(smplx_data.get("gender", "neutral")),
+        use_pca=False,
+    )
+
+    # Extract and adjust betas
+    betas = torch.tensor(smplx_data["betas"]).float().view(1, -1)
+    if betas.shape[1] > 10:
+        betas = betas[:, :10]
+
+    pose_body = smplx_data["pose_body"]
+    root_orient = smplx_data["root_orient"]
+    trans = smplx_data["trans"]
+    pose_hand = smplx_data["pose_hand"] if "pose_hand" in smplx_data else None
+    if "frame_ids" in smplx_data:
+        original_num_frames = len(trans)
+        trans, root_orient, pose_body, pose_hand, _ = _densify_smplx_frame_gaps(
+            smplx_data["frame_ids"],
+            trans,
+            root_orient,
+            pose_body,
+            pose_hand,
+        )
+        if len(trans) != original_num_frames:
+            print(
+                "Restored "
+                f"{len(trans) - original_num_frames} missing SMPL-X timeline frame(s) "
+                "from frame_ids."
+            )
+    num_frames = pose_body.shape[0]
+    if pose_hand is not None and pose_hand.ndim == 2 and pose_hand.shape[1] >= 90:
+        left_hand_pose = torch.tensor(pose_hand[:, :45]).float()
+        right_hand_pose = torch.tensor(pose_hand[:, 45:90]).float()
+    else:
+        left_hand_pose = torch.zeros(num_frames, 45).float()
+        right_hand_pose = torch.zeros(num_frames, 45).float()
+    smplx_output = body_model(
+        betas=betas,  # Shape parameters (1, 10)
+        global_orient=torch.tensor(root_orient).float(),  # (N, 3)
+        body_pose=torch.tensor(pose_body).float(),  # (N, 63)
+        transl=torch.tensor(trans).float(),  # (N, 3)
+        left_hand_pose=left_hand_pose,
+        right_hand_pose=right_hand_pose,
+        jaw_pose=torch.zeros(num_frames, 3).float(),  # Pose parameters per frame
+        leye_pose=torch.zeros(num_frames, 3).float(),  # Pose parameters per frame
+        reye_pose=torch.zeros(num_frames, 3).float(),  # Pose parameters per frame
+        expression=torch.zeros(num_frames, 10).float(),  # Expression parameters expanded to num_frames
+        return_full_pose=True,
+    )
+
+    # Extract joints and their world rotations before building rigid semantic
+    # foot frames.
+    full_joints = smplx_output.joints.detach().cpu().numpy()
+    full_pose = smplx_output.full_pose.detach().cpu().numpy()
+    # Reshape from (T, J*3) to (T, J, 3)
+    full_pose = full_pose.reshape(num_frames, -1, 3)
+    
+    orientations = compute_world_joint_orientations(
+        root_orient,
+        full_pose,
+        body_model.parents.cpu().numpy(),
+        num_body_joints=22,
+    )
+    end_effectors = None
+    if return_end_effectors:
+        end_effectors = _extract_smplx_end_effector_markers(
+            body_model,
+            smplx_output,
+            max_samples=end_effector_samples,
+            world_joint_orientations=orientations,
+            shape_betas=betas.detach().cpu().numpy(),
+        )
+
+    # Return only body joints (first 22)
+    joints = full_joints[:, :22, :]
+    
+    return pack_result(joints, orientations, root_orient, trans, end_effectors)
+
+
+# Interpolation, body-height estimation and floating-base URDF helpers used
+# by the data_sources adapters. Kept here so multi-source loading works
+# alongside the contact-priority solver.
+def linear_interpolate(
+    array: np.ndarray,
+    indices: np.ndarray,
+    axis: int = 0,
+) -> np.ndarray:
+    """Linearly interpolate *array* at fractional *indices* along *axis*.
+
+    Parameters
+    ----------
+    array:
+        Source array of any shape.
+    indices:
+        1-D array of float indices into *axis* (must be in [0, N-1]
+        where N = array.shape[axis]).
+    axis:
+        The axis along which to interpolate.
+
+    Returns
+    -------
+    np.ndarray
+        Array whose shape equals ``array.shape`` with ``array.shape[axis]``
+        replaced by ``len(indices)``.
+    """
+    axis = axis % array.ndim
+    n = array.shape[axis]
+    indices = np.asarray(indices, dtype=np.float64)
+
+    lo = np.clip(np.floor(indices).astype(int), 0, n - 1)
+    hi = np.clip(lo + 1, 0, n - 1)
+    frac = indices - lo
+
+    # Reshape frac for broadcasting: length-M along *axis*, size-1 elsewhere.
+    shape = [1] * array.ndim
+    shape[axis] = len(indices)
+    frac = frac.reshape(shape)
+
+    return np.take(array, lo, axis=axis) * (1 - frac) + np.take(array, hi, axis=axis) * frac
+
+
+def _rotvec_to_quat(rotvec: np.ndarray) -> np.ndarray:
+    """Axis-angle (..., 3) -> quaternion (..., 4) in wxyz order."""
+    original_shape = rotvec.shape[:-1]
+    flat = rotvec.reshape(-1, 3)
+    angle = np.linalg.norm(flat, axis=-1, keepdims=True)
+    safe_angle = np.where(angle > 1e-10, angle, np.ones_like(angle))
+    axis_normed = flat / safe_angle
+    half = angle / 2
+    w = np.cos(half)
+    xyz = axis_normed * np.sin(half)
+    near_zero = (angle < 1e-10).squeeze(-1)
+    w[near_zero] = 1.0
+    xyz[near_zero] = 0.0
+    quat = np.concatenate([w, xyz], axis=-1)
+    return quat.reshape(*original_shape, 4)
+
+
+def _quat_to_rotvec(quat: np.ndarray) -> np.ndarray:
+    """Quaternion (..., 4) in wxyz order -> axis-angle (..., 3)."""
+    original_shape = quat.shape[:-1]
+    flat = quat.reshape(-1, 4)
+    flat = np.where(flat[:, :1] < 0, -flat, flat)
+    w = np.clip(flat[:, 0:1], -1.0, 1.0)
+    xyz = flat[:, 1:4]
+    half_angle = np.arccos(w)
+    angle = 2 * half_angle
+    sin_half = np.sin(half_angle)
+    safe_sin = np.where(sin_half > 1e-10, sin_half, np.ones_like(sin_half))
+    axis_normed = xyz / safe_sin
+    rotvec = axis_normed * angle
+    near_zero = (sin_half < 1e-10).squeeze(-1)
+    rotvec[near_zero] = 0.0
+    return rotvec.reshape(*original_shape, 3)
+
+
+def slerp_interpolate(
+    array: np.ndarray,
+    indices: np.ndarray,
+    axis: int = 0,
+) -> np.ndarray:
+    """Spherical linear interpolation for wxyz quaternion arrays at fractional *indices*.
+
+    Parameters
+    ----------
+    array:
+        Array of wxyz quaternion data.  The last dimension must be 4
+        and *axis* selects the time/sequence dimension.  E.g. shape
+        ``(T, 4)`` for a single rotation track or ``(T, J, 4)`` for
+        *J* joints.
+    indices:
+        1-D array of float indices into *axis* (in ``[0, N-1]``).
+    axis:
+        The axis along which to interpolate (the "time" axis).
+
+    Returns
+    -------
+    np.ndarray
+        wxyz quaternion array with ``array.shape[axis]`` replaced by
+        ``len(indices)``, same dtype.
+    """
+    assert array.shape[-1] == 4, f"Last dimension must be 4 (wxyz quaternion), got {array.shape[-1]}"
+    axis = axis % array.ndim
+    n = array.shape[axis]
+    indices = np.asarray(indices, dtype=np.float64)
+
+    lo = np.clip(np.floor(indices).astype(int), 0, n - 1)
+    hi = np.clip(lo + 1, 0, n - 1)
+    frac = indices - lo
+
+    q0 = np.take(array, lo, axis=axis)
+    q1 = np.take(array, hi, axis=axis)
+
+    # Shortest-path: flip q1 when dot < 0
+    dot = np.sum(q0 * q1, axis=-1, keepdims=True)
+    q1 = np.where(dot < 0, -q1, q1)
+    dot = np.abs(dot)
+
+    shape = [1] * q0.ndim
+    shape[axis] = len(indices)
+    frac = frac.reshape(shape)
+
+    dot = np.clip(dot, -1.0, 1.0)
+    theta = np.arccos(dot)
+    sin_theta = np.sin(theta)
+
+    near_parallel = (sin_theta < 1e-10)
+    safe_sin_theta = np.where(near_parallel, np.ones_like(sin_theta), sin_theta)
+
+    s0 = np.sin((1 - frac) * theta) / safe_sin_theta
+    s1 = np.sin(frac * theta) / safe_sin_theta
+
+    s0 = np.where(near_parallel, 1 - frac, s0)
+    s1 = np.where(near_parallel, frac, s1)
+
+    result_quat = s0 * q0 + s1 * q1
+    result_quat = result_quat / np.linalg.norm(result_quat, axis=-1, keepdims=True)
+
+    return result_quat
+
+
+def calculate_exponential_edge_weights(
+    vertices: np.ndarray,
+    adj_list: list[list[int]],
+    kappa: float = 30.0,
+):
+    """
+    Distance-dependent adjacency weights from TopoRetarget (arXiv:2606.16272), Eq. (5).
+
+    For each edge (i, j): w_tilde_ij = exp(-kappa * ||v_i - v_j||), then
+    row-normalized so that sum_j w_ij = 1 for every vertex i.
+
+    Per the paper, these weights are computed once on the *source* configuration
+    and reused unchanged for the robot-side Laplacian computation.
+
+    Args:
+        vertices (np.ndarray): (N, 3) array of source vertex positions.
+        adj_list (list of lists): Adjacency list for the mesh.
+        kappa (float): Spatial decay factor (paper uses 30 for meter-scale data).
+
+    Returns:
+        list of np.ndarray: edge_weights[i] holds the normalized weights for the
+            neighbors of vertex i, aligned with the order of adj_list[i].
+    """
+    edge_weights = []
+    for i in range(len(vertices)):
+        neighbors_indices = adj_list[i]
+        if len(neighbors_indices) > 0:
+            neighbor_positions = vertices[neighbors_indices]
+            distances = np.linalg.norm(vertices[i] - neighbor_positions, axis=1)
+            weights = np.exp(-kappa * distances)
+            weights = weights / np.sum(weights)
+            edge_weights.append(weights)
+        else:
+            edge_weights.append(np.zeros(0))
+    return edge_weights
+
+
+def estimate_body_height(
+    positions: np.ndarray,
+    target_names: list[str],
+    *,
+    head_joint: str = "Head",
+    foot_joints: tuple[str, str] = ("L_Foot", "R_Foot"),
+    head_top_offset: float = 0.12,
+    fallback_height: float = 1.75,
+    min_height: float = 1.4,
+    max_height: float = 2.2,
+) -> float | None:
+    """Estimate human height from joint positions by finding the head-to-foot distance.
+
+    Estimates height from the maximum head-to-foot Z-distance across all frames,
+    clipped to [*min_height*, *max_height*].  If named joints are not found in
+    *target_names*, returns *fallback_height*.  If *positions* is empty or
+    ``None``, returns ``None``.
+
+    Args:
+        positions: Joint positions array of shape ``(T, J, 3)``.
+        target_names: List of joint names corresponding to the J axis.
+        head_joint: Name of the head joint in *target_names*.
+        foot_joints: Names of the two foot joints in *target_names*.
+        head_top_offset: Additional offset to add for the top of the head.
+        fallback_height: Height to return if named joints are not found.
+        min_height: Minimum valid height for clipping.
+        max_height: Maximum valid height for clipping.
+
+    Returns:
+        Estimated height in meters, or ``None`` if *positions* is empty or ``None``.
+    """
+    if positions is None or len(positions) == 0:
+        return None
+
+    try:
+        head_idx = target_names.index(head_joint)
+    except ValueError:
+        return fallback_height
+
+    if head_idx >= positions.shape[1]:
+        return fallback_height
+
+    foot_indices: list[int] = []
+    for fn in foot_joints:
+        try:
+            idx = target_names.index(fn)
+            if idx < positions.shape[1]:
+                foot_indices.append(idx)
+        except ValueError:
+            pass
+
+    if not foot_indices:
+        return fallback_height
+
+    try:
+        head_positions = positions[:, head_idx, 2]
+        feet_positions = np.min(positions[:, foot_indices, 2], axis=1)
+        per_frame_height = np.abs(head_positions - feet_positions) + head_top_offset
+        estimated_height = float(np.max(per_frame_height))
+        return float(np.clip(estimated_height, min_height, max_height))
+    except (IndexError, TypeError):
+        return fallback_height
+
+
+def validate_robot_joint_mapping(
+    robot_model,
+    joint_mapping: dict,
+    raise_on_missing: bool = False
+) -> list:
+    """
+    Validate that robot links in joint_mapping exist in the robot model.
+    
+    This is a shared utility to avoid code duplication between OmniRetargeter
+    and GenericInteractionRetargeter.
+    
+    Args:
+        robot_model: MuJoCo model of the robot
+        joint_mapping: Dictionary mapping source target names to robot link (body) names
+        raise_on_missing: If True, raise ValueError when missing links are found.
+                         If False, return list of missing links.
+    
+    Returns:
+        List of missing robot link names (empty if all exist)
+    
+    Raises:
+        ValueError: If raise_on_missing=True and missing links are found
+    
+    Note:
+        joint_mapping maps source target names to robot BODY (link) names,
+        not joint names. This function checks for body names in the URDF.
+    """
+    robot_bodies = set()
+    for i in range(robot_model.nbody):
+        body_name = mujoco.mj_id2name(robot_model, mujoco.mjtObj.mjOBJ_BODY, i)
+        if body_name:
+            robot_bodies.add(body_name)
+    
+    mapped_bodies = set(
+        v["robot_link"] if isinstance(v, dict) else v
+        for v in joint_mapping.values()
+    )
+    missing_bodies = mapped_bodies - robot_bodies
+    
+    if missing_bodies and raise_on_missing:
+        missing_list = sorted(list(missing_bodies))
+        available_sample = sorted(list(robot_bodies))[:10]
+        raise ValueError(
+            f"The following robot links from joint_mapping were not found in URDF: {missing_list}. "
+            f"Please check your joint_mapping. Available bodies (first 10): {available_sample}..."
+        )
+    
+    return sorted(list(missing_bodies))
+
+
+def resolve_robot_height(config: dict, model: "mujoco.MjModel", data: "mujoco.MjData") -> float:
+    """Get robot height from config dict, falling back to MuJoCo geom detection.
+
+    Checks ``robot_height`` key in *config* first; if absent, calls
+    :func:`detect_robot_height` as a fallback.
+    """
+    height = config.get("robot_height")
+    if height is not None:
+        return float(height)
+    return detect_robot_height(model, data)
+
+
+def detect_robot_height(model: "mujoco.MjModel", data: "mujoco.MjData") -> float:
+    """Detect robot height from MuJoCo geom extents (includes head casing, etc.).
+
+    Shared by core.py, and the ``_visualize.py`` scripts to avoid code duplication.
+    Prefer :func:`resolve_robot_height` at call sites that already have a config dict.
+    """
+    mujoco.mj_resetData(model, data)
+    if model.njnt > 0 and model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE and model.nq >= 7:
+        data.qpos[3:7] = [1, 0, 0, 0]
+    mujoco.mj_forward(model, data)
+
+    min_z = float("inf")
+    max_z = float("-inf")
+    for geom_idx in range(model.ngeom):
+        z = float(data.geom_xpos[geom_idx][2])
+        geom_size = model.geom_size[geom_idx]
+        geom_type = model.geom_type[geom_idx]
+        if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+            r = float(geom_size[0])
+            min_z = min(min_z, z - r); max_z = max(max_z, z + r)
+        elif geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+            r = float(geom_size[0]); hh = float(geom_size[1])
+            min_z = min(min_z, z - hh - r); max_z = max(max_z, z + hh + r)
+        elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+            hs = float(geom_size[2])
+            min_z = min(min_z, z - hs); max_z = max(max_z, z + hs)
+        else:
+            min_z = min(min_z, z); max_z = max(max_z, z)
+    height = float(max_z - min_z)
+    if height < 0.3 or height > 3.0:
+        return 1.6
+    return height
+
+
+import re
+
+
+def _strip_xml_comments(xml_str: str) -> str:
+    """Remove XML comments from a string."""
+    return re.sub(r"<!--.*?-->", "", xml_str, flags=re.DOTALL)
+
+
+def _has_floating_joint(xml_str: str) -> bool:
+    """Return True if the URDF XML already contains a floating joint."""
+    return 'type="floating"' in _strip_xml_comments(xml_str)
+
+
+def _find_urdf_root_body(xml_str: str) -> str:
+    """Find the root body name in a URDF XML string.
+
+    The root body is the link that is never a ``<child>`` of any joint.
+    """
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(xml_str)
+    links: set[str] = set()
+    children: set[str] = set()
+
+    for link in root.findall("link"):
+        name = link.get("name")
+        if name:
+            links.add(name)
+
+    for joint in root.findall("joint"):
+        child = joint.find("child")
+        if child is not None:
+            child_name = child.get("link")
+            if child_name:
+                children.add(child_name)
+
+    root_candidates = links - children
+    root_candidates.discard("world")
+
+    if not root_candidates:
+        for link in root.findall("link"):
+            name = link.get("name")
+            if name and name != "world":
+                return name
+        raise ValueError("No root body found in URDF — cannot inject floating joint.")
+
+    return sorted(root_candidates)[0]
+
+
+def _inject_floating_joint(xml_str: str) -> str:
+    """Inject a world link and floating joint into a URDF XML string."""
+    import xml.etree.ElementTree as ET
+
+    root_body = _find_urdf_root_body(xml_str)
+    root = ET.fromstring(xml_str)
+
+    has_world = any(
+        link.get("name") == "world" for link in root.findall("link")
+    )
+
+    if not has_world:
+        root.insert(0, ET.Element("link", name="world"))
+
+    floating_joint = ET.Element("joint", name="floating_base", type="floating")
+    ET.SubElement(floating_joint, "parent", link="world")
+    ET.SubElement(floating_joint, "child", link=root_body)
+
+    world_idx = None
+    for i, elem in enumerate(root):
+        if elem.tag == "link" and elem.get("name") == "world":
+            world_idx = i
+            break
+
+    if world_idx is not None:
+        root.insert(world_idx + 1, floating_joint)
+    else:
+        root.insert(0, floating_joint)
+
+    return ET.tostring(root, encoding="unicode")
+
+
+def load_robot_urdf_with_floating_base(urdf_path: str | Path) -> "mujoco.MjModel":
+    """Load a URDF into a MuJoCo model, auto-injecting a floating joint if missing.
+
+    MuJoCo treats a URDF's base link as fixed to the world unless there is a
+    ``<joint type="floating">`` connecting a world reference to the base.
+    This function detects when a floating joint is absent and injects one
+    automatically, so callers always receive a free-floating model.
+
+    Args:
+        urdf_path: Path to the URDF file. Relative mesh paths inside the URDF
+                   are resolved relative to the URDF directory.
+
+    Returns:
+        A MuJoCo ``MjModel`` that is guaranteed to have a floating base joint
+        as the first joint.
+    """
+    import os
+
+    urdf_path = Path(urdf_path)
+    xml_str = urdf_path.read_text(encoding="utf-8")
+
+    if not _has_floating_joint(xml_str):
+        xml_str = _inject_floating_joint(xml_str)
+
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(str(urdf_path.parent))
+        return mujoco.MjModel.from_xml_string(xml_str)
+    finally:
+        os.chdir(old_cwd)
+
+
+# SMPL-X end-effector marker sampling and frame densification. Ported from
+# the contact-priority line; consumed by contact inference and by callers that
+# need hand/foot surface samples rather than joint positions alone.
