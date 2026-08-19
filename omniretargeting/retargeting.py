@@ -139,6 +139,7 @@ class GenericInteractionRetargeter:
         foot_sticking_tolerance: float = 1e-3,
         collision_detection_threshold: float = 0.1,
         terrain_sample_points: int = 100,
+        terrain_sample_seed: Optional[int] = None,
         valid_joint_names: Optional[List[str]] = None,
         replace_cylinders_with_capsules: bool = False,
         hard_penetration_constraint: bool = False,
@@ -159,6 +160,8 @@ class GenericInteractionRetargeter:
             foot_sticking_tolerance: Tolerance for foot sticking
             collision_detection_threshold: Distance threshold for collision detection
             terrain_sample_points: Number of sampled terrain points for interaction mesh
+            terrain_sample_seed: Seed for the terrain surface draw. Leave unset for the
+                legacy random draw; set it to compare two runs against each other.
             valid_joint_names: Ordered list of joint names to ensure consistent ordering
             replace_cylinders_with_capsules: If True, replace all cylinder collision geoms
                 with capsules before computing penetration constraints. This matches
@@ -207,6 +210,9 @@ class GenericInteractionRetargeter:
         self.foot_sticking_tolerance = foot_sticking_tolerance
         self.collision_detection_threshold = collision_detection_threshold
         self.terrain_sample_points = int(terrain_sample_points)
+        self.terrain_sample_seed = (
+            None if terrain_sample_seed is None else int(terrain_sample_seed)
+        )
         self.preserve_root_z = bool(preserve_root_z)
 
         # Apply cylinder → capsule replacement if requested
@@ -1145,7 +1151,9 @@ class GenericInteractionRetargeter:
     def _setup_terrain_interaction(self):
         """Setup terrain interaction parameters."""
         # Sample points on terrain for interaction mesh
-        self.terrain_points = sample_points_on_mesh(self.terrain_mesh, self.terrain_sample_points)
+        self.terrain_points = sample_points_on_mesh(
+            self.terrain_mesh, self.terrain_sample_points, seed=self.terrain_sample_seed
+        )
 
 
     def create_interaction_mesh(self, human_joints: np.ndarray, terrain_points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

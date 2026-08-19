@@ -569,6 +569,7 @@ def test_perform_retargeting_passes_hard_penetration_constraint():
         1.0,
         collision_detection_threshold=0.2,
         terrain_sample_points=123,
+        terrain_sample_seed=None,
         valid_joint_names=["Pelvis"],
         replace_cylinders_with_capsules=True,
         hard_penetration_constraint=False,

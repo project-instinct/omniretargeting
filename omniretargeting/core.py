@@ -379,12 +379,33 @@ class OmniRetargeter:
                             else ""
                         )
                     )
-                if after["max_depth"] > before["max_depth"] + 1e-4:
+                deeper = after["max_depth"] > before["max_depth"] + 1e-4
+                spread_improved = (
+                    after["frames_penetrating"] < before["frames_penetrating"]
+                )
+                if deeper and not spread_improved:
                     print(
                         "Scene penetration warning: refinement increased the "
-                        "worst penetration depth. Tighten "
-                        "trajectory_refinement.penetration.sigma or relax "
-                        "acceleration_sigma/jerk_sigma."
+                        "worst penetration depth without clearing frames. "
+                        "Tighten trajectory_refinement.penetration.sigma or "
+                        "relax acceleration_sigma/jerk_sigma."
+                    )
+                elif deeper:
+                    # The worst point is usually an end effector held on its
+                    # contact anchor, so its depth is a floor the joint-space
+                    # correction cannot go below.  Once refinement has pushed
+                    # every other point down to that floor, a fractional change
+                    # at the floor itself is not a regression -- the honest
+                    # signal is that far fewer frames penetrate at all.
+                    print(
+                        "Scene penetration note: the worst point deepened by "
+                        f"{(after['max_depth'] - before['max_depth']) * 100.0:.2f} cm "
+                        f"while penetrating frames fell from "
+                        f"{before['frames_penetrating']} to "
+                        f"{after['frames_penetrating']}. "
+                        f"{after['worst_body']}@{after['worst_frame']} is pinned "
+                        "by its contact anchor; loosen that effector's contact "
+                        "task if the residual depth matters."
                     )
         retargeted_motion = self._apply_trajectory_smoothing(
             retargeted_motion,
@@ -607,6 +628,7 @@ class OmniRetargeter:
             self.robot_height,
             collision_detection_threshold=float(self.retargeting_config.get("collision_detection_threshold", 0.1)),
             terrain_sample_points=int(self.retargeting_config.get("terrain_sample_points", 100)),
+            terrain_sample_seed=self.retargeting_config.get("terrain_sample_seed"),
             valid_joint_names=self.valid_joint_names,  # CRITICAL: Pass ordered joint names for consistency
             replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
             hard_penetration_constraint=self.retargeting_config.get("penetration_resolver", "hard_constraint") == "hard_constraint",

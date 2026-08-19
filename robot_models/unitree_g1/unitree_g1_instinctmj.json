@@ -1,6 +1,10 @@
 {
   "name": "unitree_g1_instinctmj_torso_base",
-  "urdf_path": "/home/duanxin/Xyk/Project-Instinct/InstinctMJ/src/instinct_mj/assets/resources/unitree_g1/xml/g1_29dof_torsobase_popsicle.xml",
+  "urdf_path": [
+    "${OMNIRETARGETING_ASSETS}/unitree_g1/xml/g1_29dof_torsobase_popsicle.xml",
+    "~/omniretargeting_assets/unitree_g1/xml/g1_29dof_torsobase_popsicle.xml",
+    "~/Xyk/Project-Instinct/InstinctMJ/src/instinct_mj/assets/resources/unitree_g1/xml/g1_29dof_torsobase_popsicle.xml"
+  ],
   "smplx_joint_names": [
     "Pelvis",
     "L_Hip",
@@ -83,20 +87,62 @@
       "orientation_sigma": 0.1308996939,
       "swing_morphology_scale": 1.0,
       "joint_posture_limits": {
-        "left_shoulder_pitch_joint": [-2.0943951024, 2.0943951024],
-        "right_shoulder_pitch_joint": [-2.0943951024, 2.0943951024],
-        "left_shoulder_roll_joint": [-1.0471975512, 1.5707963268],
-        "right_shoulder_roll_joint": [-1.5707963268, 1.0471975512],
-        "left_shoulder_yaw_joint": [-1.5707963268, 1.5707963268],
-        "right_shoulder_yaw_joint": [-1.5707963268, 1.5707963268],
-        "left_elbow_joint": [0.0, 2.0943951024],
-        "right_elbow_joint": [0.0, 2.0943951024],
-        "left_wrist_roll_joint": [-0.7853981634, 0.7853981634],
-        "right_wrist_roll_joint": [-0.7853981634, 0.7853981634],
-        "left_wrist_pitch_joint": [-0.6108652382, 0.6108652382],
-        "right_wrist_pitch_joint": [-0.6108652382, 0.6108652382],
-        "left_wrist_yaw_joint": [-0.7853981634, 0.7853981634],
-        "right_wrist_yaw_joint": [-0.7853981634, 0.7853981634]
+        "left_shoulder_pitch_joint": [
+          -2.0943951024,
+          2.0943951024
+        ],
+        "right_shoulder_pitch_joint": [
+          -2.0943951024,
+          2.0943951024
+        ],
+        "left_shoulder_roll_joint": [
+          -1.0471975512,
+          1.5707963268
+        ],
+        "right_shoulder_roll_joint": [
+          -1.5707963268,
+          1.0471975512
+        ],
+        "left_shoulder_yaw_joint": [
+          -1.5707963268,
+          1.5707963268
+        ],
+        "right_shoulder_yaw_joint": [
+          -1.5707963268,
+          1.5707963268
+        ],
+        "left_elbow_joint": [
+          0.0,
+          2.0943951024
+        ],
+        "right_elbow_joint": [
+          0.0,
+          2.0943951024
+        ],
+        "left_wrist_roll_joint": [
+          -0.7853981634,
+          0.7853981634
+        ],
+        "right_wrist_roll_joint": [
+          -0.7853981634,
+          0.7853981634
+        ],
+        "left_wrist_pitch_joint": [
+          -0.6108652382,
+          0.6108652382
+        ],
+        "right_wrist_pitch_joint": [
+          -0.6108652382,
+          0.6108652382
+        ],
+        "left_wrist_yaw_joint": [
+          -0.7853981634,
+          0.7853981634
+        ],
+        "right_wrist_yaw_joint": [
+          -0.7853981634,
+          0.7853981634
+        ]
       },
       "pose_direction": {
         "enabled": false,
@@ -110,14 +156,38 @@
         "acceleration_enabled": false,
         "acceleration_sigma": 0.1,
         "edges": [
-          ["L_Shoulder", "L_Elbow"],
-          ["L_Elbow", "L_Wrist"],
-          ["R_Shoulder", "R_Elbow"],
-          ["R_Elbow", "R_Wrist"],
-          ["L_Hip", "L_Knee"],
-          ["L_Knee", "L_Ankle"],
-          ["R_Hip", "R_Knee"],
-          ["R_Knee", "R_Ankle"]
+          [
+            "L_Shoulder",
+            "L_Elbow"
+          ],
+          [
+            "L_Elbow",
+            "L_Wrist"
+          ],
+          [
+            "R_Shoulder",
+            "R_Elbow"
+          ],
+          [
+            "R_Elbow",
+            "R_Wrist"
+          ],
+          [
+            "L_Hip",
+            "L_Knee"
+          ],
+          [
+            "L_Knee",
+            "L_Ankle"
+          ],
+          [
+            "R_Hip",
+            "R_Knee"
+          ],
+          [
+            "R_Knee",
+            "R_Ankle"
+          ]
         ]
       },
       "temporal": {
@@ -185,8 +255,16 @@
           "up_orientation_sigma": 0.22,
           "contact_orientation_weight": 1.5,
           "swing_orientation_weight": 1.0,
-          "orientation_local_forward": [1.0, 0.0, 0.0],
-          "orientation_local_up": [0.0, -1.0, 0.0],
+          "orientation_local_forward": [
+            1.0,
+            0.0,
+            0.0
+          ],
+          "orientation_local_up": [
+            0.0,
+            -1.0,
+            0.0
+          ],
           "orientation_joint_tokens": [
             "left_wrist_roll_joint",
             "left_wrist_pitch_joint",
@@ -205,13 +283,37 @@
             "upper_direction_sigma": 0.015,
             "forearm_direction_sigma": 0.015
           },
-          "tracking_offset": [0.0864, -0.0155, 0.0049],
+          "tracking_offset": [
+            0.0864,
+            -0.0155,
+            0.0049
+          ],
           "contact_offsets": [
-            [0.0864, -0.0155, 0.0049],
-            [0.1318, -0.0312, 0.0067],
-            [0.1289, -0.0479, 0.0068],
-            [0.1157, -0.0325, -0.0430],
-            [0.0851, -0.0235, 0.0634]
+            [
+              0.0864,
+              -0.0155,
+              0.0049
+            ],
+            [
+              0.1318,
+              -0.0312,
+              0.0067
+            ],
+            [
+              0.1289,
+              -0.0479,
+              0.0068
+            ],
+            [
+              0.1157,
+              -0.0325,
+              -0.043
+            ],
+            [
+              0.0851,
+              -0.0235,
+              0.0634
+            ]
           ]
         },
         "right_hand": {
@@ -225,8 +327,16 @@
           "up_orientation_sigma": 0.22,
           "contact_orientation_weight": 1.5,
           "swing_orientation_weight": 1.0,
-          "orientation_local_forward": [1.0, 0.0, 0.0],
-          "orientation_local_up": [0.0, -1.0, 0.0],
+          "orientation_local_forward": [
+            1.0,
+            0.0,
+            0.0
+          ],
+          "orientation_local_up": [
+            0.0,
+            -1.0,
+            0.0
+          ],
           "orientation_joint_tokens": [
             "right_wrist_roll_joint",
             "right_wrist_pitch_joint",
@@ -245,19 +355,47 @@
             "upper_direction_sigma": 0.015,
             "forearm_direction_sigma": 0.015
           },
-          "tracking_offset": [0.0877, 0.0159, 0.0052],
+          "tracking_offset": [
+            0.0877,
+            0.0159,
+            0.0052
+          ],
           "contact_offsets": [
-            [0.0877, 0.0159, 0.0052],
-            [0.1318, 0.0313, 0.0067],
-            [0.1289, 0.0479, 0.0068],
-            [0.1157, 0.0326, -0.0430],
-            [0.0851, 0.0235, 0.0634]
+            [
+              0.0877,
+              0.0159,
+              0.0052
+            ],
+            [
+              0.1318,
+              0.0313,
+              0.0067
+            ],
+            [
+              0.1289,
+              0.0479,
+              0.0068
+            ],
+            [
+              0.1157,
+              0.0326,
+              -0.043
+            ],
+            [
+              0.0851,
+              0.0235,
+              0.0634
+            ]
           ]
         },
         "left_foot": {
           "robot_body": "left_ankle_roll_link",
           "preserve_world_target": true,
-          "tracking_offset": [0.039, 0.0, -0.035],
+          "tracking_offset": [
+            0.039,
+            0.0,
+            -0.035
+          ],
           "track_orientation": true,
           "track_swing_heading": true,
           "track_swing_orientation": true,
@@ -266,13 +404,21 @@
           "swing_morphology_scale": 1.0,
           "max_orientation_step": 0.1745329252,
           "contact_offsets": [
-            [0.039, 0.0, -0.035]
+            [
+              0.039,
+              0.0,
+              -0.035
+            ]
           ]
         },
         "right_foot": {
           "robot_body": "right_ankle_roll_link",
           "preserve_world_target": true,
-          "tracking_offset": [0.039, 0.0, -0.035],
+          "tracking_offset": [
+            0.039,
+            0.0,
+            -0.035
+          ],
           "track_orientation": true,
           "track_swing_heading": true,
           "track_swing_orientation": true,
@@ -281,7 +427,11 @@
           "swing_morphology_scale": 1.0,
           "max_orientation_step": 0.1745329252,
           "contact_offsets": [
-            [0.039, 0.0, -0.035]
+            [
+              0.039,
+              0.0,
+              -0.035
+            ]
           ]
         }
       }
@@ -392,7 +542,7 @@
         }
       },
       "trust_region": 0.12,
-      "solver_tolerance": 0.00001,
+      "solver_tolerance": 1e-05,
       "solver_iterations": 80,
       "step_tolerance": 0.0001,
       "sigma_reference_framerate": 30.0,
@@ -456,6 +606,7 @@
         "L_Wrist",
         "R_Wrist"
       ]
-    }
+    },
+    "terrain_sample_seed": 0
   }
 }

@@ -64,3 +64,53 @@ def test_bundled_robot_profiles_match_urdf_bodies(profile_path: Path):
     missing = sorted(set(loaded["joint_mapping"].values()) - body_names)
 
     assert missing == []
+
+
+def _write_profile(tmp_path, urdf_path):
+    profile = tmp_path / "profile.json"
+    profile.write_text(
+        json.dumps({"urdf_path": urdf_path, "joint_mapping": {"Pelvis": "pelvis"}})
+    )
+    return profile
+
+
+def test_urdf_path_list_picks_the_first_candidate_that_exists(tmp_path):
+    present = tmp_path / "there.urdf"
+    present.write_text("<robot name='x'/>")
+    profile = _write_profile(
+        tmp_path, ["${OMNIRETARGETING_ASSETS_UNSET_IN_TESTS}/x.urdf", "missing.urdf", "there.urdf"]
+    )
+
+    loaded = load_robot_config(profile)
+
+    assert Path(loaded["urdf_path"]) == present.resolve()
+
+
+def test_urdf_path_list_reports_every_candidate_when_none_exist(tmp_path):
+    profile = _write_profile(tmp_path, ["a.urdf", "b.urdf"])
+
+    with pytest.raises(FileNotFoundError) as excinfo:
+        load_robot_config(profile)
+
+    assert "a.urdf" in str(excinfo.value)
+    assert "b.urdf" in str(excinfo.value)
+
+
+def test_single_urdf_path_still_resolves_without_existing(tmp_path):
+    """A lone path keeps the old contract: resolve it, let the loader complain."""
+    profile = _write_profile(tmp_path, "not_created_yet.urdf")
+
+    loaded = load_robot_config(profile)
+
+    assert Path(loaded["urdf_path"]) == (tmp_path / "not_created_yet.urdf").resolve()
+
+
+def test_user_home_is_expanded_in_urdf_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    present = tmp_path / "home.urdf"
+    present.write_text("<robot name='x'/>")
+    profile = _write_profile(tmp_path, ["~/home.urdf"])
+
+    loaded = load_robot_config(profile)
+
+    assert Path(loaded["urdf_path"]) == present.resolve()
