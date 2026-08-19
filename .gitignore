@@ -177,3 +177,7 @@ robot_models/*/*_floating.urdf
 # lives in scripts/diagnose_foot_pose.py.
 check_sole.py
 check_contact.py
+
+# RLCR loop state is per-session working data, not project source.
+.humanize/rlcr/
+.humanize/.pending-session-id
