@@ -11,7 +11,10 @@ from scipy.spatial.transform import Rotation
 
 from omniretargeting.data_sources.base import DataSource, MotionData, MotionFrame
 from omniretargeting.data_sources.registry import register_data_source
-from omniretargeting.utils import estimate_body_height
+from omniretargeting.utils import (
+    _fallback_end_effector_markers,
+    estimate_body_height,
+)
 
 # T-pose body-aligned rotation: maps body-frame to SMPL-X T-pose frame.
 # SMPL-X canonical pose has body facing approx. +Z, Y-up.
@@ -265,9 +268,27 @@ class SmplxDataSource(DataSource):
     def load_trajectory(
         self,
         return_meta: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray | None] | tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+        return_end_effectors: bool = False,
+        end_effector_samples: int = 32,
+    ) -> tuple:
         motion_data = self.load()
         orientations = motion_data.metadata.get("joint_orientations")
+        if return_end_effectors:
+            # Surface markers are only available when the loader ran the body
+            # model. Position-only sources fall back to the mapped hand and foot
+            # joints so contact inference still has a marker set to work with.
+            markers = motion_data.metadata.get("end_effector_markers")
+            if markers is None:
+                markers = _fallback_end_effector_markers(motion_data.positions)
+            if return_meta:
+                return (
+                    motion_data.positions,
+                    orientations,
+                    motion_data.root_orientations,
+                    motion_data.root_translations,
+                    markers,
+                )
+            return motion_data.positions, orientations, markers
         if return_meta:
             return motion_data.positions, orientations, motion_data.root_orientations, motion_data.root_translations
         return motion_data.positions, orientations
@@ -512,12 +533,18 @@ def load_smplx_trajectory(
     smplx_model_directory: Optional[str] = None,
     gender: str = "neutral",
     return_meta: bool = False,
-) -> tuple[np.ndarray, np.ndarray | None] | tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    return_end_effectors: bool = False,
+    end_effector_samples: int = 32,
+) -> tuple:
     return SmplxDataSource(
         motion_file=smplx_file,
         model_directory=smplx_model_directory,
         gender=gender,
-    ).load_trajectory(return_meta=return_meta)
+    ).load_trajectory(
+        return_meta=return_meta,
+        return_end_effectors=return_end_effectors,
+        end_effector_samples=end_effector_samples,
+    )
 
 
 def retarget_smplx_to_robot(

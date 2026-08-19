@@ -25,6 +25,99 @@ from .utils import (
 from .data_sources.base import validate_motion_positions
 
 
+# Module-level helpers shared with trajectory_refinement. Ported from the
+# contact-priority line so whole-trajectory refinement can reuse the same
+# target transforms and joint-limit resolution as the framewise solver.
+def _transform_swing_target(
+    tracking_position: np.ndarray,
+    source_root_position: np.ndarray | None,
+    robot_root_z_offset: float,
+    morphology_scale: float,
+    preserve_world_target: bool = False,
+) -> np.ndarray:
+    """Express a source end-effector target around the robot root target.
+
+    The root-height offset is a world-space registration correction and must
+    therefore be applied even when ``morphology_scale`` is exactly one.  The
+    previous implementation skipped the entire transform at unit scale, which
+    left swing hands and feet at the human actor's height after the shorter
+    robot root had been moved down.
+    """
+    target = np.asarray(tracking_position, dtype=float).reshape(3)
+    if preserve_world_target or source_root_position is None:
+        return target.copy()
+    source_root = np.asarray(source_root_position, dtype=float).reshape(3)
+    robot_root_target = source_root.copy()
+    robot_root_target[2] += float(robot_root_z_offset)
+    return robot_root_target + float(morphology_scale) * (target - source_root)
+
+def _clamp_target_to_reach(
+    target: np.ndarray,
+    reach_origin: np.ndarray,
+    max_reach: float | None,
+) -> np.ndarray:
+    """Project an unreachable swing target onto a robot reach sphere.
+
+    Contact targets are intentionally not passed through this helper: they
+    describe real scene interactions and must stay in world coordinates.  For
+    free-space motion, chasing an impossible target only drives redundant arm
+    joints into their limits and creates an unnatural straight or folded arm.
+    """
+    result = np.asarray(target, dtype=float).reshape(3).copy()
+    if max_reach is None or float(max_reach) <= 0.0:
+        return result
+    origin = np.asarray(reach_origin, dtype=float).reshape(3)
+    delta = result - origin
+    distance = float(np.linalg.norm(delta))
+    if distance <= float(max_reach) or distance <= 1e-10:
+        return result
+    return origin + delta * (float(max_reach) / distance)
+
+def _apply_configured_joint_limits(
+    model: mujoco.MjModel,
+    qpos_indices: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    configured_limits: Mapping[str, Any] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Intersect mechanical limits with configured task-safe joint bounds."""
+    result_lower = np.asarray(lower, dtype=float).copy()
+    result_upper = np.asarray(upper, dtype=float).copy()
+    coordinate_by_qpos = {
+        int(qpos_idx): coordinate_idx
+        for coordinate_idx, qpos_idx in enumerate(qpos_indices)
+    }
+    for joint_name, raw_bounds in dict(configured_limits or {}).items():
+        bounds = np.asarray(raw_bounds, dtype=float).reshape(-1)
+        if bounds.shape != (2,):
+            raise ValueError(
+                f"joint_posture_limits['{joint_name}'] must contain [lower, upper]."
+            )
+        joint_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_JOINT, str(joint_name)
+        )
+        if joint_id < 0:
+            raise ValueError(
+                f"joint_posture_limits refers to missing joint '{joint_name}'."
+            )
+        qpos_idx = int(model.jnt_qposadr[joint_id])
+        coordinate_idx = coordinate_by_qpos.get(qpos_idx)
+        if coordinate_idx is None:
+            continue
+        result_lower[coordinate_idx] = max(
+            result_lower[coordinate_idx], float(bounds[0])
+        )
+        result_upper[coordinate_idx] = min(
+            result_upper[coordinate_idx], float(bounds[1])
+        )
+        if result_lower[coordinate_idx] > result_upper[coordinate_idx]:
+            raise ValueError(
+                f"joint_posture_limits for '{joint_name}' do not overlap its "
+                "mechanical range."
+            )
+    return result_lower, result_upper
+
+
 def parse_bone_chains(
     chains: List[List[str]],
     source_target_names: List[str],

@@ -456,6 +456,21 @@ print(f"Joint names: {retargeter.get_joint_names()}")
 pytest tests/
 ```
 
+## Viewing Retargeted Output with mjviser
+
+Install the package after syncing dependencies, then open any retargeted output:
+
+```bash
+omniretargeting-mjviser /path/to/retargeted_motion.npz \
+  --robot-config robot_models/unitree_g1/unitree_g1_instinctmj.json \
+  --terrain /path/to/scene_tsdf.obj
+```
+
+The viewer reads `base_pos_w`, `base_quat_w`, `joint_pos`, and `joint_names`
+from `.npz` outputs. If `object_pos_w/object_quat_w` are present, it can also
+show an object mesh via `--object-mesh`, or infer common OMOMO meshes from
+`~/Datasets/OMOMO/data/captured_objects`.
+
 ## API Reference
 
 ### `OmniRetargeter`
@@ -533,6 +548,29 @@ holosoma_retargeting project to work with generic robots and terrains:
    - `hard_constraint` – penetration inequalities inside the SQP.
    - `xyz_nudge` – post-optimization foot stabilization that projects probe points out of the terrain and smooths XY drift (see `foot_stabilization` in the profile).
 6. **Joint Limits**: Respects robot joint limits throughout.
+
+### Contact inference and whole-trajectory refinement
+
+`omniretargeting/contact.py` infers scene contact for hands and feet. The
+SMPL-X loader samples stable hand and foot surface vertices
+(`load_smplx_trajectory(..., return_end_effectors=True)`); contact is then
+detected from distance and relative speed, and every contiguous contact
+interval is anchored to the scene mesh. `infer_scene_contact_tasks` returns
+`SceneContactTask` records that carry the anchored world targets, the contact
+mask, and per-frame confidence.
+
+`omniretargeting/trajectory_refinement.py` runs a whole-trajectory pass over an
+already-retargeted joint trajectory. `refine_joint_trajectory` resolves scene
+penetration with bounded, temporally regularized joint-space corrections while
+holding the reachable hand/foot world targets, keeping the floating base fixed
+and respecting joint limits. `measure_scene_penetration` reports before/after
+depth so the correction can be audited per body and frame.
+
+Both modules are usable directly against a retargeted trajectory. They are not
+yet wired into the framewise SQP solver in `retargeting.py`, which performs its
+own scene-contact handling via `_setup_scene_contact`; the
+`end_effector_priority` block in `robot_models/unitree_g1/unitree_g1_instinctmj.json`
+is carried for the contact-priority branch and is not read by this solver.
 
 ## Limitations
 

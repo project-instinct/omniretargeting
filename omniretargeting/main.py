@@ -23,6 +23,23 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ROBOT_CONFIG_PATH = REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json"
 
 
+def extract_omomo_object_pose(motion_path, num_frames):
+    """Extract OMOMO object world pose from the source qpos if present."""
+    motion_data = np.load(motion_path, allow_pickle=True)
+    if "qpos" not in motion_data:
+        return None
+
+    qpos = motion_data["qpos"]
+    if qpos.ndim != 2 or qpos.shape[0] < num_frames or qpos.shape[1] < 43:
+        return None
+
+    # OMOMO stores the object rotation in the opposite convention from MuJoCo/Viser.
+    object_quat = np.array(qpos[:num_frames, 36:40], copy=True)
+    object_quat[:, 1:] *= -1.0
+    object_pos = qpos[:num_frames, 40:43]
+    return object_pos, object_quat
+
+
 def load_source_config(yaml_path: Path) -> dict:
     """Load source configuration from YAML file."""
     yaml_path = Path(yaml_path)

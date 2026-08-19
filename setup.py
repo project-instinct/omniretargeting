@@ -18,6 +18,7 @@ setup(
         # Due to mujoco `strippath` default value in URDF parsing updated, `strippath=false` by default.
         "mujoco>=3.7.0",
         "viser",
+        "mjviser @ git+https://github.com/mujocolab/mjviser@4ba054b9bdaf4f7604d6fa7a8b8c2f917daf43c2",
         "robot_descriptions",
         "yourdfpy",
         "clarabel",
@@ -33,5 +34,10 @@ setup(
         "all": ["smplx", "torch"],
         "dev": ["mypy", "ruff", "pytest", "black"],
         "test": ["pytest", "pytest-cov"],
+    },
+    entry_points={
+        "console_scripts": [
+            "omniretargeting-mjviser=omniretargeting.mjviser_viewer:main",
+        ],
     },
 )
