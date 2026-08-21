@@ -412,6 +412,9 @@ class OmniRetargeter:
             framerate=float(framerate or 30.0),
         )
 
+        if end_effector_tasks:
+            self._report_final_motion_quality(retargeted_motion, end_effector_tasks)
+
         foot_stabilization_cfg = dict(retargeting_config.get("foot_stabilization", {}) or {})
         if end_effector_tasks and bool(foot_stabilization_cfg.get("enabled", False)):
             print(
@@ -493,6 +496,107 @@ class OmniRetargeter:
                 result[:, qpos_index], lower, upper
             )
         return result
+
+    def _report_final_motion_quality(
+        self,
+        trajectory: np.ndarray,
+        tasks: Dict[str, SceneContactTask],
+    ) -> None:
+        """Print acceptance metrics for the trajectory that is delivered.
+
+        End-effector world-position errors, contact residuals, and temporal
+        jitter are reported separately and after every post-processing stage,
+        so the numbers describe the motion actually written to disk (scene
+        penetration is reported by the refinement stage against the same
+        trajectory unless smoothing is enabled afterwards).
+        """
+        end_effector_cfg = dict(
+            self.retargeting_config.get("end_effector_priority", {}) or {}
+        )
+        specs = dict(end_effector_cfg.get("effectors", {}) or {})
+        if not tasks or not specs or len(trajectory) == 0:
+            return
+        data = mujoco.MjData(self.robot_model)
+        contact_errors: Dict[str, List[float]] = {name: [] for name in tasks}
+        swing_errors: Dict[str, List[float]] = {name: [] for name in tasks}
+        for frame_idx, qpos in enumerate(np.asarray(trajectory, dtype=float)):
+            data.qpos[:] = qpos
+            mujoco.mj_forward(self.robot_model, data)
+            for name, task in tasks.items():
+                spec = dict(specs.get(name) or {})
+                body_name = spec.get("robot_body")
+                if not body_name:
+                    continue
+                body_id = mujoco.mj_name2id(
+                    self.robot_model, mujoco.mjtObj.mjOBJ_BODY, str(body_name)
+                )
+                if body_id < 0:
+                    continue
+                rotation = data.xmat[body_id].reshape(3, 3)
+                tracking_offset = np.asarray(
+                    spec.get("tracking_offset", [0.0, 0.0, 0.0]), dtype=float
+                ).reshape(3)
+                if bool(task.contact_mask[frame_idx]):
+                    contact_offsets = np.asarray(
+                        spec.get("contact_offsets", [tracking_offset.tolist()]),
+                        dtype=float,
+                    )
+                    if contact_offsets.ndim == 1:
+                        contact_offsets = contact_offsets[None, :]
+                    candidates = (
+                        data.xpos[body_id][None, :] + contact_offsets @ rotation.T
+                    )
+                    contact_errors[name].append(
+                        float(
+                            np.min(
+                                np.linalg.norm(
+                                    candidates
+                                    - task.contact_positions[frame_idx][None, :],
+                                    axis=1,
+                                )
+                            )
+                        )
+                    )
+                else:
+                    marker = data.xpos[body_id] + rotation @ tracking_offset
+                    swing_errors[name].append(
+                        float(
+                            np.linalg.norm(
+                                marker - task.tracking_positions[frame_idx]
+                            )
+                        )
+                    )
+        print("Final motion quality (after all post-processing):")
+        for name in tasks:
+            parts = []
+            for label, errors in (
+                ("contact", contact_errors[name]),
+                ("swing", swing_errors[name]),
+            ):
+                if errors:
+                    values = np.asarray(errors) * 100.0
+                    parts.append(
+                        f"{label}[{len(errors)}f] mean={values.mean():.2f} "
+                        f"p95={np.percentile(values, 95):.2f} "
+                        f"max={values.max():.2f} cm"
+                    )
+                else:
+                    parts.append(f"{label}[0f]")
+            print(f"  {name}: " + " | ".join(parts))
+        actuated = np.asarray(trajectory, dtype=float)[:, 7:]
+        if len(actuated) >= 4 and actuated.shape[1] > 0:
+            acceleration = np.diff(actuated, n=2, axis=0)
+            jerk = np.diff(actuated, n=3, axis=0)
+            base_acceleration = np.diff(
+                np.asarray(trajectory, dtype=float)[:, :3], n=2, axis=0
+            )
+            print(
+                "  temporal jitter: joint |acc| "
+                f"rms={np.sqrt(np.mean(acceleration**2)):.5f} "
+                f"max={np.max(np.abs(acceleration)):.4f} rad/frame^2, "
+                f"|jerk| rms={np.sqrt(np.mean(jerk**2)):.5f}, "
+                f"base |acc| rms={np.sqrt(np.mean(base_acceleration**2)):.5f} m/frame^2"
+            )
 
     def _compute_terrain_scale(
         self,

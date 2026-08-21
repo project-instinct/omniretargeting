@@ -333,13 +333,16 @@ class GenericInteractionRetargeter:
 
         Offsets are expressed in the corresponding MuJoCo body frame.  A
         contact task may expose several surface points (for example heel,
-        toe, and sole corners); at every SQP iteration we select the point
-        closest to the human-derived scene anchor.  This avoids incorrectly
+        toe, and sole corners); the point closest to the human-derived scene
+        anchor is selected when a contact run starts and then kept for the
+        whole run, so the active marker cannot chatter between neighbouring
+        offsets across SQP iterations or frames.  This avoids incorrectly
         forcing the ankle or wrist joint centre onto the scene surface.
         """
         cfg = self.end_effector_config
         self.end_effector_enabled = bool(cfg.get("enabled", False))
         self.end_effectors: Dict[str, Dict[str, Any]] = {}
+        self._active_contact_offsets: Dict[str, int] = {}
         if not self.end_effector_enabled:
             return
 
@@ -450,6 +453,18 @@ class GenericInteractionRetargeter:
         """Cache robot bone lengths for source/robot direction matching."""
         pose_cfg = dict(self.end_effector_config.get("pose_direction", {}) or {})
         self.pose_direction_enabled = bool(pose_cfg.get("enabled", True))
+        # The whole-step bisection projection rescales every optimized
+        # coordinate toward the previous frame, so it can undo contact and
+        # swing progress that the convex solve already secured.  Profiles that
+        # rely on the in-problem direction constraints can turn it off.
+        self.pose_direction_post_projection = bool(
+            pose_cfg.get("post_projection", True)
+        )
+        # The direction-velocity target transports an ambient difference
+        # between different points of the unit sphere, which can fight the
+        # position-level direction matching; profiles can keep only the
+        # position-level term.
+        self.pose_velocity_enabled = bool(pose_cfg.get("velocity_enabled", True))
         self.pose_direction_sigma = max(float(pose_cfg.get("sigma", 0.12)), 1e-6)
         self.pose_arm_weight = max(float(pose_cfg.get("arm_weight", 1.0)), 0.0)
         self.pose_leg_weight = max(float(pose_cfg.get("leg_weight", 1.0)), 0.0)
@@ -677,7 +692,8 @@ class GenericInteractionRetargeter:
     ) -> Optional[cp.Expression]:
         """Track captured bone-direction velocity instead of chasing frames."""
         if (
-            target_human_joints is None
+            not self.pose_velocity_enabled
+            or target_human_joints is None
             or previous_human_joints is None
             or not last_directions
         ):
@@ -887,11 +903,23 @@ class GenericInteractionRetargeter:
 
             if bool(target_data.get("contact", False)):
                 target = np.asarray(target_data["contact_position"], dtype=float).reshape(3)
-                candidates = []
-                for offset in spec["contact_offsets"]:
-                    position, jacobian = self._point_position_and_jacobian(body_id, offset)
-                    candidates.append((np.linalg.norm(position - target), position, jacobian))
-                _, position, jacobian = min(candidates, key=lambda item: item[0])
+                offset_index = self._active_contact_offsets.get(name)
+                if offset_index is None:
+                    offset_index = int(
+                        np.argmin(
+                            [
+                                np.linalg.norm(
+                                    self._point_position_and_jacobian(body_id, offset)[0]
+                                    - target
+                                )
+                                for offset in spec["contact_offsets"]
+                            ]
+                        )
+                    )
+                    self._active_contact_offsets[name] = offset_index
+                position, jacobian = self._point_position_and_jacobian(
+                    body_id, spec["contact_offsets"][offset_index]
+                )
                 sigma = max(float(spec["contact_sigma"]), 1e-6)
                 # Keep every detected contact in the primary level. Confidence
                 # only ranks contacts within that same priority level.
@@ -971,6 +999,7 @@ class GenericInteractionRetargeter:
                                 / orientation_sigma
                             )
             else:
+                self._active_contact_offsets.pop(name, None)
                 target = np.asarray(target_data["tracking_position"], dtype=float).reshape(3)
                 source_root_position = target_data.get("source_root_position")
                 swing_morphology_scale = float(spec["swing_morphology_scale"])
@@ -1235,12 +1264,13 @@ class GenericInteractionRetargeter:
             target_base_position=target_base_position,
             end_effector_targets=end_effector_targets,
         )
-        direction_step_limits = self._pose_direction_step_limits(
-            human_joints, previous_human_joints
-        )
-        q_opt = self._project_pose_direction_step(
-            q_opt, q_last, direction_step_limits
-        )
+        if self.pose_direction_post_projection:
+            direction_step_limits = self._pose_direction_step_limits(
+                human_joints, previous_human_joints
+            )
+            q_opt = self._project_pose_direction_step(
+                q_opt, q_last, direction_step_limits
+            )
         return self._project_actuated_temporal_step(
             q_opt, q_last, q_prev, q_prevprev
         )
@@ -1760,7 +1790,23 @@ class GenericInteractionRetargeter:
         constraints.append(cp.SOC(self.step_size, dqa))
 
         # Whole-body objective (the lowest level of the hierarchy).
-        weights = np.ones(len(vertices)) * 10  # Laplacian weights (matching original laplacian_weights = 10)
+        mesh_cfg = dict(self.end_effector_config.get("interaction_mesh", {}) or {})
+        laplacian_weight = float(mesh_cfg.get("laplacian_weight", 10.0))  # matching original laplacian_weights = 10
+        weights = np.ones(len(vertices)) * laplacian_weight
+        # The target Laplacian keeps human metric bone lengths at scale 1.0,
+        # which a shorter robot cannot reproduce.  Per-joint overrides let the
+        # profile relax exactly the limb rows whose infeasible human-length
+        # targets would otherwise stretch elbows/knees, while terrain rows and
+        # torso rows keep encoding the scene interaction at full weight.
+        for joint_name, joint_weight in dict(
+            mesh_cfg.get("joint_weight_overrides", {}) or {}
+        ).items():
+            if joint_name not in joint_names_ordered:
+                raise ValueError(
+                    f"interaction_mesh.joint_weight_overrides refers to unmapped "
+                    f"joint '{joint_name}'."
+                )
+            weights[joint_names_ordered.index(joint_name)] = float(joint_weight)
         sqrt_w3 = np.sqrt(np.repeat(weights, 3))
         
         # Minimize: ||lap_var - target_lap_vec||^2
@@ -1801,28 +1847,36 @@ class GenericInteractionRetargeter:
             body_obj += self.smooth_weight * cp.sum_squares(dqa - dqa_smooth)
         
         # Base orientation tracking cost
-        # Keep the base orientation close to the target (estimated from human joints)
-        if target_base_orientation is not None and 3 in self.q_a_indices:
-            # Find quaternion indices in q_a_indices
-            quat_indices_in_qa = []
-            for quat_idx in [3, 4, 5, 6]:  # wxyz quaternion
-                if quat_idx in self.q_a_indices:
-                    idx_in_qa = np.where(self.q_a_indices == quat_idx)[0]
-                    if len(idx_in_qa) > 0:
-                        quat_indices_in_qa.append(idx_in_qa[0])
-            
-            if len(quat_indices_in_qa) == 4:
-                # Target quaternion in wxyz (MuJoCo convention)
-                quat_target_wxyz = target_base_orientation
-                quat_current = q[3:7]  # Current quaternion
-                
-                # Add cost to keep quaternion close to target
-                orientation_weight = 5.0  # Strong preference to maintain orientation
-                for i, qa_idx in enumerate(quat_indices_in_qa):
-                    target_val = quat_target_wxyz[i]
-                    current_val = quat_current[i]
-                    # Penalize deviation: (q_new - target)^2 = (q_current + dqa - target)^2
-                    body_obj += orientation_weight * cp.square(dqa[qa_idx] + current_val - target_val)
+        # Keep the base orientation close to the target (estimated from human joints).
+        # The residual is the world-frame rotation vector to the target and its
+        # linearization is the same qdot->omega map used by every other
+        # orientation task.  Penalizing raw quaternion components instead mixes
+        # a non-metric distance into the objective and pulls along the radial
+        # quaternion direction that the kinematics cannot see.
+        if (
+            target_base_orientation is not None
+            and 3 in self.q_a_indices
+            and all(idx in self.q_a_indices for idx in (4, 5, 6))
+            and self.robot_model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE
+        ):
+            base_body_id = int(self.robot_model.jnt_bodyid[0])
+            target_wxyz = np.asarray(target_base_orientation, dtype=float).reshape(4)
+            target_rotation = Rotation.from_quat(
+                target_wxyz, scalar_first=True
+            ).as_matrix()
+            current_rotation = self.robot_data.xmat[base_body_id].reshape(3, 3)
+            base_rotation_error = Rotation.from_matrix(
+                target_rotation @ current_rotation.T
+            ).as_rotvec()
+            base_angular_jacobian = self._body_angular_jacobian(base_body_id)
+            # 1.25 rad^-2 keeps the strength of the replaced component cost:
+            # its weight was 5.0 and |dq| ~ |dtheta|/2 for unit quaternions.
+            orientation_weight = float(
+                self.end_effector_config.get("base_orientation_weight", 1.25)
+            )
+            body_obj += orientation_weight * cp.sum_squares(
+                base_angular_jacobian @ dqa - base_rotation_error
+            )
 
         last_end_effector_rotations: Dict[str, np.ndarray] = {}
         last_pose_directions: Dict[Tuple[str, str], np.ndarray] = {}
@@ -2048,6 +2102,29 @@ class GenericInteractionRetargeter:
                         )
 
                 run_solver(stage_problem)
+                if (
+                    stage_problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                    and not hierarchy_enabled
+                    and endpoint_contact_constraints
+                ):
+                    # The contact-plane halfspaces and orientation-step caps can
+                    # be jointly infeasible with the trust region for a single
+                    # linearized step.  Relax them before touching the trust
+                    # region itself: an unbounded linearized step is worse than
+                    # one frame of relaxed contact-side constraints.
+                    if show_solver_debug:
+                        print(
+                            f"    {stage_name} solve failed: {stage_problem.status}, "
+                            "retrying without endpoint contact constraints..."
+                        )
+                    relaxable = {id(c) for c in endpoint_contact_constraints}
+                    active_constraints = [
+                        constraint
+                        for constraint in active_constraints
+                        if id(constraint) not in relaxable
+                    ]
+                    stage_problem = cp.Problem(cp.Minimize(stage_obj), active_constraints)
+                    run_solver(stage_problem)
                 if (
                     stage_problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
                     and not hierarchy_enabled
@@ -2318,10 +2395,13 @@ class GenericInteractionRetargeter:
         """
         Return T(q) (nv x nq) such that v = T(q) @ qdot.
         - Free root: qpos=[x,y,z, qw,qx,qy,qz], qvel=[vx,vy,vz, ωx,ωy,ωz]
-        where ω and v are WORLD-expressed in MuJoCo.
+        where v is world-expressed and ω uses MuJoCo's free-joint convention
+        (rotational velocity in the body-local tangent frame).  The historical
+        helper names are swapped: the default ``get_e_world`` matrix is the
+        one that matches MuJoCo, verified against ``mj_integratePos``.
         - 23 hinge joints: v = qdot.
 
-        If use_world_omega=False, uses BODY-omega mapping (for debugging).
+        If use_world_omega=False, uses the alternate mapping (for debugging).
         """
         nq, nv = self.robot_model.nq, self.robot_model.nv
         T = np.zeros((nv, nq), dtype=float)
@@ -2737,51 +2817,44 @@ class GenericInteractionRetargeter:
                 return np.array(points)
 
             elif geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
-                # Capsule: size[0] = radius, size[1] = half-length along x
+                # Capsule: size[0] = radius, size[1] = half-length along the
+                # local z axis (MuJoCo convention; the previous x-axis layout
+                # sampled points that are not on the capsule surface).
                 radius = size[0]
                 half_len = size[1]
-                # Sample points on each end hemisphere + mid-body side points
-                for s in [-half_len, half_len]:
-                    for dx, dy, dz in [(1, 0, 0), (-1, 0, 0),
-                                       (0, 1, 0), (0, -1, 0),
-                                       (0, 0, 1), (0, 0, -1)]:
-                        local_pt = np.array([s, 0, 0])
-                        if dx != 0:
-                            local_pt[0] += dx * radius
-                        elif dy != 0:
-                            local_pt[1] += dy * radius
-                        else:
-                            local_pt[2] += dz * radius
-                        world_pt = geom_pos + geom_rot.apply(local_pt)
-                        points.append(world_pt)
-                # Add mid-body points along the cylinder surface
-                for theta in [0, np.pi/2, np.pi, 3*np.pi/2]:
-                    local_pt = np.array([
-                        0,
-                        radius * np.cos(theta),
-                        radius * np.sin(theta)
-                    ])
-                    world_pt = geom_pos + geom_rot.apply(local_pt)
-                    points.append(world_pt)
+                # Barrel rings at both ends and the middle, plus the two
+                # hemispherical cap tips along z.
+                for s in [-half_len, 0.0, half_len]:
+                    for theta in [0, np.pi/2, np.pi, 3*np.pi/2]:
+                        local_pt = np.array([
+                            radius * np.cos(theta),
+                            radius * np.sin(theta),
+                            s,
+                        ])
+                        points.append(geom_pos + geom_rot.apply(local_pt))
+                for tip in [-(half_len + radius), half_len + radius]:
+                    points.append(
+                        geom_pos + geom_rot.apply(np.array([0.0, 0.0, tip]))
+                    )
                 return np.array(points)
 
             elif geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
-                # Cylinder: size[0] = radius, size[1] = half-length along x
+                # Cylinder: size[0] = radius, size[1] = half-length along the
+                # local z axis (MuJoCo convention).
                 radius = size[0]
                 half_len = size[1]
-                # Sample center of each end cap + 4 side points at midpoint
+                # Center of each end cap + 4 side points at the midpoint.
                 for s in [-half_len, half_len]:
-                    local_pt = np.array([s, 0, 0])
-                    world_pt = geom_pos + geom_rot.apply(local_pt)
-                    points.append(world_pt)
+                    points.append(
+                        geom_pos + geom_rot.apply(np.array([0.0, 0.0, s]))
+                    )
                 for theta in [0, np.pi/2, np.pi, 3*np.pi/2]:
                     local_pt = np.array([
-                        0,
                         radius * np.cos(theta),
-                        radius * np.sin(theta)
+                        radius * np.sin(theta),
+                        0.0,
                     ])
-                    world_pt = geom_pos + geom_rot.apply(local_pt)
-                    points.append(world_pt)
+                    points.append(geom_pos + geom_rot.apply(local_pt))
                 return np.array(points)
 
             elif geom_type == mujoco.mjtGeom.mjGEOM_PLANE:
@@ -2929,7 +3002,7 @@ def retarget_smplx_to_robot(
     retargeted_trajectory = []
     q_init = np.zeros(robot_model.nq)
     q_init[3:7] = [1, 0, 0, 0]  # Identity quaternion
-    q_init[6] = robot_height * 0.5  # Initial height
+    q_init[2] = robot_height * 0.5  # Initial height
     q_last = None
 
     for frame_idx, human_joints in enumerate(smplx_trajectory):
@@ -2942,7 +3015,7 @@ def retarget_smplx_to_robot(
             mapped_joints = human_joints[mapped_indices]
 
         # Retarget frame
-        q_opt = retargeter.retarget_frame(mapped_joints, q_init, terrain_scale, q_last=q_last)
+        q_opt = retargeter.retarget_frame(mapped_joints, q_init, q_last=q_last)
         retargeted_trajectory.append(q_opt)
 
         # Update initial guess for next frame

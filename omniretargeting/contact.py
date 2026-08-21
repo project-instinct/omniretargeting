@@ -31,6 +31,7 @@ class SceneContactTask:
     contact_mask: np.ndarray
     forward_directions: np.ndarray | None = None
     up_directions: np.ndarray | None = None
+    transition_weights: np.ndarray | None = None
 
     def frame(self, frame_idx: int) -> Dict[str, Any]:
         """Return the optimizer payload for one frame."""
@@ -43,6 +44,11 @@ class SceneContactTask:
             "relative_speed": float(self.relative_speeds[frame_idx]),
             "confidence": float(self.contact_confidence[frame_idx]),
             "contact": bool(self.contact_mask[frame_idx]),
+            "transition_weight": (
+                float(self.transition_weights[frame_idx])
+                if self.transition_weights is not None
+                else 1.0
+            ),
         }
         if self.forward_directions is not None:
             payload["forward_direction"] = self.forward_directions[frame_idx]
@@ -177,9 +183,11 @@ def infer_scene_contact_tasks(
     speed_softness = max(float(cfg.get("speed_softness", 0.08)), 1e-6)
     min_contact_frames = max(int(cfg.get("min_contact_frames", 3)), 1)
     max_gap_frames = max(int(cfg.get("max_gap_frames", 2)), 0)
+    transition_frames = max(int(cfg.get("transition_frames", 0)), 0)
     anchor_contacts = bool(cfg.get("anchor_contacts", True))
     anchor_contact_orientation = bool(cfg.get("anchor_contact_orientation", True))
     anchor_window_frames = max(int(cfg.get("anchor_window_frames", 3)), 1)
+    anchor_drift_tolerance = max(float(cfg.get("anchor_drift_tolerance", 0.0)), 0.0)
     clearance = float(cfg.get("surface_clearance", 0.0))
     fps = float(framerate) if framerate and framerate > 0 else 30.0
 
@@ -226,6 +234,9 @@ def infer_scene_contact_tasks(
         eff_max_gap_frames = max(
             int(eff_cfg.get("max_gap_frames", max_gap_frames)), 0
         )
+        eff_transition_frames = max(
+            int(eff_cfg.get("transition_frames", transition_frames)), 0
+        )
         eff_anchor_contacts = bool(
             eff_cfg.get("anchor_contacts", anchor_contacts)
         )
@@ -236,6 +247,10 @@ def infer_scene_contact_tasks(
         )
         eff_anchor_window_frames = max(
             int(eff_cfg.get("anchor_window_frames", anchor_window_frames)), 1
+        )
+        eff_anchor_drift_tolerance = max(
+            float(eff_cfg.get("anchor_drift_tolerance", anchor_drift_tolerance)),
+            0.0,
         )
 
         # Selected samples refer to fixed SMPL-X vertex ids, but the nearest id
@@ -284,15 +299,29 @@ def infer_scene_contact_tasks(
         contact_mask = _close_short_gaps(contact_mask, eff_max_gap_frames)
         contact_mask = _remove_short_runs(contact_mask, eff_min_contact_frames)
         confidence = np.where(contact_mask, np.maximum(confidence, 0.5), confidence)
+        # Fade the contact weight in and out over a few frames, like a
+        # foot-lock blend.  A binary weight switch makes the optimizer jump
+        # between the swing target and the scene anchor within one frame; the
+        # ramp spreads that transient without changing the detected contact
+        # interval or the anchor itself.  It is stored separately so the
+        # optimizers can apply it after their own confidence floor, which
+        # would otherwise clip the fade away.
+        transition_weights = np.ones(len(contact_mask), dtype=float)
+        if eff_transition_frames > 0:
+            for start, end in _iter_true_runs(contact_mask):
+                for k in range(min(eff_transition_frames, end - start)):
+                    fade = (k + 1.0) / (eff_transition_frames + 1.0)
+                    transition_weights[start + k] = min(
+                        transition_weights[start + k], fade
+                    )
+                    transition_weights[end - 1 - k] = min(
+                        transition_weights[end - 1 - k], fade
+                    )
 
         contact_positions = selected_samples.copy()
         if eff_anchor_contacts:
-            for start, end in _iter_true_runs(contact_mask):
-                # Estimate the no-slip anchor at contact onset.  Using the
-                # median of an entire run is non-causal and can place the
-                # target far ahead of the foot on the first stance frame.
-                anchor_end = min(start + eff_anchor_window_frames, end)
-                anchor_slice = slice(start, anchor_end)
+
+            def _window_anchor(anchor_slice: slice) -> tuple[np.ndarray, np.ndarray]:
                 anchor = np.median(surface_points[anchor_slice], axis=0)
                 run_normals = surface_normals[anchor_slice].copy()
                 # Mesh winding around reconstructed TSDF seams can alternate.
@@ -326,8 +355,49 @@ def infer_scene_contact_tasks(
                 )
                 if float(np.dot(normal, toward_effector)) < 0.0:
                     normal *= -1.0
-                contact_positions[start:end] = anchor + clearance * normal
-                surface_normals[start:end] = normal
+                return anchor, normal
+
+            for start, end in _iter_true_runs(contact_mask):
+                # Estimate the no-slip anchor at contact onset.  Using the
+                # median of an entire run is non-causal and can place the
+                # target far ahead of the foot on the first stance frame.
+                # A detected "stance" from video-derived data can also contain
+                # sustained slow drift; holding one anchor across such a run
+                # drags the target far from the source foot, so the run is
+                # re-anchored whenever the source contact point durably leaves
+                # the current anchor by more than the drift tolerance.
+                segment_start = start
+                while segment_start < end:
+                    anchor_slice = slice(
+                        segment_start,
+                        min(segment_start + eff_anchor_window_frames, end),
+                    )
+                    anchor, normal = _window_anchor(anchor_slice)
+                    segment_end = end
+                    if eff_anchor_drift_tolerance > 0.0:
+                        consecutive_drift = 0
+                        for frame_idx in range(segment_start, end):
+                            if (
+                                float(
+                                    np.linalg.norm(
+                                        surface_points[frame_idx] - anchor
+                                    )
+                                )
+                                > eff_anchor_drift_tolerance
+                            ):
+                                consecutive_drift += 1
+                                if consecutive_drift >= 2:
+                                    segment_end = max(
+                                        frame_idx - 1, segment_start + 1
+                                    )
+                                    break
+                            else:
+                                consecutive_drift = 0
+                    contact_positions[segment_start:segment_end] = (
+                        anchor + clearance * normal
+                    )
+                    surface_normals[segment_start:segment_end] = normal
+                    segment_start = segment_end
                 if (
                     forward_directions is not None
                     and eff_anchor_contact_orientation
@@ -336,7 +406,10 @@ def infer_scene_contact_tasks(
                     # no-slip contact run.  Taking the median rejects mocap
                     # noise without introducing a future-dependent filter in
                     # the optimizer itself.
-                    forward = np.median(forward_directions[anchor_slice], axis=0)
+                    onset_slice = slice(
+                        start, min(start + eff_anchor_window_frames, end)
+                    )
+                    forward = np.median(forward_directions[onset_slice], axis=0)
                     forward_norm = float(np.linalg.norm(forward))
                     if forward_norm > 1e-10:
                         forward_directions[start:end] = forward / forward_norm

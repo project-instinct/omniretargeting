@@ -72,6 +72,19 @@
       "weighted_scale": 2.0,
       "contact_sigma": 0.025,
       "swing_sigma": 0.06,
+      "interaction_mesh": {
+        "laplacian_weight": 10.0,
+        "joint_weight_overrides": {
+          "L_Elbow": 5.0,
+          "R_Elbow": 5.0,
+          "L_Knee": 5.0,
+          "R_Knee": 5.0,
+          "L_Wrist": 2.0,
+          "R_Wrist": 2.0,
+          "L_Ankle": 2.0,
+          "R_Ankle": 2.0
+        }
+      },
       "combine_swing_foot_pose": true,
       "priority_relative_tolerance": 0.01,
       "priority_absolute_tolerance": 0.04,
@@ -145,7 +158,9 @@
         ]
       },
       "pose_direction": {
-        "enabled": false,
+        "enabled": true,
+        "post_projection": false,
+        "velocity_enabled": false,
         "sigma": 0.12,
         "arm_weight": 1.0,
         "leg_weight": 1.0,
@@ -215,6 +230,7 @@
         "speed_softness": 0.08,
         "min_contact_frames": 3,
         "max_gap_frames": 2,
+        "transition_frames": 2,
         "anchor_contacts": true,
         "anchor_contact_orientation": false,
         "anchor_window_frames": 3,
@@ -234,12 +250,14 @@
             "anchor_contacts": false
           },
           "left_foot": {
-            "distance_threshold": 0.045,
-            "relative_speed_threshold": 0.15
+            "distance_threshold": 0.07,
+            "relative_speed_threshold": 0.3,
+            "anchor_drift_tolerance": 0.05
           },
           "right_foot": {
-            "distance_threshold": 0.045,
-            "relative_speed_threshold": 0.15
+            "distance_threshold": 0.07,
+            "relative_speed_threshold": 0.3,
+            "anchor_drift_tolerance": 0.05
           }
         }
       },
@@ -247,7 +265,8 @@
         "left_hand": {
           "robot_body": "left_rubber_hand",
           "preserve_world_target": true,
-          "contact_position_sigma": 0.05,
+          "contact_sigma": 0.02,
+          "contact_position_sigma": 0.012,
           "swing_position_sigma": 0.05,
           "refine_orientation": true,
           "orientation_mode": "axes",
@@ -319,7 +338,8 @@
         "right_hand": {
           "robot_body": "right_rubber_hand",
           "preserve_world_target": true,
-          "contact_position_sigma": 0.05,
+          "contact_sigma": 0.02,
+          "contact_position_sigma": 0.012,
           "swing_position_sigma": 0.05,
           "refine_orientation": true,
           "orientation_mode": "axes",
@@ -551,7 +571,8 @@
         "report": true,
         "clearance": 0.005,
         "margin": 0.05,
-        "sigma": 0.012
+        "sigma": 0.012,
+        "contact_anchor_exclusion_radius": 0.05
       }
     },
     "foot_stabilization": {

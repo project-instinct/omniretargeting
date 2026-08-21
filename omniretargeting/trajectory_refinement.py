@@ -1201,6 +1201,9 @@ def refine_joint_trajectory(
     )
     penetration_clearance = float(penetration_cfg.get("clearance", 0.005))
     penetration_sigma = max(float(penetration_cfg.get("sigma", 0.004)), 1e-8)
+    penetration_anchor_radius = max(
+        float(penetration_cfg.get("contact_anchor_exclusion_radius", 0.05)), 0.0
+    )
     probe: ScenePenetrationProbe | None = None
     if penetration_enabled:
         geom_ids = collision_geom_ids(
@@ -1537,12 +1540,35 @@ def refine_joint_trajectory(
             frame_penetration = penetration_frames[frame_idx]
             if frame_penetration is None:
                 continue
+            # An effector held on its scene anchor cannot leave the surface;
+            # a penetration row on near-anchor samples has the same stiffness
+            # as the contact row and only drags the anchored point in a
+            # tug-of-war.  The exemption is by distance, not by body id: the
+            # colliding geoms often live on the wrist/ankle parent body rather
+            # than the configured effector body.  The honest depth still comes
+            # from measure_scene_penetration.
+            active_anchor_points = [
+                np.asarray(spec["task"].contact_positions[frame_idx], dtype=float)
+                for spec in effectors.values()
+                if penetration_anchor_radius > 0.0
+                and bool(spec["task"].contact_mask[frame_idx])
+            ]
             # One-sided: only points that violate the requested clearance get a
             # row, and the active set is rebuilt from the current pose at every
             # Gauss--Newton iteration.
             for index in np.flatnonzero(
                 frame_penetration["clearance"] < penetration_clearance
             ):
+                if any(
+                    float(
+                        np.linalg.norm(
+                            frame_penetration["points"][index] - anchor
+                        )
+                    )
+                    < penetration_anchor_radius
+                    for anchor in active_anchor_points
+                ):
+                    continue
                 jacobian_position.fill(0.0)
                 mujoco.mj_jac(
                     model,
