@@ -19,6 +19,7 @@ from __future__ import annotations
 from math import comb
 from typing import Any, Mapping
 
+import cvxpy as cp
 import mujoco
 import numpy as np
 import trimesh
@@ -26,12 +27,22 @@ from scipy import sparse
 from scipy.optimize import lsq_linear
 from scipy.spatial.transform import Rotation
 
-from .contact import SceneContactTask, _iter_true_runs
+from .contact import ContactMode, SceneContactTask, _iter_true_runs
 from .retargeting import (
     _apply_configured_joint_limits,
-    _clamp_target_to_reach,
+    _resolve_position_sigma,
+    _swivel_direction_and_jacobian,
+    _swivel_tangent_delta,
     _transform_swing_target,
+    _validate_swing_target_space,
 )
+
+
+# This is an aggregate, dimensionless residual-norm budget after every row has
+# been scaled by its physical sigma and confidence.  Keep it small: SLIDE
+# tangential flexibility belongs in ``slide_tangential_weight`` (and the
+# mode-specific residual/sigma), not in a large lexicographic escape hatch.
+DEFAULT_CONTACT_PRIORITY_ABSOLUTE_TOLERANCE = 0.03
 
 
 def _scalar_joint_coordinates(
@@ -430,6 +441,24 @@ def geom_surface_offsets(model: mujoco.MjModel, geom_id: int) -> np.ndarray:
     return np.zeros((1, 3), dtype=float)
 
 
+def geom_surface_points_in_body_frame(
+    model: mujoco.MjModel, geom_id: int
+) -> np.ndarray:
+    """Transform the shared geom-local surface samples into its body frame.
+
+    ``geom_surface_offsets`` remains the single primitive/mesh sampler.  This
+    helper only applies the compiled geom pose, allowing contact-patch and
+    legacy foot-support code to consume the same capsule/primitive samples as
+    scene-penetration refinement.
+    """
+    offsets = geom_surface_offsets(model, geom_id)
+    geom_quat = np.asarray(model.geom_quat[geom_id], dtype=float)
+    geom_rotation = np.empty(9, dtype=float)
+    mujoco.mju_quat2Mat(geom_rotation, geom_quat)
+    geom_position = np.asarray(model.geom_pos[geom_id], dtype=float)
+    return offsets @ geom_rotation.reshape(3, 3).T + geom_position
+
+
 def collision_geom_ids(
     model: mujoco.MjModel,
     geom_groups: Any = None,
@@ -466,6 +495,107 @@ def collision_geom_ids(
                 continue
         selected.append(geom_id)
     return np.asarray(selected, dtype=int)
+
+
+def closest_scene_triangles(
+    scene_mesh: trimesh.Trimesh, points: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Closest surface point, distance and triangle id for each query point."""
+    points = np.asarray(points, dtype=float)
+    if len(points) == 0:
+        return (
+            np.zeros((0, 3), dtype=float),
+            np.zeros(0, dtype=float),
+            np.zeros(0, dtype=int),
+        )
+    try:
+        closest, distances, triangle_ids = trimesh.proximity.closest_point(
+            scene_mesh, points
+        )
+    except (ImportError, ModuleNotFoundError):
+        closest, distances, triangle_ids = trimesh.proximity.closest_point_naive(
+            scene_mesh, points
+        )
+    return (
+        np.asarray(closest, dtype=float),
+        np.asarray(distances, dtype=float),
+        np.asarray(triangle_ids, dtype=int),
+    )
+
+
+def resolve_scene_normal_orientation(
+    scene_mesh: trimesh.Trimesh, reference_points: np.ndarray
+) -> float:
+    """Fix the global scene normal orientation from known free-side points.
+
+    Reconstructed scans have consistent winding but no guaranteed global
+    outward direction, and they are not watertight, so ``signed_distance``
+    cannot supply the side test.  Any point set that mostly lies in free space
+    resolves the sign: the median offset direction from the surface must agree
+    with the outward normal.
+    """
+    closest, distances, triangle_ids = closest_scene_triangles(
+        scene_mesh, reference_points
+    )
+    face_normals = np.asarray(scene_mesh.face_normals, dtype=float)
+    valid = (
+        (distances > 1e-6)
+        & (triangle_ids >= 0)
+        & (triangle_ids < len(face_normals))
+    )
+    if not np.any(valid):
+        return 1.0
+    offsets = np.asarray(reference_points, dtype=float)[valid] - closest[valid]
+    offsets = offsets / np.linalg.norm(offsets, axis=1, keepdims=True)
+    median_cosine = float(
+        np.median(np.sum(offsets * face_normals[triangle_ids[valid]], axis=1))
+    )
+    return -1.0 if median_cosine < 0.0 else 1.0
+
+
+def scene_signed_clearance(
+    scene_mesh: trimesh.Trimesh,
+    points: np.ndarray,
+    orientation_sign: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return signed clearance and the direction that increases it.
+
+    Clearance is positive in free space and negative inside the scene.  The
+    direction is the gradient of the signed clearance with respect to the
+    sample point, so a Gauss--Newton step along it moves the point away from
+    the scene no matter which side of the surface it currently is on.
+    """
+    points = np.asarray(points, dtype=float)
+    if len(points) == 0:
+        return np.zeros(0, dtype=float), np.zeros((0, 3), dtype=float)
+    closest, distances, triangle_ids = closest_scene_triangles(scene_mesh, points)
+
+    offsets = points - closest
+    norms = np.linalg.norm(offsets, axis=1)
+
+    face_normals = np.asarray(scene_mesh.face_normals, dtype=float)
+    normals = np.zeros_like(offsets)
+    valid = (triangle_ids >= 0) & (triangle_ids < len(face_normals))
+    normals[valid] = face_normals[triangle_ids[valid]]
+    normals = normals * (orientation_sign or 1.0)
+
+    side = np.where(np.sum(offsets * normals, axis=1) >= 0.0, 1.0, -1.0)
+    signed = side * distances
+
+    # Away from the surface the unsigned-distance gradient is the accurate
+    # push direction; exactly on the surface that gradient is undefined and
+    # the triangle normal is the only usable direction.
+    directions = np.where(
+        norms[:, None] > 1e-9,
+        offsets / np.maximum(norms, 1e-9)[:, None] * side[:, None],
+        normals,
+    )
+    direction_norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    return signed, np.where(
+        direction_norms > 1e-9,
+        directions / np.maximum(direction_norms, 1e-9),
+        np.array([0.0, 0.0, 1.0]),
+    )
 
 
 class ScenePenetrationProbe:
@@ -505,88 +635,21 @@ class ScenePenetrationProbe:
         self.orientation_sign = 0.0
 
     def _closest(self, points: np.ndarray):
-        if len(points) == 0:
-            return (
-                np.zeros((0, 3), dtype=float),
-                np.zeros(0, dtype=float),
-                np.zeros(0, dtype=int),
-            )
-        try:
-            closest, distances, triangle_ids = trimesh.proximity.closest_point(
-                self.scene_mesh, points
-            )
-        except (ImportError, ModuleNotFoundError):
-            closest, distances, triangle_ids = (
-                trimesh.proximity.closest_point_naive(self.scene_mesh, points)
-            )
-        return (
-            np.asarray(closest, dtype=float),
-            np.asarray(distances, dtype=float),
-            np.asarray(triangle_ids, dtype=int),
-        )
+        return closest_scene_triangles(self.scene_mesh, points)
 
     def _resolve_orientation(self, centers: np.ndarray) -> None:
         """Fix the global normal orientation from far-field geom centres."""
         if self.orientation_sign != 0.0:
             return
-        closest, distances, triangle_ids = self._closest(centers)
-        valid = (
-            (distances > 1e-6)
-            & (triangle_ids >= 0)
-            & (triangle_ids < len(self.scene_mesh.face_normals))
+        self.orientation_sign = resolve_scene_normal_orientation(
+            self.scene_mesh, centers
         )
-        if not np.any(valid):
-            self.orientation_sign = 1.0
-            return
-        normals = np.asarray(self.scene_mesh.face_normals, dtype=float)[
-            triangle_ids[valid]
-        ]
-        offsets = centers[valid] - closest[valid]
-        offsets = offsets / np.linalg.norm(offsets, axis=1, keepdims=True)
-        median_cosine = float(np.median(np.sum(offsets * normals, axis=1)))
-        self.orientation_sign = -1.0 if median_cosine < 0.0 else 1.0
 
     def _clearance(
         self, points: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return signed clearance and the direction that increases it.
-
-        The direction is the gradient of the signed clearance with respect to
-        the sample point, so a Gauss--Newton step along it moves the point away
-        from the scene no matter which side of the surface it currently is on.
-        """
-        closest, distances, triangle_ids = self._closest(points)
-        if len(points) == 0:
-            return np.zeros(0, dtype=float), np.zeros((0, 3), dtype=float)
-
-        offsets = points - closest
-        norms = np.linalg.norm(offsets, axis=1)
-
-        normals = np.zeros_like(offsets)
-        valid = (triangle_ids >= 0) & (
-            triangle_ids < len(self.scene_mesh.face_normals)
-        )
-        normals[valid] = np.asarray(self.scene_mesh.face_normals, dtype=float)[
-            triangle_ids[valid]
-        ]
-        normals = normals * (self.orientation_sign or 1.0)
-
-        side = np.where(np.sum(offsets * normals, axis=1) >= 0.0, 1.0, -1.0)
-        signed = side * distances
-
-        # Away from the surface the unsigned-distance gradient is the accurate
-        # push direction; exactly on the surface that gradient is undefined and
-        # the triangle normal is the only usable direction.
-        directions = np.where(
-            norms[:, None] > 1e-9,
-            offsets / np.maximum(norms, 1e-9)[:, None] * side[:, None],
-            normals,
-        )
-        direction_norms = np.linalg.norm(directions, axis=1, keepdims=True)
-        return signed, np.where(
-            direction_norms > 1e-9,
-            directions / np.maximum(direction_norms, 1e-9),
-            np.array([0.0, 0.0, 1.0]),
+        return scene_signed_clearance(
+            self.scene_mesh, points, self.orientation_sign
         )
 
     def probe_trajectory(
@@ -687,10 +750,15 @@ def measure_scene_penetration(
         "max_depth": 0.0,
         "mean_depth": 0.0,
         "frames_penetrating": 0,
+        "total_penetrating_samples": 0,
+        "penetrating_body_count": 0,
         "num_frames": int(len(trajectory)),
         "worst_frame": -1,
         "worst_body": "",
         "per_frame_depth": np.zeros(len(trajectory), dtype=float),
+        "per_frame_penetrating_samples": np.zeros(
+            len(trajectory), dtype=np.int32
+        ),
     }
     if len(geom_ids) == 0 or len(trajectory) == 0:
         return summary
@@ -699,12 +767,22 @@ def measure_scene_penetration(
         model, scene_mesh, geom_ids, float(cfg.get("margin", 0.05))
     )
     per_frame_depth = np.zeros(len(trajectory), dtype=float)
+    per_frame_penetrating_samples = np.zeros(len(trajectory), dtype=np.int32)
+    penetrating_body_ids: set[int] = set()
     worst_body_id = -1
     worst_depth = 0.0
     for frame_idx, frame in enumerate(probe.probe_trajectory(trajectory)):
         if len(frame["clearance"]) == 0:
             continue
         depths = np.maximum(-frame["clearance"], 0.0)
+        penetrating_samples = depths > 1e-6
+        per_frame_penetrating_samples[frame_idx] = int(
+            np.count_nonzero(penetrating_samples)
+        )
+        penetrating_body_ids.update(
+            int(body_id)
+            for body_id in frame["body_ids"][penetrating_samples]
+        )
         worst = int(np.argmax(depths))
         per_frame_depth[frame_idx] = float(depths[worst])
         if per_frame_depth[frame_idx] > worst_depth:
@@ -718,6 +796,10 @@ def measure_scene_penetration(
         if np.any(penetrating)
         else 0.0,
         frames_penetrating=int(np.count_nonzero(penetrating)),
+        total_penetrating_samples=int(
+            np.sum(per_frame_penetrating_samples)
+        ),
+        penetrating_body_count=int(len(penetrating_body_ids)),
         worst_frame=int(np.argmax(per_frame_depth)),
         worst_body=(
             mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, worst_body_id) or ""
@@ -725,6 +807,7 @@ def measure_scene_penetration(
         if worst_body_id >= 0
         else "",
         per_frame_depth=per_frame_depth,
+        per_frame_penetrating_samples=per_frame_penetrating_samples,
     )
     return summary
 
@@ -733,6 +816,7 @@ def _lock_contact_offsets(
     model: mujoco.MjModel,
     trajectory: np.ndarray,
     effectors: Mapping[str, dict[str, Any]],
+    preset: Mapping[str, np.ndarray] | None = None,
 ) -> dict[str, np.ndarray]:
     """Choose one contact offset per contiguous contact run.
 
@@ -765,11 +849,27 @@ def _lock_contact_offsets(
     selection: dict[str, np.ndarray] = {}
     for name, spec in effectors.items():
         chosen = np.zeros(num_frames, dtype=int)
-        mask = np.asarray(spec["task"].contact_mask, dtype=bool)
-        for start, end in _iter_true_runs(mask):
-            chosen[start:end] = int(
-                np.argmin(np.mean(distances[name][start:end], axis=0))
+        segment_ids = np.asarray(
+            spec["task"].contact_segment_ids, dtype=np.int32
+        )
+        preset_ids = None if preset is None else preset.get(name)
+        if preset_ids is not None:
+            preset_ids = np.asarray(preset_ids, dtype=np.int32)
+        for segment_id in np.unique(segment_ids[segment_ids >= 0]):
+            frames = np.flatnonzero(segment_ids == segment_id)
+            valid_preset = (
+                np.zeros(0, dtype=np.int32)
+                if preset_ids is None
+                else preset_ids[frames][preset_ids[frames] >= 0]
             )
+            if len(valid_preset):
+                counts = np.bincount(valid_preset)
+                offset_id = int(np.argmax(counts))
+            else:
+                offset_id = int(
+                    np.argmin(np.mean(distances[name][frames], axis=0))
+                )
+            chosen[frames] = offset_id
         selection[name] = chosen
     return selection
 
@@ -785,6 +885,9 @@ def refine_joint_trajectory(
     source_root_positions: np.ndarray | None = None,
     source_joint_positions: np.ndarray | None = None,
     source_joint_names: list[str] | tuple[str, ...] | None = None,
+    active_contact_offset_ids: Mapping[str, np.ndarray] | None = None,
+    joint_mapping: Mapping[str, str] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> np.ndarray:
     """Jointly refine scalar joints over time with sparse Gauss--Newton.
 
@@ -877,6 +980,53 @@ def refine_joint_trajectory(
             for joint_idx, joint_name in enumerate(source_joint_names)
         }
 
+    refinement_pose_edges: list[dict[str, int]] = []
+    pose_direction_cfg = dict(
+        end_effector_config.get("pose_direction", {}) or {}
+    )
+    if source_joint_positions is not None and joint_mapping is not None:
+        for raw_edge in pose_direction_cfg.get("edges", []):
+            if len(raw_edge) != 2:
+                continue
+            parent_name, child_name = map(str, raw_edge)
+            # Arm posture transport below handles the morphology-sensitive arm
+            # chains.  Generic unit-direction rows cover torso and legs.
+            if any(
+                token in parent_name or token in child_name
+                for token in ("Shoulder", "Elbow", "Wrist")
+            ):
+                continue
+            if (
+                parent_name not in source_name_to_index
+                or child_name not in source_name_to_index
+                or parent_name not in joint_mapping
+                or child_name not in joint_mapping
+            ):
+                continue
+            parent_body_id = mujoco.mj_name2id(
+                model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                str(joint_mapping[parent_name]),
+            )
+            child_body_id = mujoco.mj_name2id(
+                model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                str(joint_mapping[child_name]),
+            )
+            if parent_body_id >= 0 and child_body_id >= 0:
+                refinement_pose_edges.append(
+                    {
+                        "parent_body_id": int(parent_body_id),
+                        "child_body_id": int(child_body_id),
+                        "source_parent_idx": int(
+                            source_name_to_index[parent_name]
+                        ),
+                        "source_child_idx": int(
+                            source_name_to_index[child_name]
+                        ),
+                    }
+                )
+
     raw_specs = dict(end_effector_config.get("effectors", {}) or {})
     effectors: dict[str, dict[str, Any]] = {}
     for name, task in tasks.items():
@@ -889,19 +1039,6 @@ def refine_joint_trajectory(
         )
         if body_id < 0:
             continue
-        reach_reference_body = spec.get("reach_reference_body")
-        reach_reference_body_id = -1
-        if reach_reference_body:
-            reach_reference_body_id = mujoco.mj_name2id(
-                model,
-                mujoco.mjtObj.mjOBJ_BODY,
-                str(reach_reference_body),
-            )
-            if reach_reference_body_id < 0:
-                raise ValueError(
-                    f"End-effector '{name}' refers to missing reach reference "
-                    f"body '{reach_reference_body}'."
-                )
         tracking_offset = np.asarray(
             spec.get("tracking_offset", [0.0, 0.0, 0.0]), dtype=float
         ).reshape(3)
@@ -910,9 +1047,35 @@ def refine_joint_trajectory(
         )
         if contact_offsets.ndim == 1:
             contact_offsets = contact_offsets[None, :]
+        contact_target_space = str(spec["contact_target_space"]).lower()
+        if contact_target_space != "world":
+            raise ValueError(
+                f"End-effector '{name}' contact_target_space must be 'world'."
+            )
+        swing_target_space = _validate_swing_target_space(
+            name, spec["swing_target_space"]
+        )
+        swing_anchor_body_id = -1
+        if swing_target_space == "limb_morphology_scaled":
+            if task.swing_anchor_body is None or task.swing_limb_offsets is None:
+                raise ValueError(
+                    f"End-effector '{name}' is limb-relative but its live "
+                    "swing anchor data was not prepared."
+                )
+            swing_anchor_body_id = mujoco.mj_name2id(
+                model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                str(task.swing_anchor_body),
+            )
+            if swing_anchor_body_id < 0:
+                raise ValueError(
+                    f"End-effector '{name}' limb-relative swing task refers "
+                    f"to missing anchor body '{task.swing_anchor_body}'."
+                )
         raw_arm_posture = dict(spec.get("arm_posture", {}) or {})
         arm_posture = None
         if bool(raw_arm_posture.get("enabled", False)):
+            raw_swivel = dict(raw_arm_posture.get("swivel", {}) or {})
             shoulder_name = str(raw_arm_posture["shoulder_body"])
             elbow_name = str(raw_arm_posture["elbow_body"])
             wrist_name = raw_arm_posture.get("wrist_body")
@@ -995,6 +1158,21 @@ def refine_joint_trajectory(
                     ),
                     1e-6,
                 ),
+                "swivel_enabled": bool(raw_swivel.get("enabled", False)),
+                "swivel_sigma": max(
+                    float(raw_swivel.get("sigma", np.deg2rad(20.0))), 1e-6
+                ),
+                "swivel_weight": max(
+                    float(raw_swivel.get("weight", 1.0)), 0.0
+                ),
+                "swivel_min_sine": max(
+                    float(raw_swivel.get("min_sine", 0.05)), 0.0
+                ),
+                "swivel_full_sine": max(
+                    float(raw_swivel.get("full_sine", 0.35)),
+                    max(float(raw_swivel.get("min_sine", 0.05)), 0.0)
+                    + 1e-8,
+                ),
             }
         refine_orientation = bool(
             spec.get("refine_orientation", spec.get("track_orientation", False))
@@ -1026,15 +1204,19 @@ def refine_joint_trajectory(
             "body_id": body_id,
             "tracking_offset": tracking_offset,
             "contact_offsets": contact_offsets,
-            "contact_position_sigma": (
-                None
-                if spec.get("contact_position_sigma") is None
-                else max(float(spec["contact_position_sigma"]), 1e-6)
+            "contact_target_space": contact_target_space,
+            "swing_target_space": swing_target_space,
+            "swing_anchor_body_id": int(swing_anchor_body_id),
+            "swing_anchor_offset": (
+                np.zeros(3, dtype=float)
+                if task.swing_anchor_offset is None
+                else np.asarray(task.swing_anchor_offset, dtype=float).reshape(3)
             ),
-            "swing_position_sigma": (
-                None
-                if spec.get("swing_position_sigma") is None
-                else max(float(spec["swing_position_sigma"]), 1e-6)
+            "contact_position_sigma": _resolve_position_sigma(
+                spec, config, "contact", "refinement", 0.025
+            ),
+            "swing_position_sigma": _resolve_position_sigma(
+                spec, config, "swing", "refinement", 0.06
             ),
             "track_orientation": refine_orientation,
             "orientation_sigma": float(
@@ -1081,25 +1263,6 @@ def refine_joint_trajectory(
                 orientation_coordinate_mask
                 if orientation_joint_tokens
                 else None
-            ),
-            "swing_morphology_scale": float(
-                spec.get(
-                    "swing_morphology_scale",
-                    end_effector_config.get("swing_morphology_scale", 1.0),
-                )
-            ),
-            "preserve_world_target": bool(
-                spec.get("preserve_world_target", False)
-            ),
-            "reach_reference_body_id": int(reach_reference_body_id),
-            "reach_reference_offset": np.asarray(
-                spec.get("reach_reference_offset", [0.0, 0.0, 0.0]),
-                dtype=float,
-            ).reshape(3),
-            "max_swing_reach": (
-                None
-                if spec.get("max_swing_reach") is None
-                else float(spec["max_swing_reach"])
             ),
             "arm_posture": arm_posture,
         }
@@ -1174,11 +1337,20 @@ def refine_joint_trajectory(
     step_tolerance = float(config.get("step_tolerance", 1e-4))
     use_acceleration = bool(config.get("acceleration_enabled", True))
     use_jerk = bool(config.get("jerk_enabled", True))
-    root_z_offset = float(
-        (
-            end_effector_config.get("base_position_constraint", {}) or {}
-        ).get("z_offset", 0.0)
+    refinement_hierarchy = bool(
+        config.get(
+            "hierarchy",
+            end_effector_config.get("hierarchy", False),
+        )
     )
+    contact_hierarchy_enabled = refinement_hierarchy and bool(
+        config.get("contact_hierarchy", False)
+    )
+    swivel_hierarchy_enabled = refinement_hierarchy and bool(
+        config.get("swivel_hierarchy", False)
+    )
+    swing_hierarchy_enabled = refinement_hierarchy
+    pose_hierarchy_enabled = refinement_hierarchy
 
     # The derivative residuals are per-frame differences, so their sigmas carry
     # implicit units of rad/frame^n.  Rescaling against the framerate they were
@@ -1224,9 +1396,21 @@ def refine_joint_trajectory(
                 max(float(penetration_cfg.get("margin", 0.05)), 1e-6),
             )
 
-    contact_offset_choice = _lock_contact_offsets(model, result, effectors)
+    contact_offset_choice = _lock_contact_offsets(
+        model, result, effectors, active_contact_offset_ids
+    )
 
     reference_joints = result[:, qpos_indices].copy()
+    raw_max_joint_deviation = config.get("max_joint_deviation")
+    max_joint_deviation = (
+        np.inf
+        if raw_max_joint_deviation is None
+        else float(raw_max_joint_deviation)
+    )
+    if max_joint_deviation <= 0.0:
+        raise ValueError(
+            "trajectory_refinement.max_joint_deviation must be positive."
+        )
     data = mujoco.MjData(model)
     jacobian_position = np.zeros((3, model.nv), dtype=float)
     jacobian_rotation = np.zeros((3, model.nv), dtype=float)
@@ -1288,6 +1472,31 @@ def refine_joint_trajectory(
         block_values: list[np.ndarray] = []
         block_rhs: list[float] = []
         row_index = 0
+        support_block_rows: list[np.ndarray] = []
+        support_block_columns: list[np.ndarray] = []
+        support_block_values: list[np.ndarray] = []
+        support_block_rhs: list[float] = []
+        support_row_index = 0
+        contact_block_rows: list[np.ndarray] = []
+        contact_block_columns: list[np.ndarray] = []
+        contact_block_values: list[np.ndarray] = []
+        contact_block_rhs: list[float] = []
+        contact_row_index = 0
+        swing_block_rows: list[np.ndarray] = []
+        swing_block_columns: list[np.ndarray] = []
+        swing_block_values: list[np.ndarray] = []
+        swing_block_rhs: list[float] = []
+        swing_row_index = 0
+        pose_block_rows: list[np.ndarray] = []
+        pose_block_columns: list[np.ndarray] = []
+        pose_block_values: list[np.ndarray] = []
+        pose_block_rhs: list[float] = []
+        pose_row_index = 0
+        swivel_block_rows: list[np.ndarray] = []
+        swivel_block_columns: list[np.ndarray] = []
+        swivel_block_values: list[np.ndarray] = []
+        swivel_block_rhs: list[float] = []
+        swivel_row_index = 0
 
         def append_block(
             frame_idx: int,
@@ -1295,17 +1504,56 @@ def refine_joint_trajectory(
             target_delta: np.ndarray,
             sigma: float,
             weight: float = 1.0,
+            priority: str = "regular",
         ) -> None:
-            nonlocal row_index
+            nonlocal row_index, support_row_index, contact_row_index
+            nonlocal swing_row_index, pose_row_index, swivel_row_index
             scale = np.sqrt(max(float(weight), 1e-8)) / sigma
             block = np.atleast_2d(np.asarray(jacobian, dtype=float)) * scale
             target = np.asarray(target_delta, dtype=float).reshape(-1) * scale
             local_rows, local_columns = np.nonzero(np.abs(block) > 1e-14)
-            block_rows.append(local_rows + row_index)
-            block_columns.append(frame_idx * num_joints + local_columns)
-            block_values.append(block[local_rows, local_columns])
-            block_rhs.extend(target.tolist())
-            row_index += block.shape[0]
+            if priority == "support":
+                support_block_rows.append(local_rows + support_row_index)
+                support_block_columns.append(frame_idx * num_joints + local_columns)
+                support_block_values.append(block[local_rows, local_columns])
+                support_block_rhs.extend(target.tolist())
+                support_row_index += block.shape[0]
+            elif priority == "contact" and contact_hierarchy_enabled:
+                contact_block_rows.append(local_rows + contact_row_index)
+                contact_block_columns.append(frame_idx * num_joints + local_columns)
+                contact_block_values.append(block[local_rows, local_columns])
+                contact_block_rhs.extend(target.tolist())
+                contact_row_index += block.shape[0]
+            elif priority == "swing" and swing_hierarchy_enabled:
+                swing_block_rows.append(local_rows + swing_row_index)
+                swing_block_columns.append(
+                    frame_idx * num_joints + local_columns
+                )
+                swing_block_values.append(block[local_rows, local_columns])
+                swing_block_rhs.extend(target.tolist())
+                swing_row_index += block.shape[0]
+            elif priority == "pose" and pose_hierarchy_enabled:
+                pose_block_rows.append(local_rows + pose_row_index)
+                pose_block_columns.append(
+                    frame_idx * num_joints + local_columns
+                )
+                pose_block_values.append(block[local_rows, local_columns])
+                pose_block_rhs.extend(target.tolist())
+                pose_row_index += block.shape[0]
+            elif priority == "swivel" and swivel_hierarchy_enabled:
+                swivel_block_rows.append(local_rows + swivel_row_index)
+                swivel_block_columns.append(
+                    frame_idx * num_joints + local_columns
+                )
+                swivel_block_values.append(block[local_rows, local_columns])
+                swivel_block_rhs.extend(target.tolist())
+                swivel_row_index += block.shape[0]
+            else:
+                block_rows.append(local_rows + row_index)
+                block_columns.append(frame_idx * num_joints + local_columns)
+                block_values.append(block[local_rows, local_columns])
+                block_rhs.extend(target.tolist())
+                row_index += block.shape[0]
 
         penetration_frames = (
             probe.probe_trajectory(result)
@@ -1321,7 +1569,18 @@ def refine_joint_trajectory(
                 task: SceneContactTask = spec["task"]
                 body_id = int(spec["body_id"])
                 rotation = data.xmat[body_id].reshape(3, 3).copy()
-                in_contact = bool(task.contact_mask[frame_idx])
+                mode = ContactMode(int(task.contact_modes[frame_idx]))
+                in_contact = mode != ContactMode.NONE
+                position_sigma_scale = (
+                    1.0
+                    if task.position_sigma_scale is None
+                    else float(task.position_sigma_scale[frame_idx])
+                )
+                orientation_sigma_scale = (
+                    1.0
+                    if task.orientation_sigma_scale is None
+                    else float(task.orientation_sigma_scale[frame_idx])
+                )
                 if in_contact:
                     target_position = task.contact_positions[frame_idx]
                     offset = spec["contact_offsets"][
@@ -1332,37 +1591,33 @@ def refine_joint_trajectory(
                         if spec["contact_position_sigma"] is None
                         else float(spec["contact_position_sigma"])
                     )
-                    confidence = max(
-                        float(task.contact_confidence[frame_idx]), 0.25
-                    )
+                    position_sigma *= position_sigma_scale
+                    if mode == ContactMode.SUPPORT:
+                        confidence = 1.0
+                    else:
+                        transition_weight = float(
+                            task.transition_weights[frame_idx]
+                        )
+                        confidence = max(
+                            float(task.contact_confidence[frame_idx]), 0.25
+                        ) * transition_weight
+                        if mode == ContactMode.TOUCH:
+                            confidence *= float(
+                                end_effector_config.get("touch_weight", 0.5)
+                            )
                 else:
-                    target_position = _transform_swing_target(
-                        task.tracking_positions[frame_idx],
-                        None
-                        if source_root_positions is None
-                        else source_root_positions[frame_idx],
-                        root_z_offset,
-                        float(spec["swing_morphology_scale"]),
-                        bool(spec["preserve_world_target"]),
-                    )
-                    reach_body_id = int(spec["reach_reference_body_id"])
-                    if reach_body_id >= 0:
-                        reach_rotation = data.xmat[reach_body_id].reshape(3, 3)
-                        reach_origin = (
-                            data.xpos[reach_body_id]
-                            + reach_rotation @ spec["reach_reference_offset"]
+                    if task.effective_swing_positions is None:
+                        raise RuntimeError(
+                            f"{name}: effective swing targets were not prepared."
                         )
-                        target_position = _clamp_target_to_reach(
-                            target_position,
-                            reach_origin,
-                            spec["max_swing_reach"],
-                        )
+                    target_position = task.effective_swing_positions[frame_idx]
                     offset = spec["tracking_offset"]
                     position_sigma = (
                         swing_position_sigma
                         if spec["swing_position_sigma"] is None
                         else float(spec["swing_position_sigma"])
                     )
+                    position_sigma *= position_sigma_scale
                     confidence = 1.0
 
                 point = data.xpos[body_id] + rotation @ offset
@@ -1376,22 +1631,119 @@ def refine_joint_trajectory(
                     point,
                     body_id,
                 )
-                append_block(
-                    frame_idx,
-                    jacobian_position[:, dof_indices],
-                    target_position - point,
-                    position_sigma,
-                    confidence,
-                )
+                position_jacobian = jacobian_position[:, dof_indices].copy()
+                if (
+                    not in_contact
+                    and spec["swing_target_space"]
+                    == "limb_morphology_scaled"
+                ):
+                    anchor_body_id = int(spec["swing_anchor_body_id"])
+                    anchor_rotation = data.xmat[anchor_body_id].reshape(3, 3)
+                    anchor_point = (
+                        data.xpos[anchor_body_id]
+                        + anchor_rotation @ spec["swing_anchor_offset"]
+                    )
+                    anchor_jacobian_position = np.zeros(
+                        (3, model.nv), dtype=float
+                    )
+                    anchor_jacobian_rotation = np.zeros(
+                        (3, model.nv), dtype=float
+                    )
+                    mujoco.mj_jac(
+                        model,
+                        data,
+                        anchor_jacobian_position,
+                        anchor_jacobian_rotation,
+                        anchor_point,
+                        anchor_body_id,
+                    )
+                    alpha = float(task.contact_bridge_alpha[frame_idx])
+                    anchor_weight = 1.0 - alpha
+                    position_jacobian -= (
+                        anchor_weight
+                        * anchor_jacobian_position[:, dof_indices]
+                    )
+                    relative_rhs = (
+                        anchor_weight * task.swing_limb_offsets[frame_idx]
+                        + alpha * task.contact_bridge_positions[frame_idx]
+                    )
+                    position_delta = relative_rhs - (
+                        point - anchor_weight * anchor_point
+                    )
+                else:
+                    position_delta = target_position - point
+                if mode == ContactMode.SLIDE:
+                    normal = np.asarray(
+                        task.surface_normals[frame_idx], dtype=float
+                    ).reshape(3)
+                    normal /= max(float(np.linalg.norm(normal)), 1e-10)
+                    append_block(
+                        frame_idx,
+                        normal @ position_jacobian,
+                        normal @ position_delta,
+                        position_sigma,
+                        confidence,
+                        "support",
+                    )
+                    tangential_weight = max(
+                        float(
+                            end_effector_config.get(
+                                "slide_tangential_weight", 0.1
+                            )
+                        ),
+                        0.0,
+                    )
+                    if tangential_weight > 0.0:
+                        tangent_projection = np.eye(3) - np.outer(normal, normal)
+                        append_block(
+                            frame_idx,
+                            tangent_projection @ position_jacobian,
+                            tangent_projection @ position_delta,
+                            position_sigma,
+                            confidence * tangential_weight,
+                            "contact",
+                        )
+                else:
+                    append_block(
+                        frame_idx,
+                        position_jacobian,
+                        position_delta,
+                        position_sigma,
+                        confidence,
+                        (
+                            "support"
+                            if mode == ContactMode.SUPPORT
+                            else "contact"
+                            if mode == ContactMode.TOUCH
+                            else "swing"
+                        ),
+                    )
 
                 arm_posture = spec["arm_posture"]
                 if arm_posture is not None and source_joint_positions is not None:
+                    limb_anchored = (
+                        spec["swing_target_space"] == "limb_morphology_scaled"
+                    )
+                    if task.morphology_scale is None or (
+                        not limb_anchored
+                        and (
+                            source_root_positions is None
+                            or task.robot_base_reference_w is None
+                        )
+                    ):
+                        raise RuntimeError(
+                            f"{name}: arm posture transport requires source and robot "
+                            "root references."
+                        )
                     shoulder_body_id = int(arm_posture["shoulder_body_id"])
                     elbow_body_id = int(arm_posture["elbow_body_id"])
                     shoulder_position = data.xpos[shoulder_body_id].copy()
                     elbow_position = data.xpos[elbow_body_id].copy()
                     current_upper = elbow_position - shoulder_position
                     source_frame = source_joint_positions[frame_idx]
+                    source_shoulder = source_frame[
+                        int(arm_posture["source_shoulder_idx"])
+                    ]
                     wrist_body_id = int(arm_posture["wrist_body_id"])
                     use_wrist_center = wrist_body_id >= 0
                     source_endpoint = (
@@ -1399,18 +1751,24 @@ def refine_joint_trajectory(
                         if use_wrist_center
                         else task.tracking_positions[frame_idx]
                     )
+                    # Refinement already knows where the robot shoulder is, so
+                    # the limb-anchored shape target uses the solved shoulder
+                    # rather than the base-orientation reference used to build
+                    # the framewise swing targets.
                     shape_endpoint_target = _transform_swing_target(
                         source_endpoint,
-                        None
-                        if source_root_positions is None
+                        source_shoulder
+                        if limb_anchored
                         else source_root_positions[frame_idx],
-                        root_z_offset,
-                        float(spec["swing_morphology_scale"]),
-                        bool(spec["preserve_world_target"]),
+                        shoulder_position
+                        if limb_anchored
+                        else task.robot_base_reference_w[frame_idx],
+                        float(task.morphology_scale),
+                        spec["swing_target_space"],
                     )
                     target_upper, target_forearm = (
                         _transported_arm_segment_targets(
-                            source_frame[int(arm_posture["source_shoulder_idx"])],
+                            source_shoulder,
                             source_frame[int(arm_posture["source_elbow_idx"])],
                             source_endpoint,
                             shoulder_position,
@@ -1461,23 +1819,98 @@ def refine_joint_trajectory(
                         (elbow_jacobian - shoulder_jacobian)[:, dof_indices],
                         target_upper - current_upper,
                         float(arm_posture["upper_direction_sigma"]),
+                        1.0,
+                        "pose",
                     )
                     append_block(
                         frame_idx,
                         (shape_endpoint_jacobian - elbow_jacobian)[:, dof_indices],
                         target_forearm - current_forearm,
                         float(arm_posture["forearm_direction_sigma"]),
+                        1.0,
+                        "pose",
                     )
+                    if (
+                        bool(arm_posture["swivel_enabled"])
+                        and use_wrist_center
+                        and float(arm_posture["swivel_weight"]) > 0.0
+                    ):
+                        source_direction, _, source_fade, _, _ = (
+                            _swivel_direction_and_jacobian(
+                                source_frame[
+                                    int(arm_posture["source_shoulder_idx"])
+                                ],
+                                source_frame[
+                                    int(arm_posture["source_elbow_idx"])
+                                ],
+                                source_endpoint,
+                                min_sine=float(
+                                    arm_posture["swivel_min_sine"]
+                                ),
+                                full_sine=float(
+                                    arm_posture["swivel_full_sine"]
+                                ),
+                            )
+                        )
+                        (
+                            robot_direction,
+                            swivel_jacobian,
+                            robot_fade,
+                            _,
+                            robot_axis,
+                        ) = _swivel_direction_and_jacobian(
+                            shoulder_position,
+                            elbow_position,
+                            shape_endpoint_position,
+                            shoulder_jacobian,
+                            elbow_jacobian,
+                            shape_endpoint_jacobian,
+                            min_sine=float(arm_posture["swivel_min_sine"]),
+                            full_sine=float(arm_posture["swivel_full_sine"]),
+                        )
+                        swivel_weight = float(
+                            arm_posture["swivel_weight"]
+                        ) * min(source_fade, robot_fade)
+                        if swivel_weight > 0.0 and swivel_jacobian is not None:
+                            append_block(
+                                frame_idx,
+                                swivel_jacobian[:, dof_indices],
+                                _swivel_tangent_delta(
+                                    robot_direction,
+                                    source_direction,
+                                    robot_axis,
+                                ),
+                                float(arm_posture["swivel_sigma"]),
+                                swivel_weight,
+                                "swivel",
+                            )
 
                 if spec["track_orientation"]:
-                    target_rotation = _orthonormal_target_rotation(
+                    target_rotation = (
                         None
-                        if task.forward_directions is None
-                        else task.forward_directions[frame_idx],
-                        None
-                        if task.up_directions is None
-                        else task.up_directions[frame_idx],
+                        if task.orientation_target_rotations is None
+                        else task.orientation_target_rotations[frame_idx]
                     )
+                    if target_rotation is not None and not np.all(
+                        np.isfinite(target_rotation)
+                    ):
+                        target_rotation = None
+                    if target_rotation is None:
+                        target_up = (
+                            task.surface_normals[frame_idx]
+                            if mode in (ContactMode.SUPPORT, ContactMode.SLIDE)
+                            else (
+                                None
+                                if task.up_directions is None
+                                else task.up_directions[frame_idx]
+                            )
+                        )
+                        target_rotation = _orthonormal_target_rotation(
+                            None
+                            if task.forward_directions is None
+                            else task.forward_directions[frame_idx],
+                            target_up,
+                        )
                     if target_rotation is not None:
                         semantic_rotation = (
                             rotation @ spec["orientation_local_rotation"]
@@ -1498,6 +1931,21 @@ def refine_joint_trajectory(
                             else float(spec["swing_orientation_weight"])
                         )
                         orientation_weight *= confidence
+                        forward_orientation_sigma = max(
+                            float(spec["forward_orientation_sigma"])
+                            * orientation_sigma_scale,
+                            1e-6,
+                        )
+                        up_orientation_sigma = max(
+                            float(spec["up_orientation_sigma"])
+                            * orientation_sigma_scale,
+                            1e-6,
+                        )
+                        orientation_sigma = max(
+                            float(spec["orientation_sigma"])
+                            * orientation_sigma_scale,
+                            1e-6,
+                        )
                         if (
                             orientation_weight > 0.0
                             and spec["orientation_mode"] == "axes"
@@ -1514,7 +1962,7 @@ def refine_joint_trajectory(
                                 -_skew_symmetric(current_forward)
                                 @ orientation_jacobian,
                                 target_rotation[:, 0] - current_forward,
-                                float(spec["forward_orientation_sigma"]),
+                                forward_orientation_sigma,
                                 orientation_weight,
                             )
                             append_block(
@@ -1522,7 +1970,7 @@ def refine_joint_trajectory(
                                 -_skew_symmetric(current_up)
                                 @ orientation_jacobian,
                                 target_rotation[:, 2] - current_up,
-                                float(spec["up_orientation_sigma"]),
+                                up_orientation_sigma,
                                 orientation_weight,
                             )
                         elif orientation_weight > 0.0:
@@ -1533,9 +1981,67 @@ def refine_joint_trajectory(
                                 frame_idx,
                                 orientation_jacobian,
                                 rotation_error,
-                                max(float(spec["orientation_sigma"]), 1e-6),
+                                orientation_sigma,
                                 orientation_weight,
                             )
+
+            if refinement_pose_edges and source_joint_positions is not None:
+                pose_sigma = max(
+                    float(pose_direction_cfg.get("sigma", 0.12)), 1e-6
+                )
+                source_frame = source_joint_positions[frame_idx]
+                for edge in refinement_pose_edges:
+                    parent_body_id = int(edge["parent_body_id"])
+                    child_body_id = int(edge["child_body_id"])
+                    parent_position = data.xpos[parent_body_id].copy()
+                    child_position = data.xpos[child_body_id].copy()
+                    current_vector = child_position - parent_position
+                    current_length = float(np.linalg.norm(current_vector))
+                    source_vector = (
+                        source_frame[int(edge["source_child_idx"])]
+                        - source_frame[int(edge["source_parent_idx"])]
+                    )
+                    source_length = float(np.linalg.norm(source_vector))
+                    if current_length < 1e-8 or source_length < 1e-8:
+                        continue
+                    current_direction = current_vector / current_length
+                    source_direction = source_vector / source_length
+                    parent_jacobian = np.zeros_like(jacobian_position)
+                    child_jacobian = np.zeros_like(jacobian_position)
+                    mujoco.mj_jac(
+                        model,
+                        data,
+                        parent_jacobian,
+                        None,
+                        parent_position,
+                        parent_body_id,
+                    )
+                    mujoco.mj_jac(
+                        model,
+                        data,
+                        child_jacobian,
+                        None,
+                        child_position,
+                        child_body_id,
+                    )
+                    vector_jacobian = (
+                        child_jacobian - parent_jacobian
+                    )[:, dof_indices]
+                    direction_jacobian = (
+                        (np.eye(3) - np.outer(
+                            current_direction, current_direction
+                        ))
+                        @ vector_jacobian
+                        / current_length
+                    )
+                    append_block(
+                        frame_idx,
+                        direction_jacobian,
+                        source_direction - current_direction,
+                        pose_sigma,
+                        1.0,
+                        "pose",
+                    )
 
             frame_penetration = penetration_frames[frame_idx]
             if frame_penetration is None:
@@ -1551,7 +2057,8 @@ def refine_joint_trajectory(
                 np.asarray(spec["task"].contact_positions[frame_idx], dtype=float)
                 for spec in effectors.values()
                 if penetration_anchor_radius > 0.0
-                and bool(spec["task"].contact_mask[frame_idx])
+                and spec["task"].contact_modes[frame_idx]
+                == int(ContactMode.SUPPORT)
             ]
             # One-sided: only points that violate the requested clearance get a
             # row, and the active set is rebuilt from the current pose at every
@@ -1604,9 +2111,93 @@ def refine_joint_trajectory(
             ),
             shape=(row_index, num_frames * num_joints),
         ).tocsr()
+        support_block = sparse.coo_matrix(
+            (
+                np.concatenate(support_block_values)
+                if support_block_values
+                else np.zeros(0, dtype=float),
+                (
+                    np.concatenate(support_block_rows)
+                    if support_block_rows
+                    else np.zeros(0, dtype=int),
+                    np.concatenate(support_block_columns)
+                    if support_block_columns
+                    else np.zeros(0, dtype=int),
+                ),
+            ),
+            shape=(support_row_index, num_frames * num_joints),
+        ).tocsr()
+        contact_block = sparse.coo_matrix(
+            (
+                np.concatenate(contact_block_values)
+                if contact_block_values
+                else np.zeros(0, dtype=float),
+                (
+                    np.concatenate(contact_block_rows)
+                    if contact_block_rows
+                    else np.zeros(0, dtype=int),
+                    np.concatenate(contact_block_columns)
+                    if contact_block_columns
+                    else np.zeros(0, dtype=int),
+                ),
+            ),
+            shape=(contact_row_index, num_frames * num_joints),
+        ).tocsr()
+        swing_block = sparse.coo_matrix(
+            (
+                np.concatenate(swing_block_values)
+                if swing_block_values
+                else np.zeros(0, dtype=float),
+                (
+                    np.concatenate(swing_block_rows)
+                    if swing_block_rows
+                    else np.zeros(0, dtype=int),
+                    np.concatenate(swing_block_columns)
+                    if swing_block_columns
+                    else np.zeros(0, dtype=int),
+                ),
+            ),
+            shape=(swing_row_index, num_frames * num_joints),
+        ).tocsr()
+        pose_block = sparse.coo_matrix(
+            (
+                np.concatenate(pose_block_values)
+                if pose_block_values
+                else np.zeros(0, dtype=float),
+                (
+                    np.concatenate(pose_block_rows)
+                    if pose_block_rows
+                    else np.zeros(0, dtype=int),
+                    np.concatenate(pose_block_columns)
+                    if pose_block_columns
+                    else np.zeros(0, dtype=int),
+                ),
+            ),
+            shape=(pose_row_index, num_frames * num_joints),
+        ).tocsr()
+        swivel_block = sparse.coo_matrix(
+            (
+                np.concatenate(swivel_block_values)
+                if swivel_block_values
+                else np.zeros(0, dtype=float),
+                (
+                    np.concatenate(swivel_block_rows)
+                    if swivel_block_rows
+                    else np.zeros(0, dtype=int),
+                    np.concatenate(swivel_block_columns)
+                    if swivel_block_columns
+                    else np.zeros(0, dtype=int),
+                ),
+            ),
+            shape=(swivel_row_index, num_frames * num_joints),
+        ).tocsr()
 
         systems = [task_block]
         residuals = [np.asarray(block_rhs, dtype=float)]
+        posture_systems = [reference_block]
+        posture_residuals = [
+            ((reference_joints - current_joints) / reference_sigma).reshape(-1)
+        ]
 
         active_limit_rows = 0
         if joint_limit_avoidance_enabled and (
@@ -1679,11 +2270,11 @@ def refine_joint_trajectory(
             for effector_name, coordinate_mask in swing_step_masks.items():
                 if effector_name not in effectors:
                     continue
-                contact_mask = np.asarray(
-                    effectors[effector_name]["task"].contact_mask,
-                    dtype=bool,
-                )
-                swing_pairs = ~(contact_mask[:-1] | contact_mask[1:])
+                in_contact = np.asarray(
+                    effectors[effector_name]["task"].contact_modes,
+                    dtype=np.uint8,
+                ) != int(ContactMode.NONE)
+                swing_pairs = ~(in_contact[:-1] | in_contact[1:])
                 joint_ids = np.flatnonzero(coordinate_mask)
                 for frame_idx in np.flatnonzero(swing_pairs):
                     current_step = (
@@ -1768,16 +2359,9 @@ def refine_joint_trajectory(
                 systems.append(joint_step_block)
                 residuals.append(np.asarray(step_rhs, dtype=float))
 
-        # Stay near the natural framewise IK solution.  This also makes the
-        # normal equations strictly determined in redundant joint subspaces.
-        systems.append(reference_block)
-        residuals.append(
-            ((reference_joints - current_joints) / reference_sigma).reshape(-1)
-        )
-
         if posture_block is not None:
-            systems.append(posture_block)
-            residuals.append(
+            posture_systems.append(posture_block)
+            posture_residuals.append(
                 (
                     (
                         posture_targets[posture_joint_indices][None, :]
@@ -1807,52 +2391,512 @@ def refine_joint_trajectory(
                 ).reshape(-1)
             )
 
-        system = sparse.vstack(systems, format="csr")
-        rhs_array = np.concatenate(residuals)
+        motion_system = sparse.vstack(systems, format="csr")
+        motion_rhs = np.concatenate(residuals)
+        posture_system = sparse.vstack(posture_systems, format="csr")
+        posture_rhs = np.concatenate(posture_residuals)
+        system = sparse.vstack([motion_system, posture_system], format="csr")
+        rhs_array = np.concatenate([motion_rhs, posture_rhs])
 
         # A framewise solution can sit marginally outside a joint limit.  The
         # step bounds must always admit zero, otherwise the joint limit and the
         # trust region cross over and the solver rejects the problem outright.
+        absolute_lower = np.maximum(
+            np.tile(joint_lower, num_frames),
+            reference_joints.reshape(-1) - max_joint_deviation,
+        )
+        absolute_upper = np.minimum(
+            np.tile(joint_upper, num_frames),
+            reference_joints.reshape(-1) + max_joint_deviation,
+        )
         lower = np.minimum(
             np.maximum(
-                np.tile(joint_lower, num_frames) - current_joints.reshape(-1),
+                absolute_lower - current_joints.reshape(-1),
                 -trust_region,
             ),
             0.0,
         )
         upper = np.maximum(
             np.minimum(
-                np.tile(joint_upper, num_frames) - current_joints.reshape(-1),
+                absolute_upper - current_joints.reshape(-1),
                 trust_region,
             ),
             0.0,
         )
-        solution = lsq_linear(
-            system,
-            rhs_array,
-            bounds=(lower, upper),
-            method="trf",
-            lsq_solver="lsmr",
-            tol=solver_tolerance,
-            lsmr_tol=solver_tolerance,
-            max_iter=solver_iterations,
-            verbose=0,
+        support_optimum = None
+        contact_optimum = None
+        contact_bound = None
+        contact_absolute_tolerance = None
+        contact_relative_tolerance = None
+        swivel_optimum = None
+        has_support_priority = refinement_hierarchy and support_row_index > 0
+        has_contact_priority = (
+            contact_hierarchy_enabled and contact_row_index > 0
         )
-        if not np.all(np.isfinite(solution.x)):
+        has_swing_priority = swing_hierarchy_enabled and swing_row_index > 0
+        has_pose_priority = pose_hierarchy_enabled and pose_row_index > 0
+        has_swivel_priority = swivel_hierarchy_enabled and swivel_row_index > 0
+        if (
+            has_support_priority
+            or has_contact_priority
+            or has_swing_priority
+            or has_pose_priority
+            or has_swivel_priority
+        ):
+            delta = cp.Variable(num_frames * num_joints)
+            hierarchy_constraints = [
+                delta >= lower,
+                delta <= upper,
+            ]
+            support_solution = None
+            priority_solution_x = None
+            if has_support_priority:
+                support_rhs = np.asarray(support_block_rhs, dtype=float)
+                support_solution = lsq_linear(
+                    support_block,
+                    support_rhs,
+                    bounds=(lower, upper),
+                    method="trf",
+                    lsq_solver="lsmr",
+                    tol=solver_tolerance,
+                    lsmr_tol=solver_tolerance,
+                    max_iter=solver_iterations,
+                    verbose=0,
+                )
+                support_optimum = float(
+                    np.linalg.norm(
+                        support_block @ support_solution.x - support_rhs
+                    )
+                )
+                support_relative_tolerance = max(
+                    float(
+                        config.get(
+                            "support_priority_relative_tolerance", 0.01
+                        )
+                    ),
+                    0.0,
+                )
+                support_absolute_tolerance = max(
+                    float(
+                        config.get(
+                            "support_priority_absolute_tolerance", 0.05
+                        )
+                    ),
+                    0.0,
+                )
+                support_bound = (
+                    (1.0 + support_relative_tolerance) * support_optimum
+                    + support_absolute_tolerance
+                )
+                hierarchy_constraints.append(
+                    cp.norm(support_block @ delta - support_rhs, 2)
+                    <= support_bound
+                )
+                priority_solution_x = np.asarray(
+                    support_solution.x, dtype=float
+                ).reshape(-1)
+            contact_problem = None
+            if has_contact_priority:
+                contact_rhs = np.asarray(contact_block_rhs, dtype=float)
+                contact_problem = cp.Problem(
+                    cp.Minimize(
+                        cp.sum_squares(contact_block @ delta - contact_rhs)
+                    ),
+                    hierarchy_constraints,
+                )
+                try:
+                    contact_problem.solve(solver=cp.CLARABEL, verbose=False)
+                except cp.error.SolverError:
+                    pass
+                if contact_problem.status not in (
+                    cp.OPTIMAL,
+                    cp.OPTIMAL_INACCURATE,
+                ):
+                    contact_problem.solve(
+                        solver=cp.SCS,
+                        eps=solver_tolerance,
+                        max_iters=max(solver_iterations * 200, 2000),
+                        verbose=False,
+                    )
+                if contact_problem.status in (
+                    cp.OPTIMAL,
+                    cp.OPTIMAL_INACCURATE,
+                ):
+                    contact_optimum = float(
+                        np.linalg.norm(
+                            contact_block @ np.asarray(delta.value).reshape(-1)
+                            - contact_rhs
+                        )
+                    )
+                    contact_relative_tolerance = max(
+                        float(
+                            config.get(
+                                "contact_priority_relative_tolerance", 0.01
+                            )
+                        ),
+                        0.0,
+                    )
+                    contact_absolute_tolerance = max(
+                        float(
+                            config.get(
+                                "contact_priority_absolute_tolerance",
+                                DEFAULT_CONTACT_PRIORITY_ABSOLUTE_TOLERANCE,
+                            )
+                        ),
+                        0.0,
+                    )
+                    contact_bound = (
+                        (1.0 + contact_relative_tolerance) * contact_optimum
+                        + contact_absolute_tolerance
+                    )
+                    hierarchy_constraints.append(
+                        cp.norm(contact_block @ delta - contact_rhs, 2)
+                        <= contact_bound
+                    )
+                    priority_solution_x = np.asarray(
+                        delta.value, dtype=float
+                    ).reshape(-1)
+
+            failed_priority_problem = (
+                contact_problem
+                if contact_problem is not None
+                and contact_problem.status
+                not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                else None
+            )
+            kinematic_relative_tolerance = max(
+                float(
+                    config.get(
+                        "temporal_priority_relative_tolerance", 0.01
+                    )
+                ),
+                0.0,
+            )
+            kinematic_absolute_tolerance = max(
+                float(
+                    config.get(
+                        "temporal_priority_absolute_tolerance", 0.05
+                    )
+                ),
+                0.0,
+            )
+            for (
+                stage_name,
+                stage_enabled,
+                stage_block,
+                stage_rhs_values,
+            ) in (
+                (
+                    "swing",
+                    has_swing_priority,
+                    swing_block,
+                    swing_block_rhs,
+                ),
+                (
+                    "pose",
+                    has_pose_priority,
+                    pose_block,
+                    pose_block_rhs,
+                ),
+            ):
+                if failed_priority_problem is not None or not stage_enabled:
+                    continue
+                stage_rhs = np.asarray(stage_rhs_values, dtype=float)
+                stage_problem = cp.Problem(
+                    cp.Minimize(
+                        cp.sum_squares(stage_block @ delta - stage_rhs)
+                    ),
+                    hierarchy_constraints,
+                )
+                try:
+                    stage_problem.solve(solver=cp.CLARABEL, verbose=False)
+                except cp.error.SolverError:
+                    pass
+                if stage_problem.status not in (
+                    cp.OPTIMAL,
+                    cp.OPTIMAL_INACCURATE,
+                ):
+                    stage_problem.solve(
+                        solver=cp.SCS,
+                        eps=solver_tolerance,
+                        max_iters=max(solver_iterations * 200, 2000),
+                        verbose=False,
+                    )
+                if stage_problem.status in (
+                    cp.OPTIMAL,
+                    cp.OPTIMAL_INACCURATE,
+                ):
+                    stage_optimum = float(
+                        np.linalg.norm(
+                            stage_block @ np.asarray(delta.value).reshape(-1)
+                            - stage_rhs
+                        )
+                    )
+                    hierarchy_constraints.append(
+                        cp.norm(stage_block @ delta - stage_rhs, 2)
+                        <= (1.0 + kinematic_relative_tolerance)
+                        * stage_optimum
+                        + kinematic_absolute_tolerance
+                    )
+                    priority_solution_x = np.asarray(
+                        delta.value, dtype=float
+                    ).reshape(-1)
+                else:
+                    failed_priority_problem = stage_problem
+
+            swivel_problem = None
+            if failed_priority_problem is None and has_swivel_priority:
+                swivel_rhs = np.asarray(swivel_block_rhs, dtype=float)
+                swivel_problem = cp.Problem(
+                    cp.Minimize(
+                        cp.sum_squares(swivel_block @ delta - swivel_rhs)
+                    ),
+                    hierarchy_constraints,
+                )
+                try:
+                    swivel_problem.solve(solver=cp.CLARABEL, verbose=False)
+                except cp.error.SolverError:
+                    pass
+                if swivel_problem.status not in (
+                    cp.OPTIMAL,
+                    cp.OPTIMAL_INACCURATE,
+                ):
+                    swivel_problem.solve(
+                        solver=cp.SCS,
+                        eps=solver_tolerance,
+                        max_iters=max(solver_iterations * 200, 2000),
+                        verbose=False,
+                    )
+                if swivel_problem.status in (
+                    cp.OPTIMAL,
+                    cp.OPTIMAL_INACCURATE,
+                ):
+                    swivel_optimum = float(
+                        np.linalg.norm(
+                            swivel_block @ np.asarray(delta.value).reshape(-1)
+                            - swivel_rhs
+                        )
+                    )
+                    swivel_relative_tolerance = max(
+                        float(
+                            config.get(
+                                "swivel_priority_relative_tolerance", 0.01
+                            )
+                        ),
+                        0.0,
+                    )
+                    swivel_absolute_tolerance = max(
+                        float(
+                            config.get(
+                                "swivel_priority_absolute_tolerance", 5.0
+                            )
+                        ),
+                        0.0,
+                    )
+                    hierarchy_constraints.append(
+                        cp.norm(swivel_block @ delta - swivel_rhs, 2)
+                        <= (1.0 + swivel_relative_tolerance) * swivel_optimum
+                        + swivel_absolute_tolerance
+                    )
+                    priority_solution_x = np.asarray(
+                        delta.value, dtype=float
+                    ).reshape(-1)
+                else:
+                    failed_priority_problem = swivel_problem
+
+            if failed_priority_problem is not None:
+                hierarchy_problem = failed_priority_problem
+            else:
+                hierarchy_problem = cp.Problem(
+                    cp.Minimize(
+                        cp.sum_squares(motion_system @ delta - motion_rhs)
+                    ),
+                    hierarchy_constraints,
+                )
+                try:
+                    hierarchy_problem.solve(solver=cp.CLARABEL, verbose=False)
+                except cp.error.SolverError:
+                    pass
+                if hierarchy_problem.status not in (
+                    cp.OPTIMAL,
+                    cp.OPTIMAL_INACCURATE,
+                ):
+                    hierarchy_problem.solve(
+                        solver=cp.SCS,
+                        eps=solver_tolerance,
+                        max_iters=max(solver_iterations * 200, 2000),
+                        verbose=False,
+                    )
+            if hierarchy_problem.status not in (
+                cp.OPTIMAL,
+                cp.OPTIMAL_INACCURATE,
+            ):
+                # Preserve the highest achieved priority rather than silently
+                # reverting to a weighted solve that can move the contact.
+                solution_x = (
+                    np.zeros(num_frames * num_joints, dtype=float)
+                    if priority_solution_x is None
+                    else priority_solution_x
+                )
+                solution_cost = 0.5 * float(
+                    np.linalg.norm(system @ solution_x - rhs_array) ** 2
+                )
+                solution_status = 1
+            else:
+                motion_solution_x = np.asarray(delta.value, dtype=float).reshape(-1)
+                motion_optimum = float(
+                    np.linalg.norm(
+                        motion_system @ motion_solution_x - motion_rhs
+                    )
+                )
+                if bool(config.get("posture_hierarchy", True)):
+                    motion_relative_tolerance = max(
+                        float(
+                            config.get(
+                                "temporal_priority_relative_tolerance", 0.01
+                            )
+                        ),
+                        0.0,
+                    )
+                    motion_absolute_tolerance = max(
+                        float(
+                            config.get(
+                                "temporal_priority_absolute_tolerance", 0.05
+                            )
+                        ),
+                        0.0,
+                    )
+                    posture_constraints = hierarchy_constraints + [
+                        cp.norm(motion_system @ delta - motion_rhs, 2)
+                        <= (1.0 + motion_relative_tolerance) * motion_optimum
+                        + motion_absolute_tolerance
+                    ]
+                    posture_problem = cp.Problem(
+                        cp.Minimize(
+                            cp.sum_squares(posture_system @ delta - posture_rhs)
+                        ),
+                        posture_constraints,
+                    )
+                    try:
+                        posture_problem.solve(solver=cp.CLARABEL, verbose=False)
+                    except cp.error.SolverError:
+                        pass
+                    if posture_problem.status not in (
+                        cp.OPTIMAL,
+                        cp.OPTIMAL_INACCURATE,
+                    ):
+                        posture_problem.solve(
+                            solver=cp.SCS,
+                            eps=solver_tolerance,
+                            max_iters=max(solver_iterations * 200, 2000),
+                            verbose=False,
+                        )
+                    solution_x = (
+                        np.asarray(delta.value, dtype=float).reshape(-1)
+                        if posture_problem.status
+                        in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                        else motion_solution_x
+                    )
+                else:
+                    solution_x = motion_solution_x
+                solution_cost = 0.5 * float(
+                    np.linalg.norm(system @ solution_x - rhs_array) ** 2
+                )
+                solution_status = 1
+        else:
+            solution = lsq_linear(
+                system,
+                rhs_array,
+                bounds=(lower, upper),
+                method="trf",
+                lsq_solver="lsmr",
+                tol=solver_tolerance,
+                lsmr_tol=solver_tolerance,
+                max_iter=solver_iterations,
+                verbose=0,
+            )
+            solution_x = solution.x
+            solution_cost = float(solution.cost)
+            solution_status = int(getattr(solution, "status", 1))
+        if not np.all(np.isfinite(solution_x)):
             raise RuntimeError("trajectory refinement produced a non-finite step")
-        if int(getattr(solution, "status", 1)) == 0:
+        if solution_status == 0:
             print(
                 "Trajectory refinement warning: the bounded least-squares solve "
                 f"reached solver_iterations={solver_iterations} without "
                 "converging, so this step is truncated."
             )
-        step = solution.x.reshape(num_frames, num_joints)
+        step = solution_x.reshape(num_frames, num_joints)
+        if (
+            diagnostics is not None
+            and has_contact_priority
+            and contact_optimum is not None
+            and contact_bound is not None
+            and contact_relative_tolerance is not None
+            and contact_absolute_tolerance is not None
+        ):
+            final_contact_norm = float(
+                np.linalg.norm(contact_block @ solution_x - contact_rhs)
+            )
+            iteration_diagnostic = {
+                "level_optimum": float(contact_optimum),
+                "configured_relative_tolerance": float(
+                    contact_relative_tolerance
+                ),
+                "configured_absolute_tolerance": float(
+                    contact_absolute_tolerance
+                ),
+                "configured_bound": float(contact_bound),
+                "final_residual_norm": final_contact_norm,
+                "slack_consumed": max(
+                    final_contact_norm - float(contact_optimum), 0.0
+                ),
+                "active_residual_rows": int(contact_row_index),
+                "solver_status": str(hierarchy_problem.status),
+                "max_joint_step": float(np.max(np.abs(step))),
+            }
+            history = diagnostics.setdefault("contact_priority_iterations", [])
+            history.append(iteration_diagnostic.copy())
+            iteration_diagnostic["solver_failure_count"] = int(
+                sum(
+                    entry["solver_status"]
+                    not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                    for entry in history
+                )
+            )
+            iteration_diagnostic["max_joint_step"] = float(
+                max(entry["max_joint_step"] for entry in history)
+            )
+            # Physical error must be measured from the refined trajectory.
+            # A closed-form conversion is not valid because a configured level
+            # may mix residual rows with different sigmas and mode weights.
+            diagnostics["contact_priority"] = iteration_diagnostic
         result[:, qpos_indices] = current_joints + step
         print(
             "Trajectory refinement "
-            f"{iteration + 1}/{iterations}: cost={solution.cost:.4f}, "
+            f"{iteration + 1}/{iterations}: cost={solution_cost:.4f}, "
             f"max_joint_step={np.max(np.abs(step)):.5f}, "
-            f"penetration_rows={active_penetration_rows}, "
+            f"support_rows={support_row_index}, "
+            f"contact_rows={contact_row_index}, "
+            f"swing_rows={swing_row_index}, "
+            f"pose_rows={pose_row_index}, "
+            f"swivel_rows={swivel_row_index}, "
+            + (
+                f"support_optimum={support_optimum:.5f}, "
+                if support_optimum is not None
+                else ""
+            )
+            + (
+                f"contact_optimum={contact_optimum:.5f}, "
+                if contact_optimum is not None
+                else ""
+            )
+            + (
+                f"swivel_optimum={swivel_optimum:.5f}, "
+                if swivel_optimum is not None
+                else ""
+            )
+            + f"penetration_rows={active_penetration_rows}, "
             f"joint_limit_rows={active_limit_rows}, "
             f"swing_step_rows={active_swing_step_rows}, "
             f"joint_step_rows={active_joint_step_rows}"

@@ -268,6 +268,57 @@ class TestPackageImport:
         assert omniretargeting.__version__ == __version__ == "0.1.0"
 
 
+def test_perform_retargeting_uses_captured_root_orientation_each_frame(
+    monkeypatch,
+):
+    from omniretargeting import OmniRetargeter
+    import omniretargeting.retargeting as retargeting_module
+
+    captured = []
+
+    class FakeInteractionRetargeter:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def retarget_frame(self, human_joints, q_init, **kwargs):
+            captured.append(np.asarray(kwargs["target_base_orientation"]).copy())
+            return np.asarray(q_init, dtype=float).copy()
+
+    monkeypatch.setattr(
+        retargeting_module,
+        "GenericInteractionRetargeter",
+        FakeInteractionRetargeter,
+    )
+    retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter.robot_model = Mock(
+        nq=8,
+        qpos0=np.asarray([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]),
+    )
+    retargeter.robot_data = Mock()
+    retargeter.robot_height = 1.0
+    retargeter.valid_joint_mapping = {"Pelvis": "root"}
+    retargeter.valid_joint_names = ["Pelvis"]
+    retargeter.mapped_joint_indices = [0]
+    retargeter.smplx_joint_indices = {"Pelvis": 0}
+    retargeter.base_orientation_config = {"root_position": "Pelvis"}
+    retargeter.retargeting_config = {}
+    trajectory = np.zeros((2, 1, 3), dtype=float)
+    root_rotvecs = np.asarray([[0.0, 0.0, 0.2], [0.0, 0.0, 0.4]])
+    root_quaternions = Rotation.from_rotvec(root_rotvecs).as_quat(
+        scalar_first=True
+    )
+
+    retargeter._perform_retargeting(
+        trajectory,
+        Mock(),
+        base_orientations=root_quaternions,
+    )
+
+    expected_xyzw = Rotation.from_rotvec(root_rotvecs).as_quat()
+    expected_wxyz = expected_xyzw[:, [3, 0, 1, 2]]
+    np.testing.assert_allclose(captured, expected_wxyz)
+
+
 class TestRealDataIntegration:
     """Integration tests requiring real data files."""
 

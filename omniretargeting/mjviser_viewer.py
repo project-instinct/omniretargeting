@@ -12,6 +12,7 @@ import trimesh
 import viser
 from mjviser import ViserMujocoScene
 
+from omniretargeting.contact import ContactMode
 from omniretargeting.main import DEFAULT_ROBOT_CONFIG_PATH
 from omniretargeting.robot_config import load_robot_config
 
@@ -31,6 +32,48 @@ OMOMO_OBJECT_SCALES = {
     "smalltable": (1.55 * 0.0162, 1.55 * 0.0162, 1.55 * 0.0162),
     "suitcase": (1.55 * 0.3672, 1.55 * 0.3672, 1.55 * 0.3672),
 }
+
+
+def _live_effective_swing_targets(
+    model: mujoco.MjModel,
+    qpos: np.ndarray,
+    preview_targets: np.ndarray,
+    limb_offsets: np.ndarray,
+    anchor_bodies: np.ndarray,
+    anchor_offsets: np.ndarray,
+    bridge_alpha: np.ndarray,
+    bridge_targets: np.ndarray,
+) -> np.ndarray:
+    """Replace reference-pose limb previews with targets at solved anchors."""
+    result = np.asarray(preview_targets, dtype=float).copy()
+    data = mujoco.MjData(model)
+    for effector_idx, raw_body_name in enumerate(anchor_bodies):
+        body_name = str(raw_body_name)
+        if not body_name:
+            continue
+        body_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_BODY, body_name
+        )
+        if body_id < 0:
+            raise ValueError(
+                f"Effective swing target refers to missing anchor body "
+                f"'{body_name}'."
+            )
+        local_offset = np.asarray(
+            anchor_offsets[effector_idx], dtype=float
+        ).reshape(3)
+        for frame_idx, frame_qpos in enumerate(qpos):
+            data.qpos[:] = frame_qpos
+            mujoco.mj_forward(model, data)
+            rotation = data.xmat[body_id].reshape(3, 3)
+            anchor = data.xpos[body_id] + rotation @ local_offset
+            alpha = float(bridge_alpha[frame_idx, effector_idx])
+            result[frame_idx, effector_idx] = (
+                (1.0 - alpha)
+                * (anchor + limb_offsets[frame_idx, effector_idx])
+                + alpha * bridge_targets[frame_idx, effector_idx]
+            )
+    return result
 
 
 def _parse_scale(text: str) -> float | tuple[float, float, float]:
@@ -258,11 +301,12 @@ def _run_viewer(
     motion_file: Path,
     terrain_mesh: trimesh.Trimesh | None = None,
     contact_names: list[str] | None = None,
-    contact_mask: np.ndarray | None = None,
+    contact_modes: np.ndarray | None = None,
     contact_targets: np.ndarray | None = None,
     contact_normals: np.ndarray | None = None,
     contact_forwards: np.ndarray | None = None,
     effector_references: np.ndarray | None = None,
+    effective_swing_targets: np.ndarray | None = None,
     effector_ups: np.ndarray | None = None,
     smplx_joints: np.ndarray | None = None,
 ) -> None:
@@ -323,7 +367,7 @@ def _run_viewer(
     contact_axis_handles = []
     if (
         contact_names is not None
-        and contact_mask is not None
+        and contact_modes is not None
         and contact_targets is not None
     ):
         for effector_idx, name in enumerate(contact_names):
@@ -332,7 +376,9 @@ def _run_viewer(
                 radius=0.035,
                 color=contact_colors.get(name, (255, 0, 255)),
                 position=contact_targets[0, effector_idx],
-                visible=bool(contact_mask[0, effector_idx]),
+                visible=bool(
+                    contact_modes[0, effector_idx] != int(ContactMode.NONE)
+                ),
             )
             contact_handles.append(handle)
             axis_handles = (None, None)
@@ -354,8 +400,12 @@ def _run_viewer(
                             if effector_references is not None
                             else contact_targets[0, effector_idx]
                         )
-                        axis_visible = name.endswith("_hand") or bool(
-                            contact_mask[0, effector_idx]
+                        axis_visible = bool(
+                            name.endswith("_hand")
+                            or (
+                                contact_modes[0, effector_idx]
+                                != int(ContactMode.NONE)
+                            )
                         )
                         forward_handle = server.scene.add_line_segments(
                             f"/smplx_effector_frame/{name}_forward",
@@ -377,6 +427,23 @@ def _run_viewer(
                         )
                         axis_handles = (forward_handle, normal_handle)
             contact_axis_handles.append(axis_handles)
+
+    swing_target_handles = []
+    if contact_names is not None and effective_swing_targets is not None:
+        for effector_idx, name in enumerate(contact_names):
+            swing_target_handles.append(
+                server.scene.add_icosphere(
+                    f"/effective_swing_targets/{name}",
+                    radius=0.025,
+                    color=contact_colors.get(name, (255, 0, 255)),
+                    position=effective_swing_targets[0, effector_idx],
+                    visible=bool(
+                        contact_modes is None
+                        or contact_modes[0, effector_idx]
+                        == int(ContactMode.NONE)
+                    ),
+                )
+            )
 
     human_points_handle = None
     human_bones_handle = None
@@ -486,7 +553,9 @@ def _run_viewer(
                 + alpha * contact_targets[next_idx, effector_idx]
             )
             handle.position = origin
-            handle.visible = bool(contact_mask[idx, effector_idx])
+            handle.visible = bool(
+                contact_modes[idx, effector_idx] != int(ContactMode.NONE)
+            )
             forward_handle, normal_handle = contact_axis_handles[effector_idx]
             if forward_handle is not None and normal_handle is not None:
                 orientation_ups = (
@@ -515,11 +584,25 @@ def _run_viewer(
                 normal_handle.points = np.array(
                     [[axis_origin, axis_origin + 0.12 * normal]]
                 )
-                axis_visible = contact_names[effector_idx].endswith(
-                    "_hand"
-                ) or bool(contact_mask[idx, effector_idx])
+                axis_visible = bool(
+                    contact_names[effector_idx].endswith("_hand")
+                    or (
+                        contact_modes[idx, effector_idx]
+                        != int(ContactMode.NONE)
+                    )
+                )
                 forward_handle.visible = axis_visible
                 normal_handle.visible = axis_visible
+
+        for effector_idx, handle in enumerate(swing_target_handles):
+            handle.position = (
+                (1.0 - alpha) * effective_swing_targets[idx, effector_idx]
+                + alpha * effective_swing_targets[next_idx, effector_idx]
+            )
+            handle.visible = bool(
+                contact_modes is None
+                or contact_modes[idx, effector_idx] == int(ContactMode.NONE)
+            )
 
         if human_points_handle is not None and human_bones_handle is not None:
             human_points = (
@@ -610,19 +693,20 @@ def run(args: argparse.Namespace) -> None:
     )
 
     contact_names = None
-    contact_mask = None
+    contact_modes = None
     contact_targets = None
     contact_normals = None
     contact_forwards = None
     effector_references = None
+    effective_swing_targets = None
     effector_ups = None
     smplx_joints = None
     if motion_file.suffix == ".npz":
         with np.load(motion_file, allow_pickle=True) as payload:
-            required = {"contact_names", "contact_mask", "contact_targets_w"}
+            required = {"contact_names", "contact_mode", "contact_targets_w"}
             if required.issubset(payload.files):
                 contact_names = [str(name) for name in payload["contact_names"]]
-                contact_mask = np.asarray(payload["contact_mask"], dtype=bool)
+                contact_modes = np.asarray(payload["contact_mode"], dtype=np.uint8)
                 contact_targets = np.asarray(payload["contact_targets_w"], dtype=float)
                 if "contact_surface_normals_w" in payload:
                     contact_normals = np.asarray(
@@ -636,6 +720,36 @@ def run(args: argparse.Namespace) -> None:
                     effector_references = np.asarray(
                         payload["end_effector_reference_w"], dtype=float
                     )
+                if "effective_swing_targets_w" in payload:
+                    effective_swing_targets = np.asarray(
+                        payload["effective_swing_targets_w"], dtype=float
+                    )
+                    live_fields = {
+                        "swing_limb_offsets_w",
+                        "swing_anchor_body",
+                        "swing_anchor_offset",
+                        "contact_bridge_alpha",
+                        "contact_bridge_targets_w",
+                    }
+                    if live_fields.issubset(payload.files):
+                        effective_swing_targets = _live_effective_swing_targets(
+                            model,
+                            qpos,
+                            effective_swing_targets,
+                            np.asarray(
+                                payload["swing_limb_offsets_w"], dtype=float
+                            ),
+                            np.asarray(payload["swing_anchor_body"]),
+                            np.asarray(
+                                payload["swing_anchor_offset"], dtype=float
+                            ),
+                            np.asarray(
+                                payload["contact_bridge_alpha"], dtype=float
+                            ),
+                            np.asarray(
+                                payload["contact_bridge_targets_w"], dtype=float
+                            ),
+                        )
                 if "end_effector_up_w" in payload:
                     effector_ups = np.asarray(
                         payload["end_effector_up_w"], dtype=float
@@ -653,11 +767,12 @@ def run(args: argparse.Namespace) -> None:
         motion_file,
         terrain_mesh=terrain_mesh,
         contact_names=contact_names,
-        contact_mask=contact_mask,
+        contact_modes=contact_modes,
         contact_targets=contact_targets,
         contact_normals=contact_normals,
         contact_forwards=contact_forwards,
         effector_references=effector_references,
+        effective_swing_targets=effective_swing_targets,
         effector_ups=effector_ups,
         smplx_joints=smplx_joints,
     )

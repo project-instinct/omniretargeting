@@ -11,6 +11,11 @@ from omniretargeting import OmniRetargeter
 from omniretargeting.robot_config import load_robot_config
 from omniretargeting.utils import load_smplx_trajectory, normalize_retargeted_output_path
 from omniretargeting.contact import stack_contact_tasks
+from omniretargeting.evaluation import metrics_to_json
+from omniretargeting.data_sources.smplx import (
+    smplx_joint_quaternions_to_body_quaternions,
+    smplx_root_rotvecs_to_body_quaternions,
+)
 
 import contextlib
 import shutil
@@ -505,10 +510,16 @@ def main():
         loaded_motion = load_smplx_trajectory(
             smplx_file=Path(args.smplx_motion),
             smplx_model_directory=args.smplx_model_dir,
+            return_meta=True,
             return_end_effectors=contact_priority_enabled,
         )
-        smplx_trajectory, smplx_orientations = loaded_motion[:2]
-        end_effector_markers = loaded_motion[2] if contact_priority_enabled else None
+        (
+            smplx_trajectory,
+            smplx_orientations,
+            smplx_root_orientations,
+            _smplx_translations,
+        ) = loaded_motion[:4]
+        end_effector_markers = loaded_motion[4] if contact_priority_enabled else None
         
         # Try to detect framerate from SMPLX file if not provided
         framerate = args.framerate
@@ -562,6 +573,34 @@ def main():
             visualize_trajectory=args.vis,
             enable_terrain_scaling=enable_terrain_scaling,
         )
+        base_orientation_reference = None
+        orientation_joint = (
+            (base_orientation or {}).get("orientation_joint")
+            if isinstance(base_orientation, dict)
+            else None
+        )
+        if orientation_joint is not None and smplx_orientations is not None:
+            if not smplx_joint_names or orientation_joint not in smplx_joint_names:
+                raise ValueError(
+                    "base_orientation.orientation_joint must name a loaded "
+                    f"SMPL-X joint, got {orientation_joint!r}."
+                )
+            orientation_index = smplx_joint_names.index(orientation_joint)
+            base_orientation_reference = (
+                smplx_joint_quaternions_to_body_quaternions(
+                    smplx_orientations[:, orientation_index]
+                )
+            )
+            print(
+                "Using captured SMPL-X "
+                f"{orientation_joint} frame as the robot base orientation target."
+            )
+        elif smplx_root_orientations is not None:
+            base_orientation_reference = smplx_root_rotvecs_to_body_quaternions(
+                smplx_root_orientations
+            )
+        if base_orientation_reference is not None:
+            retarget_motion_kwargs["base_orientations"] = base_orientation_reference
         if end_effector_markers is not None:
             retarget_motion_kwargs["end_effector_markers"] = end_effector_markers
         terrain_scale, retargeted_motion = retargeter.retarget_motion(
@@ -607,6 +646,7 @@ def main():
         # Save as .npz with specific keys
         output_payload = dict(
             framerate=framerate,
+            terrain_scale=np.asarray(terrain_scale, dtype=float),
             # Preserve the exact MuJoCo generalized configuration.  The
             # exported base_pos_w may refer to torso_link for downstream
             # policy datasets and cannot be used as the floating-root pose
@@ -617,7 +657,16 @@ def main():
             base_pos_w=base_pos,
             base_quat_w=base_quat, # Saving as wxyz (MuJoCo convention)
             smplx_joints_w=smplx_trajectory * terrain_scale,
+            evaluation_metrics_json=np.asarray(
+                metrics_to_json(
+                    getattr(retargeter, "last_evaluation_metrics", {})
+                )
+            ),
         )
+        if base_orientation_reference is not None:
+            output_payload["robot_base_orientation_reference_w"] = np.asarray(
+                base_orientation_reference, dtype=float
+            )
         if object_pose is not None:
             object_pos, object_quat = object_pose
             output_payload["object_pos_w"] = object_pos

@@ -343,6 +343,36 @@ declared priority up to the configured numerical tolerances. The generated
 `contact_confidence`, `contact_targets_w`, and `end_effector_reference_w` for
 downstream robot policy training or evaluation.
 
+### Arm swivel refinement
+
+An optional morphology-invariant elbow swivel term is configured under each
+hand's `arm_posture.swivel` block. It compares the source and robot elbow bend
+directions around their respective shoulder-to-wrist axes. The residual fades
+smoothly near a straight arm, where a pole vector is not well-defined. Keep the
+term in trajectory refinement; enabling the corresponding framewise
+`pose_direction.swivel` term caused IK branch switching on the measured G1
+clip.
+
+For the shipped Unitree G1 profile, `sigma` is `0.25` radians and `weight` is
+`16.0`. The weight is the primary trade-off knob: larger values preserve the
+source elbow plane more aggressively but eventually increase penetration and
+temporal jitter. On the 144-frame `c167_1530_final_v3` clip, the measured
+refinement-only frontier was:
+
+| Weight | Left bend mean/P95 | Right bend mean/P95 | Left-hand contact mean | Penetration max | Acceleration RMS |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 56.7 / 113.8 deg | 40.7 / 126.1 deg | 3.32 cm | 5.15 cm | 0.02401 rad/frame^2 |
+| 4 | 48.0 / 87.7 deg | 37.2 / 122.7 deg | 3.36 cm | 5.15 cm | 0.02420 rad/frame^2 |
+| 16 | 43.0 / 81.8 deg | 33.1 / 107.2 deg | 3.39 cm | 5.16 cm | 0.02476 rad/frame^2 |
+| 32 | 39.4 / 78.8 deg | 29.3 / 97.6 deg | 3.47 cm | 5.66 cm | 0.02544 rad/frame^2 |
+| 64 | 36.5 / 77.2 deg | 26.9 / 95.0 deg | 3.56 cm | 6.08 cm | 0.02650 rad/frame^2 |
+| 256 | 32.7 / 73.9 deg | 23.4 / 92.7 deg | 3.50 cm | 6.68 cm | 0.02944 rad/frame^2 |
+| 1024 | 30.9 / 72.2 deg | 21.6 / 90.0 deg | 3.64 cm | 6.69 cm | 0.03450 rad/frame^2 |
+
+Weight 16 is the measured knee of this curve. `swivel_hierarchy` remains
+disabled: making swivel a strict refinement priority reduced mean bend error
+further but raised acceleration RMS by 61% and maximum penetration to 7.13 cm.
+
 ## TODO / Limitations
 
 - **Penetration constraint**: The terrain penetration constraint is not yet implemented. The optimization framework has the `_compute_penetration_constraints` method and collision detection scaffolding, but they are currently disabled (`retargeting.py`, lines 520–524) because collision detection setup is incomplete. As a result, retargeted motion may exhibit foot–terrain penetration in some cases.

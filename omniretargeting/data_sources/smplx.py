@@ -29,6 +29,59 @@ _SMPLX_ROOT_OFFSET = np.array(
 )
 
 
+def smplx_root_rotvecs_to_body_quaternions(
+    root_rotvecs: np.ndarray | None,
+) -> np.ndarray | None:
+    """Convert SMPL-X global axis-angle roots to body-aligned wxyz quaternions.
+
+    The fixed SMPL-X canonical-frame correction belongs at the source adapter
+    boundary.  Downstream retargeting code can consequently consume the same
+    source-neutral quaternion contract used by every other ``MotionData``
+    implementation.
+    """
+    if root_rotvecs is None:
+        return None
+    root_rotvecs = np.asarray(root_rotvecs, dtype=float)
+    if root_rotvecs.ndim != 2 or root_rotvecs.shape[1] != 3:
+        raise ValueError(
+            "SMPL-X root rotations must have shape (T, 3), got "
+            f"{root_rotvecs.shape}."
+        )
+    root_matrices = Rotation.from_rotvec(root_rotvecs).as_matrix()
+    return Rotation.from_matrix(
+        root_matrices @ _SMPLX_ROOT_OFFSET
+    ).as_quat(scalar_first=True)
+
+
+def smplx_joint_quaternions_to_body_quaternions(
+    joint_quaternions: np.ndarray | None,
+) -> np.ndarray | None:
+    """Convert captured SMPL-X joint frames to body-aligned wxyz frames.
+
+    Global joint rotations use the same canonical SMPL-X axes as the root
+    axis-angle. Applying the correction here keeps source-frame conventions at
+    the adapter boundary while allowing the generic solver to track a
+    configured anatomical frame such as Spine3.
+    """
+    if joint_quaternions is None:
+        return None
+    joint_quaternions = np.asarray(joint_quaternions, dtype=float)
+    if joint_quaternions.ndim != 2 or joint_quaternions.shape[1] != 4:
+        raise ValueError(
+            "SMPL-X joint rotations must have shape (T, 4), got "
+            f"{joint_quaternions.shape}."
+        )
+    norms = np.linalg.norm(joint_quaternions, axis=1, keepdims=True)
+    if np.any(norms < 1e-10):
+        raise ValueError("SMPL-X joint rotations contain a zero quaternion.")
+    joint_matrices = Rotation.from_quat(
+        joint_quaternions / norms, scalar_first=True
+    ).as_matrix()
+    return Rotation.from_matrix(
+        joint_matrices @ _SMPLX_ROOT_OFFSET
+    ).as_quat(scalar_first=True)
+
+
 DEFAULT_SMPLX_TARGET_NAMES = [
     "Pelvis", "L_Hip", "R_Hip", "Spine1", "L_Knee", "R_Knee",
     "Spine2", "L_Ankle", "R_Ankle", "Spine3", "L_Foot", "R_Foot",
@@ -89,8 +142,7 @@ class SmplxDataSource(DataSource):
             # Correct root_orient from SMPLX T-pose frame to body-aligned frame
             # and convert from axis-angle to wxyz quaternion at the boundary.
             if self.use_smplx_base_pose and root_orient is not None:
-                root_orient_mat = Rotation.from_rotvec(root_orient).as_matrix()
-                root_orient = Rotation.from_matrix(root_orient_mat @ _SMPLX_ROOT_OFFSET).as_quat(scalar_first=True)
+                root_orient = smplx_root_rotvecs_to_body_quaternions(root_orient)
             self._motion_data = MotionData(
                 positions=positions,
                 target_names=names,

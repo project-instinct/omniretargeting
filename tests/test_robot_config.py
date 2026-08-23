@@ -114,3 +114,107 @@ def test_user_home_is_expanded_in_urdf_path(tmp_path, monkeypatch):
     loaded = load_robot_config(profile)
 
     assert Path(loaded["urdf_path"]) == present.resolve()
+
+
+def test_shipped_profiles_have_no_unread_configuration_keys():
+    """Every profile key must be read somewhere in the package source.
+
+    A JSON key that no code reads is a silent no-op: it looks like a tuning
+    knob, drifts out of sync with the key that is actually live, and sends
+    whoever tunes the profile down a dead end.  Scanning the source for the
+    quoted key name is deliberately permissive -- it only fails on keys that
+    appear nowhere at all.
+    """
+    import json
+    from pathlib import Path
+
+    package_root = Path(__file__).resolve().parents[1] / "omniretargeting"
+    source = "\n".join(
+        path.read_text(encoding="utf-8") for path in package_root.rglob("*.py")
+    )
+
+    # Sections whose keys are user-chosen names (robot joints, effector names,
+    # joint-name substrings) rather than fixed configuration keys.
+    dynamic_sections = {
+        "joint_mapping",
+        "joint_posture_limits",
+        "joint_temporal_weights",
+        "joint_posture_targets",
+        "joint_weight_overrides",
+        "effectors",
+        "groups",
+    }
+
+    profiles = sorted(
+        (Path(__file__).resolve().parents[1] / "robot_models").rglob("*.json")
+    )
+    assert profiles, "no robot profiles found"
+
+    # Legacy profiles for robots the contact-aware pipeline has not been
+    # migrated to.  They carry an obsolete effector schema and a
+    # ``solver_max_iter`` block that no code has ever read, so their SQP
+    # iteration counts are silently the built-in defaults.  Listing them keeps
+    # the debt visible instead of letting the guard be weakened for everyone.
+    known_legacy_debt = {
+        "booster_k1.json:retargeting.solver_max_iter",
+        "booster_k1.json:retargeting.joint_regularization_boost",
+        "booster_k1.json:retargeting.effectors.left.body",
+        "booster_k1.json:retargeting.effectors.left.role",
+        "booster_k1.json:retargeting.effectors.right.body",
+        "booster_k1.json:retargeting.effectors.right.role",
+        "hightorque_mini_pi_plus.json:retargeting.solver_max_iter",
+        "hightorque_mini_pi_plus.json:retargeting.joint_regularization_boost",
+        "hightorque_mini_pi_plus.json:retargeting.effectors.left.body",
+        "hightorque_mini_pi_plus.json:retargeting.effectors.left.role",
+        "hightorque_mini_pi_plus.json:retargeting.effectors.right.body",
+        "hightorque_mini_pi_plus.json:retargeting.effectors.right.role",
+    }
+
+    unread: list[str] = []
+    for profile_path in profiles:
+        config = json.loads(profile_path.read_text(encoding="utf-8"))
+
+        def visit(node, path: str, inside_dynamic: bool) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if inside_dynamic:
+                        # A user-chosen name; its children are still checked.
+                        visit(value, f"{path}.{key}", False)
+                        continue
+                    if f'"{key}"' not in source and f"'{key}'" not in source:
+                        unread.append(f"{profile_path.name}:{path}.{key}")
+                        continue
+                    visit(value, f"{path}.{key}", key in dynamic_sections)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item, path, inside_dynamic)
+
+        visit(config.get("retargeting", {}), "retargeting", False)
+
+    unexpected = sorted(set(unread) - known_legacy_debt)
+    assert not unexpected, (
+        "configuration keys no code reads: " + ", ".join(unexpected)
+    )
+
+
+def test_instinctmj_profile_expresses_slide_freedom_with_mode_weight():
+    """SLIDE softness must not come from disabling the contact-level bound."""
+    profile = json.loads(
+        (
+            REPO_ROOT
+            / "robot_models"
+            / "unitree_g1"
+            / "unitree_g1_instinctmj.json"
+        ).read_text(encoding="utf-8")
+    )
+    priority = profile["retargeting"]["end_effector_priority"]
+    refinement = profile["retargeting"]["trajectory_refinement"]
+
+    touch_weight = float(priority.get("touch_weight", 0.5))
+    assert 0.0 < priority["slide_tangential_weight"] < touch_weight
+    assert priority["contact_detection"]["stabilize_contact_normal_signs"] is True
+    assert refinement["contact_hierarchy"] is True
+    assert (
+        refinement["contact_priority_absolute_tolerance"]
+        <= refinement["support_priority_absolute_tolerance"]
+    )

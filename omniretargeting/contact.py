@@ -10,10 +10,37 @@ motion-tracking policies.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any, Dict, Mapping
 
 import numpy as np
 import trimesh
+
+
+class ContactMode(IntEnum):
+    """Semantic state of one end effector at one source frame."""
+
+    NONE = 0
+    TOUCH = 1
+    SLIDE = 2
+    SUPPORT = 3
+
+
+def _parse_contact_mode(value: Any) -> ContactMode:
+    if isinstance(value, ContactMode):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return ContactMode(int(value))
+    name = str(value).strip().upper()
+    if name == "AUTO":
+        raise ValueError("AUTO must be resolved from a complete contact segment.")
+    try:
+        return ContactMode[name]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown contact mode {value!r}; expected NONE, TOUCH, SLIDE, "
+            "SUPPORT, or AUTO."
+        ) from exc
 
 
 @dataclass(frozen=True)
@@ -28,13 +55,228 @@ class SceneContactTask:
     distances: np.ndarray
     relative_speeds: np.ndarray
     contact_confidence: np.ndarray
-    contact_mask: np.ndarray
+    contact_modes: np.ndarray
+    contact_segment_ids: np.ndarray
+    transition_weights: np.ndarray
     forward_directions: np.ndarray | None = None
     up_directions: np.ndarray | None = None
-    transition_weights: np.ndarray | None = None
+    # ``effective_swing_positions`` is an export/visualisation preview.  For a
+    # limb-relative task it is evaluated at the reference base pose; the
+    # optimizer must instead use the live anchor fields below.
+    effective_swing_positions: np.ndarray | None = None
+    swing_limb_offsets: np.ndarray | None = None
+    swing_anchor_body: str | None = None
+    swing_anchor_offset: np.ndarray | None = None
+    contact_bridge_alpha: np.ndarray | None = None
+    contact_bridge_positions: np.ndarray | None = None
+    # Finished world-frame orientation targets.  Both optimizers consume this
+    # matrix track directly instead of independently reconstructing a rotation
+    # from the diagnostic source forward/up axes.
+    orientation_target_rotations: np.ndarray | None = None
+    orientation_bridge_alpha: np.ndarray | None = None
+    position_sigma_scale: np.ndarray | None = None
+    orientation_sigma_scale: np.ndarray | None = None
+    morphology_scale: float | None = None
+    active_contact_offset_ids: np.ndarray | None = None
+    robot_base_reference_w: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        num_frames = len(self.tracking_positions)
+        for field_name in (
+            "tracking_positions",
+            "contact_positions",
+            "surface_points",
+            "surface_normals",
+        ):
+            value = np.asarray(getattr(self, field_name), dtype=float)
+            if value.shape != (num_frames, 3):
+                raise ValueError(
+                    f"{self.name}: {field_name} must have shape ({num_frames}, 3)."
+                )
+            object.__setattr__(self, field_name, value)
+        for field_name in (
+            "distances",
+            "relative_speeds",
+            "contact_confidence",
+        ):
+            value = np.asarray(getattr(self, field_name), dtype=float)
+            if value.shape != (num_frames,):
+                raise ValueError(
+                    f"{self.name}: {field_name} must have shape ({num_frames},)."
+                )
+            object.__setattr__(self, field_name, value)
+
+        modes = np.asarray(self.contact_modes, dtype=np.uint8)
+        if modes.shape != (num_frames,):
+            raise ValueError(
+                f"{self.name}: contact_modes must have shape ({num_frames},)."
+            )
+        if np.any(modes > int(ContactMode.SUPPORT)):
+            raise ValueError(f"{self.name}: contact_modes contains an invalid mode id.")
+        object.__setattr__(self, "contact_modes", modes)
+
+        segment_ids = np.asarray(self.contact_segment_ids, dtype=np.int32)
+        if segment_ids.shape != (num_frames,):
+            raise ValueError(
+                f"{self.name}: contact_segment_ids must have shape ({num_frames},)."
+            )
+        in_contact = modes != int(ContactMode.NONE)
+        if np.any(segment_ids[in_contact] < 0) or np.any(segment_ids[~in_contact] != -1):
+            raise ValueError(
+                f"{self.name}: contact frames require a non-negative segment id "
+                "and NONE frames require segment id -1."
+            )
+        object.__setattr__(self, "contact_segment_ids", segment_ids)
+
+        transition_weights = np.asarray(
+            self.transition_weights, dtype=float
+        ).copy()
+        if transition_weights.shape != (num_frames,):
+            raise ValueError(
+                f"{self.name}: transition_weights must have shape ({num_frames},)."
+            )
+        if np.any((transition_weights < 0.0) | (transition_weights > 1.0)):
+            raise ValueError(f"{self.name}: transition_weights must lie in [0, 1].")
+        if np.any(
+            transition_weights[modes == int(ContactMode.SUPPORT)] != 1.0
+        ):
+            raise ValueError(
+                f"{self.name}: SUPPORT transition_weights must equal 1."
+            )
+        object.__setattr__(self, "transition_weights", transition_weights)
+
+        for field_name in (
+            "forward_directions",
+            "up_directions",
+            "effective_swing_positions",
+            "swing_limb_offsets",
+            "contact_bridge_positions",
+            "robot_base_reference_w",
+        ):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            value = np.asarray(value, dtype=float)
+            if value.shape != (num_frames, 3):
+                raise ValueError(
+                    f"{self.name}: {field_name} must have shape ({num_frames}, 3)."
+                )
+            object.__setattr__(self, field_name, value)
+        if self.contact_bridge_alpha is not None:
+            alpha = np.asarray(self.contact_bridge_alpha, dtype=float)
+            if alpha.shape != (num_frames,):
+                raise ValueError(
+                    f"{self.name}: contact_bridge_alpha must have shape "
+                    f"({num_frames},)."
+                )
+            if np.any((alpha < 0.0) | (alpha > 1.0)):
+                raise ValueError(
+                    f"{self.name}: contact_bridge_alpha must lie in [0, 1]."
+                )
+            object.__setattr__(self, "contact_bridge_alpha", alpha)
+        if self.orientation_bridge_alpha is not None:
+            orientation_alpha = np.asarray(
+                self.orientation_bridge_alpha, dtype=float
+            )
+            if orientation_alpha.shape != (num_frames,):
+                raise ValueError(
+                    f"{self.name}: orientation_bridge_alpha must have shape "
+                    f"({num_frames},)."
+                )
+            if np.any((orientation_alpha < 0.0) | (orientation_alpha > 1.0)):
+                raise ValueError(
+                    f"{self.name}: orientation_bridge_alpha must lie in [0, 1]."
+                )
+            object.__setattr__(
+                self, "orientation_bridge_alpha", orientation_alpha
+            )
+        if self.orientation_target_rotations is not None:
+            rotations = np.asarray(self.orientation_target_rotations, dtype=float)
+            if rotations.shape != (num_frames, 3, 3):
+                raise ValueError(
+                    f"{self.name}: orientation_target_rotations must have shape "
+                    f"({num_frames}, 3, 3)."
+                )
+            finite = np.isfinite(rotations)
+            valid = np.all(finite, axis=(1, 2))
+            if np.any(np.any(finite, axis=(1, 2)) != valid):
+                raise ValueError(
+                    f"{self.name}: unavailable orientation matrices must be all NaN."
+                )
+            if np.any(valid):
+                gram = np.swapaxes(rotations[valid], 1, 2) @ rotations[valid]
+                determinants = np.linalg.det(rotations[valid])
+                if not np.allclose(gram, np.eye(3), atol=1e-7) or not np.allclose(
+                    determinants, 1.0, atol=1e-7
+                ):
+                    raise ValueError(
+                        f"{self.name}: orientation_target_rotations must be "
+                        "right-handed orthonormal matrices."
+                    )
+            object.__setattr__(self, "orientation_target_rotations", rotations)
+        for field_name in ("position_sigma_scale", "orientation_sigma_scale"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            scale = np.asarray(value, dtype=float)
+            if scale.shape != (num_frames,):
+                raise ValueError(
+                    f"{self.name}: {field_name} must have shape ({num_frames},)."
+                )
+            if np.any(~np.isfinite(scale)) or np.any(scale <= 0.0):
+                raise ValueError(f"{self.name}: {field_name} must be positive.")
+            object.__setattr__(self, field_name, scale)
+        if self.swing_anchor_offset is not None:
+            anchor_offset = np.asarray(self.swing_anchor_offset, dtype=float)
+            if anchor_offset.shape != (3,):
+                raise ValueError(
+                    f"{self.name}: swing_anchor_offset must have shape (3,)."
+                )
+            object.__setattr__(self, "swing_anchor_offset", anchor_offset)
+        if (self.contact_bridge_alpha is None) != (
+            self.contact_bridge_positions is None
+        ):
+            raise ValueError(
+                f"{self.name}: contact_bridge_alpha and "
+                "contact_bridge_positions must be provided together."
+            )
+        relative_fields = (self.swing_limb_offsets, self.swing_anchor_body)
+        if any(value is not None for value in relative_fields) and not all(
+            value is not None for value in relative_fields
+        ):
+            raise ValueError(
+                f"{self.name}: limb-relative swing tasks require "
+                "swing_limb_offsets and swing_anchor_body together."
+            )
+        if self.swing_limb_offsets is not None and (
+            self.contact_bridge_alpha is None
+            or self.contact_bridge_positions is None
+        ):
+            raise ValueError(
+                f"{self.name}: limb-relative swing tasks also require the "
+                "contact bridge alpha and world target tracks."
+            )
+        if self.active_contact_offset_ids is not None:
+            offset_ids = np.asarray(self.active_contact_offset_ids, dtype=np.int32)
+            if offset_ids.shape != (num_frames,):
+                raise ValueError(
+                    f"{self.name}: active_contact_offset_ids must have shape "
+                    f"({num_frames},)."
+                )
+            if np.any(offset_ids[~in_contact] != -1) or np.any(
+                offset_ids[in_contact] < 0
+            ):
+                raise ValueError(
+                    f"{self.name}: active contact offsets require a non-negative "
+                    "id on contact frames and -1 on NONE frames."
+                )
+            object.__setattr__(self, "active_contact_offset_ids", offset_ids)
+        if self.morphology_scale is not None and float(self.morphology_scale) <= 0.0:
+            raise ValueError(f"{self.name}: morphology_scale must be positive.")
 
     def frame(self, frame_idx: int) -> Dict[str, Any]:
         """Return the optimizer payload for one frame."""
+        mode = ContactMode(int(self.contact_modes[frame_idx]))
         payload = {
             "name": self.name,
             "tracking_position": self.tracking_positions[frame_idx],
@@ -43,17 +285,60 @@ class SceneContactTask:
             "distance": float(self.distances[frame_idx]),
             "relative_speed": float(self.relative_speeds[frame_idx]),
             "confidence": float(self.contact_confidence[frame_idx]),
-            "contact": bool(self.contact_mask[frame_idx]),
-            "transition_weight": (
-                float(self.transition_weights[frame_idx])
-                if self.transition_weights is not None
-                else 1.0
-            ),
+            "contact_mode": mode.name,
+            "contact_segment_id": int(self.contact_segment_ids[frame_idx]),
+            "transition_weight": float(self.transition_weights[frame_idx]),
         }
+        if mode == ContactMode.NONE:
+            if self.effective_swing_positions is None:
+                raise RuntimeError(
+                    f"{self.name}: effective swing targets were not prepared."
+                )
+            payload["effective_swing_position"] = self.effective_swing_positions[
+                frame_idx
+            ]
+            if self.swing_limb_offsets is not None:
+                payload.update(
+                    {
+                        "swing_limb_offset": self.swing_limb_offsets[frame_idx],
+                        "swing_anchor_body": self.swing_anchor_body,
+                        "swing_anchor_offset": (
+                            np.zeros(3, dtype=float)
+                            if self.swing_anchor_offset is None
+                            else self.swing_anchor_offset
+                        ),
+                        "contact_bridge_alpha": float(
+                            self.contact_bridge_alpha[frame_idx]
+                        ),
+                        "contact_bridge_position": self.contact_bridge_positions[
+                            frame_idx
+                        ],
+                    }
+                )
+        if self.robot_base_reference_w is not None:
+            payload["robot_base_reference_w"] = self.robot_base_reference_w[
+                frame_idx
+            ]
         if self.forward_directions is not None:
             payload["forward_direction"] = self.forward_directions[frame_idx]
         if self.up_directions is not None:
             payload["up_direction"] = self.up_directions[frame_idx]
+        if self.orientation_target_rotations is not None:
+            payload["orientation_target_rotation"] = (
+                self.orientation_target_rotations[frame_idx]
+            )
+        if self.orientation_bridge_alpha is not None:
+            payload["orientation_bridge_alpha"] = float(
+                self.orientation_bridge_alpha[frame_idx]
+            )
+        if self.position_sigma_scale is not None:
+            payload["position_sigma_scale"] = float(
+                self.position_sigma_scale[frame_idx]
+            )
+        if self.orientation_sigma_scale is not None:
+            payload["orientation_sigma_scale"] = float(
+                self.orientation_sigma_scale[frame_idx]
+            )
         return payload
 
 
@@ -184,7 +469,6 @@ def infer_scene_contact_tasks(
     min_contact_frames = max(int(cfg.get("min_contact_frames", 3)), 1)
     max_gap_frames = max(int(cfg.get("max_gap_frames", 2)), 0)
     transition_frames = max(int(cfg.get("transition_frames", 0)), 0)
-    anchor_contacts = bool(cfg.get("anchor_contacts", True))
     anchor_contact_orientation = bool(cfg.get("anchor_contact_orientation", True))
     anchor_window_frames = max(int(cfg.get("anchor_window_frames", 3)), 1)
     anchor_drift_tolerance = max(float(cfg.get("anchor_drift_tolerance", 0.0)), 0.0)
@@ -237,9 +521,6 @@ def infer_scene_contact_tasks(
         eff_transition_frames = max(
             int(eff_cfg.get("transition_frames", transition_frames)), 0
         )
-        eff_anchor_contacts = bool(
-            eff_cfg.get("anchor_contacts", anchor_contacts)
-        )
         eff_anchor_contact_orientation = bool(
             eff_cfg.get(
                 "anchor_contact_orientation", anchor_contact_orientation
@@ -251,6 +532,12 @@ def infer_scene_contact_tasks(
         eff_anchor_drift_tolerance = max(
             float(eff_cfg.get("anchor_drift_tolerance", anchor_drift_tolerance)),
             0.0,
+        )
+        eff_stabilize_contact_normal_signs = bool(
+            eff_cfg.get(
+                "stabilize_contact_normal_signs",
+                cfg.get("stabilize_contact_normal_signs", False),
+            )
         )
 
         # Selected samples refer to fixed SMPL-X vertex ids, but the nearest id
@@ -269,7 +556,7 @@ def infer_scene_contact_tasks(
             (eff_speed_threshold - relative_speeds) / speed_softness
         )
         confidence = distance_score * speed_score
-        contact_mask = (distances <= eff_distance_threshold) & (
+        candidate_mask = (distances <= eff_distance_threshold) & (
             relative_speeds <= eff_speed_threshold
         )
         require_normal_alignment = bool(
@@ -289,83 +576,94 @@ def infer_scene_contact_tasks(
             normal_alignment = np.sum(
                 up_directions * surface_normals, axis=1
             ) >= np.cos(max_normal_angle)
-            contact_mask &= normal_alignment
+            candidate_mask &= normal_alignment
             confidence *= np.clip(
                 (np.sum(up_directions * surface_normals, axis=1) + 1.0)
                 * 0.5,
                 0.0,
                 1.0,
             )
-        contact_mask = _close_short_gaps(contact_mask, eff_max_gap_frames)
-        contact_mask = _remove_short_runs(contact_mask, eff_min_contact_frames)
-        confidence = np.where(contact_mask, np.maximum(confidence, 0.5), confidence)
-        # Fade the contact weight in and out over a few frames, like a
-        # foot-lock blend.  A binary weight switch makes the optimizer jump
-        # between the swing target and the scene anchor within one frame; the
-        # ramp spreads that transient without changing the detected contact
-        # interval or the anchor itself.  It is stored separately so the
-        # optimizers can apply it after their own confidence floor, which
-        # would otherwise clip the fade away.
-        transition_weights = np.ones(len(contact_mask), dtype=float)
-        if eff_transition_frames > 0:
-            for start, end in _iter_true_runs(contact_mask):
-                for k in range(min(eff_transition_frames, end - start)):
-                    fade = (k + 1.0) / (eff_transition_frames + 1.0)
-                    transition_weights[start + k] = min(
-                        transition_weights[start + k], fade
-                    )
-                    transition_weights[end - 1 - k] = min(
-                        transition_weights[end - 1 - k], fade
-                    )
-
+        candidate_mask = _close_short_gaps(candidate_mask, eff_max_gap_frames)
+        candidate_mask = _remove_short_runs(candidate_mask, eff_min_contact_frames)
+        confidence = np.where(candidate_mask, np.maximum(confidence, 0.5), confidence)
+        # Resolve one semantic mode for each detected segment.  The mode alone
+        # determines whether a target is anchored or allowed to slide.
+        configured_mode = str(
+            eff_cfg.get("contact_mode", "AUTO")
+        ).upper()
+        touch_max_frames = max(
+            int(eff_cfg.get("touch_max_frames", eff_min_contact_frames)), 0
+        )
+        support_speed_threshold = max(
+            float(eff_cfg.get("support_speed_threshold", 0.25)), 0.0
+        )
+        support_max_tangential_travel = max(
+            float(eff_cfg.get("support_max_tangential_travel", 0.035)), 0.0
+        )
+        contact_modes = np.full(
+            len(candidate_mask), int(ContactMode.NONE), dtype=np.uint8
+        )
+        contact_segment_ids = np.full(len(candidate_mask), -1, dtype=np.int32)
         contact_positions = selected_samples.copy()
-        if eff_anchor_contacts:
+        transition_weights = np.ones(len(candidate_mask), dtype=float)
+        next_segment_id = 0
 
-            def _window_anchor(anchor_slice: slice) -> tuple[np.ndarray, np.ndarray]:
-                anchor = np.median(surface_points[anchor_slice], axis=0)
-                run_normals = surface_normals[anchor_slice].copy()
-                # Mesh winding around reconstructed TSDF seams can alternate.
-                # Put all normals in one hemisphere before taking a robust
-                # median; otherwise opposite unit normals cancel to zero.
-                run_offsets = (
-                    selected_samples[anchor_slice] - surface_points[anchor_slice]
+        def _window_anchor(anchor_slice: slice) -> tuple[np.ndarray, np.ndarray]:
+            anchor = np.median(surface_points[anchor_slice], axis=0)
+            run_normals = surface_normals[anchor_slice].copy()
+            # Mesh winding around reconstructed TSDF seams can alternate.
+            run_offsets = selected_samples[anchor_slice] - surface_points[anchor_slice]
+            reference_idx = int(np.argmax(np.linalg.norm(run_offsets, axis=1)))
+            reference_normal = run_normals[reference_idx]
+            reference_norm = float(np.linalg.norm(reference_normal))
+            if reference_norm < 1e-10:
+                reference_normal = np.array([0.0, 0.0, 1.0])
+            else:
+                reference_normal /= reference_norm
+            opposite = (run_normals @ reference_normal) < 0.0
+            run_normals[opposite] *= -1.0
+            normal = np.median(run_normals, axis=0)
+            normal_norm = float(np.linalg.norm(normal))
+            normal = normal / normal_norm if normal_norm > 1e-10 else reference_normal
+            toward_effector = np.median(
+                tracking_positions[anchor_slice] - surface_points[anchor_slice],
+                axis=0,
+            )
+            if float(np.dot(normal, toward_effector)) < 0.0:
+                normal *= -1.0
+            return anchor, normal
+
+        for start, end in _iter_true_runs(candidate_mask):
+            run_mode_name = configured_mode
+            if run_mode_name == "AUTO":
+                run_points = surface_points[start:end]
+                run_normal = np.median(surface_normals[start:end], axis=0)
+                run_normal /= max(float(np.linalg.norm(run_normal)), 1e-10)
+                run_delta = run_points - run_points[0]
+                tangential_delta = run_delta - np.outer(run_delta @ run_normal, run_normal)
+                tangential_travel = float(
+                    np.max(np.linalg.norm(tangential_delta, axis=1))
                 )
-                reference_idx = int(np.argmax(np.linalg.norm(run_offsets, axis=1)))
-                reference_normal = run_normals[reference_idx]
-                reference_norm = float(np.linalg.norm(reference_normal))
-                if reference_norm < 1e-10:
-                    reference_normal = np.array([0.0, 0.0, 1.0])
+                mean_speed = float(np.mean(relative_speeds[start:end]))
+                if end - start <= touch_max_frames:
+                    run_mode = ContactMode.TOUCH
+                elif (
+                    tangential_travel <= support_max_tangential_travel
+                    and mean_speed <= support_speed_threshold
+                ):
+                    run_mode = ContactMode.SUPPORT
                 else:
-                    reference_normal /= reference_norm
-                opposite = (run_normals @ reference_normal) < 0.0
-                run_normals[opposite] *= -1.0
-                normal = np.median(run_normals, axis=0)
-                normal_norm = float(np.linalg.norm(normal))
-                normal = (
-                    normal / normal_norm
-                    if normal_norm > 1e-10
-                    else reference_normal
-                )
-                # Pick the outward hemisphere using the semantic hand/foot
-                # center, which is more reliable than a sampled surface
-                # vertex that may lie exactly on a two-sided TSDF triangle.
-                toward_effector = np.median(
-                    tracking_positions[anchor_slice] - surface_points[anchor_slice],
-                    axis=0,
-                )
-                if float(np.dot(normal, toward_effector)) < 0.0:
-                    normal *= -1.0
-                return anchor, normal
+                    run_mode = ContactMode.SLIDE
+            else:
+                run_mode = _parse_contact_mode(run_mode_name)
 
-            for start, end in _iter_true_runs(contact_mask):
-                # Estimate the no-slip anchor at contact onset.  Using the
-                # median of an entire run is non-causal and can place the
-                # target far ahead of the foot on the first stance frame.
-                # A detected "stance" from video-derived data can also contain
-                # sustained slow drift; holding one anchor across such a run
-                # drags the target far from the source foot, so the run is
-                # re-anchored whenever the source contact point durably leaves
-                # the current anchor by more than the drift tolerance.
+            if run_mode == ContactMode.NONE:
+                continue
+            if run_mode == ContactMode.SUPPORT:
+                # A SUPPORT segment is a true no-slip world anchor.  If a
+                # source reconstruction drifts beyond the configured tolerance,
+                # start a new segment explicitly rather than silently moving an
+                # existing anchor.
                 segment_start = start
                 while segment_start < end:
                     anchor_slice = slice(
@@ -378,46 +676,66 @@ def infer_scene_contact_tasks(
                         consecutive_drift = 0
                         for frame_idx in range(segment_start, end):
                             if (
-                                float(
-                                    np.linalg.norm(
-                                        surface_points[frame_idx] - anchor
-                                    )
-                                )
+                                float(np.linalg.norm(surface_points[frame_idx] - anchor))
                                 > eff_anchor_drift_tolerance
                             ):
                                 consecutive_drift += 1
                                 if consecutive_drift >= 2:
-                                    segment_end = max(
-                                        frame_idx - 1, segment_start + 1
-                                    )
+                                    segment_end = max(frame_idx - 1, segment_start + 1)
                                     break
                             else:
                                 consecutive_drift = 0
-                    contact_positions[segment_start:segment_end] = (
-                        anchor + clearance * normal
-                    )
+                    contact_modes[segment_start:segment_end] = int(run_mode)
+                    contact_segment_ids[segment_start:segment_end] = next_segment_id
+                    contact_positions[segment_start:segment_end] = anchor + clearance * normal
                     surface_normals[segment_start:segment_end] = normal
+                    if forward_directions is not None and eff_anchor_contact_orientation:
+                        orientation_slice = slice(
+                            segment_start,
+                            min(segment_start + eff_anchor_window_frames, segment_end),
+                        )
+                        forward = np.median(forward_directions[orientation_slice], axis=0)
+                        forward_norm = float(np.linalg.norm(forward))
+                        if forward_norm > 1e-10:
+                            forward_directions[segment_start:segment_end] = (
+                                forward / forward_norm
+                            )
+                        if up_directions is not None:
+                            up = np.median(up_directions[orientation_slice], axis=0)
+                            up_norm = float(np.linalg.norm(up))
+                            if up_norm > 1e-10:
+                                up_directions[segment_start:segment_end] = up / up_norm
+                    next_segment_id += 1
                     segment_start = segment_end
-                if (
-                    forward_directions is not None
-                    and eff_anchor_contact_orientation
-                ):
-                    # A stance foot must have one orientation throughout the
-                    # no-slip contact run.  Taking the median rejects mocap
-                    # noise without introducing a future-dependent filter in
-                    # the optimizer itself.
-                    onset_slice = slice(
+            else:
+                # TOUCH and SLIDE retain the measured scene point each frame.
+                # SLIDE therefore constrains the normal coordinate without
+                # freezing the tangential trajectory.
+                if eff_stabilize_contact_normal_signs:
+                    orientation_slice = slice(
                         start, min(start + eff_anchor_window_frames, end)
                     )
-                    forward = np.median(forward_directions[onset_slice], axis=0)
-                    forward_norm = float(np.linalg.norm(forward))
-                    if forward_norm > 1e-10:
-                        forward_directions[start:end] = forward / forward_norm
-        else:
-            contact_positions[contact_mask] = (
-                surface_points[contact_mask]
-                + clearance * surface_normals[contact_mask]
-            )
+                    _, reference_normal = _window_anchor(orientation_slice)
+                    run_normals = surface_normals[start:end].copy()
+                    opposite = (run_normals @ reference_normal) < 0.0
+                    run_normals[opposite] *= -1.0
+                    surface_normals[start:end] = run_normals
+                contact_modes[start:end] = int(run_mode)
+                contact_segment_ids[start:end] = next_segment_id
+                contact_positions[start:end] = (
+                    surface_points[start:end]
+                    + clearance * surface_normals[start:end]
+                )
+                if eff_transition_frames > 0:
+                    for k in range(min(eff_transition_frames, end - start)):
+                        fade = (k + 1.0) / (eff_transition_frames + 1.0)
+                        transition_weights[start + k] = min(
+                            transition_weights[start + k], fade
+                        )
+                        transition_weights[end - 1 - k] = min(
+                            transition_weights[end - 1 - k], fade
+                        )
+                next_segment_id += 1
 
         # Store the same valid SO(3) foot frame that the optimizer receives.
         # The contact-normal consistency test above guarantees that this
@@ -448,7 +766,9 @@ def infer_scene_contact_tasks(
             distances=distances,
             relative_speeds=relative_speeds,
             contact_confidence=confidence,
-            contact_mask=contact_mask,
+            contact_modes=contact_modes,
+            contact_segment_ids=contact_segment_ids,
+            transition_weights=transition_weights,
             forward_directions=forward_directions,
             up_directions=up_directions,
         )
@@ -463,11 +783,45 @@ def stack_contact_tasks(
     names = list(tasks)
     if not names:
         return {}
+    if any(tasks[name].effective_swing_positions is None for name in names):
+        raise RuntimeError(
+            "Contact tasks must be morphology-adapted before NPZ export."
+        )
+    if any(tasks[name].robot_base_reference_w is None for name in names):
+        raise RuntimeError(
+            "Contact tasks must include robot_base_reference_w before NPZ export."
+        )
+    if any(tasks[name].morphology_scale is None for name in names):
+        raise RuntimeError("Contact tasks must include morphology_scale before export.")
+    base_reference = np.asarray(tasks[names[0]].robot_base_reference_w, dtype=float)
+    if any(
+        not np.allclose(
+            np.asarray(tasks[name].robot_base_reference_w, dtype=float),
+            base_reference,
+        )
+        for name in names[1:]
+    ):
+        raise ValueError("All contact tasks must share robot_base_reference_w.")
     return {
         "contact_names": np.asarray(names),
-        "contact_mask": np.stack([tasks[name].contact_mask for name in names], axis=1),
+        "contact_mode": np.stack(
+            [tasks[name].contact_modes for name in names], axis=1
+        ).astype(np.uint8),
+        "contact_mode_names": np.asarray(
+            [mode.name for mode in ContactMode]
+        ),
+        "contact_segment_id": np.stack(
+            [tasks[name].contact_segment_ids for name in names], axis=1
+        ).astype(np.int32),
         "contact_confidence": np.stack(
             [tasks[name].contact_confidence for name in names], axis=1
+        ),
+        "contact_transition_weight": np.stack(
+            [
+                tasks[name].transition_weights
+                for name in names
+            ],
+            axis=1,
         ),
         "contact_targets_w": np.stack(
             [tasks[name].contact_positions for name in names], axis=1
@@ -475,6 +829,100 @@ def stack_contact_tasks(
         "end_effector_reference_w": np.stack(
             [tasks[name].tracking_positions for name in names], axis=1
         ),
+        "effective_swing_targets_w": np.stack(
+            [tasks[name].effective_swing_positions for name in names],
+            axis=1,
+        ),
+        "swing_limb_offsets_w": np.stack(
+            [
+                tasks[name].swing_limb_offsets
+                if tasks[name].swing_limb_offsets is not None
+                else np.full_like(tasks[name].tracking_positions, np.nan)
+                for name in names
+            ],
+            axis=1,
+        ),
+        "swing_anchor_body": np.asarray(
+            [tasks[name].swing_anchor_body or "" for name in names]
+        ),
+        "swing_anchor_offset": np.stack(
+            [
+                tasks[name].swing_anchor_offset
+                if tasks[name].swing_anchor_offset is not None
+                else np.full(3, np.nan, dtype=float)
+                for name in names
+            ],
+            axis=0,
+        ),
+        "contact_bridge_alpha": np.stack(
+            [
+                tasks[name].contact_bridge_alpha
+                if tasks[name].contact_bridge_alpha is not None
+                else (
+                    tasks[name].contact_modes != int(ContactMode.NONE)
+                ).astype(float)
+                for name in names
+            ],
+            axis=1,
+        ),
+        "contact_bridge_targets_w": np.stack(
+            [
+                tasks[name].contact_bridge_positions
+                if tasks[name].contact_bridge_positions is not None
+                else tasks[name].contact_positions
+                for name in names
+            ],
+            axis=1,
+        ),
+        "contact_orientation_bridge_alpha": np.stack(
+            [
+                tasks[name].orientation_bridge_alpha
+                if tasks[name].orientation_bridge_alpha is not None
+                else (
+                    tasks[name].contact_modes != int(ContactMode.NONE)
+                ).astype(float)
+                for name in names
+            ],
+            axis=1,
+        ),
+        "end_effector_bridge_forward_w": np.stack(
+            [
+                tasks[name].orientation_target_rotations[:, :, 0]
+                if tasks[name].orientation_target_rotations is not None
+                else (
+                    tasks[name].forward_directions
+                    if tasks[name].forward_directions is not None
+                    else np.full_like(tasks[name].tracking_positions, np.nan)
+                )
+                for name in names
+            ],
+            axis=1,
+        ),
+        "end_effector_bridge_up_w": np.stack(
+            [
+                tasks[name].orientation_target_rotations[:, :, 2]
+                if tasks[name].orientation_target_rotations is not None
+                else (
+                    tasks[name].up_directions
+                    if tasks[name].up_directions is not None
+                    else np.full_like(tasks[name].tracking_positions, np.nan)
+                )
+                for name in names
+            ],
+            axis=1,
+        ),
+        "swing_morphology_scale": np.asarray(
+            [tasks[name].morphology_scale for name in names], dtype=float
+        ),
+        "active_contact_offset_id": np.stack(
+            [
+                tasks[name].active_contact_offset_ids
+                if tasks[name].active_contact_offset_ids is not None
+                else np.full(len(tasks[name].contact_modes), -1, dtype=np.int32)
+                for name in names
+            ],
+            axis=1,
+        ).astype(np.int32),
         "contact_surface_normals_w": np.stack(
             [tasks[name].surface_normals for name in names], axis=1
         ),
@@ -496,4 +944,5 @@ def stack_contact_tasks(
             ],
             axis=1,
         ),
+        "robot_base_reference_w": base_reference,
     }
