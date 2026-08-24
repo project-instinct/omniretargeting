@@ -120,6 +120,7 @@ def test_support_contact_base_policy_keeps_xy_hard_but_leaves_root_z_reachable()
             "max_xy_error": 0.03,
             "max_z_error": 0.08,
         },
+        support_contact_active=True,
     )
 
     assert objective is not None
@@ -150,6 +151,7 @@ def test_support_contact_base_objective_does_not_center_source_root_z():
             "max_xy_error": 0.03,
             "max_z_error": 0.08,
         },
+        support_contact_active=True,
     )
     problem = cp.Problem(
         cp.Minimize(objective + cp.square(dqa[2] + 0.3)), constraints
@@ -158,6 +160,31 @@ def test_support_contact_base_objective_does_not_center_source_root_z():
 
     assert problem.status == cp.OPTIMAL
     assert dqa.value[2] == pytest.approx(-0.3, abs=1e-5)
+
+
+def test_support_contact_base_policy_restores_source_z_during_flight():
+    """Without a load-bearing foot, source motion owns root height again."""
+    dqa = cp.Variable(7)
+    q = np.asarray([0.0, 0.0, 1.2, 1.0, 0.0, 0.0, 0.0])
+    objective, constraints = _build_base_position_task(
+        dqa,
+        q,
+        np.arange(7),
+        np.asarray([0.0, 0.0, 1.2]),
+        {
+            "enabled": True,
+            "hard_constraints": True,
+            "z_constraint_mode": "support_contact",
+            "max_xy_error": 0.03,
+            "max_z_error": 0.08,
+        },
+        support_contact_active=False,
+    )
+    problem = cp.Problem(cp.Minimize(objective + cp.square(dqa[2] - 0.3)), constraints)
+    problem.solve(solver=cp.CLARABEL)
+
+    assert problem.status == cp.OPTIMAL
+    assert abs(float(dqa.value[2])) <= 0.08001
 
 
 def test_reference_envelope_base_policy_retains_hard_root_z_bound():
@@ -345,10 +372,11 @@ def test_g1_profile_gates_world_tracking_on_contact_and_on_the_feet():
         if name.endswith("foot"):
             assert spec["swing_target_space"] == "world"
             assert spec["swing_morphology_scale"] == pytest.approx(1.0)
-            assert spec["track_source_during_contact"] is True
+            assert spec["track_source_during_contact"] is False
+            assert len(spec["contact_offsets"]) >= 3
             contact_spec = priority["contact_detection"]["effectors"][name]
-            assert contact_spec["contact_mode"] == "SUPPORT"
-            assert contact_spec["anchor_tangent_to_tracking"] is True
+            assert contact_spec["contact_mode"] == "AUTO"
+            assert contact_spec["allow_sliding"] is True
             assert "anchor_drift_tolerance" not in contact_spec
         else:
             assert spec["swing_target_space"] == "limb_morphology_scaled"
@@ -840,7 +868,6 @@ def test_framewise_modes_split_support_touch_and_swing_objectives():
                     "contact_offsets": [[1.0, 0.0, 0.0]],
                     "contact_target_space": "world",
                     "swing_target_space": "root_morphology_scaled",
-                    "swing_priority_family": "foot_swing",
                 }
             },
         },
@@ -878,8 +905,6 @@ def test_framewise_modes_split_support_touch_and_swing_objectives():
     assert slide[0] is not None and slide[0].size == 1
     assert slide[1] is None and slide[2] is None
     assert swing[0] is None and swing[1] is None and swing[2] is not None
-    assert retargeter._last_foot_swing_residual is not None
-    assert retargeter._last_foot_swing_residual.size == 3
 
 
 def test_contact_can_track_a_distinct_semantic_source_point():
@@ -1064,6 +1089,137 @@ def test_contact_inference_allows_sliding_hand_without_moving_foot_policy():
     np.testing.assert_allclose(
         foot_targets,
         np.repeat(foot_targets[0:1], len(foot_targets), axis=0),
+        atol=1e-10,
+    )
+
+
+def test_contact_hysteresis_uses_distinct_enter_and_exit_distances():
+    scene = trimesh.creation.box(extents=[4.0, 4.0, 0.1])
+    scene.apply_translation([0.0, 0.0, -0.05])
+    tracking = np.column_stack(
+        [
+            np.zeros(6),
+            np.zeros(6),
+            np.asarray([0.06, 0.045, 0.055, 0.065, 0.075, 0.09]),
+        ]
+    )
+    task = infer_scene_contact_tasks(
+        {
+            "left_foot": {
+                "tracking_positions": tracking,
+                "contact_samples": tracking[:, None, :],
+            }
+        },
+        scene,
+        framerate=30.0,
+        config={
+            "min_contact_frames": 1,
+            "max_gap_frames": 0,
+            "effectors": {
+                "left_foot": {
+                    "distance_threshold": 0.05,
+                    "exit_distance_threshold": 0.08,
+                    "relative_speed_threshold": 10.0,
+                    "contact_mode": "SLIDE",
+                }
+            },
+        },
+    )["left_foot"]
+
+    np.testing.assert_array_equal(
+        task.contact_modes != int(ContactMode.NONE),
+        [False, True, True, True, True, False],
+    )
+
+
+def test_auto_contact_uses_normal_speed_to_keep_surface_sliding_active():
+    scene = trimesh.creation.box(extents=[4.0, 4.0, 0.1])
+    scene.apply_translation([0.0, 0.0, -0.05])
+    tracking = np.column_stack(
+        [np.linspace(0.0, 0.3, 6), np.zeros(6), np.full(6, 0.01)]
+    )
+    task = infer_scene_contact_tasks(
+        {
+            "left_foot": {
+                "tracking_positions": tracking,
+                "contact_samples": tracking[:, None, :],
+            }
+        },
+        scene,
+        framerate=30.0,
+        config={
+            "min_contact_frames": 1,
+            "effectors": {
+                "left_foot": {
+                    "distance_threshold": 0.03,
+                    "allow_sliding": True,
+                    "normal_speed_threshold": 0.1,
+                    "contact_mode": "AUTO",
+                    "support_speed_threshold": 0.1,
+                    "support_max_tangential_travel": 0.02,
+                }
+            },
+        },
+    )["left_foot"]
+
+    assert np.all(task.contact_modes == int(ContactMode.SLIDE))
+    assert np.max(task.normal_speeds) < 1e-10
+    assert np.min(task.tangential_speeds) > 1.0
+
+
+def test_auto_contact_splits_sticking_subrun_from_one_sliding_contact_run():
+    scene = trimesh.creation.box(extents=[4.0, 4.0, 0.1])
+    scene.apply_translation([0.0, 0.0, -0.05])
+    x = np.asarray([0.0, 0.05, 0.10, 0.10, 0.10, 0.10, 0.15, 0.20, 0.25])
+    tracking = np.column_stack([x, np.zeros(len(x)), np.full(len(x), 0.01)])
+
+    task = infer_scene_contact_tasks(
+        {
+            "left_foot": {
+                "tracking_positions": tracking,
+                "contact_samples": tracking[:, None, :],
+            }
+        },
+        scene,
+        framerate=30.0,
+        config={
+            "min_contact_frames": 1,
+            "max_gap_frames": 0,
+            "effectors": {
+                "left_foot": {
+                    "distance_threshold": 0.03,
+                    "allow_sliding": True,
+                    "normal_speed_threshold": 0.1,
+                    "contact_mode": "AUTO",
+                    "support_speed_threshold": 0.1,
+                    "support_max_tangential_travel": 0.02,
+                    "support_min_frames": 3,
+                    "support_max_gap_frames": 0,
+                }
+            },
+        },
+    )["left_foot"]
+
+    np.testing.assert_array_equal(
+        task.contact_modes,
+        [
+            ContactMode.SLIDE,
+            ContactMode.SLIDE,
+            ContactMode.SLIDE,
+            ContactMode.SUPPORT,
+            ContactMode.SUPPORT,
+            ContactMode.SUPPORT,
+            ContactMode.SLIDE,
+            ContactMode.SLIDE,
+            ContactMode.SLIDE,
+        ],
+    )
+    support_targets = task.contact_positions[
+        task.contact_modes == int(ContactMode.SUPPORT)
+    ]
+    np.testing.assert_allclose(
+        support_targets,
+        np.repeat(support_targets[0:1], len(support_targets), axis=0),
         atol=1e-10,
     )
 
@@ -1692,6 +1848,8 @@ def test_contact_tasks_stack_for_downstream_policy_export():
         "contact_mode_names",
         "contact_segment_id",
         "contact_confidence",
+        "contact_normal_speed",
+        "contact_tangential_speed",
         "contact_transition_weight",
         "contact_targets_w",
         "end_effector_reference_w",
@@ -2456,16 +2614,22 @@ def test_base_orientation_hard_cone_bounds_a_conflicting_lower_level():
     assert remaining_error >= 0.149
 
 
-def test_priority_level_grouping_is_configurable_between_four_and_eight_levels():
+def test_priority_level_grouping_uses_contact_then_interaction_motion_prior():
     shipped = json.loads(
         (
             Path(__file__).resolve().parents[1]
             / "robot_models/unitree_g1/unitree_g1_instinctmj.json"
         ).read_text(encoding="utf-8")
     )["retargeting"]["end_effector_priority"]
-    eight_levels = _resolve_priority_levels(shipped)
-    assert len(eight_levels) == 8
-    assert eight_levels[0]["families"] == ("support",)
+    shipped_levels = _resolve_priority_levels(shipped)
+    assert len(shipped_levels) == 4
+    assert shipped_levels[0]["families"] == ("support",)
+    assert shipped_levels[2]["families"] == (
+        "interaction",
+        "swing",
+        "orientation",
+        "pose_direction",
+    )
 
     four_config = {
         "priority_levels": [
@@ -2484,7 +2648,7 @@ def test_priority_level_grouping_is_configurable_between_four_and_eight_levels()
     four_levels = _resolve_priority_levels(four_config)
     assert len(four_levels) == 4
     assert four_levels[0]["families"] == ("support", "contact")
-    assert four_levels[1]["families"] == ("foot_swing", "swing")
+    assert four_levels[1]["families"] == ("swing",)
 
 
 def test_capsule_surface_offsets_follow_the_local_z_axis():

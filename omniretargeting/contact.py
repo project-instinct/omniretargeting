@@ -58,6 +58,8 @@ class SceneContactTask:
     contact_modes: np.ndarray
     contact_segment_ids: np.ndarray
     transition_weights: np.ndarray
+    normal_speeds: np.ndarray | None = None
+    tangential_speeds: np.ndarray | None = None
     forward_directions: np.ndarray | None = None
     up_directions: np.ndarray | None = None
     # ``effective_swing_positions`` is an export/visualisation preview.  For a
@@ -100,6 +102,16 @@ class SceneContactTask:
             "contact_confidence",
         ):
             value = np.asarray(getattr(self, field_name), dtype=float)
+            if value.shape != (num_frames,):
+                raise ValueError(
+                    f"{self.name}: {field_name} must have shape ({num_frames},)."
+                )
+            object.__setattr__(self, field_name, value)
+        for field_name in ("normal_speeds", "tangential_speeds"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            value = np.asarray(value, dtype=float)
             if value.shape != (num_frames,):
                 raise ValueError(
                     f"{self.name}: {field_name} must have shape ({num_frames},)."
@@ -289,6 +301,12 @@ class SceneContactTask:
             "contact_segment_id": int(self.contact_segment_ids[frame_idx]),
             "transition_weight": float(self.transition_weights[frame_idx]),
         }
+        if self.normal_speeds is not None:
+            payload["normal_speed"] = float(self.normal_speeds[frame_idx])
+        if self.tangential_speeds is not None:
+            payload["tangential_speed"] = float(
+                self.tangential_speeds[frame_idx]
+            )
         if mode == ContactMode.NONE:
             if self.effective_swing_positions is None:
                 raise RuntimeError(
@@ -378,6 +396,103 @@ def _remove_short_runs(mask: np.ndarray, min_contact_frames: int) -> np.ndarray:
         if end - start < min_contact_frames:
             result[start:end] = False
     return result
+
+
+def _hysteresis_contact_mask(
+    distances: np.ndarray,
+    speeds: np.ndarray,
+    *,
+    enter_distance: float,
+    exit_distance: float,
+    enter_speed: float,
+    exit_speed: float,
+) -> np.ndarray:
+    """Apply Schmitt-trigger thresholds to a contact observation track."""
+    distances = np.asarray(distances, dtype=float)
+    speeds = np.asarray(speeds, dtype=float)
+    if distances.shape != speeds.shape or distances.ndim != 1:
+        raise ValueError("distances and speeds must share shape (T,).")
+    active = False
+    result = np.zeros(len(distances), dtype=bool)
+    for frame_idx, (distance, speed) in enumerate(zip(distances, speeds)):
+        if active:
+            active = bool(distance <= exit_distance and speed <= exit_speed)
+        else:
+            active = bool(distance <= enter_distance and speed <= enter_speed)
+        result[frame_idx] = active
+    return result
+
+
+def _classify_auto_contact_modes(
+    candidate_mask: np.ndarray,
+    surface_points: np.ndarray,
+    surface_normals: np.ndarray,
+    tangential_speeds: np.ndarray,
+    *,
+    touch_max_frames: int,
+    support_speed_threshold: float,
+    support_max_tangential_travel: float,
+    support_min_frames: int,
+    support_max_gap_frames: int,
+) -> np.ndarray:
+    """Split proximity contact into transient, sliding, and sticking spans.
+
+    Contact continuity is governed by distance and normal velocity before this
+    function is called. Tangential motion is deliberately used only for the
+    semantic split: stationary sub-runs become no-slip SUPPORT anchors while
+    the remaining contact frames retain tangential freedom as SLIDE. This is
+    important for a heel-to-toe or hand-on-surface trajectory where one long
+    proximity run may legitimately contain both modes.
+    """
+    candidate_mask = np.asarray(candidate_mask, dtype=bool)
+    surface_points = np.asarray(surface_points, dtype=float)
+    surface_normals = np.asarray(surface_normals, dtype=float)
+    tangential_speeds = np.asarray(tangential_speeds, dtype=float)
+    num_frames = len(candidate_mask)
+    if surface_points.shape != (num_frames, 3):
+        raise ValueError("surface_points must have shape (T, 3).")
+    if surface_normals.shape != (num_frames, 3):
+        raise ValueError("surface_normals must have shape (T, 3).")
+    if tangential_speeds.shape != (num_frames,):
+        raise ValueError("tangential_speeds must have shape (T,).")
+
+    modes = np.full(num_frames, int(ContactMode.NONE), dtype=np.uint8)
+    for contact_start, contact_end in _iter_true_runs(candidate_mask):
+        if contact_end - contact_start <= touch_max_frames:
+            modes[contact_start:contact_end] = int(ContactMode.TOUCH)
+            continue
+
+        # Proximity and low normal separation already establish contact.
+        # Default to sliding, then promote only verified low-tangential-motion
+        # sub-runs to no-slip support.
+        modes[contact_start:contact_end] = int(ContactMode.SLIDE)
+        support_mask = (
+            tangential_speeds[contact_start:contact_end]
+            <= support_speed_threshold
+        )
+        support_mask = _close_short_gaps(
+            support_mask, support_max_gap_frames
+        )
+        support_mask = _remove_short_runs(support_mask, support_min_frames)
+
+        for local_start, local_end in _iter_true_runs(support_mask):
+            start = contact_start + local_start
+            end = contact_start + local_end
+            normal = np.median(surface_normals[start:end], axis=0)
+            normal_norm = float(np.linalg.norm(normal))
+            if normal_norm < 1e-10:
+                normal = np.array([0.0, 0.0, 1.0])
+            else:
+                normal /= normal_norm
+            deltas = surface_points[start:end] - surface_points[start]
+            tangential_deltas = deltas - np.outer(deltas @ normal, normal)
+            tangential_travel = float(
+                np.max(np.linalg.norm(tangential_deltas, axis=1), initial=0.0)
+            )
+            if tangential_travel <= support_max_tangential_travel:
+                modes[start:end] = int(ContactMode.SUPPORT)
+
+    return modes
 
 
 def _closest_scene_samples(
@@ -512,6 +627,24 @@ def infer_scene_contact_tasks(
         eff_cfg = dict(per_effector_cfg.get(name, {}) or {})
         eff_distance_threshold = float(eff_cfg.get("distance_threshold", distance_threshold))
         eff_speed_threshold = float(eff_cfg.get("relative_speed_threshold", speed_threshold))
+        eff_exit_distance_threshold = max(
+            float(
+                eff_cfg.get(
+                    "exit_distance_threshold",
+                    cfg.get("exit_distance_threshold", eff_distance_threshold),
+                )
+            ),
+            eff_distance_threshold,
+        )
+        eff_exit_speed_threshold = max(
+            float(
+                eff_cfg.get(
+                    "exit_relative_speed_threshold",
+                    cfg.get("exit_relative_speed_threshold", eff_speed_threshold),
+                )
+            ),
+            eff_speed_threshold,
+        )
         eff_min_contact_frames = max(
             int(eff_cfg.get("min_contact_frames", min_contact_frames)), 1
         )
@@ -551,16 +684,53 @@ def infer_scene_contact_tasks(
             velocity[1:] = np.diff(tracking_positions, axis=0) * fps
             velocity[0] = velocity[1]
         relative_speeds = np.linalg.norm(velocity, axis=1)
+        signed_normal_velocity = np.sum(velocity * surface_normals, axis=1)
+        normal_speeds = np.abs(signed_normal_velocity)
+        tangential_velocity = velocity - (
+            signed_normal_velocity[:, None] * surface_normals
+        )
+        tangential_speeds = np.linalg.norm(tangential_velocity, axis=1)
+
+        # Sliding contact is detected from separation speed, not total speed.
+        # A hand or sole moving quickly along a surface must remain contact-
+        # active as long as it is not moving away from that surface.
+        allow_sliding = bool(eff_cfg.get("allow_sliding", False))
+        normal_speed_threshold = float(
+            eff_cfg.get("normal_speed_threshold", eff_speed_threshold)
+        )
+        exit_normal_speed_threshold = max(
+            float(
+                eff_cfg.get(
+                    "exit_normal_speed_threshold",
+                    normal_speed_threshold,
+                )
+            ),
+            normal_speed_threshold,
+        )
+        gate_speeds = normal_speeds if allow_sliding else relative_speeds
+        enter_gate_speed = (
+            normal_speed_threshold if allow_sliding else eff_speed_threshold
+        )
+        exit_gate_speed = (
+            exit_normal_speed_threshold
+            if allow_sliding
+            else eff_exit_speed_threshold
+        )
 
         distance_score = _sigmoid(
             (eff_distance_threshold - distances) / distance_softness
         )
         speed_score = _sigmoid(
-            (eff_speed_threshold - relative_speeds) / speed_softness
+            (enter_gate_speed - gate_speeds) / speed_softness
         )
         confidence = distance_score * speed_score
-        candidate_mask = (distances <= eff_distance_threshold) & (
-            relative_speeds <= eff_speed_threshold
+        candidate_mask = _hysteresis_contact_mask(
+            distances,
+            gate_speeds,
+            enter_distance=eff_distance_threshold,
+            exit_distance=eff_exit_distance_threshold,
+            enter_speed=enter_gate_speed,
+            exit_speed=exit_gate_speed,
         )
         require_normal_alignment = bool(
             eff_cfg.get("require_normal_alignment", True)
@@ -589,8 +759,9 @@ def infer_scene_contact_tasks(
         candidate_mask = _close_short_gaps(candidate_mask, eff_max_gap_frames)
         candidate_mask = _remove_short_runs(candidate_mask, eff_min_contact_frames)
         confidence = np.where(candidate_mask, np.maximum(confidence, 0.5), confidence)
-        # Resolve one semantic mode for each detected segment.  The mode alone
-        # determines whether a target is anchored or allowed to slide.
+        # Resolve semantic modes within every detected segment. A single
+        # proximity run may alternate between sticking and sliding; classifying
+        # the whole run from its mean speed would erase stance-foot anchors.
         configured_mode = str(
             eff_cfg.get("contact_mode", "AUTO")
         ).upper()
@@ -603,9 +774,31 @@ def infer_scene_contact_tasks(
         support_max_tangential_travel = max(
             float(eff_cfg.get("support_max_tangential_travel", 0.035)), 0.0
         )
-        contact_modes = np.full(
-            len(candidate_mask), int(ContactMode.NONE), dtype=np.uint8
+        support_min_frames = max(
+            int(eff_cfg.get("support_min_frames", eff_min_contact_frames)), 1
         )
+        support_max_gap_frames = max(
+            int(eff_cfg.get("support_max_gap_frames", 1)), 0
+        )
+        if configured_mode == "AUTO":
+            contact_modes = _classify_auto_contact_modes(
+                candidate_mask,
+                surface_points,
+                surface_normals,
+                tangential_speeds,
+                touch_max_frames=touch_max_frames,
+                support_speed_threshold=support_speed_threshold,
+                support_max_tangential_travel=support_max_tangential_travel,
+                support_min_frames=support_min_frames,
+                support_max_gap_frames=support_max_gap_frames,
+            )
+        else:
+            resolved_mode = _parse_contact_mode(configured_mode)
+            contact_modes = np.where(
+                candidate_mask,
+                int(resolved_mode),
+                int(ContactMode.NONE),
+            ).astype(np.uint8)
         contact_segment_ids = np.full(len(candidate_mask), -1, dtype=np.int32)
         contact_positions = selected_samples.copy()
         transition_weights = np.ones(len(candidate_mask), dtype=float)
@@ -648,32 +841,22 @@ def infer_scene_contact_tasks(
                 )
             return anchor, normal
 
-        for start, end in _iter_true_runs(candidate_mask):
-            run_mode_name = configured_mode
-            if run_mode_name == "AUTO":
-                run_points = surface_points[start:end]
-                run_normal = np.median(surface_normals[start:end], axis=0)
-                run_normal /= max(float(np.linalg.norm(run_normal)), 1e-10)
-                run_delta = run_points - run_points[0]
-                tangential_delta = run_delta - np.outer(run_delta @ run_normal, run_normal)
-                tangential_travel = float(
-                    np.max(np.linalg.norm(tangential_delta, axis=1))
-                )
-                mean_speed = float(np.mean(relative_speeds[start:end]))
-                if end - start <= touch_max_frames:
-                    run_mode = ContactMode.TOUCH
-                elif (
-                    tangential_travel <= support_max_tangential_travel
-                    and mean_speed <= support_speed_threshold
-                ):
-                    run_mode = ContactMode.SUPPORT
-                else:
-                    run_mode = ContactMode.SLIDE
-            else:
-                run_mode = _parse_contact_mode(run_mode_name)
-
-            if run_mode == ContactMode.NONE:
+        semantic_runs = []
+        for start in range(len(contact_modes)):
+            mode = ContactMode(int(contact_modes[start]))
+            if mode == ContactMode.NONE:
                 continue
+            if start > 0 and contact_modes[start - 1] == contact_modes[start]:
+                continue
+            end = start + 1
+            while (
+                end < len(contact_modes)
+                and contact_modes[end] == contact_modes[start]
+            ):
+                end += 1
+            semantic_runs.append((start, end, mode))
+
+        for start, end, run_mode in semantic_runs:
             if run_mode == ContactMode.SUPPORT:
                 # A SUPPORT segment is a true no-slip world anchor.  If a
                 # source reconstruction drifts beyond the configured tolerance,
@@ -784,6 +967,8 @@ def infer_scene_contact_tasks(
             contact_modes=contact_modes,
             contact_segment_ids=contact_segment_ids,
             transition_weights=transition_weights,
+            normal_speeds=normal_speeds,
+            tangential_speeds=tangential_speeds,
             forward_directions=forward_directions,
             up_directions=up_directions,
         )
@@ -830,6 +1015,24 @@ def stack_contact_tasks(
         ).astype(np.int32),
         "contact_confidence": np.stack(
             [tasks[name].contact_confidence for name in names], axis=1
+        ),
+        "contact_normal_speed": np.stack(
+            [
+                tasks[name].normal_speeds
+                if tasks[name].normal_speeds is not None
+                else tasks[name].relative_speeds
+                for name in names
+            ],
+            axis=1,
+        ),
+        "contact_tangential_speed": np.stack(
+            [
+                tasks[name].tangential_speeds
+                if tasks[name].tangential_speeds is not None
+                else np.zeros_like(tasks[name].relative_speeds)
+                for name in names
+            ],
+            axis=1,
         ),
         "contact_transition_weight": np.stack(
             [
