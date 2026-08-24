@@ -18,7 +18,11 @@ from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 
 from .utils import compute_mesh_height_at_point
-from .contact import SceneContactTask, infer_scene_contact_tasks
+from .contact import (
+    SceneContactTask,
+    build_world_tracking_tasks,
+    infer_scene_contact_tasks,
+)
 from .trajectory_refinement import (
     measure_scene_penetration,
     refine_joint_trajectory,
@@ -279,8 +283,12 @@ class OmniRetargeter:
         end_effector_cfg = dict(
             retargeting_config.get("end_effector_priority", {}) or {}
         )
+        semantic_contact_enabled = bool(end_effector_cfg.get("enabled", False))
+        world_tracking_enabled = bool(
+            end_effector_cfg.get("world_tracking_only", False)
+        )
         end_effector_tasks: Dict[str, SceneContactTask] = {}
-        if bool(end_effector_cfg.get("enabled", False)) and end_effector_markers:
+        if (semantic_contact_enabled or world_tracking_enabled) and end_effector_markers:
             processed_markers = {
                 name: {
                     key: np.asarray(value, dtype=float) * terrain_scale
@@ -288,20 +296,39 @@ class OmniRetargeter:
                 }
                 for name, marker in end_effector_markers.items()
             }
-            end_effector_tasks = infer_scene_contact_tasks(
-                processed_markers,
-                scaled_terrain,
-                framerate=float(framerate or 30.0),
-                config=end_effector_cfg.get("contact_detection", {}),
-            )
-            contact_summary = ", ".join(
-                f"{name}={int(np.count_nonzero(task.contact_mask))}/{len(task.contact_mask)}"
-                for name, task in end_effector_tasks.items()
-            )
-            print(f"Inferred SMPL-X scene contacts (frames): {contact_summary}")
-        elif bool(end_effector_cfg.get("enabled", False)):
+            if world_tracking_enabled and not semantic_contact_enabled:
+                selected_names = set(
+                    end_effector_cfg.get(
+                        "world_tracking_effectors",
+                        ["left_foot", "right_foot"],
+                    )
+                )
+                processed_markers = {
+                    name: marker
+                    for name, marker in processed_markers.items()
+                    if name in selected_names
+                }
+            if semantic_contact_enabled:
+                end_effector_tasks = infer_scene_contact_tasks(
+                    processed_markers,
+                    scaled_terrain,
+                    framerate=float(framerate or 30.0),
+                    config=end_effector_cfg.get("contact_detection", {}),
+                )
+                contact_summary = ", ".join(
+                    f"{name}={int(np.count_nonzero(task.contact_mask))}/{len(task.contact_mask)}"
+                    for name, task in end_effector_tasks.items()
+                )
+                print(f"Inferred SMPL-X scene contacts (frames): {contact_summary}")
+            else:
+                end_effector_tasks = build_world_tracking_tasks(processed_markers)
+                print(
+                    "Using per-frame SMPL-X hand/sole world tracking without "
+                    "contact classification or anchors."
+                )
+        elif semantic_contact_enabled or world_tracking_enabled:
             print(
-                "Contact-priority optimization requested, but no SMPL-X "
+                "End-effector world tracking requested, but no SMPL-X "
                 "end-effector markers were supplied; using whole-body retargeting."
             )
         self.last_end_effector_tasks = end_effector_tasks
@@ -412,17 +439,18 @@ class OmniRetargeter:
             framerate=float(framerate or 30.0),
         )
 
-        if end_effector_tasks:
-            self._report_final_motion_quality(retargeted_motion, end_effector_tasks)
-
         foot_stabilization_cfg = dict(retargeting_config.get("foot_stabilization", {}) or {})
-        if end_effector_tasks and bool(foot_stabilization_cfg.get("enabled", False)):
+        active_foot_contacts = any(
+            "foot" in name and np.any(task.contact_mask)
+            for name, task in end_effector_tasks.items()
+        )
+        if active_foot_contacts and bool(foot_stabilization_cfg.get("enabled", False)):
             print(
                 "Foot stabilization skipped: contact-priority retargeting already "
                 "anchors the feet to the scene, and the post-hoc ground lock would "
                 "move the base away from those anchors."
             )
-        if not end_effector_tasks and (
+        if not active_foot_contacts and (
             retargeting_config.get("penetration_resolver", "hard_constraint") == "xyz_nudge"
             or bool(foot_stabilization_cfg.get("enabled", False))
         ):
@@ -431,6 +459,9 @@ class OmniRetargeter:
                 scaled_terrain,
                 framerate=framerate,
             )
+
+        if end_effector_tasks:
+            self._report_final_motion_quality(retargeted_motion, end_effector_tasks)
 
         return terrain_scale, retargeted_motion
 
@@ -1209,10 +1240,7 @@ class OmniRetargeter:
         geom_groups = set(int(group) for group in geom_groups) if geom_groups is not None else None
 
         specs = []
-        for side, side_tokens in {
-            "left": ("left", "l_"),
-            "right": ("right", "r_"),
-        }.items():
+        for side in ("left", "right"):
             geom_specs = []
             for geom_id in range(self.robot_model.ngeom):
                 if geom_groups is not None and int(self.robot_model.geom_group[geom_id]) not in geom_groups:
@@ -1220,7 +1248,7 @@ class OmniRetargeter:
                 body_id = int(self.robot_model.geom_bodyid[geom_id])
                 body_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
                 body_name_lower = body_name.lower()
-                if not any(token in body_name_lower for token in side_tokens):
+                if not self._body_name_matches_side(body_name_lower, side):
                     continue
                 if not any(token in body_name_lower for token in body_tokens):
                     continue
@@ -1238,6 +1266,14 @@ class OmniRetargeter:
             if geom_specs:
                 specs.append({"side": side, "geom_specs": geom_specs})
         return specs
+
+    @staticmethod
+    def _body_name_matches_side(body_name: str, side: str) -> bool:
+        """Match an explicit left/right name token, never an interior substring."""
+        normalized = str(body_name).lower().replace("-", "_")
+        tokens = tuple(token for token in normalized.split("_") if token)
+        aliases = {"left", "l"} if side == "left" else {"right", "r"}
+        return bool(aliases.intersection(tokens))
 
     def _resolve_foot_body_ids(self, cfg: Dict[str, Any]) -> Dict[str, int]:
         """Resolve left/right foot body ids from config, mapping, or robot body names."""

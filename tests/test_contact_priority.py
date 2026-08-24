@@ -5,9 +5,11 @@ from scipy.spatial.transform import Rotation
 
 from omniretargeting.contact import (
     SceneContactTask,
+    build_world_tracking_tasks,
     infer_scene_contact_tasks,
     stack_contact_tasks,
 )
+from omniretargeting.core import OmniRetargeter
 from omniretargeting.retargeting import (
     _apply_configured_joint_limits,
     _clamp_target_to_reach,
@@ -44,6 +46,31 @@ ANKLE_ARM_XML = """
   </worldbody>
 </mujoco>
 """
+
+
+def test_world_tracking_tasks_preserve_positions_without_contact_semantics():
+    positions = np.asarray(
+        [[0.0, 0.0, 0.0], [0.1, -0.2, 0.3], [0.2, -0.1, 0.4]]
+    )
+
+    task = build_world_tracking_tasks(
+        {"right_foot": {"tracking_positions": positions}}
+    )["right_foot"]
+
+    np.testing.assert_allclose(task.tracking_positions, positions)
+    assert not np.any(task.contact_mask)
+    assert all(not task.frame(frame)["contact"] for frame in range(len(positions)))
+
+
+def test_foot_side_matching_uses_name_tokens_not_roll_link_substrings():
+    assert OmniRetargeter._body_name_matches_side("left_ankle_roll_link", "left")
+    assert not OmniRetargeter._body_name_matches_side(
+        "right_ankle_roll_link", "left"
+    )
+    assert OmniRetargeter._body_name_matches_side("right_ankle_roll_link", "right")
+    assert not OmniRetargeter._body_name_matches_side(
+        "left_ankle_roll_link", "right"
+    )
 
 
 def test_densify_smplx_frame_gaps_restores_missing_pose_on_shortest_arc():

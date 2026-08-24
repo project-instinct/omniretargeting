@@ -499,16 +499,22 @@ def main():
     try:
         # Load SMPLX trajectory
         print(f"Loading SMPLX trajectory from {args.smplx_motion}...")
-        contact_priority_enabled = bool(
-            (retargeting.get("end_effector_priority", {}) or {}).get("enabled", False)
+        end_effector_cfg = dict(
+            retargeting.get("end_effector_priority", {}) or {}
+        )
+        end_effector_markers_enabled = bool(
+            end_effector_cfg.get("enabled", False)
+            or end_effector_cfg.get("world_tracking_only", False)
         )
         loaded_motion = load_smplx_trajectory(
             smplx_file=Path(args.smplx_motion),
             smplx_model_directory=args.smplx_model_dir,
-            return_end_effectors=contact_priority_enabled,
+            return_end_effectors=end_effector_markers_enabled,
         )
         smplx_trajectory, smplx_orientations = loaded_motion[:2]
-        end_effector_markers = loaded_motion[2] if contact_priority_enabled else None
+        end_effector_markers = (
+            loaded_motion[2] if end_effector_markers_enabled else None
+        )
         
         # Try to detect framerate from SMPLX file if not provided
         framerate = args.framerate

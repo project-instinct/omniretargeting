@@ -67,7 +67,12 @@
     "terrain_sample_points": 100,
     "penetration_resolver": "contact_constraints",
     "end_effector_priority": {
-      "enabled": true,
+      "enabled": false,
+      "world_tracking_only": true,
+      "world_tracking_effectors": [
+        "left_foot",
+        "right_foot"
+      ],
       "hierarchy": false,
       "weighted_scale": 2.0,
       "contact_sigma": 0.025,
@@ -216,7 +221,7 @@
         "max_base_step": 0.04
       },
       "base_position_constraint": {
-        "enabled": true,
+        "enabled": false,
         "hard_constraints": false,
         "max_xy_error": 0.03,
         "z_offset": -0.5,
@@ -420,7 +425,7 @@
           "track_swing_heading": true,
           "track_swing_orientation": true,
           "orientation_sigma": 0.0698131701,
-          "swing_sigma": 0.06,
+          "swing_sigma": 0.02,
           "swing_morphology_scale": 1.0,
           "max_orientation_step": 0.1745329252,
           "contact_offsets": [
@@ -443,7 +448,7 @@
           "track_swing_heading": true,
           "track_swing_orientation": true,
           "orientation_sigma": 0.0698131701,
-          "swing_sigma": 0.06,
+          "swing_sigma": 0.02,
           "swing_morphology_scale": 1.0,
           "max_orientation_step": 0.1745329252,
           "contact_offsets": [
@@ -461,7 +466,7 @@
       "sigma_frames": 2.0
     },
     "trajectory_refinement": {
-      "enabled": true,
+      "enabled": false,
       "iterations": 16,
       "contact_position_sigma": 0.012,
       "swing_position_sigma": 0.03,

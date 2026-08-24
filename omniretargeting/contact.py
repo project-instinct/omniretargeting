@@ -57,6 +57,59 @@ class SceneContactTask:
         return payload
 
 
+def build_world_tracking_tasks(
+    marker_trajectories: Mapping[str, Mapping[str, np.ndarray]],
+) -> Dict[str, SceneContactTask]:
+    """Build per-frame world targets without inferring contact semantics.
+
+    This is the lightweight path used when hands/soles should follow the
+    source motion but SUPPORT/SLIDE classification and scene anchoring are
+    deliberately disabled.  Every frame is therefore a swing-style tracking
+    frame; root height remains free for the robot kinematics to resolve.
+    """
+    tasks: Dict[str, SceneContactTask] = {}
+    for name, marker_data in marker_trajectories.items():
+        tracking_positions = np.asarray(
+            marker_data["tracking_positions"], dtype=float
+        )
+        if tracking_positions.ndim != 2 or tracking_positions.shape[1] != 3:
+            raise ValueError(
+                f"{name}: tracking_positions must have shape (T, 3), "
+                f"got {tracking_positions.shape}."
+            )
+        num_frames = len(tracking_positions)
+        speeds = np.zeros(num_frames, dtype=float)
+        if num_frames > 1:
+            speeds[1:] = np.linalg.norm(
+                np.diff(tracking_positions, axis=0), axis=1
+            )
+        forward_directions = marker_data.get("forward_directions")
+        up_directions = marker_data.get("up_directions")
+        tasks[name] = SceneContactTask(
+            name=name,
+            tracking_positions=tracking_positions,
+            contact_positions=tracking_positions.copy(),
+            surface_points=tracking_positions.copy(),
+            surface_normals=np.tile([0.0, 0.0, 1.0], (num_frames, 1)),
+            distances=np.full(num_frames, np.inf, dtype=float),
+            relative_speeds=speeds,
+            contact_confidence=np.ones(num_frames, dtype=float),
+            contact_mask=np.zeros(num_frames, dtype=bool),
+            forward_directions=(
+                None
+                if forward_directions is None
+                else np.asarray(forward_directions, dtype=float)
+            ),
+            up_directions=(
+                None
+                if up_directions is None
+                else np.asarray(up_directions, dtype=float)
+            ),
+            transition_weights=np.ones(num_frames, dtype=float),
+        )
+    return tasks
+
+
 def _sigmoid(value: np.ndarray) -> np.ndarray:
     value = np.clip(value, -60.0, 60.0)
     return 1.0 / (1.0 + np.exp(-value))

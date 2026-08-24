@@ -340,13 +340,27 @@ class GenericInteractionRetargeter:
         forcing the ankle or wrist joint centre onto the scene surface.
         """
         cfg = self.end_effector_config
-        self.end_effector_enabled = bool(cfg.get("enabled", False))
+        self.end_effector_enabled = bool(
+            cfg.get("enabled", False) or cfg.get("world_tracking_only", False)
+        )
         self.end_effectors: Dict[str, Dict[str, Any]] = {}
         self._active_contact_offsets: Dict[str, int] = {}
         if not self.end_effector_enabled:
             return
 
         specs = dict(cfg.get("effectors", {}) or {})
+        if bool(cfg.get("world_tracking_only", False)) and not bool(
+            cfg.get("enabled", False)
+        ):
+            selected_names = set(
+                cfg.get(
+                    "world_tracking_effectors",
+                    ["left_foot", "right_foot"],
+                )
+            )
+            specs = {
+                name: spec for name, spec in specs.items() if name in selected_names
+            }
         for name, raw_spec in specs.items():
             spec = dict(raw_spec or {})
             body_name = spec.get("robot_body")
@@ -442,8 +456,14 @@ class GenericInteractionRetargeter:
             raise ValueError(
                 "end_effector_priority is enabled but no effectors were configured."
             )
+        mode_label = (
+            "World-tracking end effectors"
+            if bool(cfg.get("world_tracking_only", False))
+            and not bool(cfg.get("enabled", False))
+            else "Contact-priority end effectors"
+        )
         print(
-            "Contact-priority end effectors: "
+            f"{mode_label}: "
             + ", ".join(
                 f"{name}->{spec['body_name']}" for name, spec in self.end_effectors.items()
             )
