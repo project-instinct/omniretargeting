@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union, Any
+from typing import Dict, List, Tuple, Optional, Union, Any, Mapping
 import trimesh
 import mujoco
 try:
@@ -27,6 +27,45 @@ from .trajectory_refinement import (
     measure_scene_penetration,
     refine_joint_trajectory,
 )
+
+
+def _partition_end_effector_markers(
+    markers: Mapping[str, Dict[str, np.ndarray]],
+    config: Mapping[str, Any],
+    *,
+    semantic_contact_enabled: bool,
+    world_tracking_enabled: bool,
+) -> Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Dict[str, np.ndarray]]]:
+    """Split source markers into semantic-contact and direct-tracking groups."""
+    all_names = set(markers)
+    world_names = (
+        set(config.get("world_tracking_effectors", ["left_foot", "right_foot"]))
+        if world_tracking_enabled
+        else set()
+    )
+    semantic_names: set[str] = set()
+    if semantic_contact_enabled:
+        configured_semantic_names = config.get("semantic_contact_effectors")
+        semantic_names = (
+            set(configured_semantic_names)
+            if configured_semantic_names is not None
+            else all_names - world_names
+        )
+
+    overlap = semantic_names & world_names
+    if overlap:
+        raise ValueError(
+            "End effectors cannot use semantic contact and direct world tracking "
+            f"at the same time: {sorted(overlap)}"
+        )
+
+    semantic_markers = {
+        name: marker for name, marker in markers.items() if name in semantic_names
+    }
+    world_markers = {
+        name: marker for name, marker in markers.items() if name in world_names
+    }
+    return semantic_markers, world_markers
 
 
 class OmniRetargeter:
@@ -286,7 +325,10 @@ class OmniRetargeter:
         semantic_contact_enabled = bool(end_effector_cfg.get("enabled", False))
         world_tracking_enabled = bool(
             end_effector_cfg.get("world_tracking_only", False)
+            or end_effector_cfg.get("world_tracking_enabled", False)
         )
+        semantic_tasks: Dict[str, SceneContactTask] = {}
+        world_tasks: Dict[str, SceneContactTask] = {}
         end_effector_tasks: Dict[str, SceneContactTask] = {}
         if (semantic_contact_enabled or world_tracking_enabled) and end_effector_markers:
             processed_markers = {
@@ -296,35 +338,31 @@ class OmniRetargeter:
                 }
                 for name, marker in end_effector_markers.items()
             }
-            if world_tracking_enabled and not semantic_contact_enabled:
-                selected_names = set(
-                    end_effector_cfg.get(
-                        "world_tracking_effectors",
-                        ["left_foot", "right_foot"],
-                    )
-                )
-                processed_markers = {
-                    name: marker
-                    for name, marker in processed_markers.items()
-                    if name in selected_names
-                }
+            semantic_markers, world_markers = _partition_end_effector_markers(
+                processed_markers,
+                end_effector_cfg,
+                semantic_contact_enabled=semantic_contact_enabled,
+                world_tracking_enabled=world_tracking_enabled,
+            )
             if semantic_contact_enabled:
-                end_effector_tasks = infer_scene_contact_tasks(
-                    processed_markers,
+                semantic_tasks = infer_scene_contact_tasks(
+                    semantic_markers,
                     scaled_terrain,
                     framerate=float(framerate or 30.0),
                     config=end_effector_cfg.get("contact_detection", {}),
                 )
                 contact_summary = ", ".join(
                     f"{name}={int(np.count_nonzero(task.contact_mask))}/{len(task.contact_mask)}"
-                    for name, task in end_effector_tasks.items()
+                    for name, task in semantic_tasks.items()
                 )
                 print(f"Inferred SMPL-X scene contacts (frames): {contact_summary}")
-            else:
-                end_effector_tasks = build_world_tracking_tasks(processed_markers)
+                end_effector_tasks.update(semantic_tasks)
+            if world_tracking_enabled:
+                world_tasks = build_world_tracking_tasks(world_markers)
+                end_effector_tasks.update(world_tasks)
                 print(
-                    "Using per-frame SMPL-X hand/sole world tracking without "
-                    "contact classification or anchors."
+                    "Using per-frame SMPL-X world tracking without contact "
+                    "classification or anchors: " + ", ".join(world_tasks)
                 )
         elif semantic_contact_enabled or world_tracking_enabled:
             print(
@@ -343,11 +381,39 @@ class OmniRetargeter:
             base_orientations=base_orientations,
             base_translations=processed_base_translations,
         )
-        if end_effector_tasks:
-            retargeting_kwargs["end_effector_tasks"] = end_effector_tasks
-        retargeted_motion = self._perform_retargeting(
-            processed_trajectory, scaled_terrain, **retargeting_kwargs
+        preserve_noncontact_baseline = bool(
+            end_effector_cfg.get("preserve_noncontact_baseline", True)
         )
+        if (
+            preserve_noncontact_baseline
+            and semantic_tasks
+            and world_tasks
+            and any(np.any(task.contact_mask) for task in semantic_tasks.values())
+        ):
+            print(
+                "Building foot-tracking baseline before applying hand-contact "
+                "overlay. Non-contact frames remain identical to the baseline."
+            )
+            baseline_motion = self._perform_retargeting(
+                processed_trajectory,
+                scaled_terrain,
+                end_effector_tasks=world_tasks,
+                **retargeting_kwargs,
+            )
+            retargeted_motion = self._perform_retargeting(
+                processed_trajectory,
+                scaled_terrain,
+                end_effector_tasks=end_effector_tasks,
+                reference_trajectory=baseline_motion,
+                overlay_contact_names=set(semantic_tasks),
+                **retargeting_kwargs,
+            )
+        else:
+            if end_effector_tasks:
+                retargeting_kwargs["end_effector_tasks"] = end_effector_tasks
+            retargeted_motion = self._perform_retargeting(
+                processed_trajectory, scaled_terrain, **retargeting_kwargs
+            )
         refinement_cfg = dict(
             retargeting_config.get("trajectory_refinement", {}) or {}
         )
@@ -460,10 +526,78 @@ class OmniRetargeter:
                 framerate=framerate,
             )
 
+        retargeted_motion = self._clamp_final_joint_safety_limits(
+            retargeted_motion
+        )
+
         if end_effector_tasks:
             self._report_final_motion_quality(retargeted_motion, end_effector_tasks)
 
         return terrain_scale, retargeted_motion
+
+    def _clamp_final_joint_safety_limits(
+        self, trajectory: np.ndarray
+    ) -> np.ndarray:
+        """Guarantee that the saved motion respects task-safe joint ranges."""
+        if len(trajectory) == 0:
+            return trajectory
+        from .retargeting import (
+            _apply_configured_joint_limits,
+            _apply_joint_limit_safety_fraction,
+        )
+
+        qpos_indices = []
+        mechanical_lower = []
+        mechanical_upper = []
+        for joint_id in range(self.robot_model.njnt):
+            if not bool(self.robot_model.jnt_limited[joint_id]):
+                continue
+            if self.robot_model.jnt_type[joint_id] not in (
+                mujoco.mjtJoint.mjJNT_HINGE,
+                mujoco.mjtJoint.mjJNT_SLIDE,
+            ):
+                continue
+            qpos_indices.append(int(self.robot_model.jnt_qposadr[joint_id]))
+            mechanical_lower.append(float(self.robot_model.jnt_range[joint_id, 0]))
+            mechanical_upper.append(float(self.robot_model.jnt_range[joint_id, 1]))
+        if not qpos_indices:
+            return trajectory
+
+        qpos_indices_array = np.asarray(qpos_indices, dtype=int)
+        lower, upper = _apply_joint_limit_safety_fraction(
+            self.robot_model,
+            qpos_indices_array,
+            np.asarray(mechanical_lower),
+            np.asarray(mechanical_upper),
+            float(
+                self.retargeting_config.get(
+                    "joint_limit_safety_fraction", 1.0
+                )
+            ),
+        )
+        lower, upper = _apply_configured_joint_limits(
+            self.robot_model,
+            qpos_indices_array,
+            lower,
+            upper,
+            dict(
+                self.retargeting_config.get("end_effector_priority", {}) or {}
+            ).get("joint_posture_limits"),
+        )
+        result = np.asarray(trajectory, dtype=float).copy()
+        before = result[:, qpos_indices_array].copy()
+        result[:, qpos_indices_array] = np.clip(
+            before, lower[None, :], upper[None, :]
+        )
+        max_correction = float(
+            np.max(np.abs(result[:, qpos_indices_array] - before))
+        )
+        if max_correction > 1e-10:
+            print(
+                "Applied final joint safety clamp: "
+                f"max correction={max_correction:.4f} rad"
+            )
+        return result
 
     def _apply_trajectory_smoothing(
         self,
@@ -548,7 +682,13 @@ class OmniRetargeter:
         if not tasks or not specs or len(trajectory) == 0:
             return
         data = mujoco.MjData(self.robot_model)
-        contact_errors: Dict[str, List[float]] = {name: [] for name in tasks}
+        sticking_errors: Dict[str, List[float]] = {name: [] for name in tasks}
+        sliding_normal_errors: Dict[str, List[float]] = {
+            name: [] for name in tasks
+        }
+        sliding_tangent_errors: Dict[str, List[float]] = {
+            name: [] for name in tasks
+        }
         swing_errors: Dict[str, List[float]] = {name: [] for name in tasks}
         for frame_idx, qpos in enumerate(np.asarray(trajectory, dtype=float)):
             data.qpos[:] = qpos
@@ -577,17 +717,38 @@ class OmniRetargeter:
                     candidates = (
                         data.xpos[body_id][None, :] + contact_offsets @ rotation.T
                     )
-                    contact_errors[name].append(
-                        float(
-                            np.min(
-                                np.linalg.norm(
-                                    candidates
-                                    - task.contact_positions[frame_idx][None, :],
-                                    axis=1,
-                                )
-                            )
-                        )
+                    residuals = (
+                        candidates
+                        - task.contact_positions[frame_idx][None, :]
                     )
+                    contact_mode = (
+                        str(task.contact_modes[frame_idx])
+                        if task.contact_modes is not None
+                        else "sticking"
+                    )
+                    if contact_mode == "sliding":
+                        normal = np.asarray(
+                            task.surface_normals[frame_idx], dtype=float
+                        )
+                        normal /= max(float(np.linalg.norm(normal)), 1e-10)
+                        signed_normal_errors = residuals @ normal
+                        marker_idx = int(
+                            np.argmin(np.abs(signed_normal_errors))
+                        )
+                        normal_error = signed_normal_errors[marker_idx]
+                        tangent_error = (
+                            residuals[marker_idx] - normal_error * normal
+                        )
+                        sliding_normal_errors[name].append(
+                            float(abs(normal_error))
+                        )
+                        sliding_tangent_errors[name].append(
+                            float(np.linalg.norm(tangent_error))
+                        )
+                    else:
+                        sticking_errors[name].append(
+                            float(np.min(np.linalg.norm(residuals, axis=1)))
+                        )
                 else:
                     marker = data.xpos[body_id] + rotation @ tracking_offset
                     swing_errors[name].append(
@@ -601,7 +762,9 @@ class OmniRetargeter:
         for name in tasks:
             parts = []
             for label, errors in (
-                ("contact", contact_errors[name]),
+                ("sticking_xyz", sticking_errors[name]),
+                ("sliding_normal", sliding_normal_errors[name]),
+                ("sliding_tangent", sliding_tangent_errors[name]),
                 ("swing", swing_errors[name]),
             ):
                 if errors:
@@ -739,9 +902,19 @@ class OmniRetargeter:
         base_orientations: np.ndarray | None = None,
         base_translations: np.ndarray | None = None,
         end_effector_tasks: Optional[Dict[str, SceneContactTask]] = None,
+        reference_trajectory: np.ndarray | None = None,
+        overlay_contact_names: Optional[set[str]] = None,
     ) -> np.ndarray:
         """Perform the actual motion retargeting using generic interaction mesh retargeting."""
         from .retargeting import GenericInteractionRetargeter
+
+        if reference_trajectory is not None and len(reference_trajectory) != len(
+            processed_trajectory
+        ):
+            raise ValueError(
+                "reference_trajectory must have the same number of frames as "
+                "processed_trajectory."
+            )
 
         # Create retargeter instance
         # Note: scaled_terrain is already scaled by _scale_terrain_mesh
@@ -767,11 +940,18 @@ class OmniRetargeter:
             valid_joint_names=self.valid_joint_names,  # CRITICAL: Pass ordered joint names for consistency
             replace_cylinders_with_capsules=bool(self.retargeting_config.get("replace_cylinders_with_capsules", False)),
             hard_penetration_constraint=self.retargeting_config.get("penetration_resolver", "hard_constraint") == "hard_constraint",
+            self_collision_enabled=bool(
+                self.retargeting_config.get("self_collision_enabled", False)
+            ),
+            joint_limit_safety_fraction=float(
+                self.retargeting_config.get("joint_limit_safety_fraction", 1.0)
+            ),
             **retargeter_kwargs,
         )
 
         # Retarget each frame
         retargeted_trajectory = []
+        self._last_estimated_quat = None
         
         # Start from the model's nominal configuration.  Joint-range midpoints
         # are not a neutral pose for humanoids (for G1 they bend the knees by
@@ -802,6 +982,39 @@ class OmniRetargeter:
             q_init[2] = self.robot_height * 0.5  # Default height (Z coordinate)
 
         for frame_idx, human_joints in enumerate(processed_trajectory):
+            if reference_trajectory is not None:
+                contact_active = any(
+                    name in end_effector_tasks
+                    and bool(end_effector_tasks[name].contact_mask[frame_idx])
+                    for name in (overlay_contact_names or set())
+                )
+                if not contact_active:
+                    q_opt = np.asarray(
+                        reference_trajectory[frame_idx], dtype=float
+                    ).copy()
+                    if retargeted_trajectory:
+                        q_opt = retargeter._project_actuated_temporal_step(
+                            q_opt,
+                            retargeted_trajectory[-1],
+                            (
+                                retargeted_trajectory[-2]
+                                if len(retargeted_trajectory) > 1
+                                else None
+                            ),
+                            (
+                                retargeted_trajectory[-3]
+                                if len(retargeted_trajectory) > 2
+                                else None
+                            ),
+                        )
+                    retargeted_trajectory.append(q_opt)
+                    q_init = q_opt.copy()
+                    continue
+                # Contact refinement is an overlay on the independently
+                # solved source-faithful trajectory, not a new warm-start path.
+                q_init = np.asarray(
+                    reference_trajectory[frame_idx], dtype=float
+                ).copy()
             # Only initialize base from SMPLX for the first frame
             # For subsequent frames, the optimization will handle base movement
             if frame_idx == 0:
@@ -955,6 +1168,40 @@ class OmniRetargeter:
                     else None
                 )
             q_opt = retargeter.retarget_frame(mapped_joints, q_init, **frame_kwargs)
+            if reference_trajectory is not None:
+                blend_weight = max(
+                    (
+                        float(
+                            end_effector_tasks[name].transition_weights[
+                                frame_idx
+                            ]
+                        )
+                        if end_effector_tasks[name].transition_weights
+                        is not None
+                        else 1.0
+                    )
+                    for name in (overlay_contact_names or set())
+                    if name in end_effector_tasks
+                    and bool(end_effector_tasks[name].contact_mask[frame_idx])
+                )
+                baseline_qpos = np.asarray(
+                    reference_trajectory[frame_idx], dtype=float
+                )
+                overlay_qpos = np.asarray(q_opt, dtype=float).copy()
+                if np.dot(overlay_qpos[3:7], baseline_qpos[3:7]) < 0.0:
+                    overlay_qpos[3:7] *= -1.0
+                q_opt = baseline_qpos + blend_weight * (
+                    overlay_qpos - baseline_qpos
+                )
+                q_opt[3:7] /= max(
+                    float(np.linalg.norm(q_opt[3:7])), 1e-12
+                )
+                q_opt = retargeter._project_actuated_temporal_step(
+                    q_opt,
+                    frame_kwargs.get("q_last"),
+                    frame_kwargs.get("q_prev"),
+                    frame_kwargs.get("q_prevprev"),
+                )
             if preserve_root_z:
                 q_opt[2] = q_init[2]
             retargeted_trajectory.append(q_opt)

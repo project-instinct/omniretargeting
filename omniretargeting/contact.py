@@ -32,23 +32,37 @@ class SceneContactTask:
     forward_directions: np.ndarray | None = None
     up_directions: np.ndarray | None = None
     transition_weights: np.ndarray | None = None
+    contact_modes: np.ndarray | None = None
 
     def frame(self, frame_idx: int) -> Dict[str, Any]:
         """Return the optimizer payload for one frame."""
+        transition_weight = (
+            float(self.transition_weights[frame_idx])
+            if self.transition_weights is not None
+            else 1.0
+        )
+        contact_mode = (
+            str(self.contact_modes[frame_idx])
+            if self.contact_modes is not None
+            else ("sticking" if bool(self.contact_mask[frame_idx]) else "none")
+        )
+        contact_position = self.contact_positions[frame_idx]
+        if contact_mode == "sticking" and transition_weight < 1.0:
+            contact_position = (
+                (1.0 - transition_weight) * self.tracking_positions[frame_idx]
+                + transition_weight * contact_position
+            )
         payload = {
             "name": self.name,
             "tracking_position": self.tracking_positions[frame_idx],
-            "contact_position": self.contact_positions[frame_idx],
+            "contact_position": contact_position,
             "surface_normal": self.surface_normals[frame_idx],
             "distance": float(self.distances[frame_idx]),
             "relative_speed": float(self.relative_speeds[frame_idx]),
             "confidence": float(self.contact_confidence[frame_idx]),
             "contact": bool(self.contact_mask[frame_idx]),
-            "transition_weight": (
-                float(self.transition_weights[frame_idx])
-                if self.transition_weights is not None
-                else 1.0
-            ),
+            "contact_mode": contact_mode,
+            "transition_weight": transition_weight,
         }
         if self.forward_directions is not None:
             payload["forward_direction"] = self.forward_directions[frame_idx]
@@ -106,6 +120,7 @@ def build_world_tracking_tasks(
                 else np.asarray(up_directions, dtype=float)
             ),
             transition_weights=np.ones(num_frames, dtype=float),
+            contact_modes=np.full(num_frames, "none", dtype="<U8"),
         )
     return tasks
 
@@ -305,6 +320,33 @@ def infer_scene_contact_tasks(
             float(eff_cfg.get("anchor_drift_tolerance", anchor_drift_tolerance)),
             0.0,
         )
+        eff_sticking_tangential_speed_threshold = max(
+            float(
+                eff_cfg.get(
+                    "sticking_tangential_speed_threshold",
+                    cfg.get("sticking_tangential_speed_threshold", 0.12),
+                )
+            ),
+            0.0,
+        )
+        eff_sticking_normal_speed_threshold = max(
+            float(
+                eff_cfg.get(
+                    "sticking_normal_speed_threshold",
+                    cfg.get("sticking_normal_speed_threshold", 0.12),
+                )
+            ),
+            0.0,
+        )
+        eff_min_sticking_frames = max(
+            int(
+                eff_cfg.get(
+                    "min_sticking_frames",
+                    cfg.get("min_sticking_frames", min_contact_frames),
+                )
+            ),
+            1,
+        )
 
         # Selected samples refer to fixed SMPL-X vertex ids, but the nearest id
         # may switch.  The semantic-center velocity is more robust to those
@@ -352,6 +394,24 @@ def infer_scene_contact_tasks(
         contact_mask = _close_short_gaps(contact_mask, eff_max_gap_frames)
         contact_mask = _remove_short_runs(contact_mask, eff_min_contact_frames)
         confidence = np.where(contact_mask, np.maximum(confidence, 0.5), confidence)
+
+        normal_speeds = np.abs(np.sum(velocity * surface_normals, axis=1))
+        tangential_velocity = velocity - surface_normals * np.sum(
+            velocity * surface_normals, axis=1, keepdims=True
+        )
+        tangential_speeds = np.linalg.norm(tangential_velocity, axis=1)
+        sticking_mask = (
+            contact_mask
+            & eff_anchor_contacts
+            & (tangential_speeds <= eff_sticking_tangential_speed_threshold)
+            & (normal_speeds <= eff_sticking_normal_speed_threshold)
+        )
+        sticking_mask = _remove_short_runs(
+            sticking_mask, eff_min_sticking_frames
+        )
+        contact_modes = np.full(len(contact_mask), "none", dtype="<U8")
+        contact_modes[contact_mask] = "sliding"
+        contact_modes[sticking_mask] = "sticking"
         # Fade the contact weight in and out over a few frames, like a
         # foot-lock blend.  A binary weight switch makes the optimizer jump
         # between the swing target and the scene anchor within one frame; the
@@ -372,6 +432,10 @@ def infer_scene_contact_tasks(
                     )
 
         contact_positions = selected_samples.copy()
+        contact_positions[contact_mask] = (
+            surface_points[contact_mask]
+            + clearance * surface_normals[contact_mask]
+        )
         if eff_anchor_contacts:
 
             def _window_anchor(anchor_slice: slice) -> tuple[np.ndarray, np.ndarray]:
@@ -410,7 +474,7 @@ def infer_scene_contact_tasks(
                     normal *= -1.0
                 return anchor, normal
 
-            for start, end in _iter_true_runs(contact_mask):
+            for start, end in _iter_true_runs(sticking_mask):
                 # Estimate the no-slip anchor at contact onset.  Using the
                 # median of an entire run is non-causal and can place the
                 # target far ahead of the foot on the first stance frame.
@@ -466,12 +530,6 @@ def infer_scene_contact_tasks(
                     forward_norm = float(np.linalg.norm(forward))
                     if forward_norm > 1e-10:
                         forward_directions[start:end] = forward / forward_norm
-        else:
-            contact_positions[contact_mask] = (
-                surface_points[contact_mask]
-                + clearance * surface_normals[contact_mask]
-            )
-
         # Store the same valid SO(3) foot frame that the optimizer receives.
         # The contact-normal consistency test above guarantees that this
         # captured frame is physically compatible with the scene; retaining
@@ -504,6 +562,8 @@ def infer_scene_contact_tasks(
             contact_mask=contact_mask,
             forward_directions=forward_directions,
             up_directions=up_directions,
+            transition_weights=transition_weights,
+            contact_modes=contact_modes,
         )
 
     return tasks
@@ -519,6 +579,15 @@ def stack_contact_tasks(
     return {
         "contact_names": np.asarray(names),
         "contact_mask": np.stack([tasks[name].contact_mask for name in names], axis=1),
+        "contact_modes": np.stack(
+            [
+                tasks[name].contact_modes
+                if tasks[name].contact_modes is not None
+                else np.where(tasks[name].contact_mask, "sticking", "none")
+                for name in names
+            ],
+            axis=1,
+        ),
         "contact_confidence": np.stack(
             [tasks[name].contact_confidence for name in names], axis=1
         ),

@@ -118,6 +118,85 @@ def _apply_configured_joint_limits(
     return result_lower, result_upper
 
 
+def _apply_configured_joint_regularization(
+    model: mujoco.MjModel,
+    qpos_indices: np.ndarray,
+    weights: np.ndarray,
+    configured_weights: Mapping[str, Any] | None,
+) -> np.ndarray:
+    """Apply exact-name posture weights to optimized scalar joints."""
+    result = np.asarray(weights, dtype=float).copy()
+    coordinate_by_qpos = {
+        int(qpos_idx): coordinate_idx
+        for coordinate_idx, qpos_idx in enumerate(qpos_indices)
+    }
+    for joint_name, raw_weight in dict(configured_weights or {}).items():
+        weight = float(raw_weight)
+        if not np.isfinite(weight) or weight < 0.0:
+            raise ValueError(
+                f"joint_regularization_weights['{joint_name}'] must be a "
+                "finite non-negative number."
+            )
+        joint_id = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_JOINT, str(joint_name)
+        )
+        if joint_id < 0:
+            raise ValueError(
+                "joint_regularization_weights refers to missing joint "
+                f"'{joint_name}'."
+            )
+        qpos_idx = int(model.jnt_qposadr[joint_id])
+        coordinate_idx = coordinate_by_qpos.get(qpos_idx)
+        if coordinate_idx is not None:
+            result[coordinate_idx] = weight
+    return result
+
+
+def _apply_joint_limit_safety_fraction(
+    model: mujoco.MjModel,
+    qpos_indices: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    safety_fraction: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Shrink scalar mechanical ranges toward the robot's neutral pose."""
+    fraction = float(safety_fraction)
+    if not 0.0 < fraction <= 1.0:
+        raise ValueError("joint_limit_safety_fraction must be in (0, 1].")
+    result_lower = np.asarray(lower, dtype=float).copy()
+    result_upper = np.asarray(upper, dtype=float).copy()
+    coordinate_by_qpos = {
+        int(qpos_idx): coordinate_idx
+        for coordinate_idx, qpos_idx in enumerate(qpos_indices)
+    }
+    for joint_id in range(model.njnt):
+        if not bool(model.jnt_limited[joint_id]):
+            continue
+        if model.jnt_type[joint_id] not in (
+            mujoco.mjtJoint.mjJNT_HINGE,
+            mujoco.mjtJoint.mjJNT_SLIDE,
+        ):
+            continue
+        qpos_idx = int(model.jnt_qposadr[joint_id])
+        coordinate_idx = coordinate_by_qpos.get(qpos_idx)
+        if coordinate_idx is None:
+            continue
+        neutral = float(
+            np.clip(
+                model.qpos0[qpos_idx],
+                result_lower[coordinate_idx],
+                result_upper[coordinate_idx],
+            )
+        )
+        result_lower[coordinate_idx] = neutral + fraction * (
+            result_lower[coordinate_idx] - neutral
+        )
+        result_upper[coordinate_idx] = neutral + fraction * (
+            result_upper[coordinate_idx] - neutral
+        )
+    return result_lower, result_upper
+
+
 class GenericInteractionRetargeter:
     """
     Generic interaction mesh retargeter that works with any robot and terrain.
@@ -143,6 +222,8 @@ class GenericInteractionRetargeter:
         valid_joint_names: Optional[List[str]] = None,
         replace_cylinders_with_capsules: bool = False,
         hard_penetration_constraint: bool = False,
+        self_collision_enabled: bool = False,
+        joint_limit_safety_fraction: float = 1.0,
         preserve_root_z: bool = False,
         end_effector_config: Optional[Dict[str, Any]] = None,
     ):
@@ -171,6 +252,11 @@ class GenericInteractionRetargeter:
             hard_penetration_constraint: If True, enforce penetration
                 constraints inside the optimizer. If False, skip them so
                 outer post-processing can handle contact correction.
+            self_collision_enabled: If True, also add robot self-collision
+                constraints. The default keeps collision handling scoped to
+                the external terrain/scene mesh.
+            joint_limit_safety_fraction: Fraction of each scalar joint's
+                neutral-to-mechanical-limit excursion available to the solver.
             preserve_root_z: If True, keep qpos[2] out of the SQP variables so
                 root height is supplied by the caller and not changed by IK.
             end_effector_config: Optional contact-aware hand/foot task
@@ -183,6 +269,8 @@ class GenericInteractionRetargeter:
         self.joint_mapping = joint_mapping  # This should already be filtered to valid joints only
         self.robot_height = robot_height
         self.hard_penetration_constraint = hard_penetration_constraint
+        self.self_collision_enabled = bool(self_collision_enabled)
+        self.joint_limit_safety_fraction = float(joint_limit_safety_fraction)
         self.end_effector_config = dict(end_effector_config or {})
         
         # CRITICAL: Store ordered joint names to ensure consistent ordering
@@ -302,11 +390,18 @@ class GenericInteractionRetargeter:
                 full_lower_limits[qpos_adr] = self.robot_model.jnt_range[i, 0]
                 full_upper_limits[qpos_adr] = self.robot_model.jnt_range[i, 1]
 
-        self.q_a_lb, self.q_a_ub = _apply_configured_joint_limits(
+        safe_lower, safe_upper = _apply_joint_limit_safety_fraction(
             self.robot_model,
             self.q_a_indices,
             full_lower_limits[self.q_a_indices],
             full_upper_limits[self.q_a_indices],
+            self.joint_limit_safety_fraction,
+        )
+        self.q_a_lb, self.q_a_ub = _apply_configured_joint_limits(
+            self.robot_model,
+            self.q_a_indices,
+            safe_lower,
+            safe_upper,
             self.end_effector_config.get("joint_posture_limits"),
         )
 
@@ -324,6 +419,32 @@ class GenericInteractionRetargeter:
         
         if len(base_indices_in_qa) > 0:
             self.Q_diag[base_indices_in_qa] = 0.001  # Very small weight for base
+
+        # The waist axes are weakly observable from positional interaction
+        # targets and otherwise become convenient compensation DOFs. Preserve
+        # the original neutral-pose safeguard, then allow robot profiles to
+        # tune exact joints without relying on substring matches in the solve.
+        for joint_id in range(self.robot_model.njnt):
+            joint_name = self.robot_model.joint(joint_id).name
+            if not joint_name:
+                continue
+            joint_name_lower = joint_name.lower()
+            if not (
+                "waist" in joint_name_lower
+                or "torso" in joint_name_lower
+                or ("hip" in joint_name_lower and "yaw" in joint_name_lower)
+            ):
+                continue
+            qpos_idx = int(self.robot_model.jnt_qposadr[joint_id])
+            matching = np.flatnonzero(self.q_a_indices == qpos_idx)
+            if len(matching):
+                self.Q_diag[int(matching[0])] = 0.2
+        self.Q_diag = _apply_configured_joint_regularization(
+            self.robot_model,
+            self.q_a_indices,
+            self.Q_diag,
+            self.end_effector_config.get("joint_regularization_weights"),
+        )
         
         # Store smoothness weight (matching original: 0.2)
         self.smooth_weight = 0.2
@@ -341,7 +462,9 @@ class GenericInteractionRetargeter:
         """
         cfg = self.end_effector_config
         self.end_effector_enabled = bool(
-            cfg.get("enabled", False) or cfg.get("world_tracking_only", False)
+            cfg.get("enabled", False)
+            or cfg.get("world_tracking_only", False)
+            or cfg.get("world_tracking_enabled", False)
         )
         self.end_effectors: Dict[str, Dict[str, Any]] = {}
         self._active_contact_offsets: Dict[str, int] = {}
@@ -349,9 +472,12 @@ class GenericInteractionRetargeter:
             return
 
         specs = dict(cfg.get("effectors", {}) or {})
-        if bool(cfg.get("world_tracking_only", False)) and not bool(
-            cfg.get("enabled", False)
-        ):
+        world_tracking_enabled = bool(
+            cfg.get("world_tracking_only", False)
+            or cfg.get("world_tracking_enabled", False)
+        )
+        semantic_contact_enabled = bool(cfg.get("enabled", False))
+        if world_tracking_enabled and not semantic_contact_enabled:
             selected_names = set(
                 cfg.get(
                     "world_tracking_effectors",
@@ -404,11 +530,31 @@ class GenericInteractionRetargeter:
                     f"End-effector '{name}' contact_offsets must have shape (K, 3)."
                 )
 
+            contact_joint_qa_indices: List[int] = []
+            for joint_name in spec.get("contact_joint_names", []):
+                joint_id = mujoco.mj_name2id(
+                    self.robot_model,
+                    mujoco.mjtObj.mjOBJ_JOINT,
+                    str(joint_name),
+                )
+                if joint_id < 0:
+                    raise ValueError(
+                        f"End-effector '{name}' contact chain refers to "
+                        f"missing joint '{joint_name}'."
+                    )
+                qpos_idx = int(self.robot_model.jnt_qposadr[joint_id])
+                matches = np.flatnonzero(self.q_a_indices == qpos_idx)
+                if len(matches):
+                    contact_joint_qa_indices.append(int(matches[0]))
+
             self.end_effectors[name] = {
                 "body_name": str(body_name),
                 "body_id": int(body_id),
                 "tracking_offset": tracking_offset,
                 "contact_offsets": contact_offsets,
+                "contact_joint_qa_indices": np.asarray(
+                    contact_joint_qa_indices, dtype=int
+                ),
                 "track_orientation": bool(spec.get("track_orientation", False)),
                 "track_swing_heading": bool(
                     spec.get("track_swing_heading", False)
@@ -440,6 +586,10 @@ class GenericInteractionRetargeter:
                 "preserve_world_target": bool(
                     spec.get("preserve_world_target", False)
                 ),
+                "track_swing": bool(spec.get("track_swing", True)),
+                "track_sliding_tangent": bool(
+                    spec.get("track_sliding_tangent", True)
+                ),
                 "reach_reference_body_id": int(reach_reference_body_id),
                 "reach_reference_offset": np.asarray(
                     spec.get("reach_reference_offset", [0.0, 0.0, 0.0]),
@@ -457,10 +607,13 @@ class GenericInteractionRetargeter:
                 "end_effector_priority is enabled but no effectors were configured."
             )
         mode_label = (
-            "World-tracking end effectors"
-            if bool(cfg.get("world_tracking_only", False))
-            and not bool(cfg.get("enabled", False))
-            else "Contact-priority end effectors"
+            "Mixed contact/world-tracking end effectors"
+            if semantic_contact_enabled and world_tracking_enabled
+            else (
+                "Contact-priority end effectors"
+                if semantic_contact_enabled
+                else "World-tracking end effectors"
+            )
         )
         print(
             f"{mode_label}: "
@@ -473,13 +626,6 @@ class GenericInteractionRetargeter:
         """Cache robot bone lengths for source/robot direction matching."""
         pose_cfg = dict(self.end_effector_config.get("pose_direction", {}) or {})
         self.pose_direction_enabled = bool(pose_cfg.get("enabled", True))
-        # The whole-step bisection projection rescales every optimized
-        # coordinate toward the previous frame, so it can undo contact and
-        # swing progress that the convex solve already secured.  Profiles that
-        # rely on the in-problem direction constraints can turn it off.
-        self.pose_direction_post_projection = bool(
-            pose_cfg.get("post_projection", True)
-        )
         # The direction-velocity target transports an ambient difference
         # between different points of the unit sphere, which can fight the
         # position-level direction matching; profiles can keep only the
@@ -488,15 +634,29 @@ class GenericInteractionRetargeter:
         self.pose_direction_sigma = max(float(pose_cfg.get("sigma", 0.12)), 1e-6)
         self.pose_arm_weight = max(float(pose_cfg.get("arm_weight", 1.0)), 0.0)
         self.pose_leg_weight = max(float(pose_cfg.get("leg_weight", 1.0)), 0.0)
-        self.pose_max_direction_step = max(
-            float(pose_cfg.get("max_direction_step", np.deg2rad(6.0))), 1e-6
-        )
-        self.pose_min_direction_step = max(
-            float(pose_cfg.get("min_direction_step", np.deg2rad(1.5))), 1e-6
-        )
-        self.pose_direction_step_margin = max(
-            float(pose_cfg.get("direction_step_margin", np.deg2rad(1.0))), 0.0
-        )
+        self.pose_edge_weight_overrides: Dict[str, float] = {}
+        for edge_name, raw_weight in dict(
+            pose_cfg.get("edge_weight_overrides", {}) or {}
+        ).items():
+            edge_weight = float(raw_weight)
+            if not np.isfinite(edge_weight) or edge_weight < 0.0:
+                raise ValueError(
+                    f"pose_direction.edge_weight_overrides['{edge_name}'] "
+                    "must be a finite non-negative number."
+                )
+            self.pose_edge_weight_overrides[str(edge_name)] = edge_weight
+        self.pose_edge_joint_effectors: Dict[str, str] = {
+            str(edge_name): str(effector_name)
+            for edge_name, effector_name in dict(
+                pose_cfg.get("edge_joint_effectors", {}) or {}
+            ).items()
+        }
+        for edge_name, effector_name in self.pose_edge_joint_effectors.items():
+            if effector_name not in self.end_effectors:
+                raise ValueError(
+                    f"pose_direction.edge_joint_effectors['{edge_name}'] "
+                    f"refers to unknown effector '{effector_name}'."
+                )
         self.pose_velocity_sigma = max(
             float(pose_cfg.get("velocity_sigma", 0.035)), 1e-6
         )
@@ -558,6 +718,27 @@ class GenericInteractionRetargeter:
         mujoco.mj_forward(self.robot_model, self.robot_data)
         print(f"Pose-direction bones: {len(self.pose_bones)}")
 
+    def _localize_pose_edge_jacobian(
+        self,
+        parent_name: str,
+        child_name: str,
+        jacobian: np.ndarray,
+    ) -> np.ndarray:
+        """Keep configured limb-direction corrections inside that limb chain."""
+        effector_name = self.pose_edge_joint_effectors.get(
+            f"{parent_name}->{child_name}"
+        )
+        if effector_name is None:
+            return jacobian
+        allowed = np.asarray(
+            self.end_effectors[effector_name]["contact_joint_qa_indices"],
+            dtype=int,
+        )
+        localized = np.zeros_like(jacobian)
+        if len(allowed):
+            localized[:, allowed] = jacobian[:, allowed]
+        return localized
+
     def _build_pose_direction_residual(
         self,
         dqa: cp.Variable,
@@ -594,12 +775,18 @@ class GenericInteractionRetargeter:
                 robot_jacobian[3 * child_idx : 3 * child_idx + 3]
                 - robot_jacobian[3 * parent_idx : 3 * parent_idx + 3]
             )
+            vector_jacobian = self._localize_pose_edge_jacobian(
+                parent_name, child_name, vector_jacobian
+            )
             is_leg = any(
                 token in parent_name or token in child_name
                 for token in ("Hip", "Knee", "Ankle")
             )
             direction_weight = (
                 self.pose_leg_weight if is_leg else self.pose_arm_weight
+            )
+            direction_weight *= self.pose_edge_weight_overrides.get(
+                f"{parent_name}->{child_name}", 1.0
             )
             terms.append(
                 np.sqrt(direction_weight)
@@ -610,96 +797,6 @@ class GenericInteractionRetargeter:
                 / self.pose_direction_sigma
             )
         return cp.hstack(terms) if terms else None
-
-    def _build_pose_direction_constraints(
-        self,
-        dqa: cp.Variable,
-        robot_positions: Mapping[str, np.ndarray],
-        robot_jacobian: np.ndarray,
-        last_directions: Mapping[Tuple[str, str], np.ndarray],
-        direction_step_limits: Mapping[Tuple[str, str], float],
-    ) -> List[cp.Constraint]:
-        """Bound visible bone rotation between output frames."""
-        if not self.pose_direction_enabled or not last_directions:
-            return []
-        name_to_index = {
-            name: index for index, name in enumerate(self.valid_joint_names)
-        }
-        constraints: List[cp.Constraint] = []
-        for parent_name, child_name, _ in self.pose_bones:
-            edge = (parent_name, child_name)
-            if edge not in last_directions:
-                continue
-            parent_idx = name_to_index[parent_name]
-            child_idx = name_to_index[child_name]
-            vector = robot_positions[child_name] - robot_positions[parent_name]
-            length = float(np.linalg.norm(vector))
-            if length < 1e-8:
-                continue
-            direction = vector / length
-            vector_jacobian = (
-                robot_jacobian[3 * child_idx : 3 * child_idx + 3]
-                - robot_jacobian[3 * parent_idx : 3 * parent_idx + 3]
-            )
-            direction_jacobian = (
-                np.eye(3) - np.outer(direction, direction)
-            ) @ vector_jacobian / length
-            constraints.append(
-                cp.norm(
-                    direction
-                    + direction_jacobian @ dqa
-                    - np.asarray(last_directions[edge], dtype=float),
-                    2,
-                )
-                <= float(
-                    direction_step_limits.get(
-                        edge, self.pose_max_direction_step
-                    )
-                )
-            )
-        return constraints
-
-    def _pose_direction_step_limits(
-        self,
-        target_human_joints: Optional[np.ndarray],
-        previous_human_joints: Optional[np.ndarray],
-    ) -> Dict[Tuple[str, str], float]:
-        """Set bone speed limits from the captured per-frame bone motion."""
-        limits: Dict[Tuple[str, str], float] = {}
-        if target_human_joints is None or previous_human_joints is None:
-            return limits
-        name_to_index = {
-            name: index for index, name in enumerate(self.valid_joint_names)
-        }
-        current = np.asarray(target_human_joints, dtype=float)
-        previous = np.asarray(previous_human_joints, dtype=float)
-        for parent_name, child_name, _ in self.pose_bones:
-            parent_idx = name_to_index[parent_name]
-            child_idx = name_to_index[child_name]
-            current_vector = current[child_idx] - current[parent_idx]
-            previous_vector = previous[child_idx] - previous[parent_idx]
-            current_norm = float(np.linalg.norm(current_vector))
-            previous_norm = float(np.linalg.norm(previous_vector))
-            if current_norm < 1e-8 or previous_norm < 1e-8:
-                continue
-            source_step = float(
-                np.arccos(
-                    np.clip(
-                        np.dot(current_vector, previous_vector)
-                        / (current_norm * previous_norm),
-                        -1.0,
-                        1.0,
-                    )
-                )
-            )
-            limits[(parent_name, child_name)] = float(
-                np.clip(
-                    source_step + self.pose_direction_step_margin,
-                    self.pose_min_direction_step,
-                    self.pose_max_direction_step,
-                )
-            )
-        return limits
 
     def _build_pose_velocity_residual(
         self,
@@ -918,6 +1015,15 @@ class GenericInteractionRetargeter:
             spec = self.end_effectors[name]
             body_id = spec["body_id"]
             confidence = float(np.clip(target_data.get("confidence", 1.0), 0.0, 1.0))
+            transition_weight = float(
+                np.clip(target_data.get("transition_weight", 1.0), 0.0, 1.0)
+            )
+            contact_mode = str(
+                target_data.get(
+                    "contact_mode",
+                    "sticking" if target_data.get("contact", False) else "none",
+                )
+            )
             forward_direction = target_data.get("forward_direction")
             up_direction = target_data.get("up_direction")
 
@@ -943,9 +1049,8 @@ class GenericInteractionRetargeter:
                 sigma = max(float(spec["contact_sigma"]), 1e-6)
                 # Keep every detected contact in the primary level. Confidence
                 # only ranks contacts within that same priority level.
-                weight = max(confidence, 0.25)
+                weight = max(confidence, 0.25) * max(transition_weight, 1e-3)
                 residual = position + jacobian @ dqa - target
-                contact_terms.append(np.sqrt(weight) * residual / sigma)
                 surface_normal = np.asarray(
                     target_data.get("surface_normal", [0.0, 0.0, 1.0]),
                     dtype=float,
@@ -953,6 +1058,33 @@ class GenericInteractionRetargeter:
                 normal_norm = float(np.linalg.norm(surface_normal))
                 if normal_norm > 1e-8:
                     surface_normal /= normal_norm
+                if contact_mode == "sliding" and normal_norm > 1e-8:
+                    contact_terms.append(
+                        np.sqrt(weight) * (surface_normal @ residual) / sigma
+                    )
+                    if spec["track_sliding_tangent"]:
+                        tangent_projection = np.eye(3) - np.outer(
+                            surface_normal, surface_normal
+                        )
+                        tangent_sigma = max(
+                            float(
+                                spec.get(
+                                    "sliding_tangent_sigma",
+                                    self.end_effector_config.get(
+                                        "sliding_tangent_sigma", 0.10
+                                    ),
+                                )
+                            ),
+                            sigma,
+                        )
+                        swing_terms.append(
+                            np.sqrt(weight)
+                            * (tangent_projection @ residual)
+                            / tangent_sigma
+                        )
+                else:
+                    contact_terms.append(np.sqrt(weight) * residual / sigma)
+                if normal_norm > 1e-8:
                     normal_tolerance = max(
                         float(
                             self.end_effector_config.get(
@@ -968,7 +1100,11 @@ class GenericInteractionRetargeter:
                         surface_normal @ residual >= -normal_tolerance
                     )
 
-                    if spec.get("track_orientation", False) and forward_direction is not None:
+                    if (
+                        contact_mode == "sticking"
+                        and spec.get("track_orientation", False)
+                        and forward_direction is not None
+                    ):
                         forward = np.asarray(forward_direction, dtype=float).reshape(3)
                         orientation_up = np.asarray(
                             up_direction
@@ -1020,6 +1156,8 @@ class GenericInteractionRetargeter:
                             )
             else:
                 self._active_contact_offsets.pop(name, None)
+                if not spec["track_swing"]:
+                    continue
                 target = np.asarray(target_data["tracking_position"], dtype=float).reshape(3)
                 source_root_position = target_data.get("source_root_position")
                 swing_morphology_scale = float(spec["swing_morphology_scale"])
@@ -1284,13 +1422,6 @@ class GenericInteractionRetargeter:
             target_base_position=target_base_position,
             end_effector_targets=end_effector_targets,
         )
-        if self.pose_direction_post_projection:
-            direction_step_limits = self._pose_direction_step_limits(
-                human_joints, previous_human_joints
-            )
-            q_opt = self._project_pose_direction_step(
-                q_opt, q_last, direction_step_limits
-            )
         return self._project_actuated_temporal_step(
             q_opt, q_last, q_prev, q_prevprev
         )
@@ -1311,6 +1442,7 @@ class GenericInteractionRetargeter:
             return q_candidate
 
         max_step = max(float(temporal_cfg.get("max_joint_step", 0.06)), 1e-8)
+        max_acceleration = np.inf
         lower = np.full(len(actuated), -max_step)
         upper = np.full(len(actuated), max_step)
         if q_prev is not None:
@@ -1343,86 +1475,73 @@ class GenericInteractionRetargeter:
 
         proposed_step = q_candidate[actuated] - q_last[actuated]
         projected = np.asarray(q_candidate, dtype=float).copy()
-        projected[actuated] = q_last[actuated] + np.clip(
-            proposed_step, lower, upper
-        )
-        return projected
-
-    def _project_pose_direction_step(
-        self,
-        q_candidate: np.ndarray,
-        q_last: Optional[np.ndarray],
-        direction_step_limits: Mapping[Tuple[str, str], float],
-    ) -> np.ndarray:
-        """Enforce the nonlinear bone-angle bound after the SQP solve."""
-        if (
-            q_last is None
-            or not self.pose_direction_enabled
-            or not self.pose_bones
-        ):
-            return q_candidate
-
-        def directions(qpos: np.ndarray) -> np.ndarray:
-            self.robot_data.qpos[:] = qpos
-            mujoco.mj_forward(self.robot_model, self.robot_data)
-            result = []
-            for parent_name, child_name, _ in self.pose_bones:
-                parent_id = mujoco.mj_name2id(
-                    self.robot_model,
-                    mujoco.mjtObj.mjOBJ_BODY,
-                    self.joint_mapping[parent_name],
-                )
-                child_id = mujoco.mj_name2id(
-                    self.robot_model,
-                    mujoco.mjtObj.mjOBJ_BODY,
-                    self.joint_mapping[child_name],
-                )
-                vector = (
-                    self.robot_data.xpos[child_id]
-                    - self.robot_data.xpos[parent_id]
-                )
-                result.append(vector / max(float(np.linalg.norm(vector)), 1e-10))
-            return np.asarray(result)
-
-        last_directions = directions(q_last)
-
-        step_limits = np.asarray(
-            [
-                direction_step_limits.get(
-                    (parent_name, child_name), self.pose_max_direction_step
-                )
-                for parent_name, child_name, _ in self.pose_bones
-            ],
-            dtype=float,
-        )
-
-        def maximum_ratio(qpos: np.ndarray) -> float:
-            candidate_directions = directions(qpos)
-            cosines = np.clip(
-                np.sum(last_directions * candidate_directions, axis=1),
-                -1.0,
-                1.0,
+        position_lower = np.full(len(actuated), -np.inf)
+        position_upper = np.full(len(actuated), np.inf)
+        qa_coordinate_by_qpos = {
+            int(qpos_idx): coordinate_idx
+            for coordinate_idx, qpos_idx in enumerate(self.q_a_indices)
+        }
+        for output_idx, qpos_idx in enumerate(actuated):
+            qa_idx = qa_coordinate_by_qpos.get(int(qpos_idx))
+            if qa_idx is None:
+                continue
+            position_lower[output_idx] = (
+                self.q_a_lb[qa_idx] - q_last[qpos_idx]
             )
-            return float(np.max(np.arccos(cosines) / step_limits))
+            position_upper[output_idx] = (
+                self.q_a_ub[qa_idx] - q_last[qpos_idx]
+            )
+        feasible_lower = np.maximum(lower, position_lower)
+        feasible_upper = np.minimum(upper, position_upper)
+        feasible = feasible_lower <= feasible_upper
+        projected_step = np.empty_like(proposed_step)
+        projected_step[feasible] = np.clip(
+            proposed_step[feasible],
+            feasible_lower[feasible],
+            feasible_upper[feasible],
+        )
+        # A joint can reach its safe boundary with too much outward velocity
+        # for the requested acceleration cap to stop it in one frame. Safety
+        # wins in that rare conflict; the profile's max step is kept no larger
+        # than its acceleration cap so the emergency stop remains bounded.
+        projected_step[~feasible] = np.clip(
+            proposed_step[~feasible],
+            position_lower[~feasible],
+            position_upper[~feasible],
+        )
+        if np.isfinite(max_acceleration):
+            def braking_speed_limit(distance: float) -> float:
+                """Largest step that can still stop before a joint boundary."""
+                distance = max(float(distance), 0.0)
+                low, high = 0.0, max_step
+                for _ in range(32):
+                    speed = 0.5 * (low + high)
+                    remaining_speed = speed
+                    stopping_distance = 0.0
+                    while remaining_speed > 1e-12:
+                        stopping_distance += remaining_speed
+                        remaining_speed = max(
+                            remaining_speed - max_acceleration, 0.0
+                        )
+                    if stopping_distance <= distance:
+                        low = speed
+                    else:
+                        high = speed
+                return low
 
-        if maximum_ratio(q_candidate) <= 1.001:
-            return q_candidate
-
-        delta = np.asarray(q_candidate, dtype=float) - np.asarray(q_last, dtype=float)
-        lower, upper = 0.0, 1.0
-        best = np.asarray(q_last, dtype=float).copy()
-        for _ in range(24):
-            alpha = 0.5 * (lower + upper)
-            trial = np.asarray(q_last, dtype=float) + alpha * delta
-            trial[3:7] /= max(float(np.linalg.norm(trial[3:7])), 1e-12)
-            if np.dot(trial[3:7], q_last[3:7]) < 0.0:
-                trial[3:7] *= -1.0
-            if maximum_ratio(trial) <= 1.0:
-                best = trial
-                lower = alpha
-            else:
-                upper = alpha
-        return best
+            for output_idx in range(len(projected_step)):
+                if projected_step[output_idx] > 0.0:
+                    projected_step[output_idx] = min(
+                        projected_step[output_idx],
+                        braking_speed_limit(position_upper[output_idx]),
+                    )
+                elif projected_step[output_idx] < 0.0:
+                    projected_step[output_idx] = max(
+                        projected_step[output_idx],
+                        -braking_speed_limit(-position_lower[output_idx]),
+                    )
+        projected[actuated] = q_last[actuated] + projected_step
+        return projected
 
     def _optimize_configuration(
         self,
@@ -1689,6 +1808,33 @@ class GenericInteractionRetargeter:
             dqa <= (self.q_a_ub - q_a_current),
         ])
 
+        if bool(
+            self.end_effector_config.get("local_contact_chain_only", False)
+        ) and end_effector_targets:
+            allowed_contact_qa: set[int] = set()
+            localized_contact_active = False
+            for name, target_data in end_effector_targets.items():
+                if not bool(target_data.get("contact", False)):
+                    continue
+                spec = self.end_effectors.get(name)
+                if spec is None or not len(spec["contact_joint_qa_indices"]):
+                    continue
+                localized_contact_active = True
+                allowed_contact_qa.update(
+                    int(index) for index in spec["contact_joint_qa_indices"]
+                )
+            if localized_contact_active:
+                frozen_qa = np.asarray(
+                    [
+                        index
+                        for index in range(len(self.q_a_indices))
+                        if index not in allowed_contact_qa
+                    ],
+                    dtype=int,
+                )
+                if len(frozen_qa):
+                    constraints.append(dqa[frozen_qa] == 0.0)
+
         temporal_cfg = dict(self.end_effector_config.get("temporal", {}) or {})
         if q_last is not None and bool(temporal_cfg.get("enabled", False)):
             actuated_qa = np.flatnonzero(self.q_a_indices >= 7)
@@ -1762,6 +1908,25 @@ class GenericInteractionRetargeter:
                         q_last[:3] - new_base <= max_base_step,
                     ]
                 )
+                if q_prev is not None:
+                    previous_base_step = q_last[:3] - q_prev[:3]
+                    new_base_step = new_base - q_last[:3]
+                    max_base_acceleration_step = max(
+                        float(
+                            temporal_cfg.get(
+                                "max_base_acceleration_step", 0.03
+                            )
+                        ),
+                        1e-6,
+                    )
+                    constraints.extend(
+                        [
+                            new_base_step - previous_base_step
+                            <= max_base_acceleration_step,
+                            previous_base_step - new_base_step
+                            <= max_base_acceleration_step,
+                        ]
+                    )
 
         # The interaction-mesh Laplacian is nearly translation invariant.  An
         # explicit morphology-aware base envelope prevents infeasible hand/foot
@@ -1801,7 +1966,8 @@ class GenericInteractionRetargeter:
                 + cp.square((base_new[2] - base_target[2]) / z_scale)
             )
 
-        # Non-penetration constraints (self-collision + terrain)
+        # Non-penetration constraints against the external scene. Robot
+        # self-collision is opt-in and disabled by the project profile.
         if self.hard_penetration_constraint:
             penetration_constraints = self._compute_penetration_constraints(q, dqa)
             constraints.extend(penetration_constraints)
@@ -1840,24 +2006,9 @@ class GenericInteractionRetargeter:
         # In our case, q_a_current = q[self.q_a_indices] which is the current guess
         Qd = np.asarray(self.Q_diag, dtype=float).reshape(-1)
         
-        # Modify Q_diag for specific joints (matching original MANUAL_COST logic)
-        Q_diag_modified = Qd.copy()
-        for i in range(self.robot_model.njnt):
-            joint_name = self.robot_model.joint(i).name
-            if joint_name:
-                joint_name_lower = joint_name.lower()
-                # Strong regularization for joints prone to 180° flips
-                if ('waist' in joint_name_lower or 'torso' in joint_name_lower or 
-                    ('hip' in joint_name_lower and 'yaw' in joint_name_lower)):
-                    qpos_adr = self.robot_model.jnt_qposadr[i]
-                    if qpos_adr in self.q_a_indices:
-                        idx_in_qa = np.where(self.q_a_indices == qpos_adr)[0]
-                        if len(idx_in_qa) > 0:
-                            Q_diag_modified[idx_in_qa[0]] = 0.2  # Strong regularization (matching original MANUAL_COST)
-        
         # Q_diag cost: ||sqrt(Q_diag) * (dqa + q_a_current)||^2
         # This matches original: cp.sum_squares(cp.multiply(np.sqrt(Qd), dqa + q_a_n_last))
-        body_obj += cp.sum_squares(cp.multiply(np.sqrt(Q_diag_modified), dqa + q_a_current))
+        body_obj += cp.sum_squares(cp.multiply(np.sqrt(Qd), dqa + q_a_current))
 
         # Smoothness cost (matching original implementation exactly)
         # CRITICAL FIX: Use previous frame's velocity, not current guess
@@ -2014,18 +2165,6 @@ class GenericInteractionRetargeter:
                 if pose_direction_residual is not None
                 else pose_acceleration_residual
             )
-        direction_step_limits = self._pose_direction_step_limits(
-            target_human_joints, previous_human_joints
-        )
-        constraints.extend(
-            self._build_pose_direction_constraints(
-                dqa,
-                p_V,
-                J_V,
-                last_pose_directions,
-                direction_step_limits,
-            )
-        )
         temporal_residual = None
         if q_last is not None and q_prev is not None:
             actuated_qa = np.flatnonzero(self.q_a_indices >= 7)
@@ -2385,6 +2524,12 @@ class GenericInteractionRetargeter:
 
                 q_opt = q.copy()
                 q_opt[self.q_a_indices] = dqa_opt + q_a_current
+                # OPTIMAL_INACCURATE solutions can violate CVXPY bounds by a
+                # visible amount. Enforce the exact task-safe range before a
+                # configuration is accepted by the next SQP iteration.
+                q_opt[self.q_a_indices] = np.clip(
+                    q_opt[self.q_a_indices], self.q_a_lb, self.q_a_ub
+                )
                 
                 # CRITICAL FIX: Normalize quaternion with sign continuity to prevent frame-to-frame jumps
                 quat_new = q_opt[3:7]
@@ -2690,17 +2835,17 @@ class GenericInteractionRetargeter:
 
     def _compute_penetration_constraints(self, q: np.ndarray, dqa: cp.Variable) -> List[cp.Constraint]:
         """
-        Compute penetration constraints for robot-robot and robot-terrain contacts.
+        Compute robot-environment penetration constraints.
 
-        Two sources of constraints are combined:
-        1. **Self-collision** – MuJoCo's built-in collision detection finds pairs of
-           robot geoms that are close to each other and builds linearised
-           non-penetration constraints via contact Jacobians.
-        2. **Terrain penetration** – for every robot geom whose centre is within
+        Terrain penetration is always considered: for every robot geom whose centre is within
            ``collision_detection_threshold`` of the terrain mesh surface (measured
            via ``trimesh.proximity.closest_point``), a unilateral constraint is
            added that pushes the geom upward (in the terrain-surface-normal
            direction) to avoid terrain penetration.
+
+        Robot self-collision is only included when ``self_collision_enabled``
+        is explicitly set. It is disabled by default so robot links do not
+        fight the scene-contact and source-motion objectives.
 
         The terrain mesh is NOT embedded in the MuJoCo model, so MuJoCo's own
         collision pipeline cannot detect robot-terrain contacts.  We handle them
@@ -2716,33 +2861,34 @@ class GenericInteractionRetargeter:
         m, d = self.robot_model, self.robot_data
         threshold = float(self.collision_detection_threshold)
 
-        # ------------------------------------------------------------------
-        # 1) Robot self-collision constraints (via MuJoCo collision)
-        # ------------------------------------------------------------------
-        candidates = self._prefilter_pairs_with_mj_collision(threshold)
-        fromto = np.zeros(6, dtype=float)
-        contype, conaff = m.geom_contype, m.geom_conaffinity
+        if self.self_collision_enabled:
+            candidates = self._prefilter_pairs_with_mj_collision(threshold)
+            fromto = np.zeros(6, dtype=float)
+            contype, conaff = m.geom_contype, m.geom_conaffinity
 
-        for g1, g2 in candidates:
-            # Skip geoms with no collision masks
-            if contype[g1] == 0 and conaff[g1] == 0:
-                continue
-            if contype[g2] == 0 and conaff[g2] == 0:
-                continue
+            for g1, g2 in candidates:
+                if contype[g1] == 0 and conaff[g1] == 0:
+                    continue
+                if contype[g2] == 0 and conaff[g2] == 0:
+                    continue
 
-            fromto[:] = 0.0
-            dist = mujoco.mj_geomDistance(m, d, g1, g2, threshold, fromto)
-            if dist <= threshold:
-                J_rel = self._compute_jacobian_for_contact_relative(
-                    g1, g2, self._geom_names[g1], self._geom_names[g2], fromto, dist
-                )
-                Ja = J_rel[self.q_a_indices]
-                rhs = -dist - self.penetration_tolerance
-                constraints.append(Ja @ dqa >= rhs)
+                fromto[:] = 0.0
+                dist = mujoco.mj_geomDistance(m, d, g1, g2, threshold, fromto)
+                if dist <= threshold:
+                    J_rel = self._compute_jacobian_for_contact_relative(
+                        g1,
+                        g2,
+                        self._geom_names[g1],
+                        self._geom_names[g2],
+                        fromto,
+                        dist,
+                    )
+                    Ja = J_rel[self.q_a_indices]
+                    rhs = -dist - self.penetration_tolerance
+                    constraints.append(Ja @ dqa >= rhs)
 
         # ------------------------------------------------------------------
-        # 2) Robot-terrain penetration constraints (via trimesh proximity)
-        # ------------------------------------------------------------------
+        # Robot-terrain penetration constraints (via trimesh proximity).
         constraints.extend(
             self._compute_terrain_penetration_constraints(q, dqa, threshold)
         )

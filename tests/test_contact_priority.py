@@ -10,8 +10,12 @@ from omniretargeting.contact import (
     stack_contact_tasks,
 )
 from omniretargeting.core import OmniRetargeter
+from omniretargeting.core import _partition_end_effector_markers
 from omniretargeting.retargeting import (
+    GenericInteractionRetargeter,
     _apply_configured_joint_limits,
+    _apply_configured_joint_regularization,
+    _apply_joint_limit_safety_fraction,
     _clamp_target_to_reach,
     _transform_swing_target,
 )
@@ -60,6 +64,86 @@ def test_world_tracking_tasks_preserve_positions_without_contact_semantics():
     np.testing.assert_allclose(task.tracking_positions, positions)
     assert not np.any(task.contact_mask)
     assert all(not task.frame(frame)["contact"] for frame in range(len(positions)))
+
+
+def test_mixed_effectors_keep_feet_out_of_semantic_contact():
+    marker = {"tracking_positions": np.zeros((2, 3))}
+    markers = {
+        "left_hand": marker,
+        "right_hand": marker,
+        "left_foot": marker,
+        "right_foot": marker,
+    }
+
+    semantic, world = _partition_end_effector_markers(
+        markers,
+        {
+            "semantic_contact_effectors": ["left_hand", "right_hand"],
+            "world_tracking_effectors": ["left_foot", "right_foot"],
+        },
+        semantic_contact_enabled=True,
+        world_tracking_enabled=True,
+    )
+
+    assert set(semantic) == {"left_hand", "right_hand"}
+    assert set(world) == {"left_foot", "right_foot"}
+
+
+def test_mixed_effectors_reject_overlapping_contact_modes():
+    marker = {"tracking_positions": np.zeros((2, 3))}
+
+    with pytest.raises(ValueError, match="at the same time"):
+        _partition_end_effector_markers(
+            {"left_foot": marker},
+            {
+                "semantic_contact_effectors": ["left_foot"],
+                "world_tracking_effectors": ["left_foot"],
+            },
+            semantic_contact_enabled=True,
+            world_tracking_enabled=True,
+        )
+
+
+def test_penetration_constraints_skip_robot_self_collision_by_default():
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
+    retargeter = GenericInteractionRetargeter.__new__(GenericInteractionRetargeter)
+    retargeter.robot_model = model
+    retargeter.robot_data = mujoco.MjData(model)
+    retargeter.collision_detection_threshold = 0.1
+    retargeter.self_collision_enabled = False
+    retargeter._prefilter_pairs_with_mj_collision = lambda _threshold: (_ for _ in ()).throw(
+        AssertionError("self-collision query must remain disabled")
+    )
+    retargeter._compute_terrain_penetration_constraints = (
+        lambda _q, _dqa, _threshold: []
+    )
+
+    constraints = retargeter._compute_penetration_constraints(
+        np.asarray(model.qpos0, dtype=float), object()
+    )
+
+    assert constraints == []
+
+
+def test_contact_frame_blends_tracking_position_into_anchor_during_transition():
+    task = _task(
+        np.asarray([[0.0, 0.0, 0.0]]),
+        contact_mask=np.asarray([True]),
+    )
+    task = SceneContactTask(
+        **{
+            **task.__dict__,
+            "tracking_positions": np.asarray([[0.0, 0.0, 0.0]]),
+            "contact_positions": np.asarray([[1.0, 0.0, 0.0]]),
+            "transition_weights": np.asarray([0.25]),
+        }
+    )
+
+    frame = task.frame(0)
+
+    np.testing.assert_allclose(frame["contact_position"], [0.25, 0.0, 0.0])
+    assert frame["transition_weight"] == pytest.approx(0.25)
 
 
 def test_foot_side_matching_uses_name_tokens_not_roll_link_substrings():
@@ -284,6 +368,100 @@ def test_configured_joint_limits_intersect_mechanical_range():
     np.testing.assert_allclose(upper, [0.4])
 
 
+def test_configured_joint_regularization_uses_exact_joint_name():
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
+    qpos_idx = int(model.jnt_qposadr[model.joint("ankle").id])
+    weights = _apply_configured_joint_regularization(
+        model,
+        np.asarray([qpos_idx]),
+        np.asarray([0.001]),
+        {"ankle": 0.5},
+    )
+
+    np.testing.assert_allclose(weights, [0.5])
+
+
+def test_joint_limit_safety_fraction_keeps_last_twenty_percent_unused():
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
+    qpos_idx = int(model.jnt_qposadr[model.joint("ankle").id])
+    lower, upper = _apply_joint_limit_safety_fraction(
+        model,
+        np.asarray([qpos_idx]),
+        np.asarray([-0.6]),
+        np.asarray([0.6]),
+        0.8,
+    )
+
+    np.testing.assert_allclose(lower, [-0.48])
+    np.testing.assert_allclose(upper, [0.48])
+
+
+def test_temporal_projection_cannot_push_joint_past_safe_limit():
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
+    retargeter = GenericInteractionRetargeter.__new__(GenericInteractionRetargeter)
+    retargeter.robot_model = model
+    retargeter.end_effector_config = {
+        "temporal": {
+            "enabled": True,
+            "max_joint_step": 0.18,
+            "max_joint_acceleration_step": 0.08,
+        }
+    }
+    retargeter.q_a_indices = np.arange(model.nq)
+    retargeter.q_a_lb = np.full(model.nq, -1e6)
+    retargeter.q_a_ub = np.full(model.nq, 1e6)
+    ankle_qpos = int(model.jnt_qposadr[model.joint("ankle").id])
+    retargeter.q_a_lb[ankle_qpos] = -0.48
+    retargeter.q_a_ub[ankle_qpos] = 0.48
+    q_prev = np.asarray(model.qpos0, dtype=float).copy()
+    q_last = q_prev.copy()
+    candidate = q_prev.copy()
+    q_prev[ankle_qpos] = 0.37
+    q_last[ankle_qpos] = 0.45
+    candidate[ankle_qpos] = 0.60
+
+    projected = retargeter._project_actuated_temporal_step(
+        candidate, q_last, q_prev, None
+    )
+
+    assert projected[ankle_qpos] == pytest.approx(0.48)
+
+
+def test_temporal_projection_brakes_before_safe_joint_limit():
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
+    retargeter = GenericInteractionRetargeter.__new__(GenericInteractionRetargeter)
+    retargeter.robot_model = model
+    retargeter.end_effector_config = {
+        "temporal": {
+            "enabled": True,
+            "max_joint_step": 0.18,
+            "max_joint_acceleration_step": 0.08,
+        }
+    }
+    retargeter.q_a_indices = np.arange(model.nq)
+    retargeter.q_a_lb = np.full(model.nq, -1e6)
+    retargeter.q_a_ub = np.full(model.nq, 1e6)
+    ankle_qpos = int(model.jnt_qposadr[model.joint("ankle").id])
+    retargeter.q_a_lb[ankle_qpos] = -0.48
+    retargeter.q_a_ub[ankle_qpos] = 0.48
+    q_prev = np.asarray(model.qpos0, dtype=float).copy()
+    q_last = q_prev.copy()
+    candidate = q_prev.copy()
+    q_prev[ankle_qpos] = 0.22
+    q_last[ankle_qpos] = 0.30
+    candidate[ankle_qpos] = 0.48
+
+    projected = retargeter._project_actuated_temporal_step(
+        candidate, q_last, q_prev, None
+    )
+
+    assert projected[ankle_qpos] <= 0.430001
+
+
 def test_transported_arm_segments_preserve_shape_and_aim_chord_at_hand():
     upper, forearm = _transported_arm_segment_targets(
         source_shoulder=np.array([0.0, 0.0, 0.0]),
@@ -346,13 +524,14 @@ def test_scene_contact_inference_filters_and_anchors_contact_runs():
         np.array([False, False, False, True, True, True, True, True, False, False]),
     )
     anchored = task.contact_positions[task.contact_mask]
+    assert np.all(task.contact_modes[task.contact_mask] == "sticking")
     np.testing.assert_allclose(
         anchored, np.repeat(anchored[0:1], len(anchored), axis=0), atol=1e-10
     )
     np.testing.assert_allclose(anchored[:, 2], 0.0, atol=1e-10)
 
 
-def test_contact_inference_allows_sliding_hand_without_moving_foot_policy():
+def test_contact_inference_classifies_sliding_hand_without_moving_foot_policy():
     scene = trimesh.creation.box(extents=[4.0, 4.0, 0.1])
     scene.apply_translation([0.0, 0.0, -0.05])
     tracking = np.column_stack(
@@ -374,13 +553,22 @@ def test_contact_inference_allows_sliding_hand_without_moving_foot_policy():
             "min_contact_frames": 1,
             "anchor_contacts": True,
             "effectors": {
-                "left_hand": {"anchor_contacts": False},
+                "left_hand": {
+                    "sticking_tangential_speed_threshold": 0.1,
+                    "sticking_normal_speed_threshold": 0.1,
+                },
+                "left_foot": {
+                    "sticking_tangential_speed_threshold": 10.0,
+                    "sticking_normal_speed_threshold": 10.0,
+                },
             },
         },
     )
 
     hand_targets = tasks["left_hand"].contact_positions
     foot_targets = tasks["left_foot"].contact_positions
+    assert np.all(tasks["left_hand"].contact_modes == "sliding")
+    assert np.all(tasks["left_foot"].contact_modes == "sticking")
     assert np.ptp(hand_targets[:, 0]) > 0.25
     np.testing.assert_allclose(
         foot_targets,
@@ -409,6 +597,7 @@ def test_contact_tasks_stack_for_downstream_policy_export():
 
     payload = stack_contact_tasks(tasks)
     assert payload["contact_mask"].shape == (4, 2)
+    assert payload["contact_modes"].shape == (4, 2)
     assert payload["contact_targets_w"].shape == (4, 2, 3)
     assert payload["end_effector_reference_w"].shape == (4, 2, 3)
 
