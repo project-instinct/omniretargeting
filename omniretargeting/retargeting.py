@@ -416,26 +416,26 @@ def _build_base_position_task(
     config: Mapping[str, Any],
     previous_base_position: np.ndarray | None = None,
     support_contact_active: bool = False,
-    previous_target_base_position: np.ndarray | None = None,
 ) -> Tuple[Optional[cp.Expression], List[cp.Constraint]]:
     """Build the source-path base objective and its hard spatial envelope.
 
     ``reference_envelope`` retains the historical behaviour: both XY and Z
     stay inside a hard box around the source-derived base reference.
 
-    ``support_contact`` never copies the human-root Z into the robot.  During
-    support, the reachable sole/scene constraint owns absolute height.  During
-    flight, the reachable world-space end-effector targets own height; a
-    lower-priority delta-continuity term carries only the source's *change* in
-    height forward from the last robot solution.  This is deliberately
-    different from a source-root envelope: human and robot leg morphology do
-    not share a valid absolute root-to-ground distance.
+    ``support_contact`` changes ownership frame by frame.  A load-bearing foot
+    contact removes the source-Z envelope so the reachable sole/scene
+    relationship selects root height.  With no load-bearing foot, source Z is
+    restored as the flight-motion prior; otherwise root height is
+    underdetermined and can jump between contact segments.  Optional temporal
+    continuity only selects among equally good reachable support solutions.
     """
     if not bool(config.get("enabled", False)):
         return None, []
 
     z_constraint_mode = _base_z_constraint_mode(config)
-    contact_owns_z = z_constraint_mode == "support_contact"
+    support_owns_z = bool(
+        z_constraint_mode == "support_contact" and support_contact_active
+    )
 
     q = np.asarray(q, dtype=float)
     q_a_indices = np.asarray(q_a_indices, dtype=int)
@@ -459,7 +459,7 @@ def _build_base_position_task(
         constraints.append(
             cp.norm(base_new[:2] - base_target[:2], 2) <= max_xy_error
         )
-        if not contact_owns_z:
+        if not support_owns_z:
             constraints.extend(
                 [
                     base_new[2] - base_target[2] <= max_z_error,
@@ -469,45 +469,25 @@ def _build_base_position_task(
 
     xy_scale = max(max_xy_error, 1e-6)
     objective = cp.sum_squares((base_new[:2] - base_target[:2]) / xy_scale)
-    if not contact_owns_z:
+    if not support_owns_z:
         z_scale = max(max_z_error, 1e-6)
         objective += cp.square((base_new[2] - base_target[2]) / z_scale)
     elif previous_base_position is not None:
-        # Reachable feet own absolute height.  This lower-priority term only
-        # selects among equally good reachable solutions; it must never pull Z
-        # toward the human-root absolute reference.
-        if support_contact_active:
-            z_temporal_weight = max(
-                float(config.get("support_z_temporal_weight", 0.0)), 0.0
-            )
+        # SUPPORT owns the absolute height.  Continuity may only select among
+        # equally good reachable support solutions; it must never pull Z back
+        # toward the human-root reference.
+        z_temporal_weight = max(
+            float(config.get("support_z_temporal_weight", 0.0)), 0.0
+        )
+        if z_temporal_weight > 0.0:
             z_temporal_scale = max(
                 float(config.get("support_z_temporal_scale", 0.04)), 1e-6
             )
-            target_z = float(
+            previous_z = float(
                 np.asarray(previous_base_position, dtype=float).reshape(3)[2]
             )
-        elif previous_target_base_position is not None:
-            z_temporal_weight = max(
-                float(config.get("flight_z_delta_weight", 1.0)), 0.0
-            )
-            z_temporal_scale = max(
-                float(config.get("flight_z_delta_scale", 0.04)), 1e-6
-            )
-            previous_target_z = float(
-                np.asarray(previous_target_base_position, dtype=float).reshape(3)[2]
-            )
-            target_z = float(
-                np.asarray(previous_base_position, dtype=float).reshape(3)[2]
-                + base_target[2]
-                - previous_target_z
-            )
-        else:
-            z_temporal_weight = 0.0
-            z_temporal_scale = 1.0
-            target_z = float(q[2])
-        if z_temporal_weight > 0.0:
             objective += z_temporal_weight * cp.square(
-                (base_new[2] - target_z) / z_temporal_scale
+                (base_new[2] - previous_z) / z_temporal_scale
             )
     return objective, constraints
 
@@ -2318,7 +2298,6 @@ class GenericInteractionRetargeter:
         previous_previous_human_joints: Optional[np.ndarray] = None,
         target_base_orientation: Optional[np.ndarray] = None,
         target_base_position: Optional[np.ndarray] = None,
-        previous_target_base_position: Optional[np.ndarray] = None,
         end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> np.ndarray:
         """
@@ -2365,7 +2344,6 @@ class GenericInteractionRetargeter:
             previous_previous_human_joints=previous_previous_human_joints,
             target_base_orientation=target_base_orientation,
             target_base_position=target_base_position,
-            previous_target_base_position=previous_target_base_position,
             end_effector_targets=end_effector_targets,
         )
         if self.pose_direction_post_projection:
@@ -2523,7 +2501,6 @@ class GenericInteractionRetargeter:
         previous_previous_human_joints: Optional[np.ndarray] = None,
         target_base_orientation: Optional[np.ndarray] = None,
         target_base_position: Optional[np.ndarray] = None,
-        previous_target_base_position: Optional[np.ndarray] = None,
         end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> np.ndarray:
         """
@@ -2579,7 +2556,6 @@ class GenericInteractionRetargeter:
                 previous_previous_human_joints,
                 target_base_orientation,
                 target_base_position,
-                previous_target_base_position,
                 end_effector_targets,
             )
             
@@ -2621,7 +2597,6 @@ class GenericInteractionRetargeter:
         previous_previous_human_joints: Optional[np.ndarray] = None,
         target_base_orientation: Optional[np.ndarray] = None,
         target_base_position: Optional[np.ndarray] = None,
-        previous_target_base_position: Optional[np.ndarray] = None,
         end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> Tuple[np.ndarray, float]:
         """
@@ -2913,7 +2888,6 @@ class GenericInteractionRetargeter:
                     base_cfg,
                     None if q_last is None else q_last[:3],
                     support_contact_active,
-                    previous_target_base_position,
                 )
             )
             constraints.extend(base_position_constraints)
