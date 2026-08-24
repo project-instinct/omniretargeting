@@ -24,48 +24,6 @@ import xml.etree.ElementTree as ET
 
 DEFAULT_ROBOT_CONFIG_PATH = "robot_models/unitree_g1/unitree_g1.json"
 
-
-def _base_orientation_reference(
-    base_orientation,
-    smplx_joint_names,
-    smplx_orientations,
-    smplx_root_orientations,
-):
-    """Resolve the source orientation track requested by a robot profile.
-
-    ``joint_positions`` deliberately returns ``None`` so the generic
-    retargeter uses its pelvis/hips/spine body-frame estimator.  This is useful
-    when an anatomical joint frame contains local spine flexion and therefore
-    is not the desired floating-base orientation.
-    """
-    config = dict(base_orientation or {})
-    source = str(config.get("orientation_source", "captured")).strip().lower()
-    if source == "joint_positions":
-        return None
-    if source != "captured":
-        raise ValueError(
-            "base_orientation.orientation_source must be 'captured' or "
-            f"'joint_positions', got {source!r}."
-        )
-
-    orientation_joint = config.get("orientation_joint")
-    if orientation_joint is not None and smplx_orientations is not None:
-        if not smplx_joint_names or orientation_joint not in smplx_joint_names:
-            raise ValueError(
-                "base_orientation.orientation_joint must name a loaded "
-                f"SMPL-X joint, got {orientation_joint!r}."
-            )
-        orientation_index = smplx_joint_names.index(orientation_joint)
-        return smplx_joint_quaternions_to_body_quaternions(
-            smplx_orientations[:, orientation_index]
-        )
-    if smplx_root_orientations is not None:
-        return smplx_root_rotvecs_to_body_quaternions(
-            smplx_root_orientations
-        )
-    return None
-
-
 @contextlib.contextmanager
 def temporary_visualization_scene(urdf_path, terrain_mesh, target_faces=5000):
     """
@@ -615,25 +573,31 @@ def main():
             visualize_trajectory=args.vis,
             enable_terrain_scaling=enable_terrain_scaling,
         )
-        orientation_joint = (base_orientation or {}).get("orientation_joint")
-        orientation_source = str(
-            (base_orientation or {}).get("orientation_source", "captured")
-        ).strip().lower()
-        base_orientation_reference = _base_orientation_reference(
-            base_orientation,
-            smplx_joint_names,
-            smplx_orientations,
-            smplx_root_orientations,
+        base_orientation_reference = None
+        orientation_joint = (
+            (base_orientation or {}).get("orientation_joint")
+            if isinstance(base_orientation, dict)
+            else None
         )
-        if orientation_source == "joint_positions":
-            print(
-                "Using the source pelvis/hips/spine position frame as the "
-                "robot base orientation target."
+        if orientation_joint is not None and smplx_orientations is not None:
+            if not smplx_joint_names or orientation_joint not in smplx_joint_names:
+                raise ValueError(
+                    "base_orientation.orientation_joint must name a loaded "
+                    f"SMPL-X joint, got {orientation_joint!r}."
+                )
+            orientation_index = smplx_joint_names.index(orientation_joint)
+            base_orientation_reference = (
+                smplx_joint_quaternions_to_body_quaternions(
+                    smplx_orientations[:, orientation_index]
+                )
             )
-        elif orientation_joint is not None and smplx_orientations is not None:
             print(
                 "Using captured SMPL-X "
                 f"{orientation_joint} frame as the robot base orientation target."
+            )
+        elif smplx_root_orientations is not None:
+            base_orientation_reference = smplx_root_rotvecs_to_body_quaternions(
+                smplx_root_orientations
             )
         if base_orientation_reference is not None:
             retarget_motion_kwargs["base_orientations"] = base_orientation_reference
@@ -709,9 +673,6 @@ def main():
             output_payload["object_quat_w"] = object_quat
         output_payload.update(
             stack_contact_tasks(getattr(retargeter, "last_end_effector_tasks", {}))
-        )
-        output_payload.update(
-            getattr(retargeter, "last_interaction_feasibility_export_payload", {})
         )
         np.savez(
             args.output,

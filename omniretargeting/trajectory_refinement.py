@@ -1206,9 +1206,6 @@ def refine_joint_trajectory(
             "contact_offsets": contact_offsets,
             "contact_target_space": contact_target_space,
             "swing_target_space": swing_target_space,
-            "track_source_during_contact": bool(
-                spec.get("track_source_during_contact", False)
-            ),
             "swing_anchor_body_id": int(swing_anchor_body_id),
             "swing_anchor_offset": (
                 np.zeros(3, dtype=float)
@@ -1720,38 +1717,6 @@ def refine_joint_trajectory(
                             if mode == ContactMode.TOUCH
                             else "swing"
                         ),
-                    )
-
-                if in_contact and spec["track_source_during_contact"]:
-                    # The terrain constraint above acts on the selected
-                    # contact point.  Preserve the source path at the distinct
-                    # semantic tracker at the ordinary swing priority.
-                    tracking_point = (
-                        data.xpos[body_id]
-                        + rotation @ spec["tracking_offset"]
-                    )
-                    jacobian_position.fill(0.0)
-                    jacobian_rotation.fill(0.0)
-                    mujoco.mj_jac(
-                        model,
-                        data,
-                        jacobian_position,
-                        jacobian_rotation,
-                        tracking_point,
-                        body_id,
-                    )
-                    tracking_sigma = (
-                        swing_position_sigma
-                        if spec["swing_position_sigma"] is None
-                        else float(spec["swing_position_sigma"])
-                    )
-                    append_block(
-                        frame_idx,
-                        jacobian_position[:, dof_indices],
-                        task.tracking_positions[frame_idx] - tracking_point,
-                        tracking_sigma * position_sigma_scale,
-                        1.0,
-                        "swing",
                     )
 
                 arm_posture = spec["arm_posture"]

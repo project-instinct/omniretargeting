@@ -369,108 +369,6 @@ def _build_base_orientation_task(
     return residual, constraints
 
 
-def _base_z_constraint_mode(config: Mapping[str, Any]) -> str:
-    mode = str(config.get("z_constraint_mode", "reference_envelope")).strip().lower()
-    valid_modes = {"reference_envelope", "support_contact"}
-    if mode not in valid_modes:
-        raise ValueError(
-            "base_position_constraint.z_constraint_mode must be "
-            f"one of {sorted(valid_modes)}, got {mode!r}."
-        )
-    return mode
-
-
-def _project_base_position_to_hard_envelope(
-    proposed_base: np.ndarray,
-    base_target: np.ndarray,
-    config: Mapping[str, Any],
-) -> np.ndarray:
-    """Numerically enforce the configured base envelope after an SQP solve."""
-    projected = np.asarray(proposed_base, dtype=float).reshape(3).copy()
-    target = np.asarray(base_target, dtype=float).reshape(3)
-    if not bool(config.get("enabled", False)) or not bool(
-        config.get("hard_constraints", True)
-    ):
-        return projected
-
-    xy_delta = projected[:2] - target[:2]
-    xy_norm = float(np.linalg.norm(xy_delta))
-    max_xy_error = max(float(config.get("max_xy_error", 0.08)), 0.0)
-    if xy_norm > max_xy_error:
-        projected[:2] = target[:2] + (
-            max_xy_error / max(xy_norm, 1e-12)
-        ) * xy_delta
-    if _base_z_constraint_mode(config) == "reference_envelope":
-        max_z_error = max(float(config.get("max_z_error", 0.12)), 0.0)
-        projected[2] = np.clip(
-            projected[2], target[2] - max_z_error, target[2] + max_z_error
-        )
-    return projected
-
-
-def _build_base_position_task(
-    dqa: cp.Variable,
-    q: np.ndarray,
-    q_a_indices: np.ndarray,
-    target_base_position: np.ndarray,
-    config: Mapping[str, Any],
-) -> Tuple[Optional[cp.Expression], List[cp.Constraint]]:
-    """Build the source-path base objective and its hard spatial envelope.
-
-    ``reference_envelope`` retains the historical behaviour: both XY and Z
-    stay inside a hard box around the source-derived base reference.
-
-    ``support_contact`` keeps only the hard XY path envelope.  Root height is
-    then a free coordinate in the higher-priority SUPPORT solve, subject to
-    the robot's actual joint limits.  The soft Z centering residual remains as
-    a tie-breaker, so free-flight frames still follow the source height and a
-    reachable support solution chooses the source-faithful height rather than
-    an arbitrary floating-base translation.
-    """
-    if not bool(config.get("enabled", False)):
-        return None, []
-
-    z_constraint_mode = _base_z_constraint_mode(config)
-
-    q = np.asarray(q, dtype=float)
-    q_a_indices = np.asarray(q_a_indices, dtype=int)
-    base_target = np.asarray(target_base_position, dtype=float).reshape(3).copy()
-    if not bool(config.get("reference_includes_z_offset", False)):
-        base_target[2] += float(config.get("z_offset", 0.0))
-    max_xy_error = max(float(config.get("max_xy_error", 0.08)), 0.0)
-    max_z_error = max(float(config.get("max_z_error", 0.12)), 0.0)
-
-    base_new_components: List[cp.Expression] = []
-    for qpos_idx in (0, 1, 2):
-        active = np.flatnonzero(q_a_indices == qpos_idx)
-        if len(active):
-            base_new_components.append(q[qpos_idx] + dqa[int(active[0])])
-        else:
-            base_new_components.append(cp.Constant(float(q[qpos_idx])))
-    base_new = cp.hstack(base_new_components)
-
-    constraints: List[cp.Constraint] = []
-    if bool(config.get("hard_constraints", True)):
-        constraints.append(
-            cp.norm(base_new[:2] - base_target[:2], 2) <= max_xy_error
-        )
-        if z_constraint_mode == "reference_envelope":
-            constraints.extend(
-                [
-                    base_new[2] - base_target[2] <= max_z_error,
-                    base_target[2] - base_new[2] <= max_z_error,
-                ]
-            )
-
-    xy_scale = max(max_xy_error, 1e-6)
-    z_scale = max(max_z_error, 1e-6)
-    objective = (
-        cp.sum_squares((base_new[:2] - base_target[:2]) / xy_scale)
-        + cp.square((base_new[2] - base_target[2]) / z_scale)
-    )
-    return objective, constraints
-
-
 #: Swing target spaces understood by every stage of the solver.
 #:
 #: ``world``
@@ -1234,9 +1132,6 @@ class GenericInteractionRetargeter:
                 "contact_offsets": contact_offsets,
                 "contact_target_space": contact_target_space,
                 "swing_target_space": swing_target_space,
-                "track_source_during_contact": bool(
-                    spec.get("track_source_during_contact", False)
-                ),
                 "track_orientation": bool(spec.get("track_orientation", False)),
                 "orientation_local_rotation": _local_semantic_rotation(
                     spec.get("orientation_local_forward", [1.0, 0.0, 0.0]),
@@ -1997,33 +1892,6 @@ class GenericInteractionRetargeter:
                                 * (angular_jacobian @ dqa - rotation_error)
                                 / orientation_sigma
                             )
-                if spec["track_source_during_contact"]:
-                    # Contact acts on a physical palm/sole point, while source
-                    # fidelity is measured at the semantic tracking point.
-                    # They need not be the same point on the rigid body.  Keep
-                    # terrain contact at its existing higher priority and use
-                    # the ordinary swing family for the best compatible source
-                    # tracking solution.
-                    tracking_position, tracking_jacobian = (
-                        self._point_position_and_jacobian(
-                            body_id, spec["tracking_offset"]
-                        )
-                    )
-                    tracking_target = np.asarray(
-                        target_data["tracking_position"], dtype=float
-                    ).reshape(3)
-                    tracking_sigma = max(
-                        float(spec["swing_sigma"]) * position_sigma_scale,
-                        1e-6,
-                    )
-                    swing_terms.append(
-                        (
-                            tracking_position
-                            + tracking_jacobian @ dqa
-                            - tracking_target
-                        )
-                        / tracking_sigma
-                    )
             else:
                 self._active_contact_offsets.pop(name, None)
                 self._active_contact_segments.pop(name, None)
@@ -2851,17 +2719,37 @@ class GenericInteractionRetargeter:
         base_cfg = dict(
             self.end_effector_config.get("base_position_constraint", {}) or {}
         )
-        if target_base_position is not None:
-            base_position_obj, base_position_constraints = (
-                _build_base_position_task(
-                    dqa,
-                    q,
-                    self.q_a_indices,
-                    target_base_position,
-                    base_cfg,
+        if target_base_position is not None and bool(base_cfg.get("enabled", False)):
+            base_target = np.asarray(target_base_position, dtype=float).reshape(3).copy()
+            if not bool(base_cfg.get("reference_includes_z_offset", False)):
+                base_target[2] += float(base_cfg.get("z_offset", 0.0))
+            max_xy_error = max(float(base_cfg.get("max_xy_error", 0.08)), 0.0)
+            max_z_error = max(float(base_cfg.get("max_z_error", 0.12)), 0.0)
+
+            base_new_components = []
+            for qpos_idx in (0, 1, 2):
+                if qpos_idx in self.q_a_indices:
+                    qa_idx = int(np.where(self.q_a_indices == qpos_idx)[0][0])
+                    base_new_components.append(q[qpos_idx] + dqa[qa_idx])
+                else:
+                    base_new_components.append(cp.Constant(float(q[qpos_idx])))
+            base_new = cp.hstack(base_new_components)
+            if bool(base_cfg.get("hard_constraints", True)):
+                constraints.append(
+                    cp.norm(base_new[:2] - base_target[:2], 2) <= max_xy_error
                 )
+                constraints.extend(
+                    [
+                        base_new[2] - base_target[2] <= max_z_error,
+                        base_target[2] - base_new[2] <= max_z_error,
+                    ]
+                )
+            xy_scale = max(max_xy_error, 1e-6)
+            z_scale = max(max_z_error, 1e-6)
+            base_position_obj = (
+                cp.sum_squares((base_new[:2] - base_target[:2]) / xy_scale)
+                + cp.square((base_new[2] - base_target[2]) / z_scale)
             )
-            constraints.extend(base_position_constraints)
 
         # Non-penetration constraints (self-collision + terrain)
         if self.hard_penetration_constraint:
@@ -3291,10 +3179,22 @@ class GenericInteractionRetargeter:
                                 base_translation_qa.append(qa_idx)
                                 proposed_base[qpos_idx] += dqa_opt[qa_idx]
 
-                        proposed_base = _project_base_position_to_hard_envelope(
-                            proposed_base,
-                            base_target,
-                            base_cfg,
+                        xy_delta = proposed_base[:2] - base_target[:2]
+                        xy_norm = float(np.linalg.norm(xy_delta))
+                        max_xy_error = max(
+                            float(base_cfg.get("max_xy_error", 0.08)), 0.0
+                        )
+                        if xy_norm > max_xy_error:
+                            proposed_base[:2] = base_target[:2] + (
+                                max_xy_error / max(xy_norm, 1e-12)
+                            ) * xy_delta
+                        max_z_error = max(
+                            float(base_cfg.get("max_z_error", 0.12)), 0.0
+                        )
+                        proposed_base[2] = np.clip(
+                            proposed_base[2],
+                            base_target[2] - max_z_error,
+                            base_target[2] + max_z_error,
                         )
                         for qpos_idx in (0, 1, 2):
                             if qpos_idx in self.q_a_indices:
