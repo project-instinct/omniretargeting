@@ -79,6 +79,12 @@ class SceneContactTask:
     position_sigma_scale: np.ndarray | None = None
     orientation_sigma_scale: np.ndarray | None = None
     morphology_scale: float | None = None
+    # Robot reach is measured from the configured same-side reference body to
+    # this effector.  The source chain carries semantic left/right identity and
+    # lets refinement preserve the source leg-extension fraction without ever
+    # choosing a target by nearest distance.
+    robot_max_reach: float | None = None
+    source_limb_chain: tuple[str, str, str] | None = None
     active_contact_offset_ids: np.ndarray | None = None
     robot_base_reference_w: np.ndarray | None = None
 
@@ -285,6 +291,18 @@ class SceneContactTask:
             object.__setattr__(self, "active_contact_offset_ids", offset_ids)
         if self.morphology_scale is not None and float(self.morphology_scale) <= 0.0:
             raise ValueError(f"{self.name}: morphology_scale must be positive.")
+        if self.robot_max_reach is not None and (
+            not np.isfinite(float(self.robot_max_reach))
+            or float(self.robot_max_reach) <= 0.0
+        ):
+            raise ValueError(f"{self.name}: robot_max_reach must be positive.")
+        if self.source_limb_chain is not None:
+            chain = tuple(str(joint) for joint in self.source_limb_chain)
+            if len(chain) != 3:
+                raise ValueError(
+                    f"{self.name}: source_limb_chain must contain three joints."
+                )
+            object.__setattr__(self, "source_limb_chain", chain)
 
     def frame(self, frame_idx: int) -> Dict[str, Any]:
         """Return the optimizer payload for one frame."""
@@ -920,8 +938,30 @@ def infer_scene_contact_tasks(
                     surface_normals[start:end] = run_normals
                 contact_modes[start:end] = int(run_mode)
                 contact_segment_ids[start:end] = next_segment_id
+                if eff_anchor_tangent_to_tracking:
+                    # Preserve the source foot/palm coordinate *within* the
+                    # contact manifold while taking only the normal coordinate
+                    # from the scene.  This is the same single-sole-point
+                    # contract used by the earlier OmniRetarget-style solver:
+                    # the nearest heel/toe detection sample must not translate
+                    # the whole robot foot by one sample spacing.
+                    tracking_to_surface = (
+                        surface_points[start:end]
+                        - tracking_positions[start:end]
+                    )
+                    normal_distance = np.sum(
+                        tracking_to_surface * surface_normals[start:end],
+                        axis=1,
+                        keepdims=True,
+                    )
+                    manifold_points = (
+                        tracking_positions[start:end]
+                        + normal_distance * surface_normals[start:end]
+                    )
+                else:
+                    manifold_points = surface_points[start:end]
                 contact_positions[start:end] = (
-                    surface_points[start:end]
+                    manifold_points
                     + clearance * surface_normals[start:end]
                 )
                 if eff_transition_frames > 0:
@@ -1131,6 +1171,23 @@ def stack_contact_tasks(
         ),
         "swing_morphology_scale": np.asarray(
             [tasks[name].morphology_scale for name in names], dtype=float
+        ),
+        "end_effector_max_reach": np.asarray(
+            [
+                np.nan
+                if tasks[name].robot_max_reach is None
+                else tasks[name].robot_max_reach
+                for name in names
+            ],
+            dtype=float,
+        ),
+        "end_effector_source_limb_chain": np.asarray(
+            [
+                ""
+                if tasks[name].source_limb_chain is None
+                else "/".join(tasks[name].source_limb_chain)
+                for name in names
+            ]
         ),
         "active_contact_offset_id": np.stack(
             [

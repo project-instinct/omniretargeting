@@ -70,7 +70,7 @@
     "penetration_resolver": "contact_constraints",
   "end_effector_priority": {
     "enabled": true,
-    "lock_base_orientation": true,
+    "lock_base_orientation": false,
       "hierarchy": true,
       "priority_levels": [
         {
@@ -89,17 +89,38 @@
           "relative_tolerance": 0.01,
           "absolute_tolerance": 0.04
         },
-        {
-          "name": "interaction-motion-prior",
-          "families": [
-            "interaction",
-            "swing",
-            "orientation",
-            "pose_direction"
-          ],
-          "relative_tolerance": 0.02,
-          "absolute_tolerance": 0.05
-        },
+      {
+        "name": "end-effector-position",
+        "families": [
+          "swing"
+        ],
+        "relative_tolerance": 0.01,
+        "absolute_tolerance": 0.04
+      },
+      {
+        "name": "end-effector-orientation",
+        "families": [
+          "orientation"
+        ],
+        "relative_tolerance": 0.01,
+        "absolute_tolerance": 0.04
+      },
+      {
+        "name": "pose-direction",
+        "families": [
+          "pose_direction"
+        ],
+        "relative_tolerance": 0.02,
+        "absolute_tolerance": 0.04
+      },
+      {
+        "name": "interaction-shape",
+        "families": [
+          "interaction"
+        ],
+        "relative_tolerance": 0.02,
+        "absolute_tolerance": 0.05
+      },
         {
           "name": "regularization",
           "families": [
@@ -262,30 +283,23 @@
         "jerk_sigma": 0.01,
         "max_base_step": 0.04
       },
-      "base_position_constraint": {
-        "enabled": true,
-        "landmarks": [
-          {
-            "source_joint": "L_Hip",
-            "robot_body": "left_hip_roll_link"
-          },
-          {
-            "source_joint": "R_Hip",
-            "robot_body": "right_hip_roll_link"
-          }
-        ],
-        "reference_includes_z_offset": true,
-        "hard_constraints": true,
-        "z_constraint_mode": "support_contact",
-        "max_xy_error": 0.03,
-        "z_offset": 0.0,
-        "max_z_error": 0.08,
-        "centering_weight": 1.0
+    "base_position_constraint": {
+      "enabled": true,
+      "source_joint": "Spine3",
+      "reference_includes_z_offset": true,
+      "hard_constraints": true,
+      "z_constraint_mode": "support_contact",
+      "max_xy_error": 0.03,
+      "z_offset": -0.5,
+      "max_z_error": 0.08,
+      "flight_z_delta_weight": 0.0,
+      "flight_z_delta_scale": 0.04,
+      "centering_weight": 1.0
       },
       "base_orientation_constraint": {
         "enabled": true,
         "hard_constraints": true,
-        "max_orientation_error": 0.07,
+        "max_orientation_error": 0.15,
         "weight": 1.0
       },
       "contact_detection": {
@@ -332,7 +346,8 @@
             "support_speed_threshold": 0.3,
             "support_max_tangential_travel": 0.06,
             "support_min_frames": 3,
-            "support_max_gap_frames": 1
+            "support_max_gap_frames": 1,
+            "anchor_tangent_to_tracking": true
           },
           "right_foot": {
             "distance_threshold": 0.05,
@@ -346,7 +361,8 @@
             "support_speed_threshold": 0.3,
             "support_max_tangential_travel": 0.06,
             "support_min_frames": 3,
-            "support_max_gap_frames": 1
+            "support_max_gap_frames": 1,
+            "anchor_tangent_to_tracking": true
           }
         }
       },
@@ -354,8 +370,8 @@
         "left_hand": {
           "robot_body": "left_rubber_hand",
           "contact_target_space": "world",
-          "swing_target_space": "limb_morphology_scaled",
-          "swing_morphology_scale": "auto",
+          "swing_target_space": "world",
+          "swing_morphology_scale": 1.0,
           "reach_reference_body": "left_shoulder_pitch_link",
           "max_swing_reach": 0.43,
           "track_orientation": true,
@@ -437,8 +453,8 @@
         "right_hand": {
           "robot_body": "right_rubber_hand",
           "contact_target_space": "world",
-          "swing_target_space": "limb_morphology_scaled",
-          "swing_morphology_scale": "auto",
+          "swing_target_space": "world",
+          "swing_morphology_scale": 1.0,
           "reach_reference_body": "right_shoulder_pitch_link",
           "max_swing_reach": 0.43,
           "track_orientation": true,
@@ -522,34 +538,29 @@
           "contact_target_space": "world",
           "swing_target_space": "world",
           "reach_reference_body": "left_hip_roll_link",
-          "max_swing_reach": 0.72,
+          "drives_root_height": true,
+          "source_limb_chain": [
+            "L_Hip",
+            "L_Knee",
+            "L_Ankle"
+          ],
           "tracking_offset": [
             0.039,
             0.0,
             -0.00536677
           ],
-          "track_source_during_contact": false,
+          "track_source_during_contact": true,
           "track_orientation": true,
           "track_swing_heading": true,
           "track_swing_orientation": true,
           "orientation_sigma": 0.0698131701,
-          "swing_sigma": 0.06,
-          "swing_position_sigma": 0.04,
+          "swing_sigma": 0.025,
+          "swing_position_sigma": 0.02,
           "swing_morphology_scale": 1.0,
           "max_orientation_step": 0.1745329252,
           "contact_offsets": [
             [
-              -0.055,
-              0.0,
-              -0.035
-            ],
-            [
               0.039,
-              0.0,
-              -0.035
-            ],
-            [
-              0.132,
               0.0,
               -0.035
             ]
@@ -560,34 +571,29 @@
           "contact_target_space": "world",
           "swing_target_space": "world",
           "reach_reference_body": "right_hip_roll_link",
-          "max_swing_reach": 0.72,
+          "drives_root_height": true,
+          "source_limb_chain": [
+            "R_Hip",
+            "R_Knee",
+            "R_Ankle"
+          ],
           "tracking_offset": [
             0.039,
             0.0,
             -0.0053985
           ],
-          "track_source_during_contact": false,
+          "track_source_during_contact": true,
           "track_orientation": true,
           "track_swing_heading": true,
           "track_swing_orientation": true,
           "orientation_sigma": 0.0698131701,
-          "swing_sigma": 0.06,
-          "swing_position_sigma": 0.04,
+          "swing_sigma": 0.025,
+          "swing_position_sigma": 0.02,
           "swing_morphology_scale": 1.0,
           "max_orientation_step": 0.1745329252,
           "contact_offsets": [
             [
-              -0.055,
-              0.0,
-              -0.035
-            ],
-            [
               0.039,
-              0.0,
-              -0.035
-            ],
-            [
-              0.132,
               0.0,
               -0.035
             ]
@@ -599,10 +605,19 @@
       "enabled": false,
       "sigma_frames": 2.0
     },
-    "trajectory_refinement": {
-      "enabled": true,
-      "hierarchy": true,
-      "group_motion_prior": true,
+  "trajectory_refinement": {
+    "enabled": true,
+    "hierarchy": true,
+    "group_motion_prior": false,
+      "optimize_root_z": true,
+      "max_root_z_deviation": 0.45,
+      "root_z_temporal_weight": 2.0,
+      "root_height_from_reach": {
+        "sigma": 0.035,
+        "weight": 2.0,
+        "min_extension_ratio": 0.45,
+        "max_extension_ratio": 0.98
+      },
       "support_priority_relative_tolerance": 0.005,
       "support_priority_absolute_tolerance": 0.005,
       "contact_hierarchy": true,

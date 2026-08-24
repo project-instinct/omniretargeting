@@ -47,12 +47,30 @@ DEFAULT_CONTACT_PRIORITY_ABSOLUTE_TOLERANCE = 0.03
 
 def _scalar_joint_coordinates(
     model: mujoco.MjModel,
+    *,
+    include_root_z: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return qpos/dof coordinates and their limits for scalar robot joints."""
+    """Return refinable qpos/dof coordinates and their hard limits.
+
+    Scalar robot joints are always included.  Floating-base height is an
+    opt-in coordinate because a scene-aware pass may need to select a root
+    height from same-side palm/sole reachability.  Root X/Y and orientation
+    remain immutable here, so refinement cannot change the source path,
+    heading, or semantic left/right assignment.
+    """
     qpos_indices: list[int] = []
     dof_indices: list[int] = []
     lower: list[float] = []
     upper: list[float] = []
+    if (
+        include_root_z
+        and model.njnt > 0
+        and model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE
+    ):
+        qpos_indices.append(2)
+        dof_indices.append(2)
+        lower.append(-np.inf)
+        upper.append(np.inf)
     for joint_id in range(model.njnt):
         joint_type = model.jnt_type[joint_id]
         if joint_type not in (
@@ -889,19 +907,21 @@ def refine_joint_trajectory(
     joint_mapping: Mapping[str, str] | None = None,
     diagnostics: dict[str, Any] | None = None,
 ) -> np.ndarray:
-    """Jointly refine scalar joints over time with sparse Gauss--Newton.
+    """Jointly refine robot joints and optional root height over time.
 
-    The floating base is deliberately held at the framewise solver result.  It
-    is already responsible for world registration and morphology compromise;
-    allowing a second optimizer to move it would reintroduce the base drift
-    that whole-body smoothing is meant to avoid.
+    Root X/Y and orientation are always held at the framewise result.  When
+    ``optimize_root_z`` is enabled, only floating-base Z joins the same-side
+    world-space contact/swing, pose, collision, and temporal system.  This
+    lets reachable soles select robot height without copying the human root Z
+    or introducing lateral path drift.
     """
     result = np.asarray(trajectory, dtype=float).copy()
     if len(result) < 4 or not tasks:
         return result
 
+    optimize_root_z = bool(config.get("optimize_root_z", False))
     qpos_indices, dof_indices, joint_lower, joint_upper = (
-        _scalar_joint_coordinates(model)
+        _scalar_joint_coordinates(model, include_root_z=optimize_root_z)
     )
     joint_lower, joint_upper = _apply_configured_joint_limits(
         model,
@@ -1072,6 +1092,47 @@ def refine_joint_trajectory(
                     f"End-effector '{name}' limb-relative swing task refers "
                     f"to missing anchor body '{task.swing_anchor_body}'."
                 )
+        drives_root_height = optimize_root_z and bool(
+            spec.get("drives_root_height", False)
+        )
+        reach_reference_body_id = -1
+        source_limb_indices: tuple[int, int, int] | None = None
+        if drives_root_height:
+            reach_reference_body = spec.get("reach_reference_body")
+            reach_reference_body_id = mujoco.mj_name2id(
+                model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                str(reach_reference_body),
+            )
+            if reach_reference_body_id < 0:
+                raise ValueError(
+                    f"End-effector '{name}' drives root height but its "
+                    f"reach_reference_body {reach_reference_body!r} is missing."
+                )
+            if task.robot_max_reach is None or task.source_limb_chain is None:
+                raise ValueError(
+                    f"End-effector '{name}' drives root height but its measured "
+                    "robot reach or semantic source limb chain was not prepared."
+                )
+            if source_joint_positions is None:
+                raise ValueError(
+                    f"End-effector '{name}' drives root height but source joint "
+                    "positions were not supplied."
+                )
+            missing_source_joints = [
+                joint
+                for joint in task.source_limb_chain
+                if joint not in source_name_to_index
+            ]
+            if missing_source_joints:
+                raise ValueError(
+                    f"End-effector '{name}' source limb chain is missing joints "
+                    f"{missing_source_joints}."
+                )
+            source_limb_indices = tuple(
+                int(source_name_to_index[joint])
+                for joint in task.source_limb_chain
+            )
         raw_arm_posture = dict(spec.get("arm_posture", {}) or {})
         arm_posture = None
         if bool(raw_arm_posture.get("enabled", False)):
@@ -1215,6 +1276,18 @@ def refine_joint_trajectory(
                 if task.swing_anchor_offset is None
                 else np.asarray(task.swing_anchor_offset, dtype=float).reshape(3)
             ),
+            "drives_root_height": drives_root_height,
+            "reach_reference_body_id": int(reach_reference_body_id),
+            "reach_reference_offset": np.asarray(
+                spec.get("reach_reference_offset", [0.0, 0.0, 0.0]),
+                dtype=float,
+            ).reshape(3),
+            "robot_max_reach": (
+                None
+                if task.robot_max_reach is None
+                else float(task.robot_max_reach)
+            ),
+            "source_limb_indices": source_limb_indices,
             "contact_position_sigma": _resolve_position_sigma(
                 spec, config, "contact", "refinement", 0.025
             ),
@@ -1428,6 +1501,11 @@ def refine_joint_trajectory(
         qpos_indices,
         config.get("joint_temporal_weights"),
     )
+    root_z_coordinate = np.flatnonzero(qpos_indices == 2)
+    if len(root_z_coordinate):
+        temporal_joint_weights[int(root_z_coordinate[0])] = max(
+            float(config.get("root_z_temporal_weight", 1.0)), 0.0
+        )
     temporal_joint_scale = sparse.diags(
         np.sqrt(temporal_joint_weights), format="csr"
     )
@@ -1736,6 +1814,84 @@ def refine_joint_trajectory(
                             else "swing"
                         ),
                     )
+
+                # Root height is selected from each configured *same-side*
+                # sole relationship.  Preserve the source leg's normalized
+                # extension while using the measured robot reach, rather than
+                # copying human root Z or matching whichever foot is nearest.
+                if (
+                    spec["drives_root_height"]
+                    and source_joint_positions is not None
+                    and spec["source_limb_indices"] is not None
+                ):
+                    source_frame = source_joint_positions[frame_idx]
+                    source_base_idx, source_middle_idx, source_tip_idx = spec[
+                        "source_limb_indices"
+                    ]
+                    source_base = source_frame[source_base_idx]
+                    source_middle = source_frame[source_middle_idx]
+                    source_tip = source_frame[source_tip_idx]
+                    source_tracker = task.tracking_positions[frame_idx]
+                    source_chain_length = (
+                        float(np.linalg.norm(source_middle - source_base))
+                        + float(np.linalg.norm(source_tip - source_middle))
+                        + float(np.linalg.norm(source_tracker - source_tip))
+                    )
+                    if source_chain_length > 1e-8:
+                        root_height_cfg = dict(
+                            config.get("root_height_from_reach", {}) or {}
+                        )
+                        min_extension = float(
+                            root_height_cfg.get("min_extension_ratio", 0.45)
+                        )
+                        max_extension = float(
+                            root_height_cfg.get("max_extension_ratio", 0.98)
+                        )
+                        source_extension = float(
+                            np.linalg.norm(source_tracker - source_base)
+                            / source_chain_length
+                        )
+                        source_extension = float(
+                            np.clip(source_extension, min_extension, max_extension)
+                        )
+                        desired_robot_extension = source_extension * float(
+                            spec["robot_max_reach"]
+                        )
+                        reach_body_id = int(spec["reach_reference_body_id"])
+                        reach_rotation = data.xmat[reach_body_id].reshape(3, 3)
+                        reach_point = (
+                            data.xpos[reach_body_id]
+                            + reach_rotation @ spec["reach_reference_offset"]
+                        )
+                        reach_delta = reach_point - source_tracker
+                        current_extension = float(np.linalg.norm(reach_delta))
+                        if current_extension > 1e-8:
+                            reach_jacobian = np.zeros_like(jacobian_position)
+                            mujoco.mj_jac(
+                                model,
+                                data,
+                                reach_jacobian,
+                                None,
+                                reach_point,
+                                reach_body_id,
+                            )
+                            extension_jacobian = (
+                                reach_delta / current_extension
+                            ) @ reach_jacobian[:, dof_indices]
+                            append_block(
+                                frame_idx,
+                                extension_jacobian,
+                                desired_robot_extension - current_extension,
+                                max(
+                                    float(root_height_cfg.get("sigma", 0.04)),
+                                    1e-6,
+                                ),
+                                max(
+                                    float(root_height_cfg.get("weight", 1.0)),
+                                    0.0,
+                                ),
+                                "swing",
+                            )
 
                 if in_contact and spec["track_source_during_contact"]:
                     # The terrain constraint above acts on the selected
@@ -2454,13 +2610,26 @@ def refine_joint_trajectory(
         # A framewise solution can sit marginally outside a joint limit.  The
         # step bounds must always admit zero, otherwise the joint limit and the
         # trust region cross over and the solver rejects the problem outright.
+        max_coordinate_deviation = np.full(num_joints, max_joint_deviation)
+        if len(root_z_coordinate):
+            max_root_z_deviation = float(
+                config.get("max_root_z_deviation", max_joint_deviation)
+            )
+            if max_root_z_deviation <= 0.0:
+                raise ValueError(
+                    "trajectory_refinement.max_root_z_deviation must be positive."
+                )
+            max_coordinate_deviation[int(root_z_coordinate[0])] = (
+                max_root_z_deviation
+            )
+        tiled_max_deviation = np.tile(max_coordinate_deviation, num_frames)
         absolute_lower = np.maximum(
             np.tile(joint_lower, num_frames),
-            reference_joints.reshape(-1) - max_joint_deviation,
+            reference_joints.reshape(-1) - tiled_max_deviation,
         )
         absolute_upper = np.minimum(
             np.tile(joint_upper, num_frames),
-            reference_joints.reshape(-1) + max_joint_deviation,
+            reference_joints.reshape(-1) + tiled_max_deviation,
         )
         lower = np.minimum(
             np.maximum(

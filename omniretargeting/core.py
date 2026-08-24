@@ -2270,6 +2270,10 @@ class OmniRetargeter:
                 - (1.0 - bridge_alpha[bridged, None])
                 * relative_preview[bridged]
             ) / bridge_alpha[bridged, None]
+            drives_root_height = bool(spec.get("drives_root_height", False))
+            prepared_max_reach = float(profile["max_reach"])
+            if not np.isfinite(prepared_max_reach):
+                prepared_max_reach = None
             result[name] = replace(
                 task,
                 effective_swing_positions=effective_targets,
@@ -2283,6 +2287,14 @@ class OmniRetargeter:
                 position_sigma_scale=position_sigma_scale,
                 orientation_sigma_scale=orientation_sigma_scale,
                 morphology_scale=scale,
+                robot_max_reach=(
+                    prepared_max_reach if drives_root_height else None
+                ),
+                source_limb_chain=(
+                    _source_limb_chain(name, spec)
+                    if drives_root_height
+                    else None
+                ),
                 robot_base_reference_w=robot_base_reference,
             )
         self.last_robot_base_reference_w = robot_base_reference
@@ -3352,6 +3364,14 @@ class OmniRetargeter:
                         if robot_base_reference is not None
                         else human_joints[root_position_idx]
                     )
+                    if frame_idx > 0:
+                        frame_kwargs["previous_target_base_position"] = (
+                            robot_base_reference[frame_idx - 1]
+                            if robot_base_reference is not None
+                            else processed_trajectory[
+                                frame_idx - 1, root_position_idx
+                            ]
+                        )
                 frame_kwargs["end_effector_targets"] = {}
                 for name, task in end_effector_tasks.items():
                     target_payload = (

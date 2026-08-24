@@ -44,6 +44,7 @@ from omniretargeting.trajectory_refinement import (
     _joint_posture_target_vectors,
     _joint_temporal_weight_vector,
     _local_semantic_rotation,
+    _scalar_joint_coordinates,
     _skew_symmetric,
     _transported_arm_segment_targets,
     collision_geom_ids,
@@ -71,6 +72,23 @@ ANKLE_ARM_XML = """
   </worldbody>
 </mujoco>
 """
+
+
+def test_root_height_refinement_adds_only_floating_base_z():
+    """Reach refinement must not gain lateral or rotational root authority."""
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
+    scalar_qpos, scalar_dofs, _, _ = _scalar_joint_coordinates(model)
+    root_qpos, root_dofs, _, _ = _scalar_joint_coordinates(
+        model, include_root_z=True
+    )
+
+    np.testing.assert_array_equal(scalar_qpos, [7])
+    np.testing.assert_array_equal(scalar_dofs, [6])
+    np.testing.assert_array_equal(root_qpos, [2, 7])
+    np.testing.assert_array_equal(root_dofs, [2, 6])
+    assert not np.any(np.isin(root_qpos, [0, 1, 3, 4, 5, 6]))
 
 
 def test_robot_body_alignment_derives_floating_root_from_nominal_morphology():
@@ -162,8 +180,8 @@ def test_support_contact_base_objective_does_not_center_source_root_z():
     assert dqa.value[2] == pytest.approx(-0.3, abs=1e-5)
 
 
-def test_support_contact_base_policy_restores_source_z_during_flight():
-    """Without a load-bearing foot, source motion owns root height again."""
+def test_support_contact_base_policy_leaves_root_z_reachable_during_flight():
+    """Human-root Z must not override reachable world-space foot targets."""
     dqa = cp.Variable(7)
     q = np.asarray([0.0, 0.0, 1.2, 1.0, 0.0, 0.0, 0.0])
     objective, constraints = _build_base_position_task(
@@ -184,7 +202,35 @@ def test_support_contact_base_policy_restores_source_z_during_flight():
     problem.solve(solver=cp.CLARABEL)
 
     assert problem.status == cp.OPTIMAL
-    assert abs(float(dqa.value[2])) <= 0.08001
+    assert dqa.value[2] == pytest.approx(0.3, abs=1e-5)
+
+
+def test_support_contact_flight_uses_source_delta_not_absolute_root_z():
+    dqa = cp.Variable(7)
+    q = np.asarray([0.0, 0.0, 0.9, 1.0, 0.0, 0.0, 0.0])
+    objective, constraints = _build_base_position_task(
+        dqa,
+        q,
+        np.arange(7),
+        np.asarray([0.0, 0.0, 4.1]),
+        {
+            "enabled": True,
+            "hard_constraints": True,
+            "z_constraint_mode": "support_contact",
+            "max_xy_error": 0.03,
+            "max_z_error": 0.08,
+            "flight_z_delta_weight": 1.0,
+            "flight_z_delta_scale": 0.04,
+        },
+        previous_base_position=np.asarray([0.0, 0.0, 0.9]),
+        support_contact_active=False,
+        previous_target_base_position=np.asarray([0.0, 0.0, 4.0]),
+    )
+    problem = cp.Problem(cp.Minimize(objective), constraints)
+    problem.solve(solver=cp.CLARABEL)
+
+    assert problem.status == cp.OPTIMAL
+    assert q[2] + dqa.value[2] == pytest.approx(1.0, abs=1e-5)
 
 
 def test_reference_envelope_base_policy_retains_hard_root_z_bound():
@@ -360,31 +406,43 @@ def test_g1_profile_gates_world_tracking_on_contact_and_on_the_feet():
         profile = json.load(profile_file)
     priority = profile["retargeting"]["end_effector_priority"]
     assert priority["root_warp"]["enabled"] is False
-    assert priority["lock_base_orientation"] is True
-    assert (
-        priority["base_position_constraint"]["z_constraint_mode"]
-        == "support_contact"
-    )
+    assert priority["lock_base_orientation"] is False
+    base_position = priority["base_position_constraint"]
+    assert base_position["source_joint"] == "Spine3"
+    assert "landmarks" not in base_position
+    assert base_position["z_constraint_mode"] == "support_contact"
     assert ["Spine3", "Pelvis"] in priority["pose_direction"]["edges"]
     for name, spec in priority["effectors"].items():
         # Every contact is a real scene interaction and stays in world metres.
         assert spec["contact_target_space"] == "world"
         if name.endswith("foot"):
+            expected_side = "left" if name.startswith("left") else "right"
+            assert spec["robot_body"].startswith(expected_side)
+            assert spec["reach_reference_body"].startswith(expected_side)
+            assert spec["drives_root_height"] is True
+            expected_prefix = "L_" if expected_side == "left" else "R_"
+            assert all(
+                joint.startswith(expected_prefix)
+                for joint in spec["source_limb_chain"]
+            )
+            assert "max_swing_reach" not in spec
             assert spec["swing_target_space"] == "world"
             assert spec["swing_morphology_scale"] == pytest.approx(1.0)
-            assert spec["track_source_during_contact"] is False
-            assert len(spec["contact_offsets"]) >= 3
+            assert spec["track_source_during_contact"] is True
+            assert len(spec["contact_offsets"]) == 1
             contact_spec = priority["contact_detection"]["effectors"][name]
             assert contact_spec["contact_mode"] == "AUTO"
             assert contact_spec["allow_sliding"] is True
+            assert contact_spec["anchor_tangent_to_tracking"] is True
             assert "anchor_drift_tolerance" not in contact_spec
         else:
-            assert spec["swing_target_space"] == "limb_morphology_scaled"
+            assert spec["swing_target_space"] == "world"
+            assert spec["swing_morphology_scale"] == pytest.approx(1.0)
             assert (
                 priority["contact_detection"]["effectors"][name]["contact_mode"]
                 == "NONE"
             )
-            # The limb base must resolve, otherwise the anchor is undefined.
+            # The same-side limb base is still used by posture/reach analysis.
             assert spec["reach_reference_body"]
 
 
@@ -1268,6 +1326,51 @@ def test_support_anchor_can_ignore_migrating_source_sole_sample_tangent():
     np.testing.assert_allclose(task.contact_positions[:, 2], 0.0, atol=1e-10)
 
 
+def test_slide_target_keeps_tracking_tangent_not_nearest_detection_sample():
+    scene = trimesh.creation.box(extents=[4.0, 4.0, 0.1])
+    scene.apply_translation([0.0, 0.0, -0.05])
+    tracking = np.column_stack(
+        [np.linspace(0.4, 0.7, 6), np.full(6, 0.2), np.full(6, 0.04)]
+    )
+    contact_samples = np.stack(
+        [
+            tracking + np.array([-0.08, 0.0, -0.035]),
+            tracking + np.array([0.08, 0.0, -0.035]),
+        ],
+        axis=1,
+    )
+    contact_samples[::2, 1, 2] += 0.015
+    contact_samples[1::2, 0, 2] += 0.015
+
+    task = infer_scene_contact_tasks(
+        {
+            "left_foot": {
+                "tracking_positions": tracking,
+                "contact_samples": contact_samples,
+            }
+        },
+        scene,
+        framerate=30.0,
+        config={
+            "distance_threshold": 0.03,
+            "relative_speed_threshold": 10.0,
+            "min_contact_frames": 1,
+            "effectors": {
+                "left_foot": {
+                    "contact_mode": "SLIDE",
+                    "anchor_tangent_to_tracking": True,
+                }
+            },
+        },
+    )["left_foot"]
+
+    assert np.all(task.contact_modes == int(ContactMode.SLIDE))
+    np.testing.assert_allclose(
+        task.contact_positions[:, :2], tracking[:, :2], atol=1e-10
+    )
+    np.testing.assert_allclose(task.contact_positions[:, 2], 0.0, atol=1e-10)
+
+
 def test_vault_support_anchor_bridge_and_local_robot_root_warp():
     """A vault hand becomes SUPPORT without altering source or scene data."""
     scene = trimesh.creation.box(extents=[4.0, 4.0, 0.1])
@@ -1842,6 +1945,8 @@ def test_contact_tasks_stack_for_downstream_policy_export():
     assert payload["contact_bridge_alpha"].shape == (4, 2)
     assert payload["contact_bridge_targets_w"].shape == (4, 2, 3)
     assert payload["active_contact_offset_id"].shape == (4, 2)
+    assert payload["end_effector_max_reach"].shape == (2,)
+    assert payload["end_effector_source_limb_chain"].shape == (2,)
     assert set(payload) == {
         "contact_names",
         "contact_mode",
@@ -1863,6 +1968,8 @@ def test_contact_tasks_stack_for_downstream_policy_export():
         "end_effector_bridge_forward_w",
         "end_effector_bridge_up_w",
         "swing_morphology_scale",
+        "end_effector_max_reach",
+        "end_effector_source_limb_chain",
         "active_contact_offset_id",
         "contact_surface_normals_w",
         "end_effector_forward_w",
@@ -2614,7 +2721,7 @@ def test_base_orientation_hard_cone_bounds_a_conflicting_lower_level():
     assert remaining_error >= 0.149
 
 
-def test_priority_level_grouping_uses_contact_then_interaction_motion_prior():
+def test_priority_levels_preserve_end_effectors_before_interaction_shape():
     shipped = json.loads(
         (
             Path(__file__).resolve().parents[1]
@@ -2622,14 +2729,12 @@ def test_priority_level_grouping_uses_contact_then_interaction_motion_prior():
         ).read_text(encoding="utf-8")
     )["retargeting"]["end_effector_priority"]
     shipped_levels = _resolve_priority_levels(shipped)
-    assert len(shipped_levels) == 4
+    assert len(shipped_levels) == 7
     assert shipped_levels[0]["families"] == ("support",)
-    assert shipped_levels[2]["families"] == (
-        "interaction",
-        "swing",
-        "orientation",
-        "pose_direction",
-    )
+    assert shipped_levels[2]["families"] == ("swing",)
+    assert shipped_levels[3]["families"] == ("orientation",)
+    assert shipped_levels[4]["families"] == ("pose_direction",)
+    assert shipped_levels[5]["families"] == ("interaction",)
 
     four_config = {
         "priority_levels": [
