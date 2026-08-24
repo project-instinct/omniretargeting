@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
 import numpy as np
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
+from typing import Dict, List, Tuple, Optional, Union, Any
 import trimesh
 import mujoco
 try:
@@ -19,348 +18,11 @@ from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 
 from .utils import compute_mesh_height_at_point
-from .contact import ContactMode, SceneContactTask, infer_scene_contact_tasks
-from .retargeting import (
-    MORPHOLOGY_SWING_TARGET_SPACES,
-    _bridge_contact_orientation,
-    _bridge_swing_to_contact,
-    _clamp_target_to_reach,
-    _contact_bridge_windows,
-    _contact_segment_spans,
-    _minimum_jerk_blend,
-    _numeric_morphology_scale,
-    _local_semantic_rotation,
-    _validate_swing_target_space,
-)
+from .contact import SceneContactTask, infer_scene_contact_tasks
 from .trajectory_refinement import (
-    collision_geom_ids,
-    geom_surface_points_in_body_frame,
     measure_scene_penetration,
     refine_joint_trajectory,
-    resolve_scene_normal_orientation,
-    scene_signed_clearance,
 )
-from .evaluation import evaluate_retargeted_motion
-from .morphology import (
-    analyze_robot_morphology,
-    resolve_end_effector_chain_specs,
-)
-
-
-def _build_per_frame_sigma_scales(
-    contact_modes: np.ndarray,
-    contact_segment_ids: np.ndarray,
-    contact_bridge_alpha: np.ndarray,
-    config: Mapping[str, Any],
-) -> Tuple[np.ndarray | None, np.ndarray | None]:
-    """Derive optional tolerance scales from contact semantics and bridge alpha.
-
-    The static framewise/refinement sigmas remain the locked tolerances.  When
-    enabled, free motion starts at a configurable loose multiple and follows
-    the position bridge monotonically toward the owning segment's scale.
-    SUPPORT reaches exactly 1.0, TOUCH stays loose, and SLIDE keeps orientation
-    loose so its tangential heading is never promoted to a full SE(3) lock.
-    """
-    raw_policy = config.get("time_varying_tolerance", {})
-    if isinstance(raw_policy, Mapping):
-        policy = dict(raw_policy)
-        enabled = bool(policy.get("enabled", False))
-    else:
-        policy = {}
-        enabled = bool(raw_policy)
-    if not enabled:
-        return None, None
-
-    modes = np.asarray(contact_modes, dtype=np.uint8)
-    segment_ids = np.asarray(contact_segment_ids, dtype=np.int32)
-    alpha = np.asarray(contact_bridge_alpha, dtype=float)
-    num_frames = len(modes)
-    if segment_ids.shape != (num_frames,) or alpha.shape != (num_frames,):
-        raise ValueError(
-            "contact_segment_ids and contact_bridge_alpha must match contact_modes."
-        )
-    if np.any((alpha < 0.0) | (alpha > 1.0)):
-        raise ValueError("contact_bridge_alpha must lie in [0, 1].")
-
-    loose_position = max(float(policy.get("loose_position_scale", 2.0)), 1.0)
-    loose_orientation = max(
-        float(policy.get("loose_orientation_scale", 2.0)), 1.0
-    )
-    slide_orientation = max(
-        float(policy.get("slide_orientation_scale", loose_orientation)),
-        1.0,
-    )
-    position_scale = np.full(num_frames, loose_position, dtype=float)
-    orientation_scale = np.full(num_frames, loose_orientation, dtype=float)
-
-    def locked_scales(mode_value: int) -> Tuple[float, float]:
-        mode = ContactMode(int(mode_value))
-        if mode == ContactMode.SUPPORT:
-            return 1.0, 1.0
-        if mode == ContactMode.SLIDE:
-            return 1.0, slide_orientation
-        # TOUCH remains a transient point contact; it is not an SE(3) lock.
-        return loose_position, loose_orientation
-
-    spans = _contact_segment_spans(segment_ids)
-    bridge_frames = max(
-        int(
-            config.get(
-                "contact_bridge_frames",
-                (config.get("contact_detection", {}) or {}).get(
-                    "transition_frames", 0
-                ),
-            )
-        ),
-        0,
-    )
-    windows = _contact_bridge_windows(spans, num_frames, bridge_frames)
-    for (start, end), (approach_zero, release_zero) in zip(spans, windows):
-        for frame_idx in range(start, end):
-            position_scale[frame_idx], orientation_scale[frame_idx] = locked_scales(
-                int(modes[frame_idx])
-            )
-        for frame_idx in range(approach_zero, start):
-            target_position, target_orientation = locked_scales(int(modes[start]))
-            blend = float(alpha[frame_idx])
-            position_scale[frame_idx] = (
-                loose_position + blend * (target_position - loose_position)
-            )
-            orientation_scale[frame_idx] = (
-                loose_orientation
-                + blend * (target_orientation - loose_orientation)
-            )
-        for frame_idx in range(end, release_zero + 1):
-            target_position, target_orientation = locked_scales(
-                int(modes[end - 1])
-            )
-            blend = float(alpha[frame_idx])
-            position_scale[frame_idx] = (
-                loose_position + blend * (target_position - loose_position)
-            )
-            orientation_scale[frame_idx] = (
-                loose_orientation
-                + blend * (target_orientation - loose_orientation)
-            )
-    return position_scale, orientation_scale
-
-
-def _source_limb_chain(
-    name: str,
-    spec: Mapping[str, Any] | None = None,
-) -> Tuple[str, str, str]:
-    """Return the source limb chain (base, middle, tip) for one effector.
-
-    The chain is the kinematic path whose summed segment lengths define the
-    limb's reach, and whose first joint is the limb base used as the anchor of
-    ``limb_morphology_scaled``.  A profile may override it explicitly for a
-    source skeleton that does not use the SMPL-X joint names.
-    """
-    configured = dict(spec or {}).get("source_limb_chain")
-    if configured is not None:
-        chain = tuple(str(joint) for joint in configured)
-        if len(chain) != 3:
-            raise ValueError(
-                f"End-effector '{name}' source_limb_chain must list exactly "
-                f"[base, middle, tip] joints, got {list(configured)!r}."
-            )
-        return chain
-    side = "L" if name.startswith("left") else "R"
-    if name.endswith("hand"):
-        return (f"{side}_Shoulder", f"{side}_Elbow", f"{side}_Wrist")
-    return (f"{side}_Hip", f"{side}_Knee", f"{side}_Ankle")
-
-
-def _resolve_swing_targets_against_scene(
-    scaled_targets: np.ndarray,
-    world_targets: np.ndarray,
-    scene_mesh: trimesh.Trimesh | None,
-    clearance: float,
-    free_mask: np.ndarray | None = None,
-    iterations: int = 10,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Fade a morphology-scaled swing target back to world where it hits the scene.
-
-    Shortening a limb about its base pulls the endpoint toward the body, so an
-    extended human reach over a step can map to a robot target *inside* that
-    step.  Such a target is unattainable and actively drags the limb into the
-    geometry, which is exactly the free-space penetration the scaled target was
-    meant to avoid.
-
-    The registered world target is the one reference known to sit outside the
-    scene, so each offending frame is blended back toward it by the smallest
-    fraction that clears the surface.  Free-space frames keep the scaled target
-    untouched, and the fade degrades to plain world tracking only where the
-    geometry demands it.  Returns the resolved targets and the per-frame blend.
-    """
-    scaled = np.asarray(scaled_targets, dtype=float)
-    world = np.asarray(world_targets, dtype=float)
-    blend = np.zeros(len(scaled), dtype=float)
-    if scene_mesh is None or len(scaled) == 0:
-        return scaled.copy(), blend
-    margin = max(float(clearance), 0.0)
-    # The registered source markers are the free-side reference that fixes the
-    # global normal orientation; the scan is not watertight, so an inside test
-    # based on ray containment would be unreliable here.
-    orientation_sign = resolve_scene_normal_orientation(scene_mesh, world)
-
-    def outside(points: np.ndarray) -> np.ndarray:
-        clearances = scene_signed_clearance(
-            scene_mesh, points, orientation_sign
-        )[0]
-        return clearances >= margin
-
-    pending = ~outside(scaled)
-    if free_mask is not None:
-        # Contact cores are replaced by their scene anchors downstream, so
-        # only free-space frames carry a scaled target worth resolving.
-        pending &= np.asarray(free_mask, dtype=bool)
-    if not np.any(pending):
-        return scaled.copy(), blend
-    # The world target itself may be inside the scene on a badly reconstructed
-    # frame.  Those frames keep the honest world reference rather than an
-    # invented one, matching how world-space effectors are treated.
-    lower = np.zeros(len(scaled), dtype=float)
-    upper = np.ones(len(scaled), dtype=float)
-    for _ in range(max(int(iterations), 1)):
-        middle = 0.5 * (lower + upper)
-        candidate = scaled + middle[:, None] * (world - scaled)
-        clear = outside(candidate)
-        upper = np.where(pending & clear, middle, upper)
-        lower = np.where(pending & ~clear, middle, lower)
-    blend = np.where(pending, upper, 0.0)
-    return scaled + blend[:, None] * (world - scaled), blend
-
-
-def _base_quaternions_wxyz(
-    base_orientations: np.ndarray | None,
-    num_frames: int,
-) -> np.ndarray | None:
-    """Normalise a source-neutral base orientation track to wxyz quaternions."""
-    if base_orientations is None:
-        return None
-    base_orientations = np.asarray(base_orientations, dtype=float)
-    if base_orientations.shape == (num_frames, 4):
-        norms = np.linalg.norm(base_orientations, axis=1, keepdims=True)
-        if np.any(norms < 1e-10):
-            raise ValueError("base_orientations contains a zero quaternion.")
-        quaternions = base_orientations / norms
-    elif base_orientations.shape == (num_frames, 3):
-        # Backward-compatible axis-angle input. Source adapters should
-        # normally convert their native convention to wxyz first.
-        quaternions = Rotation.from_rotvec(base_orientations).as_quat(
-            scalar_first=True
-        )
-    else:
-        raise ValueError(
-            "base_orientations must have shape (T, 4) for source-neutral "
-            "wxyz quaternions or legacy shape (T, 3) for rotation vectors; "
-            f"got {base_orientations.shape}."
-        )
-    for frame_idx in range(1, len(quaternions)):
-        if np.dot(quaternions[frame_idx - 1], quaternions[frame_idx]) < 0.0:
-            quaternions[frame_idx] *= -1.0
-    return quaternions
-
-
-def _build_robot_base_reference(
-    human_root_positions: np.ndarray,
-    tasks: Dict[str, SceneContactTask],
-    reach_profiles: Dict[str, Dict[str, Any]],
-    config: Dict[str, Any],
-    root_z_offset: float,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Create a low-frequency robot-only root reference around contacts."""
-    source_root = np.asarray(human_root_positions, dtype=float)
-    base_reference = source_root.copy()
-    base_reference[:, 2] += float(root_z_offset)
-    unwarped = base_reference.copy()
-    if not bool(config.get("enabled", False)) or not tasks:
-        return base_reference, unwarped
-
-    num_frames = len(source_root)
-    correction_sum = np.zeros((num_frames, 3), dtype=float)
-    correction_weight = np.zeros(num_frames, dtype=float)
-    approach_frames = max(int(config.get("approach_frames", 8)), 0)
-    release_frames = max(int(config.get("release_frames", 8)), 0)
-    max_xyz = np.asarray(
-        config.get("max_xyz", [0.08, 0.08, 0.06]), dtype=float
-    ).reshape(3)
-    max_norm = max(float(config.get("max_norm", 0.10)), 0.0)
-    raw_qualifying_modes = config.get(
-        "qualifying_contact_modes", [ContactMode.SUPPORT.name]
-    )
-    if isinstance(raw_qualifying_modes, (str, int, np.integer, ContactMode)):
-        raw_qualifying_modes = [raw_qualifying_modes]
-    try:
-        qualifying_modes = {
-            int(value)
-            if isinstance(value, (int, np.integer, ContactMode))
-            else int(ContactMode[str(value).strip().upper()])
-            for value in raw_qualifying_modes
-        }
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError(
-            "root_warp.qualifying_contact_modes must contain contact-mode "
-            "names or ids (NONE, TOUCH, SLIDE, SUPPORT)."
-        ) from exc
-
-    for name, task in tasks.items():
-        profile = reach_profiles.get(name)
-        if not profile:
-            continue
-        modes = np.asarray(task.contact_modes, dtype=np.uint8)
-        segment_ids = np.asarray(task.contact_segment_ids, dtype=np.int32)
-        for segment_id in np.unique(segment_ids[segment_ids >= 0]):
-            frames = np.flatnonzero(segment_ids == segment_id)
-            if len(frames) == 0:
-                continue
-            # SUPPORT-only remains the default. Experiments may explicitly let
-            # other contact semantics qualify without changing their schedule.
-            if not np.any(np.isin(modes[frames], tuple(qualifying_modes))):
-                continue
-            origins = (
-                unwarped[frames]
-                + np.asarray(profile["origin_offset"], dtype=float)[None, :]
-            )
-            deltas = task.contact_positions[frames] - origins
-            distances = np.linalg.norm(deltas, axis=1)
-            max_reach = max(float(profile["max_reach"]), 1e-6)
-            excess = np.maximum(distances - max_reach, 0.0)
-            desired = deltas * (
-                excess / np.maximum(distances, 1e-10)
-            )[:, None]
-            correction = np.median(desired, axis=0)
-            correction = np.clip(correction, -max_xyz, max_xyz)
-            correction_norm = float(np.linalg.norm(correction))
-            if max_norm > 0.0 and correction_norm > max_norm:
-                correction *= max_norm / correction_norm
-            if float(np.linalg.norm(correction)) < 1e-8:
-                continue
-
-            start = int(frames[0])
-            end = int(frames[-1]) + 1
-            window_start = max(0, start - approach_frames)
-            window_end = min(num_frames, end + release_frames)
-            weights = np.ones(window_end - window_start, dtype=float)
-            if start > window_start:
-                pre = np.arange(window_start, start + 1)
-                weights[: len(pre)] = _minimum_jerk_blend(
-                    (pre - window_start) / max(start - window_start, 1)
-                )
-            if window_end > end:
-                post = np.arange(end - 1, window_end)
-                weights[-len(post) :] = 1.0 - _minimum_jerk_blend(
-                    (post - (end - 1)) / max(window_end - end, 1)
-                )
-            correction_sum[window_start:window_end] += weights[:, None] * correction
-            correction_weight[window_start:window_end] += weights
-
-    active = correction_weight > 1e-10
-    base_reference[active] += (
-        correction_sum[active] / correction_weight[active, None]
-    )
-    return base_reference, unwarped
 
 
 class OmniRetargeter:
@@ -572,358 +234,6 @@ class OmniRetargeter:
         print(f"Robot height: {self.robot_height:.3f}m")
         print(f"Robot DOF: {self.get_robot_dof()}")
 
-    def _end_effector_reach_profiles(
-        self,
-        end_effector_cfg: Dict[str, Any],
-    ) -> Dict[str, Dict[str, Any]]:
-        """Measure per-chain reach and shoulder/hip origin from robot morphology."""
-        specs = resolve_end_effector_chain_specs(
-            self.robot_model,
-            end_effector_cfg,
-            self.valid_joint_mapping,
-        )
-        if not specs:
-            return {}
-        morphology = analyze_robot_morphology(
-            self.robot_model,
-            {"chains": specs},
-            configured_joint_limits=end_effector_cfg.get("joint_posture_limits"),
-            reach_samples=int(end_effector_cfg.get("morphology_reach_samples", 512)),
-        )
-        profiles: Dict[str, Dict[str, Any]] = {}
-        for name, spec in specs.items():
-            chain = morphology.chains[name]
-            max_reach = (
-                chain.actual_reach
-                if spec.configured_reach is None
-                else float(spec.configured_reach)
-            )
-            profiles[name] = {
-                "origin_offset": chain.origin_root_local.copy(),
-                # Explicit profile values remain backwards-compatible
-                # overrides.  The former qpos0 proxy is replaced by sampled
-                # joint-limit-aware reach whenever no override is present.
-                "max_reach": max_reach,
-                "measured_reach": chain.actual_reach,
-                "reference_body": spec.reference_body,
-                "reference_offset": np.asarray(spec.reference_offset, dtype=float),
-                "nominal_length": chain.nominal_length,
-                "qpos0_reach": chain.qpos0_reach,
-            }
-        return profiles
-
-    def _automatic_morphology_scale(
-        self,
-        name: str,
-        spec: Dict[str, Any],
-        task: SceneContactTask,
-        source_joints: np.ndarray,
-        robot_reach: float,
-    ) -> float:
-        configured = spec.get(
-            "swing_morphology_scale",
-            self.retargeting_config.get("end_effector_priority", {}).get(
-                "swing_morphology_scale", 1.0
-            ),
-        )
-        if not (isinstance(configured, str) and configured.lower() == "auto"):
-            return _numeric_morphology_scale(configured)
-
-        chain = _source_limb_chain(name, spec)
-        if any(joint not in self.smplx_joint_indices for joint in chain):
-            return 1.0
-        points = [source_joints[:, self.smplx_joint_indices[joint]] for joint in chain]
-        source_reach = np.linalg.norm(points[1] - points[0], axis=1)
-        source_reach += np.linalg.norm(points[2] - points[1], axis=1)
-        source_reach += np.linalg.norm(task.tracking_positions - points[2], axis=1)
-        median_source_reach = float(np.median(source_reach))
-        if median_source_reach <= 1e-8:
-            return 1.0
-        scale = float(robot_reach) / median_source_reach
-        bounds = np.asarray(
-            spec.get("swing_morphology_scale_bounds", [0.55, 1.15]),
-            dtype=float,
-        ).reshape(2)
-        return float(np.clip(scale, bounds[0], bounds[1]))
-
-    def _source_limb_anchor(
-        self,
-        name: str,
-        spec: Mapping[str, Any],
-        source_trajectory: np.ndarray,
-    ) -> np.ndarray:
-        """Return the source limb-base track that anchors a scaled swing target."""
-        joint_name = str(
-            spec.get("swing_anchor_source_joint", _source_limb_chain(name, spec)[0])
-        )
-        if joint_name not in self.smplx_joint_indices:
-            raise ValueError(
-                f"End-effector '{name}' uses swing_target_space "
-                "'limb_morphology_scaled' but its limb-base joint "
-                f"'{joint_name}' is not present in the source skeleton."
-            )
-        return source_trajectory[:, self.smplx_joint_indices[joint_name]]
-
-    def _robot_limb_anchor(
-        self,
-        name: str,
-        profile: Mapping[str, Any],
-        robot_base_reference: np.ndarray,
-        base_rotations: np.ndarray | None,
-    ) -> np.ndarray:
-        """Return the robot limb-base track that anchors a scaled swing target.
-
-        The reach reference body (shoulder or hip) is rigidly attached to the
-        floating base on the supported profiles, so transporting its qpos0
-        base-frame offset by the base orientation reference reproduces its
-        world position without running the solver first.
-        """
-        if profile.get("reference_body") is None:
-            raise ValueError(
-                f"End-effector '{name}' uses swing_target_space "
-                "'limb_morphology_scaled' but no 'reach_reference_body' "
-                "resolves on the robot; the limb base is undefined."
-            )
-        offset = np.asarray(profile["origin_offset"], dtype=float).reshape(3)
-        if base_rotations is None:
-            return robot_base_reference + offset[None, :]
-        return robot_base_reference + np.einsum("tij,j->ti", base_rotations, offset)
-
-    def _prepare_contact_aware_references(
-        self,
-        source_trajectory: np.ndarray,
-        tasks: Dict[str, SceneContactTask],
-        end_effector_cfg: Dict[str, Any],
-        base_orientations: np.ndarray | None = None,
-        scene_mesh: trimesh.Trimesh | None = None,
-    ) -> Dict[str, SceneContactTask]:
-        """Attach explicit swing, contact-bridge, and robot-root references."""
-        root_name = self.base_orientation_config.get("root_position", "Pelvis")
-        root_idx = self.smplx_joint_indices.get(root_name, 0)
-        source_roots = source_trajectory[:, root_idx]
-        base_cfg = dict(end_effector_cfg.get("base_position_constraint", {}) or {})
-        root_z_offset = float(base_cfg.get("z_offset", 0.0))
-        reach_profiles = self._end_effector_reach_profiles(end_effector_cfg)
-        robot_base_reference, unwarped = _build_robot_base_reference(
-            source_roots,
-            tasks,
-            reach_profiles,
-            dict(end_effector_cfg.get("root_warp", {}) or {}),
-            root_z_offset,
-        )
-        base_quaternions = _base_quaternions_wxyz(
-            base_orientations, len(source_trajectory)
-        )
-        base_rotations = (
-            None
-            if base_quaternions is None
-            else Rotation.from_quat(
-                base_quaternions, scalar_first=True
-            ).as_matrix()
-        )
-        bridge_frames = max(
-            int(
-                end_effector_cfg.get(
-                    "contact_bridge_frames",
-                    (end_effector_cfg.get("contact_detection", {}) or {}).get(
-                        "transition_frames", 0
-                    ),
-                )
-            ),
-            0,
-        )
-        orientation_bridge_frames = max(
-            int(end_effector_cfg.get("orientation_bridge_frames", bridge_frames)),
-            0,
-        )
-        specs = dict(end_effector_cfg.get("effectors", {}) or {})
-        result: Dict[str, SceneContactTask] = {}
-        scales: Dict[str, float] = {}
-        scene_blends: Dict[str, np.ndarray] = {}
-        for name, task in tasks.items():
-            spec = dict(specs.get(name, {}) or {})
-            profile = reach_profiles.get(
-                name,
-                {
-                    "origin_offset": np.zeros(3),
-                    "max_reach": np.inf,
-                    "reference_body": None,
-                    "reference_offset": np.zeros(3),
-                },
-            )
-            target_space = _validate_swing_target_space(
-                name, spec.get("swing_target_space", "world")
-            )
-            limb_offsets = None
-            swing_anchor_body = None
-            swing_anchor_offset = None
-            robot_anchors = None
-            if target_space == "world":
-                scale = 1.0
-                swing_targets = task.tracking_positions.copy()
-            else:
-                scale = self._automatic_morphology_scale(
-                    name,
-                    spec,
-                    task,
-                    source_trajectory,
-                    float(profile["max_reach"]),
-                )
-                if target_space == "root_morphology_scaled":
-                    source_anchors = source_roots
-                    robot_anchors = robot_base_reference
-                else:
-                    # Anchoring at the limb base keeps the free-space limb
-                    # direction identical to the source and only shortens the
-                    # limb.  The root anchor cannot: the robot torso carries
-                    # its shoulders far below the human ones, so a
-                    # root-relative target lands outside the arm's reach shell
-                    # and has to be clipped, which is what bends the free arm
-                    # away from the captured pose.
-                    source_anchors = self._source_limb_anchor(
-                        name, spec, source_trajectory
-                    )
-                    robot_anchors = self._robot_limb_anchor(
-                        name, profile, robot_base_reference, base_rotations
-                    )
-                scaled_offsets = scale * (
-                    task.tracking_positions - source_anchors
-                )
-                if (
-                    target_space == "limb_morphology_scaled"
-                    and np.isfinite(float(profile["max_reach"]))
-                ):
-                    # The reach constraint belongs to the relative vector, not
-                    # a reference-pose world point.  This keeps the same vector
-                    # attached to the live shoulder throughout SQP.
-                    scaled_offsets = np.stack(
-                        [
-                            _clamp_target_to_reach(
-                                offset,
-                                np.zeros(3, dtype=float),
-                                profile["max_reach"],
-                            )
-                            for offset in scaled_offsets
-                        ],
-                        axis=0,
-                    )
-                    limb_offsets = scaled_offsets
-                    swing_anchor_body = str(profile["reference_body"])
-                    swing_anchor_offset = np.asarray(
-                        profile.get("reference_offset", np.zeros(3)),
-                        dtype=float,
-                    ).reshape(3)
-                swing_targets = robot_anchors + scaled_offsets
-            scales[name] = scale
-            # A world-space source target stays immutable even when unreachable;
-            # the resulting residual is the honest morphology error.  Reach
-            # projection is reserved for the explicit morphology-scaled modes.
-            if (
-                target_space in MORPHOLOGY_SWING_TARGET_SPACES
-                and np.isfinite(float(profile["max_reach"]))
-            ):
-                if target_space != "limb_morphology_scaled":
-                    reach_origins = robot_base_reference + np.asarray(
-                        profile["origin_offset"], dtype=float
-                    )[None, :]
-                    swing_targets = np.stack(
-                        [
-                            _clamp_target_to_reach(
-                                target, origin, profile["max_reach"]
-                            )
-                            for target, origin in zip(
-                                swing_targets, reach_origins
-                            )
-                        ],
-                        axis=0,
-                    )
-                swing_targets, scene_blend = _resolve_swing_targets_against_scene(
-                    swing_targets,
-                    task.tracking_positions,
-                    scene_mesh,
-                    float(
-                        (
-                            end_effector_cfg.get("contact_detection", {}) or {}
-                        ).get("surface_clearance", 0.005)
-                    ),
-                    free_mask=np.asarray(task.contact_modes, dtype=np.uint8)
-                    == int(ContactMode.NONE),
-                )
-                faded = int(np.count_nonzero(scene_blend > 1e-6))
-                if faded:
-                    print(
-                        f"  {name}: {faded}/{len(scene_blend)} scaled swing "
-                        "targets intersected the scene and were faded toward "
-                        "their world reference (max blend "
-                        f"{scene_blend.max():.2f})."
-                    )
-                scene_blends[name] = scene_blend
-            else:
-                scene_blend = np.zeros(len(task.tracking_positions), dtype=float)
-            effective_targets, bridge_alpha = _bridge_swing_to_contact(
-                swing_targets,
-                task.contact_positions,
-                task.contact_modes,
-                task.contact_segment_ids,
-                bridge_frames,
-            )
-            if limb_offsets is not None:
-                # Scene fade is another transition from a relative target to a
-                # world target.  Fold it into the same affine representation
-                # without modifying the source-derived limb vector.
-                bridge_alpha = 1.0 - (
-                    (1.0 - bridge_alpha) * (1.0 - scene_blend)
-                )
-                relative_preview = robot_anchors + limb_offsets
-            else:
-                relative_preview = swing_targets
-            orientation_rotations, orientation_alpha = (
-                _bridge_contact_orientation(
-                    task.forward_directions,
-                    task.up_directions,
-                    task.surface_normals,
-                    task.contact_modes,
-                    task.contact_segment_ids,
-                    bridge_alpha,
-                    orientation_bridge_frames,
-                )
-            )
-            position_sigma_scale, orientation_sigma_scale = (
-                _build_per_frame_sigma_scales(
-                    task.contact_modes,
-                    task.contact_segment_ids,
-                    bridge_alpha,
-                    end_effector_cfg,
-                )
-            )
-            bridge_positions = task.contact_positions.copy()
-            bridged = bridge_alpha > 1e-10
-            bridge_positions[bridged] = (
-                effective_targets[bridged]
-                - (1.0 - bridge_alpha[bridged, None])
-                * relative_preview[bridged]
-            ) / bridge_alpha[bridged, None]
-            result[name] = replace(
-                task,
-                effective_swing_positions=effective_targets,
-                swing_limb_offsets=limb_offsets,
-                swing_anchor_body=swing_anchor_body,
-                swing_anchor_offset=swing_anchor_offset,
-                contact_bridge_alpha=bridge_alpha,
-                contact_bridge_positions=bridge_positions,
-                orientation_target_rotations=orientation_rotations,
-                orientation_bridge_alpha=orientation_alpha,
-                position_sigma_scale=position_sigma_scale,
-                orientation_sigma_scale=orientation_sigma_scale,
-                morphology_scale=scale,
-                robot_base_reference_w=robot_base_reference,
-            )
-        self.last_robot_base_reference_w = robot_base_reference
-        self.last_unwarped_robot_base_reference_w = unwarped
-        self.last_morphology_scales = scales
-        self.last_swing_scene_blends = scene_blends
-        return result
-
     def retarget_motion(
         self,
         smplx_trajectory: np.ndarray,
@@ -985,22 +295,10 @@ class OmniRetargeter:
                 config=end_effector_cfg.get("contact_detection", {}),
             )
             contact_summary = ", ".join(
-                f"{name}="
-                + "/".join(
-                    f"{mode.name}:{int(np.count_nonzero(task.contact_modes == int(mode)))}"
-                    for mode in (ContactMode.TOUCH, ContactMode.SLIDE, ContactMode.SUPPORT)
-                )
-                + f"/{len(task.contact_modes)}f"
+                f"{name}={int(np.count_nonzero(task.contact_mask))}/{len(task.contact_mask)}"
                 for name, task in end_effector_tasks.items()
             )
             print(f"Inferred SMPL-X scene contacts (frames): {contact_summary}")
-            end_effector_tasks = self._prepare_contact_aware_references(
-                processed_trajectory,
-                end_effector_tasks,
-                end_effector_cfg,
-                base_orientations=base_orientations,
-                scene_mesh=scaled_terrain,
-            )
         elif bool(end_effector_cfg.get("enabled", False)):
             print(
                 "Contact-priority optimization requested, but no SMPL-X "
@@ -1023,15 +321,11 @@ class OmniRetargeter:
         retargeted_motion = self._perform_retargeting(
             processed_trajectory, scaled_terrain, **retargeting_kwargs
         )
-        # Keep the framewise result immutable so final acceptance metrics can
-        # reveal how much refinement and any later smoothing changed the motion.
-        pre_refinement_motion = np.asarray(retargeted_motion, dtype=float).copy()
-        self.last_pre_refinement_motion = pre_refinement_motion
         refinement_cfg = dict(
             retargeting_config.get("trajectory_refinement", {}) or {}
         )
-        penetration_cfg = dict(refinement_cfg.get("penetration", {}) or {})
         if bool(refinement_cfg.get("enabled", False)) and end_effector_tasks:
+            penetration_cfg = dict(refinement_cfg.get("penetration", {}) or {})
             report_penetration = bool(penetration_cfg.get("report", True))
             before = (
                 measure_scene_penetration(
@@ -1062,12 +356,6 @@ class OmniRetargeter:
                 ],
                 source_joint_positions=processed_trajectory,
                 source_joint_names=self.smplx_joint_names,
-                active_contact_offset_ids={
-                    name: task.active_contact_offset_ids
-                    for name, task in end_effector_tasks.items()
-                    if task.active_contact_offset_ids is not None
-                },
-                joint_mapping=self.valid_joint_mapping,
             )
             if before is not None:
                 after = measure_scene_penetration(
@@ -1124,6 +412,9 @@ class OmniRetargeter:
             framerate=float(framerate or 30.0),
         )
 
+        if end_effector_tasks:
+            self._report_final_motion_quality(retargeted_motion, end_effector_tasks)
+
         foot_stabilization_cfg = dict(retargeting_config.get("foot_stabilization", {}) or {})
         if end_effector_tasks and bool(foot_stabilization_cfg.get("enabled", False)):
             print(
@@ -1140,38 +431,6 @@ class OmniRetargeter:
                 scaled_terrain,
                 framerate=framerate,
             )
-
-        # Evaluate only after every post-processing stage.  This is the exact
-        # trajectory returned to the caller and catches collision/contact
-        # regressions introduced by either smoothing or legacy foot locking.
-        if hasattr(self, "robot_model"):
-            root_idx = self.smplx_joint_indices.get(
-                self.base_orientation_config.get("root_position", "Spine3"), 0
-            )
-            self.last_evaluation_metrics = evaluate_retargeted_motion(
-                self.robot_model,
-                retargeted_motion,
-                end_effector_tasks,
-                end_effector_cfg,
-                framerate=float(framerate or 30.0),
-                reference_trajectory=pre_refinement_motion,
-                source_root_positions=processed_trajectory[:, root_idx],
-                source_joint_positions=processed_trajectory,
-                source_joint_names=self.smplx_joint_names,
-                scene_mesh=(
-                    scaled_terrain
-                    if bool(penetration_cfg.get("report", True))
-                    else None
-                ),
-                penetration_config=penetration_cfg,
-            )
-        else:
-            # Lightweight unit-test instances may intentionally omit a MuJoCo
-            # model. Preserve the existing mocked retarget_motion contract.
-            self.last_evaluation_metrics = {}
-
-        if end_effector_tasks:
-            self._report_final_motion_quality(retargeted_motion, end_effector_tasks)
 
         return terrain_scale, retargeted_motion
 
@@ -1246,8 +505,10 @@ class OmniRetargeter:
         """Print acceptance metrics for the trajectory that is delivered.
 
         End-effector world-position errors, contact residuals, and temporal
-        jitter are reported separately after every post-processing stage, so
-        the numbers describe the motion actually written to disk.
+        jitter are reported separately and after every post-processing stage,
+        so the numbers describe the motion actually written to disk (scene
+        penetration is reported by the refinement stage against the same
+        trajectory unless smoothing is enabled afterwards).
         """
         end_effector_cfg = dict(
             self.retargeting_config.get("end_effector_priority", {}) or {}
@@ -1257,22 +518,7 @@ class OmniRetargeter:
             return
         data = mujoco.MjData(self.robot_model)
         contact_errors: Dict[str, List[float]] = {name: [] for name in tasks}
-        support_errors: Dict[str, List[float]] = {name: [] for name in tasks}
         swing_errors: Dict[str, List[float]] = {name: [] for name in tasks}
-        swing_anchor_errors: Dict[str, List[float]] = {
-            name: [] for name in tasks
-        }
-        source_swing_errors: Dict[str, List[float]] = {
-            name: [] for name in tasks
-        }
-        source_contact_errors: Dict[str, List[float]] = {
-            name: [] for name in tasks
-        }
-        normal_errors: Dict[str, List[float]] = {name: [] for name in tasks}
-        orientation_errors: Dict[str, List[float]] = {name: [] for name in tasks}
-        support_markers: Dict[str, Dict[int, List[np.ndarray]]] = {
-            name: {} for name in tasks
-        }
         for frame_idx, qpos in enumerate(np.asarray(trajectory, dtype=float)):
             data.qpos[:] = qpos
             mujoco.mj_forward(self.robot_model, data)
@@ -1290,155 +536,42 @@ class OmniRetargeter:
                 tracking_offset = np.asarray(
                     spec.get("tracking_offset", [0.0, 0.0, 0.0]), dtype=float
                 ).reshape(3)
-                mode = ContactMode(int(task.contact_modes[frame_idx]))
-                tracking_marker = (
-                    data.xpos[body_id] + rotation @ tracking_offset
-                )
-                live_swing_target = None
-                if task.swing_limb_offsets is not None:
-                    anchor_body_id = mujoco.mj_name2id(
-                        self.robot_model,
-                        mujoco.mjtObj.mjOBJ_BODY,
-                        str(task.swing_anchor_body),
-                    )
-                    anchor_rotation = data.xmat[anchor_body_id].reshape(3, 3)
-                    anchor_offset = (
-                        np.zeros(3, dtype=float)
-                        if task.swing_anchor_offset is None
-                        else task.swing_anchor_offset
-                    )
-                    live_anchor = (
-                        data.xpos[anchor_body_id]
-                        + anchor_rotation @ anchor_offset
-                    )
-                    limb_target = (
-                        live_anchor + task.swing_limb_offsets[frame_idx]
-                    )
-                    alpha = float(task.contact_bridge_alpha[frame_idx])
-                    live_swing_target = (
-                        (1.0 - alpha) * limb_target
-                        + alpha * task.contact_bridge_positions[frame_idx]
-                    )
-                    swing_anchor_errors[name].append(
-                        float(
-                            np.linalg.norm(
-                                (limb_target - task.swing_limb_offsets[frame_idx])
-                                - live_anchor
-                            )
-                        )
-                    )
-                source_error = float(
-                    np.linalg.norm(
-                        tracking_marker - task.tracking_positions[frame_idx]
-                    )
-                )
-                if mode == ContactMode.NONE:
-                    source_swing_errors[name].append(source_error)
-                else:
-                    source_contact_errors[name].append(source_error)
-                if mode != ContactMode.NONE:
+                if bool(task.contact_mask[frame_idx]):
                     contact_offsets = np.asarray(
                         spec.get("contact_offsets", [tracking_offset.tolist()]),
                         dtype=float,
                     )
                     if contact_offsets.ndim == 1:
                         contact_offsets = contact_offsets[None, :]
-                    offset_id = (
-                        -1
-                        if task.active_contact_offset_ids is None
-                        else int(task.active_contact_offset_ids[frame_idx])
+                    candidates = (
+                        data.xpos[body_id][None, :] + contact_offsets @ rotation.T
                     )
-                    if offset_id < 0 or offset_id >= len(contact_offsets):
-                        offset_id = 0
-                    marker = data.xpos[body_id] + rotation @ contact_offsets[offset_id]
-                    error = float(
-                        np.linalg.norm(marker - task.contact_positions[frame_idx])
-                    )
-                    contact_errors[name].append(error)
-                    if mode == ContactMode.SUPPORT:
-                        support_errors[name].append(error)
-                        segment_id = int(task.contact_segment_ids[frame_idx])
-                        support_markers[name].setdefault(segment_id, []).append(
-                            marker.copy()
-                        )
-
-                    local_rotation = _local_semantic_rotation(
-                        spec.get("orientation_local_forward", [1.0, 0.0, 0.0]),
-                        spec.get("orientation_local_up", [0.0, 0.0, 1.0]),
-                    )
-                    semantic_rotation = rotation @ local_rotation
-                    normal = np.asarray(task.surface_normals[frame_idx], dtype=float)
-                    normal /= max(float(np.linalg.norm(normal)), 1e-10)
-                    normal_errors[name].append(
+                    contact_errors[name].append(
                         float(
-                            np.arccos(
-                                np.clip(
-                                    float(np.dot(semantic_rotation[:, 2], normal)),
-                                    -1.0,
-                                    1.0,
+                            np.min(
+                                np.linalg.norm(
+                                    candidates
+                                    - task.contact_positions[frame_idx][None, :],
+                                    axis=1,
                                 )
                             )
                         )
                     )
-                    target_up = (
-                        normal
-                        if mode in (ContactMode.SUPPORT, ContactMode.SLIDE)
-                        else (
-                            None
-                            if task.up_directions is None
-                            else task.up_directions[frame_idx]
-                        )
-                    )
-                    if task.forward_directions is not None and target_up is not None:
-                        target_up = np.asarray(target_up, dtype=float)
-                        target_up /= max(float(np.linalg.norm(target_up)), 1e-10)
-                        target_forward = np.asarray(
-                            task.forward_directions[frame_idx], dtype=float
-                        ).copy()
-                        target_forward -= target_up * float(
-                            np.dot(target_forward, target_up)
-                        )
-                        target_forward /= max(
-                            float(np.linalg.norm(target_forward)), 1e-10
-                        )
-                        forward_error = np.arccos(
-                            np.clip(
-                                float(np.dot(semantic_rotation[:, 0], target_forward)),
-                                -1.0,
-                                1.0,
-                            )
-                        )
-                        up_error = np.arccos(
-                            np.clip(
-                                float(np.dot(semantic_rotation[:, 2], target_up)),
-                                -1.0,
-                                1.0,
-                            )
-                        )
-                        orientation_errors[name].append(float(max(forward_error, up_error)))
                 else:
-                    marker = tracking_marker
-                    if task.effective_swing_positions is None:
-                        raise RuntimeError(
-                            f"{name}: effective swing targets were not prepared."
-                        )
-                    swing_target = (
-                        task.effective_swing_positions[frame_idx]
-                        if live_swing_target is None
-                        else live_swing_target
-                    )
+                    marker = data.xpos[body_id] + rotation @ tracking_offset
                     swing_errors[name].append(
-                        float(np.linalg.norm(marker - swing_target))
+                        float(
+                            np.linalg.norm(
+                                marker - task.tracking_positions[frame_idx]
+                            )
+                        )
                     )
         print("Final motion quality (after all post-processing):")
         for name in tasks:
             parts = []
             for label, errors in (
                 ("contact", contact_errors[name]),
-                ("support", support_errors[name]),
-                ("source_contact", source_contact_errors[name]),
-                ("source_swing", source_swing_errors[name]),
-                ("effective_swing", swing_errors[name]),
+                ("swing", swing_errors[name]),
             ):
                 if errors:
                     values = np.asarray(errors) * 100.0
@@ -1449,125 +582,16 @@ class OmniRetargeter:
                     )
                 else:
                     parts.append(f"{label}[0f]")
-            slip_values = []
-            for segment_id, markers in support_markers[name].items():
-                points = np.asarray(markers, dtype=float)
-                frames = np.flatnonzero(
-                    tasks[name].contact_segment_ids == segment_id
-                )
-                normal = np.median(tasks[name].surface_normals[frames], axis=0)
-                normal /= max(float(np.linalg.norm(normal)), 1e-10)
-                delta = points - points[0]
-                tangential = delta - np.outer(delta @ normal, normal)
-                slip_values.append(float(np.max(np.linalg.norm(tangential, axis=1))))
-            if slip_values:
-                parts.append(f"support_slip_max={max(slip_values) * 100.0:.2f} cm")
-            if swing_anchor_errors[name]:
-                parts.append(
-                    "live_anchor_err_max="
-                    f"{max(swing_anchor_errors[name]) * 100.0:.6f} cm"
-                )
-            if normal_errors[name]:
-                parts.append(
-                    "normal_err="
-                    f"{np.rad2deg(np.mean(normal_errors[name])):.1f}/"
-                    f"{np.rad2deg(np.max(normal_errors[name])):.1f} deg mean/max"
-                )
-            if orientation_errors[name]:
-                parts.append(
-                    "palm/sole_err="
-                    f"{np.rad2deg(np.mean(orientation_errors[name])):.1f}/"
-                    f"{np.rad2deg(np.max(orientation_errors[name])):.1f} deg mean/max"
-                )
-            in_contact = (
-                np.asarray(tasks[name].contact_modes, dtype=np.uint8)
-                != int(ContactMode.NONE)
-            )
-            onset_frames = np.flatnonzero(
-                in_contact & ~np.r_[False, in_contact[:-1]]
-            )
-            release_frames = np.flatnonzero(
-                in_contact & ~np.r_[in_contact[1:], False]
-            )
-            parts.append(
-                "timing_offset=0f "
-                f"onset={onset_frames.tolist()} release={release_frames.tolist()}"
-            )
             print(f"  {name}: " + " | ".join(parts))
-        final_metrics = getattr(self, "last_evaluation_metrics", {})
-        penetration = final_metrics.get("penetration")
-        if penetration:
-            print(
-                "  final scene penetration: "
-                f"mean={penetration['mean_depth'] * 100.0:.2f} cm, "
-                f"p95={penetration.get('p95_depth', 0.0) * 100.0:.2f} cm, "
-                f"max={penetration['max_depth'] * 100.0:.2f} cm, "
-                f"frames={penetration['frames_penetrating']}/"
-                f"{penetration['num_frames']}, "
-                f"samples={penetration.get('total_penetrating_samples', 0)}, "
-                f"bodies={penetration.get('penetrating_body_count', 0)}, "
-                f"worst={penetration['worst_body']}@"
-                f"{penetration['worst_frame']}"
-            )
-        deviation = final_metrics.get("deviation_from_pre_refinement")
-        if deviation:
-            joint_delta = deviation["joint_absolute_rad"]
-            body_delta = deviation["whole_body_root_relative_m"]
-            print(
-                "  deviation from pre-refinement: "
-                f"joint mean/p95/max={joint_delta['mean']:.4f}/"
-                f"{joint_delta['p95']:.4f}/{joint_delta['max']:.4f} rad, "
-                f"whole-body mean/p95/max={body_delta['mean'] * 100.0:.2f}/"
-                f"{body_delta['p95'] * 100.0:.2f}/"
-                f"{body_delta['max'] * 100.0:.2f} cm"
-            )
-        for arm_name, arm_metrics in final_metrics.get(
-            "arm_pose_fidelity", {}
-        ).items():
-            parts = []
-            for label, key in (
-                ("upper", "upper_arm_direction_error_rad"),
-                ("fore", "forearm_direction_error_rad"),
-                ("bend_plane", "elbow_bend_plane_error_rad"),
-                ("flex_diff", "elbow_flexion_difference_rad"),
-            ):
-                values = arm_metrics[key]
-                parts.append(
-                    f"{label}={np.rad2deg(values['mean']):.1f}/"
-                    f"{np.rad2deg(values['p95']):.1f}/"
-                    f"{np.rad2deg(values['max']):.1f} deg"
-                )
-            robot_flexion = arm_metrics["robot_elbow_flexion_rad"]
-            source_flexion = arm_metrics["source_elbow_flexion_rad"]
-            parts.append(
-                "flex_robot/source_mean="
-                f"{np.rad2deg(robot_flexion['mean']):.1f}/"
-                f"{np.rad2deg(source_flexion['mean']):.1f} deg"
-            )
-            print(f"  {arm_name} pose: " + " | ".join(parts))
-        base_reference = getattr(self, "last_robot_base_reference_w", None)
-        unwarped_reference = getattr(
-            self, "last_unwarped_robot_base_reference_w", None
-        )
-        if base_reference is not None and unwarped_reference is not None:
-            warp = np.linalg.norm(base_reference - unwarped_reference, axis=1)
-            print(
-                "  robot root warp: "
-                f"mean={warp.mean() * 100.0:.2f} cm, "
-                f"p95={np.percentile(warp, 95) * 100.0:.2f} cm, "
-                f"max={warp.max() * 100.0:.2f} cm"
-            )
         actuated = np.asarray(trajectory, dtype=float)[:, 7:]
         if len(actuated) >= 4 and actuated.shape[1] > 0:
-            velocity = np.diff(actuated, axis=0)
             acceleration = np.diff(actuated, n=2, axis=0)
             jerk = np.diff(actuated, n=3, axis=0)
             base_acceleration = np.diff(
                 np.asarray(trajectory, dtype=float)[:, :3], n=2, axis=0
             )
             print(
-                "  temporal jitter: joint "
-                f"|vel| rms={np.sqrt(np.mean(velocity**2)):.5f} rad/frame, "
+                "  temporal jitter: joint |acc| "
                 f"rms={np.sqrt(np.mean(acceleration**2)):.5f} "
                 f"max={np.max(np.abs(acceleration)):.4f} rad/frame^2, "
                 f"|jerk| rms={np.sqrt(np.mean(jerk**2)):.5f}, "
@@ -1688,10 +712,6 @@ class OmniRetargeter:
         """Perform the actual motion retargeting using generic interaction mesh retargeting."""
         from .retargeting import GenericInteractionRetargeter
 
-        base_quaternions_wxyz = _base_quaternions_wxyz(
-            base_orientations, len(processed_trajectory)
-        )
-
         # Create retargeter instance
         # Note: scaled_terrain is already scaled by _scale_terrain_mesh
         # CRITICAL: Pass only valid_joint_mapping to ensure consistent sizes
@@ -1741,10 +761,6 @@ class OmniRetargeter:
         root_position_idx = getattr(self, "smplx_joint_indices", {}).get(
             root_position_name, 0
         )
-        active_contact_offset_ids = {
-            name: np.full(len(processed_trajectory), -1, dtype=np.int32)
-            for name in (end_effector_tasks or {})
-        }
         
         # Initial height: Use processed (scaled) trajectory root height or default
         # Assuming joint 0 is root
@@ -1754,26 +770,22 @@ class OmniRetargeter:
         else:
             q_init[2] = self.robot_height * 0.5  # Default height (Z coordinate)
 
-        self._last_estimated_quat = None
         for frame_idx, human_joints in enumerate(processed_trajectory):
             # Only initialize base from SMPLX for the first frame
             # For subsequent frames, the optimization will handle base movement
             if frame_idx == 0:
                 # Initialize base position from SMPLX root
-                robot_base_reference = getattr(
-                    self, "last_robot_base_reference_w", None
-                )
-                if end_effector_tasks and robot_base_reference is not None:
-                    q_init[:3] = robot_base_reference[frame_idx]
-                elif base_translations is not None:
+                if base_translations is not None:
                     q_init[:3] = base_translations[frame_idx]
                 else:
                     # Use the configured root position as initial guess
                     q_init[:3] = human_joints[root_position_idx]
 
                 # Initialize base orientation
-                if base_quaternions_wxyz is not None:
-                    q_init[3:7] = base_quaternions_wxyz[frame_idx]
+                if base_orientations is not None:
+                    root_rotvec = base_orientations[frame_idx]
+                    quat_xyzw = Rotation.from_rotvec(root_rotvec).as_quat()
+                    q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
                 else:
                     quat_xyzw = self._estimate_base_orientation_from_joints(human_joints)
                     if quat_xyzw is not None:
@@ -1854,16 +866,11 @@ class OmniRetargeter:
                 # Better to store the previous estimated xyzw.
                 pass
                 
-            # Prefer the captured SMPL-X root rotation when available.  Joint-
-            # position reconstruction remains a source-neutral fallback for
-            # position-only inputs.
-            if base_quaternions_wxyz is not None:
-                target_quat_wxyz = base_quaternions_wxyz[frame_idx]
-                target_quat_xyzw = target_quat_wxyz[[1, 2, 3, 0]]
-            else:
-                target_quat_xyzw = self._estimate_base_orientation_from_joints(
-                    human_joints, self._last_estimated_quat
-                )
+            # We need to maintain state of estimated quaternion to ensure continuity
+            if not hasattr(self, '_last_estimated_quat'):
+                self._last_estimated_quat = None
+                
+            target_quat_xyzw = self._estimate_base_orientation_from_joints(human_joints, self._last_estimated_quat)
             self._last_estimated_quat = target_quat_xyzw
             
             target_quat_wxyz = None
@@ -1871,16 +878,6 @@ class OmniRetargeter:
                 # Convert xyzw to wxyz for MuJoCo
                 target_quat_wxyz = np.array([target_quat_xyzw[3], target_quat_xyzw[0], 
                                             target_quat_xyzw[1], target_quat_xyzw[2]])
-
-            if (
-                target_quat_wxyz is not None
-                and bool(
-                    self.retargeting_config.get(
-                        "end_effector_priority", {}
-                    ).get("lock_base_orientation", False)
-                )
-            ):
-                q_init[3:7] = target_quat_wxyz
 
             # Retarget frame with previous frame as reference for smoothness
             q_last = retargeted_trajectory[-1] if len(retargeted_trajectory) > 0 else None
@@ -1896,17 +893,15 @@ class OmniRetargeter:
                     or {}
                 )
                 if bool(base_position_cfg.get("enabled", False)):
-                    robot_base_reference = getattr(
-                        self, "last_robot_base_reference_w", None
-                    )
-                    frame_kwargs["target_base_position"] = (
-                        robot_base_reference[frame_idx]
-                        if robot_base_reference is not None
-                        else human_joints[root_position_idx]
-                    )
+                    frame_kwargs["target_base_position"] = human_joints[
+                        root_position_idx
+                    ]
                 frame_kwargs["end_effector_targets"] = {}
                 for name, task in end_effector_tasks.items():
                     target_payload = task.frame(frame_idx)
+                    target_payload["source_root_position"] = human_joints[
+                        root_position_idx
+                    ]
                     frame_kwargs["end_effector_targets"][name] = target_payload
                 frame_kwargs["q_prev"] = (
                     retargeted_trajectory[-2]
@@ -1932,23 +927,10 @@ class OmniRetargeter:
             if preserve_root_z:
                 q_opt[2] = q_init[2]
             retargeted_trajectory.append(q_opt)
-            if end_effector_tasks:
-                for name, task in end_effector_tasks.items():
-                    if task.contact_modes[frame_idx] != int(ContactMode.NONE):
-                        offset_id = retargeter._active_contact_offsets.get(name)
-                        if offset_id is not None:
-                            active_contact_offset_ids[name][frame_idx] = int(offset_id)
 
             # Update initial guess for next frame (smooth trajectory)
             q_init = q_opt.copy()
 
-        if end_effector_tasks:
-            for name, task in list(end_effector_tasks.items()):
-                end_effector_tasks[name] = replace(
-                    task,
-                    active_contact_offset_ids=active_contact_offset_ids[name],
-                )
-            self.last_end_effector_tasks = end_effector_tasks
         return np.array(retargeted_trajectory)
 
     def _estimate_base_orientation_from_joints(self, joints: np.ndarray, last_quat: np.ndarray | None = None) -> np.ndarray | None:
@@ -2313,11 +1295,7 @@ class OmniRetargeter:
 
     def _collect_body_contact_points(self, body_id: int) -> np.ndarray:
         """Collect representative support points for a foot body in body coordinates."""
-        geom_ids = [
-            int(geom_id)
-            for geom_id in collision_geom_ids(self.robot_model)
-            if int(self.robot_model.geom_bodyid[geom_id]) == body_id
-        ]
+        geom_ids = [geom_id for geom_id in range(self.robot_model.ngeom) if int(self.robot_model.geom_bodyid[geom_id]) == body_id]
         if not geom_ids:
             return np.zeros((0, 3), dtype=float)
 
@@ -2335,8 +1313,75 @@ class OmniRetargeter:
         return np.vstack(points)
 
     def _sample_geom_points_in_body_frame(self, geom_id: int) -> np.ndarray:
-        """Return the shared collision-shell samples in the owning body frame."""
-        return geom_surface_points_in_body_frame(self.robot_model, geom_id)
+        """Sample support candidate points for one geom in the owning body frame."""
+        geom_type = int(self.robot_model.geom_type[geom_id])
+        size = np.asarray(self.robot_model.geom_size[geom_id], dtype=float)
+
+        if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
+            mesh_id = int(self.robot_model.geom_dataid[geom_id])
+            if mesh_id < 0:
+                points_local = np.zeros((1, 3), dtype=float)
+            else:
+                vert_start = int(self.robot_model.mesh_vertadr[mesh_id])
+                vert_count = int(self.robot_model.mesh_vertnum[mesh_id])
+                points_local = np.asarray(
+                    self.robot_model.mesh_vert[vert_start : vert_start + vert_count],
+                    dtype=float,
+                )
+        elif geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+            radius = size[0]
+            points_local = np.array([
+                [0.0, 0.0, -radius],
+                [0.0, 0.0, radius],
+                [radius, 0.0, 0.0],
+                [-radius, 0.0, 0.0],
+                [0.0, radius, 0.0],
+                [0.0, -radius, 0.0],
+            ])
+        elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+            hx, hy, hz = size
+            corners = []
+            for sx in (-hx, hx):
+                for sy in (-hy, hy):
+                    for sz in (-hz, hz):
+                        corners.append([sx, sy, sz])
+            corners.extend([[0.0, 0.0, -hz], [0.0, 0.0, hz]])
+            points_local = np.asarray(corners, dtype=float)
+        elif geom_type in (mujoco.mjtGeom.mjGEOM_CYLINDER, mujoco.mjtGeom.mjGEOM_CAPSULE):
+            radius = size[0]
+            half_length = size[1]
+            theta = np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False)
+            rings = []
+            for z in (-half_length, 0.0, half_length):
+                ring = np.column_stack([
+                    radius * np.cos(theta),
+                    radius * np.sin(theta),
+                    np.full_like(theta, z),
+                ])
+                rings.append(ring)
+            endpoints = np.array([[0.0, 0.0, -half_length], [0.0, 0.0, half_length]], dtype=float)
+            if geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+                endpoints = np.vstack([endpoints, [[0.0, 0.0, -half_length - radius], [0.0, 0.0, half_length + radius]]])
+            points_local = np.vstack(rings + [endpoints])
+        elif geom_type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
+            rx, ry, rz = size
+            points_local = np.array([
+                [0.0, 0.0, -rz],
+                [0.0, 0.0, rz],
+                [rx, 0.0, 0.0],
+                [-rx, 0.0, 0.0],
+                [0.0, ry, 0.0],
+                [0.0, -ry, 0.0],
+            ])
+        else:
+            points_local = np.zeros((1, 3), dtype=float)
+
+        geom_pos = np.asarray(self.robot_model.geom_pos[geom_id], dtype=float)
+        geom_quat = np.asarray(self.robot_model.geom_quat[geom_id], dtype=float)
+        geom_quat_xyzw = np.array([geom_quat[1], geom_quat[2], geom_quat[3], geom_quat[0]], dtype=float)
+        geom_rot = Rotation.from_quat(geom_quat_xyzw).as_matrix()
+
+        return points_local @ geom_rot.T + geom_pos
 
     def _select_collision_probe_points(self, sample_points: np.ndarray) -> np.ndarray:
         """Reduce dense foot samples to a compact set of boundary probes for collision checks."""

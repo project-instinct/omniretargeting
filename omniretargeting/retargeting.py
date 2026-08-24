@@ -9,11 +9,9 @@ from scipy import sparse as sp
 from scipy.spatial import Delaunay
 from scipy.spatial.transform import Rotation
 import trimesh
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 from pathlib import Path
 import yourdfpy
-
-from .contact import ContactMode
 
 from .utils import (
     load_terrain_mesh,
@@ -28,415 +26,28 @@ from .utils import (
 )
 
 
-_PRIORITY_FAMILIES = frozenset(
-    {
-        "support",
-        "contact",
-        "swing",
-        "orientation",
-        "pose_direction",
-        "interaction",
-        "regularization",
-    }
-)
-
-_DEFAULT_PRIORITY_LEVELS = (
-    {
-        "name": "support-contact",
-        "families": ("support",),
-        "relative_tolerance": 0.005,
-        "absolute_tolerance": 0.02,
-    },
-    {
-        "name": "contact",
-        "families": ("contact",),
-        "relative_tolerance": 0.01,
-        "absolute_tolerance": 0.04,
-    },
-    {
-        "name": "swing",
-        "families": ("swing",),
-        "relative_tolerance": 0.01,
-        "absolute_tolerance": 0.04,
-    },
-    {
-        "name": "end-effector-orientation",
-        "families": ("orientation",),
-        "relative_tolerance": 0.01,
-        "absolute_tolerance": 0.04,
-    },
-    {
-        "name": "pose-direction",
-        "families": ("pose_direction",),
-        "relative_tolerance": 0.02,
-        "absolute_tolerance": 0.04,
-    },
-    {
-        "name": "whole-body-interaction",
-        "families": ("interaction",),
-        "relative_tolerance": 0.02,
-        "absolute_tolerance": 0.05,
-    },
-    {
-        "name": "regularization",
-        "families": ("regularization",),
-        "relative_tolerance": 0.01,
-        "absolute_tolerance": 0.04,
-    },
-)
-
-
-def _swivel_direction_and_jacobian(
-    shoulder: np.ndarray,
-    elbow: np.ndarray,
-    wrist: np.ndarray,
-    shoulder_jacobian: np.ndarray | None = None,
-    elbow_jacobian: np.ndarray | None = None,
-    wrist_jacobian: np.ndarray | None = None,
-    *,
-    min_sine: float = 0.05,
-    full_sine: float = 0.35,
-) -> tuple[np.ndarray, np.ndarray | None, float, float, np.ndarray]:
-    """Return morphology-invariant elbow bend direction and its Jacobian.
-
-    The bend direction is the shoulder-to-elbow vector rejected from the
-    shoulder-to-wrist axis.  Its weight fades smoothly to zero as either arm
-    segment becomes collinear, where swivel is physically undefined and the
-    normalized rejection Jacobian would otherwise become singular.
-    """
-    shoulder = np.asarray(shoulder, dtype=float).reshape(3)
-    elbow = np.asarray(elbow, dtype=float).reshape(3)
-    wrist = np.asarray(wrist, dtype=float).reshape(3)
-    upper = elbow - shoulder
-    forearm = wrist - elbow
-    chord = wrist - shoulder
-    upper_length = float(np.linalg.norm(upper))
-    forearm_length = float(np.linalg.norm(forearm))
-    chord_length = float(np.linalg.norm(chord))
-    jacobians = (shoulder_jacobian, elbow_jacobian, wrist_jacobian)
-    if any(jacobian is not None for jacobian in jacobians) and any(
-        jacobian is None for jacobian in jacobians
-    ):
-        raise ValueError(
-            "shoulder, elbow, and wrist Jacobians must be supplied together."
-        )
-    result_jacobian = None
-    if shoulder_jacobian is not None:
-        shoulder_jacobian = np.asarray(shoulder_jacobian, dtype=float)
-        elbow_jacobian = np.asarray(elbow_jacobian, dtype=float)
-        wrist_jacobian = np.asarray(wrist_jacobian, dtype=float)
-        if not (
-            shoulder_jacobian.shape == elbow_jacobian.shape
-            == wrist_jacobian.shape
-            and shoulder_jacobian.shape[0] == 3
-        ):
-            raise ValueError("swivel point Jacobians must share shape (3, N).")
-        result_jacobian = np.zeros_like(shoulder_jacobian)
-
-    zero_direction = np.zeros(3, dtype=float)
-    zero_axis = np.zeros(3, dtype=float)
-    if min(upper_length, forearm_length, chord_length) < 1e-10:
-        return zero_direction, result_jacobian, 0.0, 0.0, zero_axis
-
-    upper_direction = upper / upper_length
-    forearm_direction = forearm / forearm_length
-    flexion_sine = float(
-        np.linalg.norm(np.cross(upper_direction, forearm_direction))
-    )
-    fade_start = max(float(min_sine), 0.0)
-    fade_end = max(float(full_sine), fade_start + 1e-8)
-    fade_coordinate = float(
-        np.clip(
-            (flexion_sine - fade_start) / (fade_end - fade_start),
-            0.0,
-            1.0,
-        )
-    )
-    fade = fade_coordinate**2 * (3.0 - 2.0 * fade_coordinate)
-
-    axis = chord / chord_length
-    axis_projection = np.eye(3) - np.outer(axis, axis)
-    rejection = axis_projection @ upper
-    rejection_length = float(np.linalg.norm(rejection))
-    if rejection_length < 1e-10:
-        return zero_direction, result_jacobian, 0.0, flexion_sine, axis
-    bend_direction = rejection / rejection_length
-
-    if result_jacobian is not None:
-        if fade <= 0.0:
-            return (
-                bend_direction,
-                result_jacobian,
-                0.0,
-                flexion_sine,
-                axis,
-            )
-        chord_jacobian = wrist_jacobian - shoulder_jacobian
-        upper_jacobian = elbow_jacobian - shoulder_jacobian
-        axis_jacobian = axis_projection @ chord_jacobian / chord_length
-        axial_upper = float(np.dot(axis, upper))
-        rejection_jacobian = (
-            axis_projection @ upper_jacobian
-            - (axial_upper * np.eye(3) + np.outer(axis, upper))
-            @ axis_jacobian
-        )
-        bend_projection = np.eye(3) - np.outer(
-            bend_direction, bend_direction
-        )
-        result_jacobian = (
-            bend_projection @ rejection_jacobian / rejection_length
-        )
-    return bend_direction, result_jacobian, fade, flexion_sine, axis
-
-
-def _swivel_tangent_delta(
-    current_direction: np.ndarray,
-    target_direction: np.ndarray,
-    current_axis: np.ndarray,
-) -> np.ndarray:
-    """Return the S2 logarithm taking the current bend toward the target."""
-    current = np.asarray(current_direction, dtype=float).reshape(3)
-    target = np.asarray(target_direction, dtype=float).reshape(3)
-    current_norm = float(np.linalg.norm(current))
-    target_norm = float(np.linalg.norm(target))
-    if current_norm < 1e-10 or target_norm < 1e-10:
-        return np.zeros(3, dtype=float)
-    current /= current_norm
-    target /= target_norm
-    cosine = float(np.clip(np.dot(current, target), -1.0, 1.0))
-    angle = float(np.arccos(cosine))
-    tangent = target - cosine * current
-    tangent_norm = float(np.linalg.norm(tangent))
-    if tangent_norm < 1e-8:
-        if cosine > 0.0:
-            return np.zeros(3, dtype=float)
-        axis = np.asarray(current_axis, dtype=float).reshape(3)
-        tangent = np.cross(axis, current)
-        tangent_norm = float(np.linalg.norm(tangent))
-        if tangent_norm < 1e-8:
-            return np.zeros(3, dtype=float)
-    return angle * tangent / tangent_norm
-
-
-def _resolve_priority_levels(config: Mapping[str, Any]) -> Tuple[Dict[str, Any], ...]:
-    """Validate and normalize the configured lexicographic grouping."""
-    raw_levels = config.get("priority_levels")
-    if raw_levels is None:
-        raw_levels = _DEFAULT_PRIORITY_LEVELS
-    if not isinstance(raw_levels, (list, tuple)) or not raw_levels:
-        raise ValueError("end_effector_priority.priority_levels must be a non-empty list.")
-
-    default_relative = max(float(config.get("priority_relative_tolerance", 0.01)), 0.0)
-    default_absolute = max(float(config.get("priority_absolute_tolerance", 0.04)), 0.0)
-    normalized: List[Dict[str, Any]] = []
-    seen_names: set[str] = set()
-    seen_families: set[str] = set()
-    for level_index, raw_level in enumerate(raw_levels):
-        if not isinstance(raw_level, Mapping):
-            raise ValueError(
-                "Each end_effector_priority.priority_levels entry must be an object."
-            )
-        name = str(raw_level.get("name", f"level-{level_index + 1}")).strip()
-        if not name:
-            raise ValueError("Priority level names must be non-empty.")
-        if name in seen_names:
-            raise ValueError(f"Duplicate priority level name '{name}'.")
-        seen_names.add(name)
-
-        raw_families = raw_level.get("families")
-        if not isinstance(raw_families, (list, tuple)) or not raw_families:
-            raise ValueError(f"Priority level '{name}' must name at least one family.")
-        families = tuple(str(family) for family in raw_families)
-        unknown = set(families) - _PRIORITY_FAMILIES
-        if unknown:
-            raise ValueError(
-                f"Priority level '{name}' contains unknown families: {sorted(unknown)}."
-            )
-        duplicates = seen_families.intersection(families)
-        if duplicates:
-            raise ValueError(
-                "Each priority family must appear exactly once; repeated: "
-                f"{sorted(duplicates)}."
-            )
-        if len(set(families)) != len(families):
-            raise ValueError(f"Priority level '{name}' repeats a family.")
-        seen_families.update(families)
-        normalized.append(
-            {
-                "name": name,
-                "families": families,
-                "relative_tolerance": max(
-                    float(raw_level.get("relative_tolerance", default_relative)), 0.0
-                ),
-                "absolute_tolerance": max(
-                    float(raw_level.get("absolute_tolerance", default_absolute)), 0.0
-                ),
-            }
-        )
-
-    missing = _PRIORITY_FAMILIES - seen_families
-    if missing:
-        raise ValueError(
-            "end_effector_priority.priority_levels must assign every priority "
-            f"family exactly once; missing: {sorted(missing)}."
-        )
-    return tuple(normalized)
-
-
-def _priority_level_metric(
-    families: Sequence[str],
-    residuals: Mapping[str, Optional[cp.Expression]],
-    regularization_obj: cp.Expression,
-) -> Tuple[Optional[cp.Expression], bool]:
-    """Return a group's convex metric and whether it already regularizes ``dqa``."""
-    active_residuals = [
-        residuals[family]
-        for family in families
-        if family != "regularization" and residuals.get(family) is not None
-    ]
-    includes_regularization = "regularization" in families
-    if includes_regularization:
-        metric = regularization_obj
-        for residual in active_residuals:
-            metric += cp.sum_squares(residual)
-        return metric, True
-    if not active_residuals:
-        return None, False
-    return cp.norm(cp.hstack(active_residuals), 2), False
-
-
-def _solve_configured_priority_levels(
-    dqa: cp.Variable,
-    constraints: Sequence[cp.Constraint],
-    residuals: Mapping[str, Optional[cp.Expression]],
-    regularization_obj: cp.Expression,
-    config: Mapping[str, Any],
-    solve_problem: Callable[[cp.Expression, str, Sequence[cp.Constraint]], cp.Problem],
-) -> Tuple[Optional[cp.Problem], Tuple[str, ...]]:
-    """Solve and bound each active configured lexicographic level in order."""
-    tie_break = max(float(config.get("tie_break_regularization", 1e-8)), 0.0)
-    active_levels: List[Tuple[Dict[str, Any], cp.Expression, bool]] = []
-    for level in _resolve_priority_levels(config):
-        metric, includes_regularization = _priority_level_metric(
-            level["families"], residuals, regularization_obj
-        )
-        if metric is not None:
-            active_levels.append((level, metric, includes_regularization))
-
-    active_constraints = list(constraints)
-    solved_names: List[str] = []
-    problem: Optional[cp.Problem] = None
-    for level_index, (level, metric, includes_regularization) in enumerate(active_levels):
-        objective = metric
-        if not includes_regularization and tie_break > 0.0:
-            objective = objective + tie_break * cp.sum_squares(dqa)
-        problem = solve_problem(objective, level["name"], active_constraints)
-        solved_names.append(level["name"])
-        if problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-            return problem, tuple(solved_names)
-        if level_index + 1 < len(active_levels):
-            optimum = max(float(metric.value), 0.0)
-            active_constraints.append(
-                metric
-                <= (1.0 + float(level["relative_tolerance"])) * optimum
-                + float(level["absolute_tolerance"])
-            )
-    return problem, tuple(solved_names)
-
-
-def _build_base_orientation_task(
-    dqa: cp.Variable,
-    angular_jacobian: np.ndarray,
-    rotation_error: np.ndarray,
-    config: Mapping[str, Any],
-) -> Tuple[Optional[cp.Expression], List[cp.Constraint]]:
-    """Build the dimensionless torso-frame residual and optional hard cone."""
-    if not bool(config.get("enabled", False)):
-        return None, []
-    max_error = max(
-        float(config.get("max_orientation_error", np.deg2rad(8.6))),
-        1e-6,
-    )
-    linearized_error = (
-        np.asarray(angular_jacobian, dtype=float) @ dqa
-        - np.asarray(rotation_error, dtype=float).reshape(3)
-    )
-    weight = max(float(config.get("weight", 1.0)), 0.0)
-    residual = np.sqrt(weight) * linearized_error / max_error
-    constraints: List[cp.Constraint] = []
-    if bool(config.get("hard_constraints", True)):
-        constraints.append(cp.norm(linearized_error, 2) <= max_error)
-    return residual, constraints
-
-
-#: Swing target spaces understood by every stage of the solver.
-#:
-#: ``world``
-#:     Track the registered SMPL-X world point unchanged.  Correct whenever
-#:     the effector position is itself the interaction (feet on the terrain).
-#: ``root_morphology_scaled``
-#:     Scale the source point about the root/base anchor pair.
-#: ``limb_morphology_scaled``
-#:     Scale the source point about the limb-base anchor pair (shoulder for a
-#:     hand, hip for a foot).  This keeps the free-space limb *direction*
-#:     identical to the source and only shortens it by the morphology ratio,
-#:     which the root anchor cannot do when the robot torso and the human
-#:     torso place their shoulders at different heights.
-SWING_TARGET_SPACES = (
-    "world",
-    "root_morphology_scaled",
-    "limb_morphology_scaled",
-)
-
-#: Morphology-scaled spaces share one formula and differ only in the anchor
-#: pair the caller supplies.
-MORPHOLOGY_SWING_TARGET_SPACES = (
-    "root_morphology_scaled",
-    "limb_morphology_scaled",
-)
-
-
-def _validate_swing_target_space(name: str, swing_target_space: str) -> str:
-    """Normalise and validate one configured swing target space."""
-    target_space = str(swing_target_space).lower()
-    if target_space not in SWING_TARGET_SPACES:
-        raise ValueError(
-            f"End-effector '{name}' swing_target_space must be one of "
-            + ", ".join(repr(space) for space in SWING_TARGET_SPACES)
-            + f", got {swing_target_space!r}."
-        )
-    return target_space
-
-
 def _transform_swing_target(
     tracking_position: np.ndarray,
-    source_anchor_position: np.ndarray,
-    robot_anchor_position: np.ndarray,
+    source_root_position: np.ndarray | None,
+    robot_root_z_offset: float,
     morphology_scale: float,
-    swing_target_space: str,
+    preserve_world_target: bool = False,
 ) -> np.ndarray:
-    """Map a human swing point into the configured robot target space.
+    """Express a source end-effector target around the robot root target.
 
-    The two morphology-scaled spaces share this formula; the caller decides
-    which anchor pair to pass.  ``root_morphology_scaled`` supplies the source
-    root and the robot base reference, ``limb_morphology_scaled`` supplies the
-    source limb base (shoulder/hip) and its robot counterpart.
+    The root-height offset is a world-space registration correction and must
+    therefore be applied even when ``morphology_scale`` is exactly one.  The
+    previous implementation skipped the entire transform at unit scale, which
+    left swing hands and feet at the human actor's height after the shorter
+    robot root had been moved down.
     """
-    target_space = str(swing_target_space).lower()
     target = np.asarray(tracking_position, dtype=float).reshape(3)
-    if target_space == "world":
-        # The registered source is already a valid metric-world reference.
-        # Reachability is handled as optimizer residual, not by moving it.
+    if preserve_world_target or source_root_position is None:
         return target.copy()
-    if target_space not in MORPHOLOGY_SWING_TARGET_SPACES:
-        raise ValueError(
-            "swing_target_space must be one of "
-            + ", ".join(repr(space) for space in SWING_TARGET_SPACES)
-            + f", got {swing_target_space!r}."
-        )
-    source_anchor = np.asarray(source_anchor_position, dtype=float).reshape(3)
-    robot_anchor = np.asarray(robot_anchor_position, dtype=float).reshape(3)
-    return robot_anchor + float(morphology_scale) * (target - source_anchor)
+    source_root = np.asarray(source_root_position, dtype=float).reshape(3)
+    robot_root_target = source_root.copy()
+    robot_root_target[2] += float(robot_root_z_offset)
+    return robot_root_target + float(morphology_scale) * (target - source_root)
 
 
 def _clamp_target_to_reach(
@@ -460,346 +71,6 @@ def _clamp_target_to_reach(
     if distance <= float(max_reach) or distance <= 1e-10:
         return result
     return origin + delta * (float(max_reach) / distance)
-
-
-def _minimum_jerk_blend(value: np.ndarray | float) -> np.ndarray | float:
-    """Quintic blend with zero velocity and acceleration at both ends."""
-    value = np.clip(value, 0.0, 1.0)
-    return value**3 * (10.0 - 15.0 * value + 6.0 * value**2)
-
-
-def _orthonormal_target_rotation(
-    forward_direction: np.ndarray | None,
-    up_direction: np.ndarray | None,
-) -> np.ndarray | None:
-    """Return the right-handed forward/lateral/up frame, or ``None``.
-
-    The up direction wins: the forward direction is only used for the residual
-    heading inside the plane it spans.  Callers must treat ``None`` as "this
-    frame carries no usable orientation reference".
-    """
-    if forward_direction is None or up_direction is None:
-        return None
-    forward = np.asarray(forward_direction, dtype=float).reshape(3).copy()
-    up = np.asarray(up_direction, dtype=float).reshape(3).copy()
-    if not np.all(np.isfinite(forward)) or not np.all(np.isfinite(up)):
-        return None
-    up_norm = float(np.linalg.norm(up))
-    if up_norm < 1e-10:
-        return None
-    up /= up_norm
-    forward -= up * float(np.dot(up, forward))
-    forward_norm = float(np.linalg.norm(forward))
-    if forward_norm < 1e-10:
-        return None
-    forward /= forward_norm
-    lateral = np.cross(up, forward)
-    lateral_norm = float(np.linalg.norm(lateral))
-    if lateral_norm < 1e-10:
-        return None
-    lateral /= lateral_norm
-    forward = np.cross(lateral, up)
-    return np.column_stack([forward, lateral, up])
-
-
-def _contact_segment_spans(contact_segment_ids: np.ndarray) -> List[Tuple[int, int]]:
-    """Return every contact run as a ``(start, end)`` half-open frame span."""
-    segment_ids = np.asarray(contact_segment_ids, dtype=np.int32)
-    spans: List[Tuple[int, int]] = []
-    for segment_id in np.unique(segment_ids[segment_ids >= 0]):
-        frames = np.flatnonzero(segment_ids == segment_id)
-        if len(frames) == 0:
-            continue
-        spans.append((int(frames[0]), int(frames[-1]) + 1))
-    spans.sort()
-    return spans
-
-
-def _contact_bridge_windows(
-    spans: Sequence[Tuple[int, int]],
-    num_frames: int,
-    transition_frames: int,
-) -> List[Tuple[int, int]]:
-    """Resolve the transition frame each contact run owns on either side.
-
-    Two neighbouring contacts both reach into the free gap between them: the
-    earlier one releases forward and the later one approaches backward.  Each
-    gets one half of that gap, so the later window cannot overwrite the earlier
-    ramp.  Overwriting truncates the release, collapses the blend weight within
-    a single frame, and for a short gap can remove the free state altogether.
-    The split only binds when the two windows would really overlap, so
-    well-separated contacts keep their unclipped ramps.
-
-    Returns one ``(approach_zero, release_zero)`` pair per span: the frames at
-    which the approach ramp starts from and the release ramp returns to the
-    free target.  Position and orientation bridges share this result so their
-    transitions stay aligned frame for frame.
-    """
-    window = max(int(transition_frames), 0)
-    last_frame = num_frames - 1
-    release_limits = [last_frame] * len(spans)
-    approach_limits = [0] * len(spans)
-    for index in range(len(spans) - 1):
-        gap_start = spans[index][1]
-        gap = spans[index + 1][0] - gap_start
-        if gap >= 1:
-            split = gap_start + gap // 2
-            release_limits[index] = min(release_limits[index], split)
-            approach_limits[index + 1] = max(approach_limits[index + 1], split)
-        else:
-            # Anchor-drift splits leave no free frame to transition through.
-            release_limits[index] = gap_start - 1
-            approach_limits[index + 1] = spans[index + 1][0]
-
-    windows: List[Tuple[int, int]] = []
-    for index, (start, end) in enumerate(spans):
-        if window <= 0:
-            windows.append((start, end - 1))
-            continue
-        windows.append(
-            (
-                max(start - window, approach_limits[index]),
-                min(end - 1 + window, last_frame, release_limits[index]),
-            )
-        )
-    return windows
-
-
-def _bridge_swing_to_contact(
-    swing_targets: np.ndarray,
-    contact_targets: np.ndarray,
-    contact_modes: np.ndarray,
-    contact_segment_ids: np.ndarray,
-    transition_frames: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Blend morphology-space swing targets into world-space contact targets.
-
-    Only compact onset/release windows are changed.  Contact cores remain
-    exact scene targets, and no filtering is applied to the full trajectory.
-    Returns both the reference-pose preview and its world-contact blend weight
-    so a limb-relative solver can reproduce the same bridge from a live anchor.
-    """
-    swing = np.asarray(swing_targets, dtype=float)
-    contact = np.asarray(contact_targets, dtype=float)
-    modes = np.asarray(contact_modes, dtype=np.uint8)
-    segment_ids = np.asarray(contact_segment_ids, dtype=np.int32)
-    if swing.shape != contact.shape or swing.ndim != 2 or swing.shape[1] != 3:
-        raise ValueError("swing_targets and contact_targets must have shape (T, 3).")
-    if modes.shape != (len(swing),) or segment_ids.shape != (len(swing),):
-        raise ValueError("contact_modes and contact_segment_ids must have shape (T,).")
-    result = swing.copy()
-    contact_alpha = np.zeros(len(swing), dtype=float)
-    window = max(int(transition_frames), 0)
-    spans = _contact_segment_spans(segment_ids)
-    windows = _contact_bridge_windows(spans, len(swing), window)
-
-    for (start, end), (approach_zero, release_zero) in zip(spans, windows):
-        result[start:end] = contact[start:end]
-        contact_alpha[start:end] = 1.0
-        if window <= 0:
-            continue
-
-        # Both ramps are renormalized onto their own clipped span so they still
-        # reach exactly zero with zero velocity and acceleration.
-        if approach_zero < start:
-            pre_frames = np.arange(approach_zero, start + 1)
-            alpha = _minimum_jerk_blend(
-                (pre_frames - approach_zero) / (start - approach_zero)
-            )[:, None]
-            result[pre_frames] = (
-                (1.0 - alpha) * swing[pre_frames]
-                + alpha * contact[start][None, :]
-            )
-            contact_alpha[pre_frames] = alpha[:, 0]
-
-        if release_zero > end - 1:
-            post_frames = np.arange(end - 1, release_zero + 1)
-            alpha = _minimum_jerk_blend(
-                (post_frames - (end - 1)) / (release_zero - (end - 1))
-            )[:, None]
-            result[post_frames] = (
-                (1.0 - alpha) * contact[end - 1][None, :]
-                + alpha * swing[post_frames]
-            )
-            contact_alpha[post_frames] = 1.0 - alpha[:, 0]
-    result[modes != int(ContactMode.NONE)] = contact[
-        modes != int(ContactMode.NONE)
-    ]
-    contact_alpha[modes != int(ContactMode.NONE)] = 1.0
-    return result, contact_alpha
-
-
-def _bridge_contact_orientation(
-    forward_directions: np.ndarray | None,
-    up_directions: np.ndarray | None,
-    surface_normals: np.ndarray,
-    contact_modes: np.ndarray,
-    contact_segment_ids: np.ndarray,
-    contact_bridge_alpha: np.ndarray,
-    transition_frames: int,
-) -> Tuple[Optional[np.ndarray], np.ndarray]:
-    """Walk the free effector frame into its contact frame along SO(3).
-
-    Position already crosses a contact boundary through a minimum-jerk bridge.
-    Orientation used to switch inside a single frame, because a load-bearing or
-    sliding patch must present the registered scene normal while a free limb
-    follows the source frame.  That step lands on the wrist and ankle as a
-    rotation transient at every contact onset and release.
-
-    The blend follows the shortest SO(3) geodesic
-
-        R(t) = R_free(t) Exp(alpha(t) Log(R_free(t)^T R_contact))
-
-    The position bridge's already-computed alpha is the sole blend parameter.
-    The shared per-segment windows are used only to assign each free bridge
-    frame to one neighbouring contact, so a real free gap returns to the source
-    frame instead of interpolating contact A directly into contact B.  The
-    returned matrices are the finished targets consumed by both optimizers;
-    raw source forward/up tracks remain untouched for diagnostics.
-    """
-    if forward_directions is None or up_directions is None:
-        return None, np.zeros(len(contact_modes), dtype=float)
-
-    forward = np.asarray(forward_directions, dtype=float)
-    up = np.asarray(up_directions, dtype=float)
-    normals = np.asarray(surface_normals, dtype=float)
-    modes = np.asarray(contact_modes, dtype=np.uint8)
-    segment_ids = np.asarray(contact_segment_ids, dtype=np.int32)
-    position_alpha = np.asarray(contact_bridge_alpha, dtype=float)
-    num_frames = len(modes)
-    if forward.shape != (num_frames, 3) or up.shape != (num_frames, 3):
-        raise ValueError(
-            "forward_directions and up_directions must have shape "
-            f"({num_frames}, 3)."
-        )
-    if normals.shape != (num_frames, 3):
-        raise ValueError(f"surface_normals must have shape ({num_frames}, 3).")
-    if segment_ids.shape != (num_frames,) or position_alpha.shape != (num_frames,):
-        raise ValueError(
-            "contact_segment_ids and contact_bridge_alpha must have shape "
-            f"({num_frames},)."
-        )
-    if np.any((position_alpha < 0.0) | (position_alpha > 1.0)):
-        raise ValueError("contact_bridge_alpha must lie in [0, 1].")
-
-    source_rotations: List[Optional[np.ndarray]] = [
-        _orthonormal_target_rotation(forward[idx], up[idx])
-        for idx in range(num_frames)
-    ]
-    rotations = np.full((num_frames, 3, 3), np.nan, dtype=float)
-    for frame_idx, source_rotation in enumerate(source_rotations):
-        if source_rotation is not None:
-            rotations[frame_idx] = source_rotation
-    orientation_alpha = np.zeros(num_frames, dtype=float)
-
-    def _contact_frame(frame_idx: int) -> Optional[np.ndarray]:
-        # Mirror the rule both solvers apply on a contact frame: a load-bearing
-        # or sliding patch presents the scene normal, everything else keeps the
-        # captured anatomical up direction.
-        mode = ContactMode(int(modes[frame_idx]))
-        reference_up = (
-            normals[frame_idx]
-            if mode in (ContactMode.SUPPORT, ContactMode.SLIDE)
-            else up[frame_idx]
-        )
-        return _orthonormal_target_rotation(forward[frame_idx], reference_up)
-
-    def _blend(frame_idx: int, target: np.ndarray) -> None:
-        free = source_rotations[frame_idx]
-        if free is None:
-            return
-        # ``as_rotvec`` returns the shortest-path axis-angle, which resolves the
-        # quaternion double cover without an explicit sign test.
-        delta = Rotation.from_matrix(free.T @ target).as_rotvec()
-        alpha = float(position_alpha[frame_idx])
-        rotations[frame_idx] = free @ Rotation.from_rotvec(alpha * delta).as_matrix()
-        orientation_alpha[frame_idx] = alpha
-
-    spans = _contact_segment_spans(segment_ids)
-    windows = _contact_bridge_windows(spans, num_frames, transition_frames)
-    contact_frames = {
-        frame_idx: _contact_frame(frame_idx)
-        for start, end in spans
-        for frame_idx in range(start, end)
-    }
-    for (start, end), (approach_zero, release_zero) in zip(spans, windows):
-        # Publishing the contact frame itself keeps the bridged track equal to
-        # the rotation both solvers already impose there, so the ramp reaches
-        # the contact orientation instead of stopping one frame short of it.
-        for frame_idx in range(start, end):
-            resolved = contact_frames[frame_idx]
-            if resolved is not None:
-                rotations[frame_idx] = resolved
-                orientation_alpha[frame_idx] = float(position_alpha[frame_idx])
-        if approach_zero < start:
-            target = contact_frames[start]
-            if target is not None:
-                for frame_idx in range(approach_zero, start):
-                    _blend(frame_idx, target)
-        if release_zero > end - 1:
-            target = contact_frames[end - 1]
-            if target is not None:
-                for frame_idx in range(end, release_zero + 1):
-                    _blend(frame_idx, target)
-    return rotations, orientation_alpha
-
-
-def _local_semantic_rotation(
-    forward_direction: np.ndarray,
-    up_direction: np.ndarray,
-) -> np.ndarray:
-    """Return a right-handed local anatomical frame in body coordinates."""
-    forward = np.asarray(forward_direction, dtype=float).reshape(3)
-    up = np.asarray(up_direction, dtype=float).reshape(3)
-    forward /= max(float(np.linalg.norm(forward)), 1e-10)
-    up -= forward * float(np.dot(up, forward))
-    up /= max(float(np.linalg.norm(up)), 1e-10)
-    lateral = np.cross(up, forward)
-    lateral /= max(float(np.linalg.norm(lateral)), 1e-10)
-    up = np.cross(forward, lateral)
-    return np.column_stack([forward, lateral, up])
-
-
-def _numeric_morphology_scale(value: Any, default: float = 1.0) -> float:
-    if isinstance(value, str) and value.strip().lower() == "auto":
-        return float(default)
-    return float(value)
-
-
-def _resolve_position_sigma(
-    spec: Mapping[str, Any],
-    global_config: Mapping[str, Any],
-    phase: str,
-    stage: str,
-    default: float,
-) -> float:
-    """Resolve an end-effector tolerance without cross-stage ambiguity.
-
-    New profiles should use ``framewise_*_position_sigma`` and
-    ``refinement_*_position_sigma``.  Historical keys remain supported so
-    existing robot profiles keep their exact behavior.
-    """
-    if phase not in {"contact", "swing"}:
-        raise ValueError(f"Unknown end-effector phase {phase!r}.")
-    if stage not in {"framewise", "refinement"}:
-        raise ValueError(f"Unknown optimizer stage {stage!r}.")
-    explicit_key = f"{stage}_{phase}_position_sigma"
-    legacy_key = (
-        f"{phase}_sigma"
-        if stage == "framewise"
-        else f"{phase}_position_sigma"
-    )
-    value = spec.get(
-        explicit_key,
-        spec.get(
-            legacy_key,
-            global_config.get(
-                explicit_key,
-                global_config.get(legacy_key, default),
-            ),
-        ),
-    )
-    return max(float(value), 1e-6)
 
 
 def _apply_configured_joint_limits(
@@ -1000,17 +271,6 @@ class GenericInteractionRetargeter:
         self.q_a_indices = np.arange(start_idx, self.nq)
         if self.preserve_root_z and 2 in self.q_a_indices:
             self.q_a_indices = self.q_a_indices[self.q_a_indices != 2]
-        self.lock_base_orientation = bool(
-            self.end_effector_config.get("lock_base_orientation", False)
-        )
-        if self.lock_base_orientation:
-            # The captured root orientation is immutable source data.  Keeping
-            # quaternion coordinates out of the IK variables prevents an
-            # underdetermined limb task from using a large torso rotation as a
-            # substitute for shoulder/elbow motion.
-            self.q_a_indices = self.q_a_indices[
-                ~np.isin(self.q_a_indices, np.arange(3, 7))
-            ]
         self.nq_a = len(self.q_a_indices)
         
         print(f"Robot config: nq={self.nq}, nv={self.nv}, nq_a={self.nq_a}")
@@ -1083,7 +343,6 @@ class GenericInteractionRetargeter:
         self.end_effector_enabled = bool(cfg.get("enabled", False))
         self.end_effectors: Dict[str, Dict[str, Any]] = {}
         self._active_contact_offsets: Dict[str, int] = {}
-        self._active_contact_segments: Dict[str, int] = {}
         if not self.end_effector_enabled:
             return
 
@@ -1104,6 +363,20 @@ class GenericInteractionRetargeter:
                     f"'{body_name}'."
                 )
 
+            reach_reference_body = spec.get("reach_reference_body")
+            reach_reference_body_id = -1
+            if reach_reference_body:
+                reach_reference_body_id = mujoco.mj_name2id(
+                    self.robot_model,
+                    mujoco.mjtObj.mjOBJ_BODY,
+                    str(reach_reference_body),
+                )
+                if reach_reference_body_id < 0:
+                    raise ValueError(
+                        f"End-effector '{name}' refers to missing reach reference "
+                        f"body '{reach_reference_body}'."
+                    )
+
             tracking_offset = np.asarray(
                 spec.get("tracking_offset", [0.0, 0.0, 0.0]), dtype=float
             ).reshape(3)
@@ -1116,27 +389,13 @@ class GenericInteractionRetargeter:
                 raise ValueError(
                     f"End-effector '{name}' contact_offsets must have shape (K, 3)."
                 )
-            contact_target_space = str(spec["contact_target_space"]).lower()
-            if contact_target_space != "world":
-                raise ValueError(
-                    f"End-effector '{name}' contact_target_space must be 'world'."
-                )
-            swing_target_space = _validate_swing_target_space(
-                name, spec["swing_target_space"]
-            )
 
             self.end_effectors[name] = {
                 "body_name": str(body_name),
                 "body_id": int(body_id),
                 "tracking_offset": tracking_offset,
                 "contact_offsets": contact_offsets,
-                "contact_target_space": contact_target_space,
-                "swing_target_space": swing_target_space,
                 "track_orientation": bool(spec.get("track_orientation", False)),
-                "orientation_local_rotation": _local_semantic_rotation(
-                    spec.get("orientation_local_forward", [1.0, 0.0, 0.0]),
-                    spec.get("orientation_local_up", [0.0, 0.0, 1.0]),
-                ),
                 "track_swing_heading": bool(
                     spec.get("track_swing_heading", False)
                 ),
@@ -1152,11 +411,30 @@ class GenericInteractionRetargeter:
                 "max_orientation_step": float(
                     spec.get("max_orientation_step", np.deg2rad(6.0))
                 ),
-                "contact_sigma": _resolve_position_sigma(
-                    spec, cfg, "contact", "framewise", 0.025
+                "contact_sigma": float(
+                    spec.get("contact_sigma", cfg.get("contact_sigma", 0.025))
                 ),
-                "swing_sigma": _resolve_position_sigma(
-                    spec, cfg, "swing", "framewise", 0.06
+                "swing_sigma": float(
+                    spec.get("swing_sigma", cfg.get("swing_sigma", 0.06))
+                ),
+                "swing_morphology_scale": float(
+                    spec.get(
+                        "swing_morphology_scale",
+                        cfg.get("swing_morphology_scale", 1.0),
+                    )
+                ),
+                "preserve_world_target": bool(
+                    spec.get("preserve_world_target", False)
+                ),
+                "reach_reference_body_id": int(reach_reference_body_id),
+                "reach_reference_offset": np.asarray(
+                    spec.get("reach_reference_offset", [0.0, 0.0, 0.0]),
+                    dtype=float,
+                ).reshape(3),
+                "max_swing_reach": (
+                    None
+                    if spec.get("max_swing_reach") is None
+                    else float(spec["max_swing_reach"])
                 ),
             }
 
@@ -1208,41 +486,6 @@ class GenericInteractionRetargeter:
         self.pose_acceleration_sigma = max(
             float(pose_cfg.get("acceleration_sigma", 0.03)), 1e-6
         )
-        swivel_cfg = dict(pose_cfg.get("swivel", {}) or {})
-        self.pose_swivel_enabled = self.pose_direction_enabled and bool(
-            swivel_cfg.get("enabled", False)
-        )
-        self.pose_swivel_sigma = max(
-            float(swivel_cfg.get("sigma", np.deg2rad(20.0))), 1e-6
-        )
-        self.pose_swivel_weight = max(
-            float(swivel_cfg.get("weight", 1.0)), 0.0
-        )
-        self.pose_swivel_min_sine = max(
-            float(swivel_cfg.get("min_sine", 0.05)), 0.0
-        )
-        self.pose_swivel_full_sine = max(
-            float(swivel_cfg.get("full_sine", 0.35)),
-            self.pose_swivel_min_sine + 1e-8,
-        )
-        raw_swivel_chains = swivel_cfg.get(
-            "chains",
-            [
-                ["L_Shoulder", "L_Elbow", "L_Wrist"],
-                ["R_Shoulder", "R_Elbow", "R_Wrist"],
-            ],
-        )
-        self.pose_swivel_chains: List[Tuple[str, str, str]] = []
-        if self.pose_swivel_enabled:
-            for chain in raw_swivel_chains:
-                if len(chain) != 3:
-                    raise ValueError(
-                        "pose_direction.swivel chains must contain shoulder, "
-                        f"elbow, and wrist names, got {chain}."
-                    )
-                names = tuple(str(name) for name in chain)
-                if all(name in self.joint_mapping for name in names):
-                    self.pose_swivel_chains.append(names)
         raw_edges = pose_cfg.get(
             "edges",
             [
@@ -1305,7 +548,7 @@ class GenericInteractionRetargeter:
         """Match robot bone directions to SMPL-X, independent of morphology."""
         if (
             not self.pose_direction_enabled
-            or (not self.pose_bones and not self.pose_swivel_chains)
+            or not self.pose_bones
             or target_human_joints is None
         ):
             return None
@@ -1345,57 +588,6 @@ class GenericInteractionRetargeter:
                     - target_direction
                 )
                 / self.pose_direction_sigma
-            )
-        for shoulder_name, elbow_name, wrist_name in self.pose_swivel_chains:
-            shoulder_idx = name_to_index[shoulder_name]
-            elbow_idx = name_to_index[elbow_name]
-            wrist_idx = name_to_index[wrist_name]
-            source_direction, _, source_fade, _, _ = (
-                _swivel_direction_and_jacobian(
-                    target_human_joints[shoulder_idx],
-                    target_human_joints[elbow_idx],
-                    target_human_joints[wrist_idx],
-                    min_sine=self.pose_swivel_min_sine,
-                    full_sine=self.pose_swivel_full_sine,
-                )
-            )
-            shoulder_jacobian = robot_jacobian[
-                3 * shoulder_idx : 3 * shoulder_idx + 3
-            ]
-            elbow_jacobian = robot_jacobian[
-                3 * elbow_idx : 3 * elbow_idx + 3
-            ]
-            wrist_jacobian = robot_jacobian[
-                3 * wrist_idx : 3 * wrist_idx + 3
-            ]
-            (
-                robot_direction,
-                swivel_jacobian,
-                robot_fade,
-                _,
-                robot_axis,
-            ) = _swivel_direction_and_jacobian(
-                robot_positions[shoulder_name],
-                robot_positions[elbow_name],
-                robot_positions[wrist_name],
-                shoulder_jacobian,
-                elbow_jacobian,
-                wrist_jacobian,
-                min_sine=self.pose_swivel_min_sine,
-                full_sine=self.pose_swivel_full_sine,
-            )
-            swivel_weight = (
-                self.pose_swivel_weight * min(source_fade, robot_fade)
-            )
-            if swivel_weight <= 0.0 or swivel_jacobian is None:
-                continue
-            target_delta = _swivel_tangent_delta(
-                robot_direction, source_direction, robot_axis
-            )
-            terms.append(
-                np.sqrt(swivel_weight)
-                * (swivel_jacobian @ dqa - target_delta)
-                / self.pose_swivel_sigma
             )
         return cp.hstack(terms) if terms else None
 
@@ -1682,9 +874,7 @@ class GenericInteractionRetargeter:
         Optional[cp.Expression],
         Optional[cp.Expression],
         Optional[cp.Expression],
-        Optional[cp.Expression],
         List[cp.Constraint],
-        int,
         int,
         int,
         int,
@@ -1696,12 +886,11 @@ class GenericInteractionRetargeter:
         metric tolerance ``sigma`` makes each squared residual dimensionless.
         """
         if not self.end_effector_enabled or not targets:
-            return None, None, None, None, [], 0, 0, 0, 0
+            return None, None, None, [], 0, 0, 0
 
-        support_terms: List[cp.Expression] = []
         contact_terms: List[cp.Expression] = []
         swing_terms: List[cp.Expression] = []
-        orientation_terms: List[cp.Expression] = []
+        swing_orientation_terms: List[cp.Expression] = []
         contact_constraints: List[cp.Constraint] = []
         for name, target_data in targets.items():
             if name not in self.end_effectors:
@@ -1711,35 +900,11 @@ class GenericInteractionRetargeter:
             confidence = float(np.clip(target_data.get("confidence", 1.0), 0.0, 1.0))
             forward_direction = target_data.get("forward_direction")
             up_direction = target_data.get("up_direction")
-            orientation_target_rotation = target_data.get(
-                "orientation_target_rotation"
-            )
-            if orientation_target_rotation is not None:
-                orientation_target_rotation = np.asarray(
-                    orientation_target_rotation, dtype=float
-                ).reshape(3, 3)
-                if not np.all(np.isfinite(orientation_target_rotation)):
-                    orientation_target_rotation = None
-            position_sigma_scale = max(
-                float(target_data.get("position_sigma_scale", 1.0)), 1e-6
-            )
-            orientation_sigma_scale = max(
-                float(target_data.get("orientation_sigma_scale", 1.0)), 1e-6
-            )
 
-            mode = ContactMode[str(target_data["contact_mode"]).upper()]
-            transition_weight = float(
-                np.clip(target_data.get("transition_weight", 1.0), 0.0, 1.0)
-            )
-
-            if mode != ContactMode.NONE:
+            if bool(target_data.get("contact", False)):
                 target = np.asarray(target_data["contact_position"], dtype=float).reshape(3)
-                segment_id = int(target_data.get("contact_segment_id", -1))
                 offset_index = self._active_contact_offsets.get(name)
-                if (
-                    offset_index is None
-                    or self._active_contact_segments.get(name) != segment_id
-                ):
+                if offset_index is None:
                     offset_index = int(
                         np.argmin(
                             [
@@ -1752,14 +917,15 @@ class GenericInteractionRetargeter:
                         )
                     )
                     self._active_contact_offsets[name] = offset_index
-                    self._active_contact_segments[name] = segment_id
                 position, jacobian = self._point_position_and_jacobian(
                     body_id, spec["contact_offsets"][offset_index]
                 )
-                sigma = max(
-                    float(spec["contact_sigma"]) * position_sigma_scale, 1e-6
-                )
+                sigma = max(float(spec["contact_sigma"]), 1e-6)
+                # Keep every detected contact in the primary level. Confidence
+                # only ranks contacts within that same priority level.
+                weight = max(confidence, 0.25)
                 residual = position + jacobian @ dqa - target
+                contact_terms.append(np.sqrt(weight) * residual / sigma)
                 surface_normal = np.asarray(
                     target_data.get("surface_normal", [0.0, 0.0, 1.0]),
                     dtype=float,
@@ -1767,50 +933,6 @@ class GenericInteractionRetargeter:
                 normal_norm = float(np.linalg.norm(surface_normal))
                 if normal_norm > 1e-8:
                     surface_normal /= normal_norm
-                if mode == ContactMode.SUPPORT:
-                    # SUPPORT is never faded: the world anchor is the primary
-                    # lexicographic task throughout the segment core.
-                    support_terms.append(residual / sigma)
-                    orientation_weight = 1.0
-                else:
-                    weight = max(confidence, 0.25) * transition_weight
-                    if mode == ContactMode.TOUCH:
-                        weight *= float(
-                            self.end_effector_config.get("touch_weight", 0.5)
-                        )
-                    if mode == ContactMode.SLIDE and normal_norm > 1e-8:
-                        # Sliding contact is load-bearing only in the surface
-                        # normal.  Lock that scalar at the highest contact
-                        # level; retain source tangential motion only as a weak
-                        # secondary preference so the hand may actually slide.
-                        support_terms.append(
-                            np.sqrt(max(weight, 1e-8))
-                            * (surface_normal @ residual)
-                            / sigma
-                        )
-                        tangential_weight = max(
-                            float(
-                                self.end_effector_config.get(
-                                    "slide_tangential_weight", 0.1
-                                )
-                            ),
-                            0.0,
-                        )
-                        if tangential_weight > 0.0:
-                            tangent_projection = np.eye(3) - np.outer(
-                                surface_normal, surface_normal
-                            )
-                            contact_terms.append(
-                                np.sqrt(max(weight * tangential_weight, 1e-8))
-                                * (tangent_projection @ residual)
-                                / sigma
-                            )
-                    else:
-                        contact_terms.append(
-                            np.sqrt(max(weight, 1e-8)) * residual / sigma
-                        )
-                    orientation_weight = max(weight, 1e-8)
-                if normal_norm > 1e-8:
                     normal_tolerance = max(
                         float(
                             self.end_effector_config.get(
@@ -1822,54 +944,39 @@ class GenericInteractionRetargeter:
                     # The inferred normal is oriented from the scene toward
                     # the source SMPL-X surface. Keep the robot marker on that
                     # same side of the contact plane.
-                    normal_slack = cp.Variable(nonneg=True)
                     contact_constraints.append(
-                        surface_normal @ residual
-                        >= -normal_tolerance - normal_slack
-                    )
-                    orientation_terms.append(
-                        normal_slack
-                        / max(
-                            float(
-                                self.end_effector_config.get(
-                                    "contact_normal_slack_sigma", 0.005
-                                )
-                            ),
-                            1e-6,
-                        )
+                        surface_normal @ residual >= -normal_tolerance
                     )
 
-                    if spec.get("track_orientation", False) and (
-                        orientation_target_rotation is not None
-                        or forward_direction is not None
-                    ):
-                        target_rotation = orientation_target_rotation
-                        # A load-bearing or sliding patch must present its
-                        # anatomical palm/sole normal to the scene.  The
-                        # source orientation still supplies the tangent
-                        # heading, but it must not override the registered
-                        # scene normal during contact.
-                        if target_rotation is None:
-                            forward = np.asarray(
-                                forward_direction, dtype=float
-                            ).reshape(3)
-                            orientation_up = np.asarray(
-                                surface_normal
-                                if mode in (ContactMode.SUPPORT, ContactMode.SLIDE)
-                                else (
-                                    up_direction
-                                    if up_direction is not None
-                                    else surface_normal
-                                ),
-                                dtype=float,
-                            ).reshape(3)
-                            target_rotation = _orthonormal_target_rotation(
-                                forward, orientation_up
+                    if spec.get("track_orientation", False) and forward_direction is not None:
+                        forward = np.asarray(forward_direction, dtype=float).reshape(3)
+                        orientation_up = np.asarray(
+                            up_direction
+                            if up_direction is not None
+                            else surface_normal,
+                            dtype=float,
+                        ).reshape(3)
+                        orientation_up /= max(
+                            float(np.linalg.norm(orientation_up)), 1e-10
+                        )
+                        # The contact detector has already verified that the
+                        # captured sole is compatible with the surface.  Track
+                        # the captured rigid foot frame rather than replacing
+                        # its pitch/roll with a noisy mesh-triangle normal.
+                        forward -= orientation_up * float(
+                            np.dot(orientation_up, forward)
+                        )
+                        forward_norm = float(np.linalg.norm(forward))
+                        if forward_norm > 1e-8:
+                            forward /= forward_norm
+                            lateral = np.cross(orientation_up, forward)
+                            lateral /= max(float(np.linalg.norm(lateral)), 1e-10)
+                            forward = np.cross(lateral, orientation_up)
+                            target_rotation = np.column_stack(
+                                [forward, lateral, orientation_up]
                             )
-                        if target_rotation is not None:
-                            current_rotation = (
-                                self.robot_data.xmat[body_id].reshape(3, 3)
-                                @ spec["orientation_local_rotation"]
+                            current_rotation = self.robot_data.xmat[body_id].reshape(
+                                3, 3
                             )
                             rotation_error = Rotation.from_matrix(
                                 target_rotation @ current_rotation.T
@@ -1883,128 +990,97 @@ class GenericInteractionRetargeter:
                                             "orientation_sigma", np.deg2rad(7.5)
                                         ),
                                     )
-                                )
-                                * orientation_sigma_scale,
+                                ),
                                 1e-6,
                             )
-                            orientation_terms.append(
-                                np.sqrt(orientation_weight)
+                            contact_terms.append(
+                                np.sqrt(weight)
                                 * (angular_jacobian @ dqa - rotation_error)
                                 / orientation_sigma
                             )
             else:
                 self._active_contact_offsets.pop(name, None)
-                self._active_contact_segments.pop(name, None)
+                target = np.asarray(target_data["tracking_position"], dtype=float).reshape(3)
+                source_root_position = target_data.get("source_root_position")
+                swing_morphology_scale = float(spec["swing_morphology_scale"])
+                root_z_offset = float(
+                    (
+                        self.end_effector_config.get(
+                            "base_position_constraint", {}
+                        )
+                        or {}
+                    ).get("z_offset", 0.0)
+                )
+                # Contact positions remain exact world-space constraints.
+                # Swing targets follow the registered robot root and may also
+                # be scaled root-relatively for morphology.  Root registration
+                # still applies when morphology_scale == 1.0.
+                target = _transform_swing_target(
+                    target,
+                    source_root_position,
+                    root_z_offset,
+                    swing_morphology_scale,
+                    bool(spec["preserve_world_target"]),
+                )
+                reach_body_id = int(spec["reach_reference_body_id"])
+                if reach_body_id >= 0:
+                    reach_rotation = self.robot_data.xmat[reach_body_id].reshape(3, 3)
+                    reach_origin = (
+                        self.robot_data.xpos[reach_body_id]
+                        + reach_rotation @ spec["reach_reference_offset"]
+                    )
+                    target = _clamp_target_to_reach(
+                        target,
+                        reach_origin,
+                        spec["max_swing_reach"],
+                    )
                 position, jacobian = self._point_position_and_jacobian(
                     body_id, spec["tracking_offset"]
                 )
-                sigma = max(
-                    float(spec["swing_sigma"]) * position_sigma_scale, 1e-6
-                )
-                if spec["swing_target_space"] == "limb_morphology_scaled":
-                    anchor_name = str(target_data.get("swing_anchor_body", ""))
-                    anchor_body_id = mujoco.mj_name2id(
-                        self.robot_model,
-                        mujoco.mjtObj.mjOBJ_BODY,
-                        anchor_name,
-                    )
-                    if anchor_body_id < 0:
-                        raise ValueError(
-                            f"End-effector '{name}' limb-relative swing task "
-                            f"refers to missing anchor body '{anchor_name}'."
-                        )
-                    anchor_position, anchor_jacobian = (
-                        self._point_position_and_jacobian(
-                            anchor_body_id,
-                            np.asarray(
-                                target_data.get(
-                                    "swing_anchor_offset", [0.0, 0.0, 0.0]
-                                ),
-                                dtype=float,
-                            ),
-                        )
-                    )
-                    alpha = float(
-                        np.clip(
-                            target_data.get("contact_bridge_alpha", 0.0),
-                            0.0,
-                            1.0,
-                        )
-                    )
-                    anchor_weight = 1.0 - alpha
-                    limb_offset = np.asarray(
-                        target_data["swing_limb_offset"], dtype=float
-                    ).reshape(3)
-                    world_target = np.asarray(
-                        target_data["contact_bridge_position"], dtype=float
-                    ).reshape(3)
-                    residual = (
-                        position
-                        - anchor_weight * anchor_position
-                        + (jacobian - anchor_weight * anchor_jacobian) @ dqa
-                        - (anchor_weight * limb_offset + alpha * world_target)
-                    )
-                else:
-                    # World-space effectors, including both feet in the G1
-                    # profile, retain the original absolute tracking path.
-                    target = np.asarray(
-                        target_data["effective_swing_position"], dtype=float
-                    ).reshape(3)
-                    residual = position + jacobian @ dqa - target
+                sigma = max(float(spec["swing_sigma"]), 1e-6)
+                residual = position + jacobian @ dqa - target
                 swing_terms.append(residual / sigma)
                 if (
                     spec.get("track_orientation", False)
                     and spec.get("track_swing_orientation", False)
-                    and (
-                        orientation_target_rotation is not None
-                        or (
-                            forward_direction is not None
-                            and up_direction is not None
-                        )
-                    )
+                    and forward_direction is not None
+                    and up_direction is not None
                 ):
-                    target_rotation = orientation_target_rotation
-                    if target_rotation is None:
-                        target_rotation = _orthonormal_target_rotation(
-                            forward_direction, up_direction
+                    target_up = np.asarray(up_direction, dtype=float).reshape(3)
+                    target_up /= max(float(np.linalg.norm(target_up)), 1e-10)
+                    target_forward = np.asarray(forward_direction, dtype=float).reshape(3)
+                    target_forward -= target_up * float(
+                        np.dot(target_up, target_forward)
+                    )
+                    forward_norm = float(np.linalg.norm(target_forward))
+                    if forward_norm > 1e-8:
+                        target_forward /= forward_norm
+                        target_lateral = np.cross(target_up, target_forward)
+                        target_lateral /= max(
+                            float(np.linalg.norm(target_lateral)), 1e-10
                         )
-                    if target_rotation is not None:
-                        current_rotation = (
-                            self.robot_data.xmat[body_id].reshape(3, 3)
-                            @ spec["orientation_local_rotation"]
+                        target_forward = np.cross(target_lateral, target_up)
+                        target_rotation = np.column_stack(
+                            [target_forward, target_lateral, target_up]
                         )
+                        current_rotation = self.robot_data.xmat[body_id].reshape(3, 3)
                         rotation_error = Rotation.from_matrix(
                             target_rotation @ current_rotation.T
                         ).as_rotvec()
                         angular_jacobian = self._body_angular_jacobian(body_id)
-                        orientation_sigma = max(
-                            float(spec["orientation_sigma"])
-                            * orientation_sigma_scale,
-                            1e-6,
-                        )
-                        orientation_terms.append(
+                        orientation_sigma = max(float(spec["orientation_sigma"]), 1e-6)
+                        swing_orientation_terms.append(
                             (angular_jacobian @ dqa - rotation_error)
                             / orientation_sigma
                         )
                 elif (
                     spec.get("track_orientation", False)
                     and spec.get("track_swing_heading", False)
-                    and (
-                        orientation_target_rotation is not None
-                        or forward_direction is not None
-                    )
+                    and forward_direction is not None
                 ):
-                    target_forward = np.asarray(
-                        orientation_target_rotation[:, 0]
-                        if orientation_target_rotation is not None
-                        else forward_direction,
-                        dtype=float,
-                    ).reshape(3)
+                    target_forward = np.asarray(forward_direction, dtype=float).reshape(3)
                     target_forward[2] = 0.0
-                    current_rotation = (
-                        self.robot_data.xmat[body_id].reshape(3, 3)
-                        @ spec["orientation_local_rotation"]
-                    )
+                    current_rotation = self.robot_data.xmat[body_id].reshape(3, 3)
                     current_forward = current_rotation[:, 0].copy()
                     current_forward[2] = 0.0
                     target_norm = float(np.linalg.norm(target_forward))
@@ -2019,19 +1095,16 @@ class GenericInteractionRetargeter:
                             )
                         )
                         angular_jacobian = self._body_angular_jacobian(body_id)
-                        orientation_sigma = max(
-                            float(spec["orientation_sigma"])
-                            * orientation_sigma_scale,
-                            1e-6,
-                        )
-                        orientation_terms.append(
+                        orientation_sigma = max(float(spec["orientation_sigma"]), 1e-6)
+                        swing_orientation_terms.append(
                             cp.hstack([angular_jacobian[2] @ dqa - yaw_error])
                             / orientation_sigma
                         )
 
-            # Orientation continuity lives at the orientation priority, so a
-            # temporarily incompatible normal/heading cannot make the SUPPORT
-            # position stage infeasible.
+            # This is a physical angular-velocity bound, not a soft smoothing
+            # term.  It prevents a newly activated contact from rotating an
+            # already stable foot when simultaneous human anchors are not
+            # exactly feasible for the robot's morphology.
             if (
                 spec.get("track_orientation", False)
                 and last_rotations is not None
@@ -2046,17 +1119,16 @@ class GenericInteractionRetargeter:
                     float(spec.get("max_orientation_step", np.deg2rad(6.0))),
                     1e-6,
                 )
-                orientation_terms.append(
-                    (rotation_since_last + angular_jacobian @ dqa)
-                    / max_orientation_step
+                contact_constraints.append(
+                    cp.norm(rotation_since_last + angular_jacobian @ dqa, 2)
+                    <= max_orientation_step
                 )
 
-        support_residual = cp.hstack(support_terms) if support_terms else None
         contact_residual = cp.hstack(contact_terms) if contact_terms else None
         swing_residual = cp.hstack(swing_terms) if swing_terms else None
-        orientation_residual = (
-            cp.hstack(orientation_terms)
-            if orientation_terms
+        swing_orientation_residual = (
+            cp.hstack(swing_orientation_terms)
+            if swing_orientation_terms
             else None
         )
         # A foot pose is one SE(3) task: translating the sole marker and
@@ -2067,24 +1139,21 @@ class GenericInteractionRetargeter:
         # can leave the toe axis tens of degrees from the captured foot.
         if (
             bool(self.end_effector_config.get("combine_swing_foot_pose", False))
-            and not bool(self.end_effector_config.get("hierarchy", True))
             and swing_residual is not None
-            and orientation_residual is not None
+            and swing_orientation_residual is not None
         ):
             swing_residual = cp.hstack(
-                [swing_residual, orientation_residual]
+                [swing_residual, swing_orientation_residual]
             )
-            orientation_residual = None
+            swing_orientation_residual = None
         return (
-            support_residual,
             contact_residual,
             swing_residual,
-            orientation_residual,
+            swing_orientation_residual,
             contact_constraints,
-            len(support_terms),
             len(contact_terms),
             len(swing_terms),
-            len(orientation_terms),
+            len(swing_orientation_terms),
         )
     
     def _validate_joint_mapping(self):
@@ -2674,44 +1743,6 @@ class GenericInteractionRetargeter:
                     ]
                 )
 
-        # The floating-base torso frame is captured source motion, not an IK
-        # redundancy for extending short limbs. Build the complete SO(3)
-        # residual before any lexicographic stage so its hard cone applies to
-        # every task family. The soft term joins the body-pose priority below.
-        base_orientation_residual = None
-        base_orientation_cfg = dict(
-            self.end_effector_config.get("base_orientation_constraint", {}) or {}
-        )
-        base_rotation_error = None
-        base_angular_jacobian = None
-        if (
-            target_base_orientation is not None
-            and 3 in self.q_a_indices
-            and all(idx in self.q_a_indices for idx in (4, 5, 6))
-            and self.robot_model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE
-        ):
-            base_body_id = int(self.robot_model.jnt_bodyid[0])
-            target_wxyz = np.asarray(
-                target_base_orientation, dtype=float
-            ).reshape(4)
-            target_rotation = Rotation.from_quat(
-                target_wxyz, scalar_first=True
-            ).as_matrix()
-            current_rotation = self.robot_data.xmat[base_body_id].reshape(3, 3)
-            base_rotation_error = Rotation.from_matrix(
-                target_rotation @ current_rotation.T
-            ).as_rotvec()
-            base_angular_jacobian = self._body_angular_jacobian(base_body_id)
-            base_orientation_residual, orientation_constraints = (
-                _build_base_orientation_task(
-                    dqa,
-                    base_angular_jacobian,
-                    base_rotation_error,
-                    base_orientation_cfg,
-                )
-            )
-            constraints.extend(orientation_constraints)
-
         # The interaction-mesh Laplacian is nearly translation invariant.  An
         # explicit morphology-aware base envelope prevents infeasible hand/foot
         # targets from dragging the floating base away from the source actor.
@@ -2721,8 +1752,7 @@ class GenericInteractionRetargeter:
         )
         if target_base_position is not None and bool(base_cfg.get("enabled", False)):
             base_target = np.asarray(target_base_position, dtype=float).reshape(3).copy()
-            if not bool(base_cfg.get("reference_includes_z_offset", False)):
-                base_target[2] += float(base_cfg.get("z_offset", 0.0))
+            base_target[2] += float(base_cfg.get("z_offset", 0.0))
             max_xy_error = max(float(base_cfg.get("max_xy_error", 0.08)), 0.0)
             max_z_error = max(float(base_cfg.get("max_z_error", 0.12)), 0.0)
 
@@ -2781,16 +1811,9 @@ class GenericInteractionRetargeter:
         
         # Minimize: ||lap_var - target_lap_vec||^2
         # where lap_var = lap0_vec + J_L @ dqa (from constraint)
-        interaction_residual = cp.multiply(
-            sqrt_w3, lap_var - target_lap_vec
-        )
-        interaction_obj = cp.sum_squares(interaction_residual)
-        regularization_obj: cp.Expression | float = 0.0
+        body_obj = cp.sum_squares(cp.multiply(sqrt_w3, lap_var - target_lap_vec))
         if base_position_obj is not None:
-            regularization_obj += (
-                float(base_cfg.get("centering_weight", 5.0))
-                * base_position_obj
-            )
+            body_obj += float(base_cfg.get("centering_weight", 5.0)) * base_position_obj
         
         # Joint regularization cost (keep joints near zero/neutral)
         # Matching original: Q_diag cost uses q_a_n_last (last optimized at current time step)
@@ -2814,30 +1837,44 @@ class GenericInteractionRetargeter:
         
         # Q_diag cost: ||sqrt(Q_diag) * (dqa + q_a_current)||^2
         # This matches original: cp.sum_squares(cp.multiply(np.sqrt(Qd), dqa + q_a_n_last))
-        regularization_obj += cp.sum_squares(
-            cp.multiply(np.sqrt(Q_diag_modified), dqa + q_a_current)
-        )
+        body_obj += cp.sum_squares(cp.multiply(np.sqrt(Q_diag_modified), dqa + q_a_current))
 
         # Smoothness cost (matching original implementation exactly)
         # CRITICAL FIX: Use previous frame's velocity, not current guess
         if q_last is not None:
             q_a_current = q[self.q_a_indices]  # Current guess at this SQP iteration
             dqa_smooth = q_last[self.q_a_indices] - q_a_current  # Velocity from prev frame to current guess
-            regularization_obj += self.smooth_weight * cp.sum_squares(
-                dqa - dqa_smooth
-            )
+            body_obj += self.smooth_weight * cp.sum_squares(dqa - dqa_smooth)
         
-        # Profiles that have not opted into the explicit body-orientation task
-        # retain the historical low-priority soft target for compatibility.
+        # Base orientation tracking cost
+        # Keep the base orientation close to the target (estimated from human joints).
+        # The residual is the world-frame rotation vector to the target and its
+        # linearization is the same qdot->omega map used by every other
+        # orientation task.  Penalizing raw quaternion components instead mixes
+        # a non-metric distance into the objective and pulls along the radial
+        # quaternion direction that the kinematics cannot see.
         if (
-            base_rotation_error is not None
-            and base_angular_jacobian is not None
-            and base_orientation_residual is None
+            target_base_orientation is not None
+            and 3 in self.q_a_indices
+            and all(idx in self.q_a_indices for idx in (4, 5, 6))
+            and self.robot_model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE
         ):
+            base_body_id = int(self.robot_model.jnt_bodyid[0])
+            target_wxyz = np.asarray(target_base_orientation, dtype=float).reshape(4)
+            target_rotation = Rotation.from_quat(
+                target_wxyz, scalar_first=True
+            ).as_matrix()
+            current_rotation = self.robot_data.xmat[base_body_id].reshape(3, 3)
+            base_rotation_error = Rotation.from_matrix(
+                target_rotation @ current_rotation.T
+            ).as_rotvec()
+            base_angular_jacobian = self._body_angular_jacobian(base_body_id)
+            # 1.25 rad^-2 keeps the strength of the replaced component cost:
+            # its weight was 5.0 and |dq| ~ |dtheta|/2 for unit quaternions.
             orientation_weight = float(
                 self.end_effector_config.get("base_orientation_weight", 1.25)
             )
-            regularization_obj += orientation_weight * cp.sum_squares(
+            body_obj += orientation_weight * cp.sum_squares(
                 base_angular_jacobian @ dqa - base_rotation_error
             )
 
@@ -2906,15 +1943,13 @@ class GenericInteractionRetargeter:
             mujoco.mj_forward(self.robot_model, self.robot_data)
 
         (
-            support_residual,
             contact_residual,
             swing_residual,
-            orientation_residual,
+            swing_orientation_residual,
             endpoint_contact_constraints,
-            num_supports,
             num_contacts,
             num_swings,
-            num_orientations,
+            num_swing_orientations,
         ) = (
             self._build_end_effector_objectives(
                 dqa, end_effector_targets, last_end_effector_rotations
@@ -2959,14 +1994,6 @@ class GenericInteractionRetargeter:
                 if pose_direction_residual is not None
                 else pose_acceleration_residual
             )
-        if base_orientation_residual is not None:
-            pose_direction_residual = (
-                cp.hstack(
-                    [pose_direction_residual, base_orientation_residual]
-                )
-                if pose_direction_residual is not None
-                else base_orientation_residual
-            )
         direction_step_limits = self._pose_direction_step_limits(
             target_human_joints, previous_human_joints
         )
@@ -2980,11 +2007,7 @@ class GenericInteractionRetargeter:
             )
         )
         temporal_residual = None
-        if (
-            q_last is not None
-            and q_prev is not None
-            and bool(temporal_cfg.get("enabled", False))
-        ):
+        if q_last is not None and q_prev is not None:
             actuated_qa = np.flatnonzero(self.q_a_indices >= 7)
             if len(actuated_qa):
                 actuated_qpos = self.q_a_indices[actuated_qa]
@@ -3024,20 +2047,15 @@ class GenericInteractionRetargeter:
             self.end_effector_config.get("temporal_weight", 0.02)
         )
         if temporal_residual is not None and temporal_weight > 0.0:
-            regularization_obj += temporal_weight * cp.sum_squares(
-                temporal_residual
-            )
-
-        body_obj = interaction_obj + regularization_obj
+            body_obj += temporal_weight * cp.sum_squares(temporal_residual)
 
         hierarchy_enabled = bool(
             self.end_effector_enabled
             and self.end_effector_config.get("hierarchy", True)
             and (
-                support_residual is not None
-                or contact_residual is not None
+                contact_residual is not None
                 or swing_residual is not None
-                or orientation_residual is not None
+                or swing_orientation_residual is not None
                 or pose_direction_residual is not None
             )
         )
@@ -3045,15 +2063,13 @@ class GenericInteractionRetargeter:
             # Weighted fallback is useful for ablations, but the default is the
             # hierarchy below because finite weights cannot guarantee priority.
             endpoint_weight = float(self.end_effector_config.get("weighted_scale", 1.0))
-            if support_residual is not None:
-                body_obj += endpoint_weight * cp.sum_squares(support_residual)
             if contact_residual is not None:
                 body_obj += endpoint_weight * cp.sum_squares(contact_residual)
             if swing_residual is not None:
                 body_obj += endpoint_weight * cp.sum_squares(swing_residual)
-            if orientation_residual is not None:
+            if swing_orientation_residual is not None:
                 body_obj += endpoint_weight * cp.sum_squares(
-                    orientation_residual
+                    swing_orientation_residual
                 )
             if pose_direction_residual is not None:
                 body_obj += float(
@@ -3064,75 +2080,41 @@ class GenericInteractionRetargeter:
         show_solver_debug = hasattr(sys, '_omni_frame_count') and sys._omni_frame_count <= 5
         
         try:
-            def run_solver(candidate: cp.Problem) -> None:
-                try:
-                    candidate.solve(solver=cp.CLARABEL, verbose=False)
-                except cp.error.SolverError:
-                    pass
-                if candidate.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-                    candidate.solve(
-                        solver=cp.SCS,
-                        verbose=False,
-                        eps=float(
-                            self.end_effector_config.get("solver_tolerance", 1e-4)
-                        ),
-                        max_iters=int(
-                            self.end_effector_config.get(
-                                "solver_max_iterations", 20000
-                            )
-                        ),
-                    )
+            active_constraints = list(constraints)
 
-            def solve_problem(
-                stage_obj: cp.Expression,
-                stage_name: str,
-                stage_constraints: Sequence[cp.Constraint],
-            ) -> cp.Problem:
-                stage_problem = cp.Problem(
-                    cp.Minimize(stage_obj), list(stage_constraints)
-                )
+            def solve_stage(stage_obj: cp.Expression, stage_name: str) -> cp.Problem:
+                nonlocal active_constraints
+                stage_problem = cp.Problem(cp.Minimize(stage_obj), active_constraints)
+
+                def run_solver(candidate: cp.Problem) -> None:
+                    try:
+                        candidate.solve(solver=cp.CLARABEL, verbose=False)
+                    except cp.error.SolverError:
+                        pass
+                    if candidate.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                        candidate.solve(
+                            solver=cp.SCS,
+                            verbose=False,
+                            eps=float(self.end_effector_config.get("solver_tolerance", 1e-4)),
+                            max_iters=int(
+                                self.end_effector_config.get("solver_max_iterations", 20000)
+                            ),
+                        )
+
                 run_solver(stage_problem)
-                return stage_problem
-
-            if hierarchy_enabled:
-                priority_residuals = {
-                    "support": support_residual,
-                    "contact": contact_residual,
-                    "swing": swing_residual,
-                    "orientation": orientation_residual,
-                    "pose_direction": pose_direction_residual,
-                    "interaction": interaction_residual,
-                }
-                problem, solved_priority_levels = _solve_configured_priority_levels(
-                    dqa,
-                    constraints,
-                    priority_residuals,
-                    regularization_obj,
-                    self.end_effector_config,
-                    solve_problem,
-                )
-                if problem is None:
-                    return q, np.inf
-                if show_solver_debug:
-                    print(
-                        f"    hierarchy levels={list(solved_priority_levels)}; "
-                        f"tasks: support={num_supports}, contact={num_contacts}, "
-                        f"swing={num_swings}, orientation={num_orientations}, "
-                        f"pose_bones={len(self.pose_bones)}"
-                    )
-            else:
-                active_constraints = list(constraints)
-                problem = solve_problem(body_obj, "weighted", active_constraints)
                 if (
-                    problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                    stage_problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                    and not hierarchy_enabled
                     and endpoint_contact_constraints
                 ):
-                    # Preserve the trust region and every mechanical constraint.
-                    # Only the endpoint-side halfspaces and orientation-step caps
-                    # are optional in the weighted ablation fallback.
+                    # The contact-plane halfspaces and orientation-step caps can
+                    # be jointly infeasible with the trust region for a single
+                    # linearized step.  Relax them before touching the trust
+                    # region itself: an unbounded linearized step is worse than
+                    # one frame of relaxed contact-side constraints.
                     if show_solver_debug:
                         print(
-                            f"    weighted solve failed: {problem.status}, "
+                            f"    {stage_name} solve failed: {stage_problem.status}, "
                             "retrying without endpoint contact constraints..."
                         )
                     relaxable = {id(c) for c in endpoint_contact_constraints}
@@ -3141,9 +2123,169 @@ class GenericInteractionRetargeter:
                         for constraint in active_constraints
                         if id(constraint) not in relaxable
                     ]
-                    problem = solve_problem(
-                        body_obj, "weighted-relaxed-endpoints", active_constraints
+                    stage_problem = cp.Problem(cp.Minimize(stage_obj), active_constraints)
+                    run_solver(stage_problem)
+                if (
+                    stage_problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
+                    and not hierarchy_enabled
+                ):
+                    if show_solver_debug:
+                        print(
+                            f"    {stage_name} solve failed: {stage_problem.status}, "
+                            "trying without SOC..."
+                        )
+                    active_constraints = [
+                        constraint
+                        for constraint in active_constraints
+                        if not isinstance(constraint, cp.constraints.second_order.SOC)
+                    ]
+                    stage_problem = cp.Problem(cp.Minimize(stage_obj), active_constraints)
+                    run_solver(stage_problem)
+                return stage_problem
+
+            if hierarchy_enabled:
+                relative_tolerance = max(
+                    float(self.end_effector_config.get("priority_relative_tolerance", 0.01)),
+                    0.0,
+                )
+                absolute_tolerance = max(
+                    float(self.end_effector_config.get("priority_absolute_tolerance", 1e-4)),
+                    0.0,
+                )
+                tie_break = float(self.end_effector_config.get("tie_break_regularization", 1e-8))
+
+                if contact_residual is not None:
+                    contact_level = cp.norm(contact_residual, 2)
+                    contact_problem = solve_stage(
+                        contact_level + tie_break * cp.sum_squares(dqa), "contact"
                     )
+                    if contact_problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                        return q, np.inf
+                    contact_optimum = max(float(contact_level.value), 0.0)
+                    contact_bound = (
+                        (1.0 + relative_tolerance) * contact_optimum
+                        + absolute_tolerance
+                    )
+                    active_constraints.append(contact_level <= contact_bound)
+
+                if swing_residual is not None:
+                    swing_level = cp.norm(swing_residual, 2)
+                    swing_problem = solve_stage(
+                        swing_level + tie_break * cp.sum_squares(dqa), "swing"
+                    )
+                    if swing_problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
+                        return q, np.inf
+                    swing_optimum = max(float(swing_level.value), 0.0)
+                    swing_relative_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "swing_priority_relative_tolerance",
+                                relative_tolerance,
+                            )
+                        ),
+                        0.0,
+                    )
+                    swing_absolute_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "swing_priority_absolute_tolerance",
+                                absolute_tolerance,
+                            )
+                        ),
+                        0.0,
+                    )
+                    swing_bound = (
+                        (1.0 + swing_relative_tolerance) * swing_optimum
+                        + swing_absolute_tolerance
+                    )
+                    active_constraints.append(swing_level <= swing_bound)
+
+                if swing_orientation_residual is not None:
+                    swing_orientation_level = cp.norm(
+                        swing_orientation_residual, 2
+                    )
+                    swing_orientation_problem = solve_stage(
+                        swing_orientation_level
+                        + tie_break * cp.sum_squares(dqa),
+                        "swing-orientation",
+                    )
+                    if swing_orientation_problem.status not in (
+                        cp.OPTIMAL,
+                        cp.OPTIMAL_INACCURATE,
+                    ):
+                        return q, np.inf
+                    swing_orientation_optimum = max(
+                        float(swing_orientation_level.value), 0.0
+                    )
+                    orientation_relative_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "orientation_priority_relative_tolerance",
+                                relative_tolerance,
+                            )
+                        ),
+                        0.0,
+                    )
+                    orientation_absolute_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "orientation_priority_absolute_tolerance",
+                                absolute_tolerance,
+                            )
+                        ),
+                        0.0,
+                    )
+                    active_constraints.append(
+                        swing_orientation_level
+                        <= (1.0 + orientation_relative_tolerance)
+                        * swing_orientation_optimum
+                        + orientation_absolute_tolerance
+                    )
+
+                if pose_direction_residual is not None:
+                    pose_level = cp.norm(pose_direction_residual, 2)
+                    pose_problem = solve_stage(
+                        pose_level + tie_break * cp.sum_squares(dqa),
+                        "pose-direction",
+                    )
+                    if pose_problem.status not in (
+                        cp.OPTIMAL,
+                        cp.OPTIMAL_INACCURATE,
+                    ):
+                        return q, np.inf
+                    pose_optimum = max(float(pose_level.value), 0.0)
+                    pose_relative_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "pose_priority_relative_tolerance", 0.02
+                            )
+                        ),
+                        0.0,
+                    )
+                    pose_absolute_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "pose_priority_absolute_tolerance", 0.04
+                            )
+                        ),
+                        0.0,
+                    )
+                    active_constraints.append(
+                        pose_level
+                        <= (1.0 + pose_relative_tolerance) * pose_optimum
+                        + pose_absolute_tolerance
+                    )
+
+                problem = solve_stage(body_obj, "whole-body")
+                if show_solver_debug:
+                    print(
+                        f"    hierarchy tasks: contact={num_contacts}, "
+                        f"swing={num_swings}, "
+                        f"swing_orientation={num_swing_orientations}, "
+                        f"pose_bones={len(self.pose_bones)}"
+                    )
+            else:
+                problem = solve_stage(body_obj, "weighted")
 
             if (
                 problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
@@ -3166,10 +2308,7 @@ class GenericInteractionRetargeter:
                         base_target = np.asarray(
                             target_base_position, dtype=float
                         ).reshape(3).copy()
-                        if not bool(
-                            base_cfg.get("reference_includes_z_offset", False)
-                        ):
-                            base_target[2] += float(base_cfg.get("z_offset", 0.0))
+                        base_target[2] += float(base_cfg.get("z_offset", 0.0))
                         proposed_base = q[:3].copy()
                         for qpos_idx in (0, 1, 2):
                             if qpos_idx in self.q_a_indices:

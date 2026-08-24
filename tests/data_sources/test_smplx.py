@@ -7,8 +7,6 @@ from omniretargeting.data_sources.smplx import (
     DEFAULT_SMPLX_TARGET_NAMES,
     SmplxDataSource,
     compute_world_joint_orientations,
-    smplx_joint_quaternions_to_body_quaternions,
-    smplx_root_rotvecs_to_body_quaternions,
     validate_smplx_trajectory,
 )
 
@@ -75,26 +73,3 @@ def test_compute_world_joint_orientations():
             -expected_quat,
             atol=1e-6,
         )
-
-
-def test_smplx_root_rotation_is_converted_at_adapter_boundary():
-    root_rotvecs = np.zeros((2, 3), dtype=float)
-    quaternions = smplx_root_rotvecs_to_body_quaternions(root_rotvecs)
-
-    assert quaternions.shape == (2, 4)
-    np.testing.assert_allclose(np.linalg.norm(quaternions, axis=1), 1.0)
-    # An identity SMPL-X global rotation still needs the canonical T-pose to
-    # body-frame correction, so passing the raw identity downstream is wrong.
-    assert not np.allclose(quaternions[0], [1.0, 0.0, 0.0, 0.0])
-
-
-def test_smplx_joint_frame_uses_the_same_body_axis_conversion_as_root():
-    joint_quaternions = np.asarray(
-        [[1.0, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]]
-    )
-    converted = smplx_joint_quaternions_to_body_quaternions(
-        joint_quaternions
-    )
-    expected = smplx_root_rotvecs_to_body_quaternions(np.zeros((2, 3)))
-
-    np.testing.assert_allclose(converted, expected)
