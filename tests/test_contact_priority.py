@@ -18,10 +18,12 @@ from omniretargeting.retargeting import (
     GenericInteractionRetargeter,
     _apply_configured_joint_limits,
     _build_base_orientation_task,
+    _build_base_position_task,
     _bridge_contact_orientation,
     _clamp_target_to_reach,
     _bridge_swing_to_contact,
     _minimum_jerk_blend,
+    _project_base_position_to_hard_envelope,
     _resolve_position_sigma,
     _resolve_priority_levels,
     _solve_configured_priority_levels,
@@ -34,6 +36,7 @@ import omniretargeting.trajectory_refinement as trajectory_refinement_module
 from omniretargeting.core import (
     _build_per_frame_sigma_scales,
     _build_robot_base_reference,
+    _root_positions_aligning_robot_body,
 )
 from omniretargeting.trajectory_refinement import (
     _joint_coordinate_mask,
@@ -68,6 +71,107 @@ ANKLE_ARM_XML = """
   </worldbody>
 </mujoco>
 """
+
+
+def test_robot_body_alignment_derives_floating_root_from_nominal_morphology():
+    import mujoco
+
+    model = mujoco.MjModel.from_xml_string(
+        """
+        <mujoco>
+          <worldbody>
+            <body name="torso">
+              <freejoint/>
+              <geom type="sphere" size="0.02" mass="1"/>
+              <body name="pelvis" pos="0 0 -0.2">
+                <geom type="sphere" size="0.02" mass="1"/>
+              </body>
+            </body>
+          </worldbody>
+        </mujoco>
+        """
+    )
+    targets = np.asarray([[1.0, 2.0, 3.0], [1.0, 2.0, 3.0]])
+    quaternions = Rotation.from_euler(
+        "x", [[0.0], [90.0]], degrees=True
+    ).as_quat(scalar_first=True)
+
+    roots = _root_positions_aligning_robot_body(
+        model, targets, "pelvis", quaternions
+    )
+
+    np.testing.assert_allclose(roots[0], [1.0, 2.0, 3.2], atol=1e-9)
+    np.testing.assert_allclose(roots[1], [1.0, 1.8, 3.0], atol=1e-9)
+
+
+def test_support_contact_base_policy_keeps_xy_hard_but_leaves_root_z_reachable():
+    """SUPPORT and joint limits, not a human-hip envelope, must choose root Z."""
+    dqa = cp.Variable(7)
+    q = np.asarray([0.0, 0.0, 1.2, 1.0, 0.0, 0.0, 0.0])
+    objective, constraints = _build_base_position_task(
+        dqa,
+        q,
+        np.arange(7),
+        np.asarray([0.0, 0.0, 1.2]),
+        {
+            "enabled": True,
+            "hard_constraints": True,
+            "z_constraint_mode": "support_contact",
+            "max_xy_error": 0.03,
+            "max_z_error": 0.08,
+        },
+    )
+
+    assert objective is not None
+    problem = cp.Problem(
+        cp.Minimize(cp.square(dqa[0] - 1.0) + cp.square(dqa[2] + 0.30)),
+        constraints,
+    )
+    problem.solve(solver=cp.CLARABEL)
+
+    assert problem.status == cp.OPTIMAL
+    assert abs(float(dqa.value[0])) <= 0.03001
+    assert dqa.value[2] == pytest.approx(-0.30, abs=1e-5)
+
+
+def test_reference_envelope_base_policy_retains_hard_root_z_bound():
+    dqa = cp.Variable(7)
+    q = np.asarray([0.0, 0.0, 1.2, 1.0, 0.0, 0.0, 0.0])
+    _, constraints = _build_base_position_task(
+        dqa,
+        q,
+        np.arange(7),
+        np.asarray([0.0, 0.0, 1.2]),
+        {
+            "enabled": True,
+            "hard_constraints": True,
+            "z_constraint_mode": "reference_envelope",
+            "max_xy_error": 0.03,
+            "max_z_error": 0.08,
+        },
+    )
+    problem = cp.Problem(cp.Minimize(cp.square(dqa[2] + 0.30)), constraints)
+    problem.solve(solver=cp.CLARABEL)
+
+    assert problem.status == cp.OPTIMAL
+    assert dqa.value[2] == pytest.approx(-0.08, abs=1e-5)
+
+
+def test_support_contact_postsolve_projection_does_not_reintroduce_root_z_clip():
+    config = {
+        "enabled": True,
+        "hard_constraints": True,
+        "z_constraint_mode": "support_contact",
+        "max_xy_error": 0.03,
+        "max_z_error": 0.08,
+    }
+    projected = _project_base_position_to_hard_envelope(
+        np.asarray([0.2, 0.0, 0.85]),
+        np.asarray([0.0, 0.0, 1.20]),
+        config,
+    )
+
+    np.testing.assert_allclose(projected, [0.03, 0.0, 0.85], atol=1e-12)
 
 
 def test_densify_smplx_frame_gaps_restores_missing_pose_on_shortest_arc():
@@ -192,7 +296,7 @@ def test_world_swing_target_is_not_morphology_scaled_or_root_shifted():
 
 
 def test_g1_profile_gates_world_tracking_on_contact_and_on_the_feet():
-    """Feet stay world-exact; free hands follow the source arm proportionally."""
+    """The G1 follows source effectors and only infers terrain-foot contact."""
     profile_path = (
         Path(__file__).resolve().parents[1]
         / "robot_models"
@@ -204,16 +308,27 @@ def test_g1_profile_gates_world_tracking_on_contact_and_on_the_feet():
     priority = profile["retargeting"]["end_effector_priority"]
     assert priority["root_warp"]["enabled"] is False
     assert priority["lock_base_orientation"] is False
+    assert (
+        priority["base_position_constraint"]["z_constraint_mode"]
+        == "support_contact"
+    )
     assert ["Spine3", "Pelvis"] in priority["pose_direction"]["edges"]
     for name, spec in priority["effectors"].items():
         # Every contact is a real scene interaction and stays in world metres.
         assert spec["contact_target_space"] == "world"
+        assert spec["swing_target_space"] == "world"
         if name.endswith("foot"):
-            assert spec["swing_target_space"] == "world"
             assert spec["swing_morphology_scale"] == pytest.approx(1.0)
+            assert spec["track_source_during_contact"] is True
+            contact_spec = priority["contact_detection"]["effectors"][name]
+            assert contact_spec["contact_mode"] == "SUPPORT"
+            assert contact_spec["anchor_tangent_to_tracking"] is True
+            assert "anchor_drift_tolerance" not in contact_spec
         else:
-            assert spec["swing_target_space"] == "limb_morphology_scaled"
-            assert spec["swing_morphology_scale"] == "auto"
+            assert (
+                priority["contact_detection"]["effectors"][name]["contact_mode"]
+                == "NONE"
+            )
             # The limb base must resolve, otherwise the anchor is undefined.
             assert spec["reach_reference_body"]
 
@@ -737,6 +852,58 @@ def test_framewise_modes_split_support_touch_and_swing_objectives():
     assert swing[0] is None and swing[1] is None and swing[2] is not None
 
 
+def test_contact_can_track_a_distinct_semantic_source_point():
+    """Terrain contact and source tracking may act on two rigid-body points."""
+    cvxpy = pytest.importorskip("cvxpy")
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
+    data = mujoco.MjData(model)
+    data.qpos[3] = 1.0
+    mujoco.mj_forward(model, data)
+    retargeter = GenericInteractionRetargeter(
+        model,
+        data,
+        trimesh.creation.box(extents=[2.0, 2.0, 0.1]),
+        {"LeftFoot": "foot"},
+        robot_height=1.0,
+        terrain_sample_points=4,
+        valid_joint_names=["LeftFoot"],
+        end_effector_config={
+            "enabled": True,
+            "hierarchy": True,
+            "effectors": {
+                "left_foot": {
+                    "robot_body": "foot",
+                    "tracking_offset": [0.8, 0.0, 0.0],
+                    "contact_offsets": [[1.0, 0.0, 0.0]],
+                    "contact_target_space": "world",
+                    "swing_target_space": "world",
+                    "track_source_during_contact": True,
+                }
+            },
+        },
+    )
+    dqa = cvxpy.Variable(retargeter.nq_a)
+    support, contact, swing = retargeter._build_end_effector_objectives(
+        dqa,
+        {
+            "left_foot": {
+                "contact_mode": "SLIDE",
+                "contact_segment_id": 0,
+                "contact_position": [1.0, 0.0, 0.0],
+                "tracking_position": [0.8, 0.0, 0.0],
+                "surface_normal": [0.0, 0.0, 1.0],
+                "confidence": 1.0,
+            }
+        },
+    )[:3]
+
+    assert support is not None
+    assert contact is not None
+    assert swing is not None
+    assert swing.size == 3
+
+
 def test_frame_payload_uses_contact_mode_without_legacy_contact_boolean():
     targets = np.tile([0.0, 0.0, 0.01], (2, 1))
     task = _task(targets, np.asarray([ContactMode.TOUCH, ContactMode.NONE]))
@@ -869,6 +1036,50 @@ def test_contact_inference_allows_sliding_hand_without_moving_foot_policy():
         np.repeat(foot_targets[0:1], len(foot_targets), axis=0),
         atol=1e-10,
     )
+
+
+def test_support_anchor_can_ignore_migrating_source_sole_sample_tangent():
+    scene = trimesh.creation.box(extents=[4.0, 4.0, 0.1])
+    scene.apply_translation([0.0, 0.0, -0.05])
+    tracking = np.tile([0.5, 0.2, 0.04], (6, 1))
+    contact_samples = np.empty((6, 2, 3), dtype=float)
+    contact_samples[:, 0] = [0.42, 0.2, 0.005]
+    contact_samples[:, 1] = [0.58, 0.2, 0.005]
+    # Make the nearest sample alternate heel-to-toe while both samples remain
+    # on the same perfectly horizontal tread.
+    contact_samples[::2, 1, 2] = 0.02
+    contact_samples[1::2, 0, 2] = 0.02
+
+    task = infer_scene_contact_tasks(
+        {
+            "left_foot": {
+                "tracking_positions": tracking,
+                "contact_samples": contact_samples,
+            }
+        },
+        scene,
+        framerate=30.0,
+        config={
+            "distance_threshold": 0.03,
+            "relative_speed_threshold": 0.1,
+            "min_contact_frames": 1,
+            "anchor_window_frames": 3,
+            "effectors": {
+                "left_foot": {
+                    "contact_mode": "SUPPORT",
+                    "anchor_tangent_to_tracking": True,
+                }
+            },
+        },
+    )["left_foot"]
+
+    assert np.all(task.contact_modes == int(ContactMode.SUPPORT))
+    assert len(np.unique(task.contact_segment_ids)) == 1
+    np.testing.assert_allclose(
+        task.contact_positions[:, :2],
+        np.tile([0.5, 0.2], (len(tracking), 1)),
+    )
+    np.testing.assert_allclose(task.contact_positions[:, 2], 0.0, atol=1e-10)
 
 
 def test_vault_support_anchor_bridge_and_local_robot_root_warp():
@@ -1810,6 +2021,55 @@ def test_contact_offset_selection_is_locked_per_contact_run():
         refined[contact_modes == int(ContactMode.SUPPORT), 7], n=3
     )
     assert np.max(np.abs(contact_jerk)) < 0.01
+
+
+def test_refinement_tracks_semantic_point_around_a_fixed_contact_point():
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
+    trajectory = np.tile(model.qpos0, (5, 1))
+    trajectory[:, 3] = 1.0
+    contact_modes = np.full(
+        len(trajectory), int(ContactMode.SUPPORT), dtype=np.uint8
+    )
+    contact_targets = np.zeros((len(trajectory), 3), dtype=float)
+    angle = 0.25
+    tracking_targets = np.tile(
+        [np.cos(angle), 0.0, -np.sin(angle)], (len(trajectory), 1)
+    )
+    task = replace(
+        _task(contact_targets, contact_modes),
+        tracking_positions=tracking_targets,
+    )
+
+    refined = refine_joint_trajectory(
+        model,
+        trajectory,
+        {"left_foot": task},
+        {
+            "hierarchy": True,
+            "effectors": {
+                "left_foot": {
+                    "robot_body": "foot",
+                    "tracking_offset": [1.0, 0.0, 0.0],
+                    "contact_offsets": [[0.0, 0.0, 0.0]],
+                    "contact_target_space": "world",
+                    "swing_target_space": "world",
+                    "track_source_during_contact": True,
+                }
+            },
+        },
+        {
+            "hierarchy": True,
+            "iterations": 4,
+            "reference_sigma": 100.0,
+            "acceleration_enabled": True,
+            "acceleration_sigma": 1.0,
+            "jerk_enabled": False,
+            "trust_region": 0.3,
+        },
+    )
+
+    np.testing.assert_allclose(refined[:, 7], angle, atol=2e-3)
 
 
 def test_refinement_hierarchy_keeps_vault_support_above_smoothness():

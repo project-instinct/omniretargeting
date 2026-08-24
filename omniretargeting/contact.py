@@ -533,6 +533,9 @@ def infer_scene_contact_tasks(
             float(eff_cfg.get("anchor_drift_tolerance", anchor_drift_tolerance)),
             0.0,
         )
+        eff_anchor_tangent_to_tracking = bool(
+            eff_cfg.get("anchor_tangent_to_tracking", False)
+        )
         eff_stabilize_contact_normal_signs = bool(
             eff_cfg.get(
                 "stabilize_contact_normal_signs",
@@ -631,6 +634,18 @@ def infer_scene_contact_tasks(
             )
             if float(np.dot(normal, toward_effector)) < 0.0:
                 normal *= -1.0
+            if eff_anchor_tangent_to_tracking:
+                # The closest source sole sample can migrate heel-to-toe as
+                # the foot rolls, even on one perfectly flat tread.  Terrain
+                # contact only determines the normal coordinate; preserve the
+                # semantic foot marker's tangential coordinate so the anchor
+                # cannot walk along the sole with that sample-id switch.
+                tracking_anchor = np.median(
+                    tracking_positions[anchor_slice], axis=0
+                )
+                anchor = tracking_anchor + normal * float(
+                    np.dot(anchor - tracking_anchor, normal)
+                )
             return anchor, normal
 
         for start, end in _iter_true_runs(candidate_mask):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import numpy as np
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
@@ -18,8 +18,16 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 
+from .affordance import ContactRegion, build_contact_region
 from .utils import compute_mesh_height_at_point
 from .contact import ContactMode, SceneContactTask, infer_scene_contact_tasks
+from .feasibility import (
+    DROPPED_OPTIONAL,
+    INFEASIBLE,
+    FeasibilityOptions,
+    InteractionFeasibilityResult,
+    solve_interaction_feasibility,
+)
 from .retargeting import (
     MORPHOLOGY_SWING_TARGET_SPACES,
     _bridge_contact_orientation,
@@ -263,30 +271,302 @@ def _base_quaternions_wxyz(
     return quaternions
 
 
+def _root_positions_aligning_robot_body(
+    model: mujoco.MjModel,
+    source_body_positions: np.ndarray,
+    robot_body_name: str,
+    root_quaternions_wxyz: np.ndarray,
+) -> np.ndarray:
+    """Place the floating root so a nominal robot body matches a source body.
+
+    The body offset is measured from the compiled robot at ``qpos0`` and
+    rotated by the per-frame source root orientation. This replaces a
+    hand-tuned global height offset with explicit anatomical registration.
+    """
+    targets = np.asarray(source_body_positions, dtype=float)
+    quaternions = np.asarray(root_quaternions_wxyz, dtype=float)
+    if targets.ndim != 2 or targets.shape[1] != 3:
+        raise ValueError(
+            "source body positions must have shape (T, 3), got "
+            f"{targets.shape}."
+        )
+    if quaternions.shape != (len(targets), 4):
+        raise ValueError(
+            "root quaternions must have shape "
+            f"({len(targets)}, 4), got {quaternions.shape}."
+        )
+    if model.njnt == 0 or model.jnt_type[0] != mujoco.mjtJoint.mjJNT_FREE:
+        raise ValueError("robot-body base alignment requires a floating-base model.")
+    root_body_id = int(model.jnt_bodyid[0])
+    robot_body_id = mujoco.mj_name2id(
+        model, mujoco.mjtObj.mjOBJ_BODY, str(robot_body_name)
+    )
+    if robot_body_id < 0:
+        raise ValueError(
+            "base_position_constraint.robot_body refers to missing MuJoCo "
+            f"body {robot_body_name!r}."
+        )
+
+    data = mujoco.MjData(model)
+    data.qpos[:] = np.asarray(model.qpos0, dtype=float)
+    mujoco.mj_forward(model, data)
+    root_rotation0 = data.xmat[root_body_id].reshape(3, 3)
+    body_offset_root = root_rotation0.T @ (
+        data.xpos[robot_body_id] - data.xpos[root_body_id]
+    )
+    root_rotations = Rotation.from_quat(
+        quaternions, scalar_first=True
+    ).as_matrix()
+    body_offsets_world = np.einsum(
+        "tij,j->ti", root_rotations, body_offset_root
+    )
+    return targets - body_offsets_world
+
+
+def _feasibility_options_from_config(
+    config: Mapping[str, Any],
+    root_warp_config: Mapping[str, Any],
+    framerate: float,
+) -> FeasibilityOptions:
+    """Build one feasibility limit set coordinated with the root shaper."""
+    if not np.isfinite(framerate) or float(framerate) <= 0.0:
+        raise ValueError(
+            f"interaction_feasibility framerate must be positive, got {framerate!r}."
+        )
+    root_cfg = dict(root_warp_config or {})
+    values: Dict[str, Any] = {"dt": 1.0 / float(framerate)}
+    if "max_xyz" in root_cfg:
+        values["max_root_translation"] = tuple(
+            np.asarray(root_cfg["max_xyz"], dtype=float).reshape(3)
+        )
+    if "max_translation_norm" in root_cfg:
+        values["max_root_translation_norm"] = float(
+            root_cfg["max_translation_norm"]
+        )
+    elif "max_norm" in root_cfg and float(root_cfg["max_norm"]) > 0.0:
+        values["max_root_translation_norm"] = float(root_cfg["max_norm"])
+    if "max_yaw" in root_cfg:
+        values["max_root_yaw"] = (
+            float(root_cfg["max_yaw"])
+            if bool(root_cfg.get("yaw_enabled", False))
+            else 0.0
+        )
+    if root_cfg.get("max_linear_velocity") is not None:
+        limit = float(root_cfg["max_linear_velocity"])
+        values["max_root_velocity"] = (limit, limit, limit)
+    if root_cfg.get("max_linear_acceleration") is not None:
+        limit = float(root_cfg["max_linear_acceleration"])
+        values["max_root_acceleration"] = (limit, limit, limit)
+    if root_cfg.get("max_yaw_rate") is not None:
+        values["max_yaw_velocity"] = float(root_cfg["max_yaw_rate"])
+    if root_cfg.get("max_yaw_acceleration") is not None:
+        values["max_yaw_acceleration"] = float(
+            root_cfg["max_yaw_acceleration"]
+        )
+
+    raw_options = config.get("options", config)
+    if not isinstance(raw_options, Mapping):
+        raise ValueError("interaction_feasibility.options must be an object.")
+    option_names = set(FeasibilityOptions.__dataclass_fields__)
+    values.update(
+        {
+            str(name): value
+            for name, value in raw_options.items()
+            if str(name) in option_names
+        }
+    )
+    return FeasibilityOptions(**values)
+
+
+def _coordinated_root_warp_config(
+    config: Mapping[str, Any], options: FeasibilityOptions
+) -> Dict[str, Any]:
+    """Make the shaper consume exactly the feasibility amplitude decisions."""
+    result = dict(config or {})
+    result.update(
+        {
+            "enabled": True,
+            "max_xyz": list(options.max_root_translation),
+            "max_translation_norm": float(options.max_root_translation_norm),
+            "yaw_enabled": bool(options.max_root_yaw > 0.0),
+            "max_yaw": float(options.max_root_yaw),
+        }
+    )
+    if "max_linear_velocity" not in result:
+        result["max_linear_velocity"] = float(
+            np.linalg.norm(np.asarray(options.max_root_velocity, dtype=float))
+        )
+    if "max_linear_acceleration" not in result:
+        result["max_linear_acceleration"] = float(
+            np.linalg.norm(np.asarray(options.max_root_acceleration, dtype=float))
+        )
+    result.setdefault("max_yaw_rate", float(options.max_yaw_velocity))
+    result.setdefault("max_yaw_acceleration", float(options.max_yaw_acceleration))
+    return result
+
+
+def _build_interaction_contact_regions(
+    tasks: Mapping[str, SceneContactTask],
+    scene_mesh: trimesh.Trimesh,
+    config: Mapping[str, Any],
+) -> Dict[Tuple[str, int], ContactRegion]:
+    """Extract one immutable source-conditioned scene region per contact run."""
+    affordance_cfg = dict(config.get("affordance", {}) or {})
+    default_radius = affordance_cfg.get("neighborhood_radius")
+    default_object_id = affordance_cfg.get("object_id")
+    per_effector = dict(affordance_cfg.get("effectors", {}) or {})
+    regions: Dict[Tuple[str, int], ContactRegion] = {}
+    for name, task in tasks.items():
+        effector_cfg = dict(per_effector.get(name, {}) or {})
+        radius = effector_cfg.get("neighborhood_radius", default_radius)
+        object_id = effector_cfg.get("object_id", default_object_id)
+        segment_ids = np.asarray(task.contact_segment_ids, dtype=np.int32)
+        for raw_segment_id in np.unique(segment_ids[segment_ids >= 0]):
+            segment_id = int(raw_segment_id)
+            frames = np.flatnonzero(segment_ids == segment_id)
+            kwargs: Dict[str, Any] = {}
+            if radius is not None:
+                kwargs["neighborhood_radius"] = float(radius)
+            if object_id is not None:
+                kwargs["object_id"] = str(object_id)
+            regions[(str(name), segment_id)] = build_contact_region(
+                scene_mesh,
+                np.asarray(task.surface_points, dtype=float)[frames],
+                np.asarray(task.surface_normals, dtype=float)[frames],
+                **kwargs,
+            )
+    return regions
+
+
+def _apply_feasibility_contact_choices(
+    tasks: Mapping[str, SceneContactTask],
+    result: InteractionFeasibilityResult,
+) -> Dict[str, SceneContactTask]:
+    """Copy tasks and replace active solver targets with on-region choices."""
+    chosen: Dict[str, np.ndarray] = {
+        name: np.asarray(task.contact_positions, dtype=float).copy()
+        for name, task in tasks.items()
+    }
+    for segment in result.segments:
+        if segment.effector_name not in chosen:
+            raise KeyError(
+                f"Feasibility returned unknown effector {segment.effector_name!r}."
+            )
+        chosen[segment.effector_name][segment.frame_indices] = (
+            segment.chosen_contact_points_world
+        )
+    return {
+        name: replace(task, contact_positions=chosen[name])
+        for name, task in tasks.items()
+    }
+
+
 def _build_robot_base_reference(
     human_root_positions: np.ndarray,
     tasks: Dict[str, SceneContactTask],
     reach_profiles: Dict[str, Dict[str, Any]],
     config: Dict[str, Any],
-    root_z_offset: float,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Create a low-frequency robot-only root reference around contacts."""
+    root_z_offset: float | np.ndarray,
+    *,
+    base_orientations: np.ndarray | None = None,
+    framerate: float = 30.0,
+    return_diagnostics: bool = False,
+    feasibility_segment_corrections: Mapping[
+        Tuple[str, int], Mapping[str, np.ndarray]
+    ]
+    | None = None,
+) -> Any:
+    """Create one bounded robot-only root warp around contact segments.
+
+    Translation and yaw share the existing segment-median, minimum-jerk, and
+    overlap-averaging path.  Derivative caps apply to the *correction* rather
+    than the source root motion: deliberate source speed must remain intact.
+    Caps are met by widening the approach/release windows, never by clipping
+    individual frames.  ``return_diagnostics`` is opt-in so the historical
+    two-array return contract remains available to callers and tests.
+
+    ``root_z_offset`` retains its legacy name for API compatibility, but may
+    now be a full xyz reference offset.  A scalar still means global z only.
+
+    When ``feasibility_segment_corrections`` is supplied, feasibility is the
+    sole authority for correction amplitude and direction.  This function
+    only turns each decided segment core into the existing smooth,
+    derivative-limited trajectory.  The legacy reach-excess calculation is
+    used only when that argument is ``None``; the two paths are never summed.
+    """
     source_root = np.asarray(human_root_positions, dtype=float)
     base_reference = source_root.copy()
-    base_reference[:, 2] += float(root_z_offset)
+    root_offset = np.asarray(root_z_offset, dtype=float)
+    if root_offset.ndim == 0:
+        reference_offset = np.array([0.0, 0.0, float(root_offset)], dtype=float)
+    else:
+        reference_offset = root_offset.reshape(3).copy()
+    base_reference += reference_offset[None, :]
     unwarped = base_reference.copy()
+    num_frames = len(source_root)
+    yaw_correction = np.zeros(num_frames, dtype=float)
+    empty_diagnostics = {
+        "strategy": "minimum_jerk_window_widening",
+        "max_translation": 0.0,
+        "max_yaw": 0.0,
+        "max_linear_velocity": 0.0,
+        "max_linear_acceleration": 0.0,
+        "max_yaw_rate": 0.0,
+        "max_yaw_acceleration": 0.0,
+        "derivative_slack": {
+            "linear_velocity": 0.0,
+            "linear_acceleration": 0.0,
+            "yaw_rate": 0.0,
+            "yaw_acceleration": 0.0,
+        },
+        "segment_windows": [],
+    }
     if not bool(config.get("enabled", False)) or not tasks:
+        if return_diagnostics:
+            return base_reference, unwarped, yaw_correction, empty_diagnostics
         return base_reference, unwarped
 
-    num_frames = len(source_root)
-    correction_sum = np.zeros((num_frames, 3), dtype=float)
-    correction_weight = np.zeros(num_frames, dtype=float)
+    if not np.isfinite(framerate) or float(framerate) <= 0.0:
+        raise ValueError(f"root_warp framerate must be positive, got {framerate!r}.")
+    framerate = float(framerate)
     approach_frames = max(int(config.get("approach_frames", 8)), 0)
     release_frames = max(int(config.get("release_frames", 8)), 0)
     max_xyz = np.asarray(
         config.get("max_xyz", [0.08, 0.08, 0.06]), dtype=float
     ).reshape(3)
-    max_norm = max(float(config.get("max_norm", 0.10)), 0.0)
+    if np.any(~np.isfinite(max_xyz)) or np.any(max_xyz < 0.0):
+        raise ValueError("root_warp.max_xyz must contain three non-negative values.")
+    uses_new_norm_key = "max_translation_norm" in config
+    max_norm = float(
+        config.get("max_translation_norm", config.get("max_norm", 0.10))
+    )
+    if not np.isfinite(max_norm) or max_norm < 0.0:
+        raise ValueError("root_warp.max_translation_norm must be non-negative.")
+    yaw_enabled = bool(config.get("yaw_enabled", False))
+    max_yaw = float(config.get("max_yaw", 0.0))
+    if not np.isfinite(max_yaw) or max_yaw < 0.0:
+        raise ValueError("root_warp.max_yaw must be non-negative radians.")
+
+    def derivative_limit(name: str) -> float:
+        if name not in config or config[name] is None:
+            return np.inf
+        value = float(config[name])
+        if not np.isfinite(value) or value < 0.0:
+            raise ValueError(f"root_warp.{name} must be non-negative.")
+        return value
+
+    limits = {
+        "linear_velocity": derivative_limit("max_linear_velocity"),
+        "linear_acceleration": derivative_limit("max_linear_acceleration"),
+        "yaw_rate": derivative_limit("max_yaw_rate"),
+        "yaw_acceleration": derivative_limit("max_yaw_acceleration"),
+    }
+    base_quaternions = _base_quaternions_wxyz(base_orientations, num_frames)
+    base_rotations = (
+        None
+        if base_quaternions is None
+        else Rotation.from_quat(base_quaternions, scalar_first=True).as_matrix()
+    )
     raw_qualifying_modes = config.get(
         "qualifying_contact_modes", [ContactMode.SUPPORT.name]
     )
@@ -305,9 +585,47 @@ def _build_robot_base_reference(
             "names or ids (NONE, TOUCH, SLIDE, SUPPORT)."
         ) from exc
 
+    segment_warps: List[Dict[str, Any]] = []
+
+    def minimum_yaw_to_reach(
+        root_to_target: np.ndarray,
+        origin_offset_w: np.ndarray,
+        max_reach: float,
+    ) -> float:
+        """Return the smallest world-z yaw that can reduce a reach excess."""
+        current_delta = root_to_target - origin_offset_w
+        if float(np.linalg.norm(current_delta)) <= max_reach + 1e-10:
+            return 0.0
+        target_radius = float(np.linalg.norm(root_to_target[:2]))
+        offset_radius = float(np.linalg.norm(origin_offset_w[:2]))
+        if target_radius < 1e-10 or offset_radius < 1e-10:
+            return 0.0
+        alignment = float(
+            np.arctan2(root_to_target[1], root_to_target[0])
+            - np.arctan2(origin_offset_w[1], origin_offset_w[0])
+        )
+        alignment = float((alignment + np.pi) % (2.0 * np.pi) - np.pi)
+        vertical_error = float(root_to_target[2] - origin_offset_w[2])
+        cosine_needed = (
+            target_radius**2
+            + offset_radius**2
+            + vertical_error**2
+            - max_reach**2
+        ) / max(2.0 * target_radius * offset_radius, 1e-12)
+        if cosine_needed <= -1.0:
+            return 0.0
+        allowed_residual = (
+            0.0
+            if cosine_needed >= 1.0
+            else float(np.arccos(np.clip(cosine_needed, -1.0, 1.0)))
+        )
+        magnitude = max(abs(alignment) - allowed_residual, 0.0)
+        return float(np.copysign(magnitude, alignment))
+
+    feasibility_decided = feasibility_segment_corrections is not None
     for name, task in tasks.items():
         profile = reach_profiles.get(name)
-        if not profile:
+        if not feasibility_decided and not profile:
             continue
         modes = np.asarray(task.contact_modes, dtype=np.uint8)
         segment_ids = np.asarray(task.contact_segment_ids, dtype=np.int32)
@@ -319,29 +637,126 @@ def _build_robot_base_reference(
             # other contact semantics qualify without changing their schedule.
             if not np.any(np.isin(modes[frames], tuple(qualifying_modes))):
                 continue
-            origins = (
-                unwarped[frames]
-                + np.asarray(profile["origin_offset"], dtype=float)[None, :]
-            )
-            deltas = task.contact_positions[frames] - origins
-            distances = np.linalg.norm(deltas, axis=1)
-            max_reach = max(float(profile["max_reach"]), 1e-6)
-            excess = np.maximum(distances - max_reach, 0.0)
-            desired = deltas * (
-                excess / np.maximum(distances, 1e-10)
-            )[:, None]
-            correction = np.median(desired, axis=0)
-            correction = np.clip(correction, -max_xyz, max_xyz)
-            correction_norm = float(np.linalg.norm(correction))
-            if max_norm > 0.0 and correction_norm > max_norm:
-                correction *= max_norm / correction_norm
-            if float(np.linalg.norm(correction)) < 1e-8:
-                continue
+            if feasibility_decided:
+                assert feasibility_segment_corrections is not None
+                target = feasibility_segment_corrections.get(
+                    (str(name), int(segment_id))
+                )
+                if target is None:
+                    continue
 
+                def segment_values(
+                    field: str, width: int | None = None
+                ) -> np.ndarray:
+                    values = np.asarray(target[field], dtype=float)
+                    expected_tail = () if width is None else (width,)
+                    if values.shape == (num_frames, *expected_tail):
+                        return values[frames]
+                    if values.shape == (len(frames), *expected_tail):
+                        return values
+                    raise ValueError(
+                        "Feasibility segment correction "
+                        f"{(name, int(segment_id))!r} field {field!r} has "
+                        f"shape {values.shape}; expected a full {num_frames}-frame "
+                        f"track or {len(frames)} segment samples."
+                    )
+
+                correction = np.median(
+                    segment_values("translation", width=3), axis=0
+                )
+                segment_yaw = float(np.median(segment_values("yaw")))
+                norm_cap_active = uses_new_norm_key or max_norm > 0.0
+                if np.any(np.abs(correction) > max_xyz + 1e-8) or (
+                    norm_cap_active
+                    and float(np.linalg.norm(correction)) > max_norm + 1e-8
+                ):
+                    raise ValueError(
+                        "Feasibility root translation exceeds the coordinated "
+                        "root_warp amplitude cap; use one shared set of limits."
+                    )
+                if abs(segment_yaw) > max_yaw + 1e-8:
+                    raise ValueError(
+                        "Feasibility root yaw exceeds the coordinated root_warp "
+                        "amplitude cap; use one shared set of limits."
+                    )
+            else:
+                assert profile is not None
+                origin_offset = np.asarray(
+                    profile["origin_offset"], dtype=float
+                ).reshape(3)
+                if yaw_enabled and base_rotations is not None:
+                    origin_offsets_w = np.einsum(
+                        "tij,j->ti", base_rotations[frames], origin_offset
+                    )
+                else:
+                    # Preserve the exact historical translation numerics unless
+                    # yaw has explicitly been enabled with an orientation track.
+                    origin_offsets_w = np.repeat(
+                        origin_offset[None, :], len(frames), axis=0
+                    )
+                origins = unwarped[frames] + origin_offsets_w
+                deltas = task.contact_positions[frames] - origins
+                distances = np.linalg.norm(deltas, axis=1)
+                max_reach = max(float(profile["max_reach"]), 1e-6)
+                excess = np.maximum(distances - max_reach, 0.0)
+                desired = deltas * (
+                    excess / np.maximum(distances, 1e-10)
+                )[:, None]
+                correction = np.median(desired, axis=0)
+                correction = np.clip(correction, -max_xyz, max_xyz)
+                correction_norm = float(np.linalg.norm(correction))
+                # Legacy max_norm=0 meant "no norm clamp".  The new explicit key
+                # follows ordinary cap semantics, where zero disables translation.
+                norm_cap_active = uses_new_norm_key or max_norm > 0.0
+                if norm_cap_active and correction_norm > max_norm:
+                    correction *= max_norm / max(correction_norm, 1e-12)
+
+                segment_yaw = 0.0
+                if yaw_enabled and max_yaw > 0.0 and base_rotations is not None:
+                    desired_yaw = np.asarray(
+                        [
+                            minimum_yaw_to_reach(
+                                task.contact_positions[frame_idx]
+                                - (unwarped[frame_idx] + correction),
+                                offset_w,
+                                max_reach,
+                            )
+                            for frame_idx, offset_w in zip(frames, origin_offsets_w)
+                        ],
+                        dtype=float,
+                    )
+                    segment_yaw = float(
+                        np.clip(np.median(desired_yaw), -max_yaw, max_yaw)
+                    )
+            if (
+                float(np.linalg.norm(correction)) < 1e-8
+                and abs(segment_yaw) < 1e-8
+            ):
+                continue
             start = int(frames[0])
             end = int(frames[-1]) + 1
-            window_start = max(0, start - approach_frames)
-            window_end = min(num_frames, end + release_frames)
+            segment_warps.append(
+                {
+                    "name": name,
+                    "segment_id": int(segment_id),
+                    "start": start,
+                    "end": end,
+                    "approach": min(approach_frames, start),
+                    "release": min(release_frames, num_frames - end),
+                    "translation": correction.copy(),
+                    "yaw": segment_yaw,
+                }
+            )
+
+    def assemble_correction() -> Tuple[np.ndarray, np.ndarray]:
+        correction_sum = np.zeros((num_frames, 3), dtype=float)
+        correction_weight = np.zeros(num_frames, dtype=float)
+        yaw_sum = np.zeros(num_frames, dtype=float)
+        for segment in segment_warps:
+            start = int(segment["start"])
+            end = int(segment["end"])
+            window_start = start - int(segment["approach"])
+            window_end = end + int(segment["release"])
             weights = np.ones(window_end - window_start, dtype=float)
             if start > window_start:
                 pre = np.arange(window_start, start + 1)
@@ -353,14 +768,590 @@ def _build_robot_base_reference(
                 weights[-len(post) :] = 1.0 - _minimum_jerk_blend(
                     (post - (end - 1)) / max(window_end - end, 1)
                 )
-            correction_sum[window_start:window_end] += weights[:, None] * correction
+            correction_sum[window_start:window_end] += (
+                weights[:, None] * segment["translation"]
+            )
+            yaw_sum[window_start:window_end] += weights * float(segment["yaw"])
             correction_weight[window_start:window_end] += weights
 
-    active = correction_weight > 1e-10
-    base_reference[active] += (
-        correction_sum[active] / correction_weight[active, None]
-    )
+        translation = np.zeros((num_frames, 3), dtype=float)
+        yaw = np.zeros(num_frames, dtype=float)
+        active = correction_weight > 1e-10
+        # A lone segment must retain its minimum-jerk amplitude.  Normalize
+        # only the excess weight created by overlapping segment windows;
+        # dividing by a sub-unit single-segment weight would cancel the ramp
+        # and recreate a one-frame step at each nonzero endpoint.
+        normalization = np.maximum(correction_weight[active], 1.0)
+        translation[active] = (
+            correction_sum[active] / normalization[:, None]
+        )
+        yaw[active] = yaw_sum[active] / normalization
+        return translation, yaw
+
+    def correction_metrics(
+        translation: np.ndarray, yaw: np.ndarray
+    ) -> Dict[str, float]:
+        linear_velocity = np.diff(translation, axis=0) * framerate
+        linear_acceleration = np.diff(translation, n=2, axis=0) * framerate**2
+        yaw_rate = np.diff(yaw) * framerate
+        yaw_acceleration = np.diff(yaw, n=2) * framerate**2
+
+        def max_row_norm(values: np.ndarray) -> float:
+            return (
+                float(np.max(np.linalg.norm(values, axis=1)))
+                if len(values)
+                else 0.0
+            )
+
+        return {
+            "max_translation": max_row_norm(translation),
+            "max_yaw": float(np.max(np.abs(yaw))) if len(yaw) else 0.0,
+            "max_linear_velocity": max_row_norm(linear_velocity),
+            "max_linear_acceleration": max_row_norm(linear_acceleration),
+            "max_yaw_rate": (
+                float(np.max(np.abs(yaw_rate))) if len(yaw_rate) else 0.0
+            ),
+            "max_yaw_acceleration": (
+                float(np.max(np.abs(yaw_acceleration)))
+                if len(yaw_acceleration)
+                else 0.0
+            ),
+        }
+
+    def limit_violations(metrics: Mapping[str, float]) -> Dict[str, float]:
+        return {
+            name: max(float(metrics[f"max_{name}"]) - limit, 0.0)
+            if np.isfinite(limit)
+            else 0.0
+            for name, limit in limits.items()
+        }
+
+    translation_correction, yaw_correction = assemble_correction()
+    metrics = correction_metrics(translation_correction, yaw_correction)
+    violations = limit_violations(metrics)
+
+    # Strategy (a): widen complete minimum-jerk windows.  This preserves the
+    # quintic shape and segment overlap semantics; it never clips a frame.
+    for _ in range(max(2 * num_frames, 1)):
+        if not any(value > 1e-10 for value in violations.values()):
+            break
+        linear_bad = (
+            violations["linear_velocity"] > 1e-10
+            or violations["linear_acceleration"] > 1e-10
+        )
+        yaw_bad = (
+            violations["yaw_rate"] > 1e-10
+            or violations["yaw_acceleration"] > 1e-10
+        )
+        changed = False
+        for segment in segment_warps:
+            relevant = (
+                linear_bad
+                and float(np.linalg.norm(segment["translation"])) > 1e-10
+            ) or (yaw_bad and abs(float(segment["yaw"])) > 1e-10)
+            if not relevant:
+                continue
+            if int(segment["approach"]) < int(segment["start"]):
+                segment["approach"] = int(segment["approach"]) + 1
+                changed = True
+            if int(segment["release"]) < num_frames - int(segment["end"]):
+                segment["release"] = int(segment["release"]) + 1
+                changed = True
+        if not changed:
+            break
+        translation_correction, yaw_correction = assemble_correction()
+        metrics = correction_metrics(translation_correction, yaw_correction)
+        violations = limit_violations(metrics)
+
+    base_reference += translation_correction
+    diagnostics = {
+        "strategy": (
+            "feasibility_decision_minimum_jerk_window_widening"
+            if feasibility_decided
+            else "minimum_jerk_window_widening"
+        ),
+        "correction_authority": (
+            "interaction_feasibility" if feasibility_decided else "reach_excess"
+        ),
+        **metrics,
+        "derivative_slack": violations,
+        "segment_windows": [
+            {
+                "name": segment["name"],
+                "segment_id": segment["segment_id"],
+                "start": segment["start"],
+                "end": segment["end"],
+                "approach_frames": segment["approach"],
+                "release_frames": segment["release"],
+            }
+            for segment in segment_warps
+        ],
+    }
+    nonzero_slack = {
+        name: value for name, value in violations.items() if value > 1e-10
+    }
+    if nonzero_slack:
+        formatted = ", ".join(
+            f"{name}={value:.6g}" for name, value in nonzero_slack.items()
+        )
+        print(
+            "Root warp derivative-limit slack after exhausting available "
+            f"minimum-jerk windows: {formatted}."
+        )
+
+    if return_diagnostics:
+        return base_reference, unwarped, yaw_correction, diagnostics
     return base_reference, unwarped
+
+
+@dataclass
+class _SupportHandoffEvent:
+    """Runtime state for one explicitly configured support-transfer event."""
+
+    kind: str
+    old_supports: Tuple[str, ...]
+    new_supports: Tuple[str, ...]
+    start: int
+    end: int
+    requested_release: int
+    anchor_frames: Dict[str, int]
+    hold_frames: int
+    position_error_threshold: float
+    max_penetration: float
+    min_bridge_alpha: float
+    stable_count: int = 0
+    established_frame: int | None = None
+    flight_release_frame: int | None = None
+
+
+class _SupportHandoffGuard:
+    """Delay configured support releases until a new support is established.
+
+    This is deliberately not a second contact-phase state machine.  Locked
+    support and requested release are read directly from each task's
+    ``(ContactMode, contact_bridge_alpha, contact_segment_ids)`` tracks.  Only
+    events explicitly marked ``support_transfer`` or ``quasi_static`` are
+    guarded.  Explicit flight/jump/roll/full-release windows always win.
+    """
+
+    _GUARDED_KINDS = {"support_transfer", "quasi_static"}
+    _FLIGHT_KINDS = {
+        "flight",
+        "jump",
+        "roll",
+        "full_release",
+        "intentional_full_release",
+    }
+
+    def __init__(
+        self,
+        tasks: Mapping[str, SceneContactTask],
+        config: Mapping[str, Any] | bool | None,
+    ) -> None:
+        self.tasks = dict(tasks)
+        self.num_frames = (
+            len(next(iter(self.tasks.values())).contact_modes) if self.tasks else 0
+        )
+        self.events: List[_SupportHandoffEvent] = []
+        self.override_sources: Dict[str, Dict[int, int]] = {
+            name: {} for name in self.tasks
+        }
+        self.flight_mask = np.zeros(self.num_frames, dtype=bool)
+
+        if isinstance(config, Mapping):
+            policy = dict(config)
+            enabled = bool(policy.get("enabled", False))
+        else:
+            policy = {}
+            enabled = bool(config)
+        self.enabled = enabled and bool(self.tasks)
+        if not self.enabled:
+            return
+
+        raw_events = policy.get("events", [])
+        if not isinstance(raw_events, list):
+            raise ValueError("support_handoff.events must be a list.")
+        for raw_event in raw_events:
+            if not isinstance(raw_event, Mapping):
+                raise ValueError("Each support_handoff event must be an object.")
+            event = dict(raw_event)
+            kind = str(
+                event.get("type", event.get("kind", ""))
+            ).strip().lower().replace("-", "_")
+            start = int(event.get("start_frame", 0))
+            end = int(event.get("end_frame", self.num_frames))
+            if not (0 <= start < end <= self.num_frames):
+                raise ValueError(
+                    "support_handoff event windows must satisfy "
+                    f"0 <= start_frame < end_frame <= {self.num_frames}."
+                )
+            if kind in self._FLIGHT_KINDS:
+                self.flight_mask[start:end] = True
+
+        for raw_event in raw_events:
+            event = dict(raw_event)
+            kind = str(
+                event.get("type", event.get("kind", ""))
+            ).strip().lower().replace("-", "_")
+            if kind in self._FLIGHT_KINDS:
+                continue
+            if kind not in self._GUARDED_KINDS:
+                raise ValueError(
+                    "support_handoff event type must be support_transfer, "
+                    "quasi_static, flight, jump, roll, or full_release; got "
+                    f"{kind!r}."
+                )
+            start = int(event.get("start_frame", 0))
+            end = int(event.get("end_frame", self.num_frames))
+            old_supports = self._name_tuple(
+                event.get("old_supports", event.get("from", ()))
+            )
+            new_supports = self._name_tuple(
+                event.get("new_supports", event.get("to", ()))
+            )
+            if not old_supports or not new_supports:
+                raise ValueError(
+                    "Guarded support_handoff events require non-empty "
+                    "old_supports and new_supports."
+                )
+            unknown = (set(old_supports) | set(new_supports)) - set(self.tasks)
+            if unknown:
+                raise ValueError(
+                    "support_handoff refers to unknown effectors: "
+                    + ", ".join(sorted(unknown))
+                )
+            release_frame = event.get("release_frame")
+            if release_frame is None:
+                release_frame = self._derive_requested_release(
+                    old_supports, start, end
+                )
+            release_frame = int(release_frame)
+            if not (start <= release_frame < end):
+                raise ValueError(
+                    "support_handoff.release_frame must lie inside its event window."
+                )
+            anchors = {
+                name: self._support_anchor_before(name, release_frame, start)
+                for name in old_supports
+            }
+            hold_frames = max(
+                int(event.get("hold_frames", policy.get("hold_frames", 3))), 1
+            )
+            position_threshold = float(
+                event.get(
+                    "position_error_threshold",
+                    policy.get("position_error_threshold", 0.025),
+                )
+            )
+            max_penetration = float(
+                event.get(
+                    "max_penetration",
+                    policy.get("max_penetration", 0.05),
+                )
+            )
+            min_bridge_alpha = float(
+                event.get(
+                    "min_bridge_alpha",
+                    policy.get("min_bridge_alpha", 1.0 - 1e-8),
+                )
+            )
+            if position_threshold < 0.0 or max_penetration < 0.0:
+                raise ValueError(
+                    "support_handoff error and penetration thresholds must be "
+                    "non-negative."
+                )
+            if not 0.0 <= min_bridge_alpha <= 1.0:
+                raise ValueError(
+                    "support_handoff.min_bridge_alpha must lie in [0, 1]."
+                )
+            self.events.append(
+                _SupportHandoffEvent(
+                    kind=kind,
+                    old_supports=old_supports,
+                    new_supports=new_supports,
+                    start=start,
+                    end=end,
+                    requested_release=release_frame,
+                    anchor_frames=anchors,
+                    hold_frames=hold_frames,
+                    position_error_threshold=position_threshold,
+                    max_penetration=max_penetration,
+                    min_bridge_alpha=min_bridge_alpha,
+                )
+            )
+
+    @staticmethod
+    def _name_tuple(value: Any) -> Tuple[str, ...]:
+        if isinstance(value, str):
+            return (value,)
+        return tuple(str(name) for name in value)
+
+    @staticmethod
+    def _bridge_alpha(task: SceneContactTask) -> np.ndarray:
+        if task.contact_bridge_alpha is not None:
+            return np.asarray(task.contact_bridge_alpha, dtype=float)
+        return (
+            np.asarray(task.contact_modes, dtype=np.uint8)
+            != int(ContactMode.NONE)
+        ).astype(float)
+
+    @classmethod
+    def _locked_support(
+        cls,
+        task: SceneContactTask,
+        frame_idx: int,
+        min_bridge_alpha: float,
+    ) -> bool:
+        return bool(
+            int(task.contact_modes[frame_idx]) == int(ContactMode.SUPPORT)
+            and int(task.contact_segment_ids[frame_idx]) >= 0
+            and float(cls._bridge_alpha(task)[frame_idx]) >= min_bridge_alpha
+        )
+
+    def _derive_requested_release(
+        self,
+        old_supports: Tuple[str, ...],
+        start: int,
+        end: int,
+    ) -> int:
+        releases: List[int] = []
+        for name in old_supports:
+            task = self.tasks[name]
+            alpha = self._bridge_alpha(task)
+            for frame_idx in range(max(start, 1), end):
+                previous_locked = bool(
+                    int(task.contact_modes[frame_idx - 1])
+                    == int(ContactMode.SUPPORT)
+                    and int(task.contact_segment_ids[frame_idx - 1]) >= 0
+                    and float(alpha[frame_idx - 1]) >= 1.0 - 1e-8
+                )
+                current_locked = self._locked_support(
+                    task, frame_idx, 1.0 - 1e-8
+                )
+                if previous_locked and not current_locked:
+                    releases.append(frame_idx)
+                    break
+        if not releases:
+            raise ValueError(
+                "support_handoff could not derive a SUPPORT release inside the "
+                "event; configure release_frame explicitly."
+            )
+        return min(releases)
+
+    def _support_anchor_before(
+        self, name: str, release_frame: int, event_start: int
+    ) -> int:
+        task = self.tasks[name]
+        candidates = [
+            frame_idx
+            for frame_idx in range(release_frame - 1, event_start - 1, -1)
+            if self._locked_support(task, frame_idx, 1.0 - 1e-8)
+        ]
+        if not candidates:
+            raise ValueError(
+                f"support_handoff old support {name!r} has no locked SUPPORT "
+                "frame before release."
+            )
+        return candidates[0]
+
+    @property
+    def new_support_names(self) -> Tuple[str, ...]:
+        return tuple(
+            dict.fromkeys(
+                name for event in self.events for name in event.new_supports
+            )
+        )
+
+    def overrides_for_frame(self, frame_idx: int) -> Dict[str, int]:
+        """Return old-support frame anchors that must remain active now."""
+        overrides: Dict[str, int] = {}
+        if not self.enabled:
+            return overrides
+        for event in self.events:
+            if frame_idx < event.start:
+                continue
+            if self.flight_mask[frame_idx]:
+                if event.flight_release_frame is None:
+                    event.flight_release_frame = frame_idx
+                continue
+            release_allowed = (
+                event.flight_release_frame is not None
+                or (
+                    event.established_frame is not None
+                    and frame_idx > event.established_frame
+                )
+            )
+            if frame_idx >= event.requested_release and not release_allowed:
+                for name, anchor_frame in event.anchor_frames.items():
+                    overrides[name] = anchor_frame
+                    self.override_sources[name][frame_idx] = anchor_frame
+        return overrides
+
+    def needs_observation(self, frame_idx: int) -> bool:
+        """Whether an unresolved guarded event can advance on this frame."""
+        return any(
+            event.established_frame is None
+            and event.flight_release_frame is None
+            and event.start <= frame_idx < event.end
+            for event in self.events
+        )
+
+    def payload(
+        self,
+        name: str,
+        frame_idx: int,
+        anchor_frame: int,
+    ) -> Dict[str, Any]:
+        """Return a locked old-support payload with the current root reference."""
+        task = self.tasks[name]
+        payload = dict(task.frame(anchor_frame))
+        payload["contact_mode"] = ContactMode.SUPPORT.name
+        payload["transition_weight"] = 1.0
+        if task.robot_base_reference_w is not None:
+            payload["robot_base_reference_w"] = task.robot_base_reference_w[
+                frame_idx
+            ]
+        return payload
+
+    def observe(
+        self,
+        frame_idx: int,
+        position_errors: Mapping[str, float],
+        penetration_depths: Mapping[str, float] | float,
+    ) -> None:
+        """Observe the just-solved frame and advance consecutive hold counts."""
+        if not self.enabled:
+            return
+        for event in self.events:
+            if (
+                event.established_frame is not None
+                or event.flight_release_frame is not None
+                or not event.start <= frame_idx < event.end
+            ):
+                continue
+            stable = True
+            for name in event.new_supports:
+                task = self.tasks[name]
+                error = float(position_errors.get(name, np.inf))
+                if isinstance(penetration_depths, Mapping):
+                    penetration = float(penetration_depths.get(name, np.inf))
+                else:
+                    penetration = float(penetration_depths)
+                stable &= self._locked_support(
+                    task, frame_idx, event.min_bridge_alpha
+                )
+                stable &= error <= event.position_error_threshold
+                stable &= penetration <= event.max_penetration
+            event.stable_count = event.stable_count + 1 if stable else 0
+            if event.stable_count >= event.hold_frames:
+                event.established_frame = frame_idx
+
+    def materialize(
+        self, tasks: Mapping[str, SceneContactTask]
+    ) -> Dict[str, SceneContactTask]:
+        """Copy runtime support holds into tasks consumed by refinement/export."""
+        result = dict(tasks)
+        for name, frame_sources in self.override_sources.items():
+            if not frame_sources:
+                continue
+            task = result[name]
+
+            def copied(field_name: str) -> np.ndarray:
+                return np.asarray(getattr(task, field_name)).copy()
+
+            contact_positions = copied("contact_positions")
+            surface_points = copied("surface_points")
+            surface_normals = copied("surface_normals")
+            distances = copied("distances")
+            relative_speeds = copied("relative_speeds")
+            contact_confidence = copied("contact_confidence")
+            contact_modes = copied("contact_modes")
+            segment_ids = copied("contact_segment_ids")
+            transition_weights = copied("transition_weights")
+            optional_names = (
+                "forward_directions",
+                "up_directions",
+                "contact_bridge_alpha",
+                "contact_bridge_positions",
+                "orientation_target_rotations",
+                "orientation_bridge_alpha",
+                "position_sigma_scale",
+                "orientation_sigma_scale",
+            )
+            optional = {
+                field_name: (
+                    None
+                    if getattr(task, field_name) is None
+                    else copied(field_name)
+                )
+                for field_name in optional_names
+            }
+            for frame_idx, anchor_frame in frame_sources.items():
+                for values in (
+                    contact_positions,
+                    surface_points,
+                    surface_normals,
+                    distances,
+                    relative_speeds,
+                    contact_confidence,
+                ):
+                    values[frame_idx] = values[anchor_frame]
+                contact_modes[frame_idx] = int(ContactMode.SUPPORT)
+                segment_ids[frame_idx] = segment_ids[anchor_frame]
+                transition_weights[frame_idx] = 1.0
+                for field_name, values in optional.items():
+                    if values is None:
+                        continue
+                    values[frame_idx] = values[anchor_frame]
+                    if field_name in (
+                        "contact_bridge_alpha",
+                        "orientation_bridge_alpha",
+                    ):
+                        values[frame_idx] = 1.0
+            result[name] = replace(
+                task,
+                contact_positions=contact_positions,
+                surface_points=surface_points,
+                surface_normals=surface_normals,
+                distances=distances,
+                relative_speeds=relative_speeds,
+                contact_confidence=contact_confidence,
+                contact_modes=contact_modes,
+                contact_segment_ids=segment_ids,
+                transition_weights=transition_weights,
+                **optional,
+            )
+        return result
+
+    def diagnostics(self) -> List[Dict[str, Any]]:
+        diagnostics: List[Dict[str, Any]] = []
+        for event in self.events:
+            if event.flight_release_frame is not None:
+                actual_release = event.flight_release_frame
+            elif event.established_frame is None:
+                actual_release = None
+            else:
+                actual_release = max(
+                    event.requested_release, event.established_frame + 1
+                )
+            diagnostics.append(
+                {
+                    "type": event.kind,
+                    "old_supports": event.old_supports,
+                    "new_supports": event.new_supports,
+                    "requested_release_frame": event.requested_release,
+                    "hold_frames": event.hold_frames,
+                    "established_frame": event.established_frame,
+                    "actual_release_frame": actual_release,
+                    "held_extra_frames": (
+                        None
+                        if actual_release is None
+                        else max(actual_release - event.requested_release, 0)
+                    ),
+                    "flight_override": event.flight_release_frame is not None,
+                }
+            )
+        return diagnostics
 
 
 class OmniRetargeter:
@@ -696,24 +1687,292 @@ class OmniRetargeter:
         end_effector_cfg: Dict[str, Any],
         base_orientations: np.ndarray | None = None,
         scene_mesh: trimesh.Trimesh | None = None,
+        framerate: float = 30.0,
     ) -> Dict[str, SceneContactTask]:
         """Attach explicit swing, contact-bridge, and robot-root references."""
-        root_name = self.base_orientation_config.get("root_position", "Pelvis")
-        root_idx = self.smplx_joint_indices.get(root_name, 0)
-        source_roots = source_trajectory[:, root_idx]
         base_cfg = dict(end_effector_cfg.get("base_position_constraint", {}) or {})
+        root_name = str(
+            base_cfg.get(
+                "source_joint",
+                self.base_orientation_config.get("root_position", "Pelvis"),
+            )
+        )
+        if root_name not in self.smplx_joint_indices:
+            raise ValueError(
+                "base_position_constraint.source_joint must name a loaded "
+                f"source joint, got {root_name!r}."
+            )
+        root_idx = self.smplx_joint_indices[root_name]
+        source_roots = source_trajectory[:, root_idx].copy()
+        raw_landmarks = base_cfg.get("landmarks")
+        landmark_specs: List[Tuple[str, str]] = []
+        if raw_landmarks is not None:
+            if not isinstance(raw_landmarks, list) or not raw_landmarks:
+                raise ValueError(
+                    "base_position_constraint.landmarks must be a non-empty list."
+                )
+            for raw_landmark in raw_landmarks:
+                if not isinstance(raw_landmark, Mapping):
+                    raise ValueError(
+                        "Each base_position_constraint.landmarks entry must "
+                        "be an object."
+                    )
+                source_joint = str(raw_landmark.get("source_joint", ""))
+                robot_body = str(raw_landmark.get("robot_body", ""))
+                if source_joint not in self.smplx_joint_indices:
+                    raise ValueError(
+                        "base_position_constraint landmark source_joint must "
+                        f"name a loaded source joint, got {source_joint!r}."
+                    )
+                if not robot_body:
+                    raise ValueError(
+                        "base_position_constraint landmark robot_body is required."
+                    )
+                landmark_specs.append((source_joint, robot_body))
         root_z_offset = float(base_cfg.get("z_offset", 0.0))
+        root_reference_offset = np.asarray(
+            base_cfg.get("offset", [0.0, 0.0, root_z_offset]), dtype=float
+        ).reshape(3)
         reach_profiles = self._end_effector_reach_profiles(end_effector_cfg)
-        robot_base_reference, unwarped = _build_robot_base_reference(
+        root_warp_cfg = dict(end_effector_cfg.get("root_warp", {}) or {})
+        raw_feasibility_cfg = end_effector_cfg.get(
+            "interaction_feasibility", {}
+        )
+        if isinstance(raw_feasibility_cfg, Mapping):
+            feasibility_cfg = dict(raw_feasibility_cfg)
+            feasibility_enabled = bool(feasibility_cfg.get("enabled", False))
+        else:
+            feasibility_cfg = {}
+            feasibility_enabled = bool(raw_feasibility_cfg)
+        feasibility_options = (
+            _feasibility_options_from_config(
+                feasibility_cfg, root_warp_cfg, framerate
+            )
+            if feasibility_enabled
+            else None
+        )
+        self.last_interaction_feasibility_result = None
+        self.last_interaction_contact_regions = {}
+        self.last_interaction_feasibility_export_payload = {}
+        source_base_quaternions = _base_quaternions_wxyz(
+            base_orientations, len(source_trajectory)
+        )
+        align_robot_body = base_cfg.get("robot_body")
+        needs_body_alignment = bool(
+            align_robot_body is not None or landmark_specs
+        )
+        if (
+            source_base_quaternions is None
+            and (
+                needs_body_alignment
+                or
+                (
+                    bool(root_warp_cfg.get("enabled", False))
+                    and bool(root_warp_cfg.get("yaw_enabled", False))
+                )
+                or (
+                    feasibility_options is not None
+                    and feasibility_options.max_root_yaw > 0.0
+                )
+            )
+        ):
+            # Position-only adapters still have a source-neutral body-frame
+            # fallback.  Estimate it here so yaw warp is not silently disabled
+            # merely because captured root rotations were unavailable.
+            estimated_quaternions: List[np.ndarray] = []
+            previous_xyzw = None
+            for source_joints in source_trajectory:
+                xyzw = self._estimate_base_orientation_from_joints(
+                    source_joints, previous_xyzw
+                )
+                if xyzw is None:
+                    estimated_quaternions = []
+                    break
+                estimated_quaternions.append(
+                    np.asarray(xyzw, dtype=float)[[3, 0, 1, 2]]
+                )
+                previous_xyzw = xyzw
+            if estimated_quaternions:
+                source_base_quaternions = np.asarray(
+                    estimated_quaternions, dtype=float
+                )
+        if needs_body_alignment:
+            if source_base_quaternions is None:
+                raise ValueError(
+                    "base-position body alignment requires a source "
+                    "base orientation or a valid joint-position body frame."
+                )
+            if landmark_specs:
+                aligned_roots = [
+                    _root_positions_aligning_robot_body(
+                        self.robot_model,
+                        source_trajectory[
+                            :, self.smplx_joint_indices[source_joint]
+                        ],
+                        robot_body,
+                        source_base_quaternions,
+                    )
+                    for source_joint, robot_body in landmark_specs
+                ]
+                source_roots = np.mean(aligned_roots, axis=0)
+            else:
+                source_roots = _root_positions_aligning_robot_body(
+                    self.robot_model,
+                    source_roots,
+                    str(align_robot_body),
+                    source_base_quaternions,
+                )
+
+        feasibility_result: InteractionFeasibilityResult | None = None
+        feasibility_corrections: Dict[
+            Tuple[str, int], Mapping[str, np.ndarray]
+        ] | None = None
+        if feasibility_enabled:
+            if scene_mesh is None:
+                raise ValueError(
+                    "interaction_feasibility requires the original scene mesh "
+                    "to construct source-conditioned contact regions."
+                )
+            regions = _build_interaction_contact_regions(
+                tasks, scene_mesh, feasibility_cfg
+            )
+            self.last_interaction_contact_regions = regions
+            if regions:
+                chain_specs = resolve_end_effector_chain_specs(
+                    self.robot_model,
+                    end_effector_cfg,
+                    self.valid_joint_mapping,
+                )
+                morphology = analyze_robot_morphology(
+                    self.robot_model,
+                    {"chains": chain_specs},
+                    configured_joint_limits=end_effector_cfg.get(
+                        "joint_posture_limits"
+                    ),
+                    reach_samples=int(
+                        end_effector_cfg.get("morphology_reach_samples", 512)
+                    ),
+                )
+                unwarped_qpos = np.repeat(
+                    np.asarray(self.robot_model.qpos0, dtype=float)[None, :],
+                    len(source_trajectory),
+                    axis=0,
+                )
+                if unwarped_qpos.shape[1] < 7:
+                    raise ValueError(
+                        "interaction_feasibility requires a floating-base robot."
+                    )
+                unwarped_qpos[:, :3] = (
+                    source_roots + root_reference_offset[None, :]
+                )
+                if source_base_quaternions is not None:
+                    unwarped_qpos[:, 3:7] = source_base_quaternions
+                assert feasibility_options is not None
+                feasibility_result = solve_interaction_feasibility(
+                    self.robot_model,
+                    morphology,
+                    tasks,
+                    regions,
+                    unwarped_qpos,
+                    required_contacts=feasibility_cfg.get(
+                        "required_contacts", True
+                    ),
+                    configured_joint_limits=end_effector_cfg.get(
+                        "joint_posture_limits"
+                    ),
+                    options=feasibility_options,
+                )
+                self.last_interaction_feasibility_result = feasibility_result
+                self.last_interaction_feasibility_export_payload = (
+                    feasibility_result.to_npz_dict()
+                )
+                failures = [
+                    segment
+                    for segment in feasibility_result.segments
+                    if segment.required
+                    and segment.reachability_status == INFEASIBLE
+                ]
+                if failures:
+                    details = "; ".join(
+                        f"{segment.effector_name}[{segment.segment_id}] "
+                        f"slack={segment.max_contact_slack:.6g}m: "
+                        f"{segment.infeasible_reason}"
+                        for segment in failures
+                    )
+                    message = (
+                        "Required interaction feasibility failed; framewise "
+                        f"retargeting was not accepted as contact success: {details}"
+                    )
+                    failure_policy = str(
+                        feasibility_cfg.get("infeasible_policy", "raise")
+                    ).strip().lower()
+                    if failure_policy == "raise":
+                        raise RuntimeError(message)
+                    if failure_policy != "flag":
+                        raise ValueError(
+                            "interaction_feasibility.infeasible_policy must be "
+                            "'raise' or 'flag'."
+                        )
+                    print(f"WARNING: {message}")
+                tasks = _apply_feasibility_contact_choices(
+                    tasks, feasibility_result
+                )
+                feasibility_corrections = {
+                    (segment.effector_name, segment.segment_id): {
+                        "translation": segment.root_correction_translation,
+                        "yaw": segment.root_correction_yaw,
+                    }
+                    for segment in feasibility_result.segments
+                    if segment.required
+                    and segment.reachability_status != DROPPED_OPTIONAL
+                }
+            else:
+                # An enabled prepass with no active contact run still owns the
+                # zero correction.  Passing an empty mapping prevents the
+                # legacy reach heuristic from becoming a second authority.
+                feasibility_corrections = {}
+            assert feasibility_options is not None
+            root_warp_cfg = _coordinated_root_warp_config(
+                root_warp_cfg, feasibility_options
+            )
+        (
+            robot_base_reference,
+            unwarped,
+            root_yaw_correction,
+            root_warp_diagnostics,
+        ) = _build_robot_base_reference(
             source_roots,
             tasks,
             reach_profiles,
-            dict(end_effector_cfg.get("root_warp", {}) or {}),
-            root_z_offset,
+            root_warp_cfg,
+            root_reference_offset,
+            base_orientations=source_base_quaternions,
+            framerate=framerate,
+            return_diagnostics=True,
+            feasibility_segment_corrections=feasibility_corrections,
         )
-        base_quaternions = _base_quaternions_wxyz(
-            base_orientations, len(source_trajectory)
-        )
+        base_quaternions = source_base_quaternions
+        if base_quaternions is not None and np.any(
+            np.abs(root_yaw_correction) > 1e-12
+        ):
+            source_rotations = Rotation.from_quat(
+                base_quaternions, scalar_first=True
+            )
+            yaw_rotations = Rotation.from_euler(
+                "z", root_yaw_correction[:, None]
+            )
+            base_quaternions = (yaw_rotations * source_rotations).as_quat(
+                scalar_first=True
+            )
+            for frame_idx in range(1, len(base_quaternions)):
+                if (
+                    np.dot(
+                        base_quaternions[frame_idx - 1],
+                        base_quaternions[frame_idx],
+                    )
+                    < 0.0
+                ):
+                    base_quaternions[frame_idx] *= -1.0
         base_rotations = (
             None
             if base_quaternions is None
@@ -920,6 +2179,16 @@ class OmniRetargeter:
             )
         self.last_robot_base_reference_w = robot_base_reference
         self.last_unwarped_robot_base_reference_w = unwarped
+        self.last_robot_base_yaw_correction = root_yaw_correction
+        self.last_robot_base_orientation_reference_w = (
+            None if base_quaternions is None else base_quaternions.copy()
+        )
+        self.last_unwarped_robot_base_orientation_reference_w = (
+            None
+            if source_base_quaternions is None
+            else source_base_quaternions.copy()
+        )
+        self.last_root_warp_diagnostics = root_warp_diagnostics
         self.last_morphology_scales = scales
         self.last_swing_scene_blends = scene_blends
         return result
@@ -1000,6 +2269,7 @@ class OmniRetargeter:
                 end_effector_cfg,
                 base_orientations=base_orientations,
                 scene_mesh=scaled_terrain,
+                framerate=float(framerate or 30.0),
             )
         elif bool(end_effector_cfg.get("enabled", False)):
             print(
@@ -1014,8 +2284,15 @@ class OmniRetargeter:
             self._visualize_trajectory(processed_trajectory, scaled_terrain)
 
         # Step 4: Perform retargeting using the generic retargeting system
+        solver_base_orientations = base_orientations
+        if end_effector_tasks:
+            solver_base_orientations = getattr(
+                self,
+                "last_robot_base_orientation_reference_w",
+                base_orientations,
+            )
         retargeting_kwargs = dict(
-            base_orientations=base_orientations,
+            base_orientations=solver_base_orientations,
             base_translations=processed_base_translations,
         )
         if end_effector_tasks:
@@ -1023,6 +2300,12 @@ class OmniRetargeter:
         retargeted_motion = self._perform_retargeting(
             processed_trajectory, scaled_terrain, **retargeting_kwargs
         )
+        if end_effector_tasks:
+            # Runtime handoff holds are finalized by the framewise pass and
+            # must be the same schedule consumed by refinement and evaluation.
+            end_effector_tasks = getattr(
+                self, "last_end_effector_tasks", end_effector_tasks
+            )
         # Keep the framewise result immutable so final acceptance metrics can
         # reveal how much refinement and any later smoothing changed the motion.
         pre_refinement_motion = np.asarray(retargeted_motion, dtype=float).copy()
@@ -1551,12 +2834,31 @@ class OmniRetargeter:
         )
         if base_reference is not None and unwarped_reference is not None:
             warp = np.linalg.norm(base_reference - unwarped_reference, axis=1)
+            root_warp_diagnostics = getattr(
+                self, "last_root_warp_diagnostics", {}
+            )
             print(
                 "  robot root warp: "
                 f"mean={warp.mean() * 100.0:.2f} cm, "
                 f"p95={np.percentile(warp, 95) * 100.0:.2f} cm, "
-                f"max={warp.max() * 100.0:.2f} cm"
+                f"max={warp.max() * 100.0:.2f} cm, "
+                f"yaw={np.rad2deg(root_warp_diagnostics.get('max_yaw', 0.0)):.2f} deg, "
+                f"velocity={root_warp_diagnostics.get('max_linear_velocity', 0.0):.3f} m/s, "
+                f"acceleration={root_warp_diagnostics.get('max_linear_acceleration', 0.0):.3f} m/s^2, "
+                f"yaw_rate={np.rad2deg(root_warp_diagnostics.get('max_yaw_rate', 0.0)):.2f} deg/s, "
+                "strategy="
+                f"{root_warp_diagnostics.get('strategy', 'minimum_jerk_window_widening')}"
             )
+            slack = root_warp_diagnostics.get("derivative_slack", {})
+            if any(float(value) > 1e-10 for value in slack.values()):
+                print(
+                    "  robot root warp derivative slack: "
+                    + ", ".join(
+                        f"{name}={float(value):.6g}"
+                        for name, value in slack.items()
+                        if float(value) > 1e-10
+                    )
+                )
         actuated = np.asarray(trajectory, dtype=float)[:, 7:]
         if len(actuated) >= 4 and actuated.shape[1] > 0:
             velocity = np.diff(actuated, axis=0)
@@ -1718,6 +3020,16 @@ class OmniRetargeter:
             hard_penetration_constraint=self.retargeting_config.get("penetration_resolver", "hard_constraint") == "hard_constraint",
             **retargeter_kwargs,
         )
+        end_effector_priority_cfg = dict(
+            self.retargeting_config.get("end_effector_priority", {}) or {}
+        )
+        handoff_guard = _SupportHandoffGuard(
+            end_effector_tasks or {},
+            end_effector_priority_cfg.get("support_handoff", {}),
+        )
+        handoff_data = (
+            mujoco.MjData(self.robot_model) if handoff_guard.enabled else None
+        )
 
         # Retarget each frame
         retargeted_trajectory = []
@@ -1737,6 +3049,22 @@ class OmniRetargeter:
             q_init = np.zeros(int(self.robot_model.nq), dtype=float)
         if len(q_init) >= 7 and np.linalg.norm(q_init[3:7]) < 1e-8:
             q_init[3:7] = [1, 0, 0, 0]  # Identity quaternion (wxyz)
+        feasibility_result = getattr(
+            self, "last_interaction_feasibility_result", None
+        )
+        feasibility_warm_start = (
+            None
+            if feasibility_result is None
+            else np.asarray(feasibility_result.configurations, dtype=float)
+        )
+        if feasibility_warm_start is not None and feasibility_warm_start.shape != (
+            len(processed_trajectory),
+            int(self.robot_model.nq),
+        ):
+            raise ValueError(
+                "Interaction-feasibility warm start does not match the framewise "
+                "trajectory/model dimensions."
+            )
         root_position_name = self.base_orientation_config.get("root_position", "Pelvis")
         root_position_idx = getattr(self, "smplx_joint_indices", {}).get(
             root_position_name, 0
@@ -1756,6 +3084,17 @@ class OmniRetargeter:
 
         self._last_estimated_quat = None
         for frame_idx, human_joints in enumerate(processed_trajectory):
+            if feasibility_warm_start is not None:
+                # Feasibility owns only a warm start and the decided root warp;
+                # framewise SQP still produces the delivered configuration.
+                q_init = feasibility_warm_start[frame_idx].copy()
+                robot_base_reference = getattr(
+                    self, "last_robot_base_reference_w", None
+                )
+                if robot_base_reference is not None:
+                    q_init[:3] = robot_base_reference[frame_idx]
+                if base_quaternions_wxyz is not None:
+                    q_init[3:7] = base_quaternions_wxyz[frame_idx]
             # Only initialize base from SMPLX for the first frame
             # For subsequent frames, the optimization will handle base movement
             if frame_idx == 0:
@@ -1884,6 +3223,7 @@ class OmniRetargeter:
 
             # Retarget frame with previous frame as reference for smoothness
             q_last = retargeted_trajectory[-1] if len(retargeted_trajectory) > 0 else None
+            handoff_overrides = handoff_guard.overrides_for_frame(frame_idx)
             frame_kwargs: Dict[str, Any] = dict(
                 q_last=q_last,
                 target_base_orientation=target_quat_wxyz,
@@ -1906,7 +3246,15 @@ class OmniRetargeter:
                     )
                 frame_kwargs["end_effector_targets"] = {}
                 for name, task in end_effector_tasks.items():
-                    target_payload = task.frame(frame_idx)
+                    target_payload = (
+                        handoff_guard.payload(
+                            name,
+                            frame_idx,
+                            handoff_overrides[name],
+                        )
+                        if name in handoff_overrides
+                        else task.frame(frame_idx)
+                    )
                     frame_kwargs["end_effector_targets"][name] = target_payload
                 frame_kwargs["q_prev"] = (
                     retargeted_trajectory[-2]
@@ -1934,19 +3282,116 @@ class OmniRetargeter:
             retargeted_trajectory.append(q_opt)
             if end_effector_tasks:
                 for name, task in end_effector_tasks.items():
-                    if task.contact_modes[frame_idx] != int(ContactMode.NONE):
+                    if (
+                        task.contact_modes[frame_idx] != int(ContactMode.NONE)
+                        or name in handoff_overrides
+                    ):
                         offset_id = retargeter._active_contact_offsets.get(name)
                         if offset_id is not None:
                             active_contact_offset_ids[name][frame_idx] = int(offset_id)
+
+            if handoff_guard.needs_observation(frame_idx):
+                assert handoff_data is not None
+                handoff_data.qpos[:] = q_opt
+                mujoco.mj_forward(self.robot_model, handoff_data)
+                position_errors: Dict[str, float] = {}
+                any_new_support = False
+                effectors_cfg = dict(
+                    end_effector_priority_cfg.get("effectors", {}) or {}
+                )
+                for name in handoff_guard.new_support_names:
+                    task = end_effector_tasks[name]
+                    if not _SupportHandoffGuard._locked_support(
+                        task, frame_idx, 0.0
+                    ):
+                        continue
+                    any_new_support = True
+                    spec = dict(effectors_cfg.get(name, {}) or {})
+                    body_id = mujoco.mj_name2id(
+                        self.robot_model,
+                        mujoco.mjtObj.mjOBJ_BODY,
+                        str(spec.get("robot_body", "")),
+                    )
+                    if body_id < 0:
+                        position_errors[name] = np.inf
+                        continue
+                    tracking_offset = np.asarray(
+                        spec.get("tracking_offset", [0.0, 0.0, 0.0]),
+                        dtype=float,
+                    ).reshape(3)
+                    contact_offsets = np.asarray(
+                        spec.get("contact_offsets", [tracking_offset]),
+                        dtype=float,
+                    )
+                    if contact_offsets.ndim == 1:
+                        contact_offsets = contact_offsets[None, :]
+                    rotation = handoff_data.xmat[body_id].reshape(3, 3)
+                    candidates = (
+                        handoff_data.xpos[body_id][None, :]
+                        + contact_offsets @ rotation.T
+                    )
+                    offset_id = retargeter._active_contact_offsets.get(name)
+                    if offset_id is None or not 0 <= int(offset_id) < len(candidates):
+                        offset_id = int(
+                            np.argmin(
+                                np.linalg.norm(
+                                    candidates
+                                    - task.contact_positions[frame_idx][None, :],
+                                    axis=1,
+                                )
+                            )
+                        )
+                    position_errors[name] = float(
+                        np.linalg.norm(
+                            candidates[int(offset_id)]
+                            - task.contact_positions[frame_idx]
+                        )
+                    )
+                penetration_depth = np.inf
+                if any_new_support:
+                    penetration_config = dict(
+                        (
+                            self.retargeting_config.get(
+                                "trajectory_refinement", {}
+                            )
+                            or {}
+                        ).get("penetration", {})
+                        or {}
+                    )
+                    penetration_depth = float(
+                        measure_scene_penetration(
+                            self.robot_model,
+                            np.asarray(q_opt, dtype=float)[None, :],
+                            scaled_terrain,
+                            penetration_config,
+                        )["max_depth"]
+                    )
+                handoff_guard.observe(
+                    frame_idx,
+                    position_errors,
+                    penetration_depth,
+                )
 
             # Update initial guess for next frame (smooth trajectory)
             q_init = q_opt.copy()
 
         if end_effector_tasks:
+            end_effector_tasks = handoff_guard.materialize(end_effector_tasks)
             for name, task in list(end_effector_tasks.items()):
                 end_effector_tasks[name] = replace(
                     task,
                     active_contact_offset_ids=active_contact_offset_ids[name],
+                )
+            self.last_support_handoff_diagnostics = handoff_guard.diagnostics()
+            for handoff in self.last_support_handoff_diagnostics:
+                print(
+                    "Support handoff "
+                    f"{handoff['type']}: requested release "
+                    f"{handoff['requested_release_frame']}, established "
+                    f"{handoff['established_frame']}, actual release "
+                    f"{handoff['actual_release_frame']}, hold "
+                    f"{handoff['hold_frames']} frames, extra hold "
+                    f"{handoff['held_extra_frames']}."
                 )
             self.last_end_effector_tasks = end_effector_tasks
         return np.array(retargeted_trajectory)

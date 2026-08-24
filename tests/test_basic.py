@@ -319,6 +319,36 @@ def test_perform_retargeting_uses_captured_root_orientation_each_frame(
     np.testing.assert_allclose(captured, expected_wxyz)
 
 
+def test_base_orientation_reference_can_defer_to_joint_position_frame():
+    from omniretargeting.main import _base_orientation_reference
+
+    captured = np.repeat(
+        np.asarray([[1.0, 0.0, 0.0, 0.0]]), 2, axis=0
+    )
+    root = np.zeros((2, 3), dtype=float)
+
+    reference = _base_orientation_reference(
+        {"orientation_source": "joint_positions"},
+        ["Pelvis", "Spine3"],
+        captured[:, None, :],
+        root,
+    )
+
+    assert reference is None
+
+
+def test_base_orientation_reference_rejects_unknown_source():
+    from omniretargeting.main import _base_orientation_reference
+
+    with pytest.raises(ValueError, match="orientation_source"):
+        _base_orientation_reference(
+            {"orientation_source": "anatomical_guess"},
+            ["Pelvis"],
+            None,
+            None,
+        )
+
+
 class TestRealDataIntegration:
     """Integration tests requiring real data files."""
 

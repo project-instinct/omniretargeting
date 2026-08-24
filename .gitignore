@@ -176,3 +176,8 @@ robot_models/*/*_floating.urdf
 # RLCR loop state is per-session working data, not project source.
 .humanize/rlcr/
 .humanize/.pending-session-id
+
+# Licensed SMPL-X / SMPL body models. Required at runtime to expand AMASS pose
+# parameters into 3D surface points, but they are licensed per-user and must
+# never be committed. Obtain them from https://smpl-x.is.tue.mpg.de/
+assets/body_models/

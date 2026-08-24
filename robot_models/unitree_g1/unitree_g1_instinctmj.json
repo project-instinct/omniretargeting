@@ -60,7 +60,7 @@
     "right_hip": "R_Hip",
     "spine": "Spine3",
     "root_position": "Spine3",
-    "orientation_joint": "Spine3"
+    "orientation_source": "joint_positions"
   },
   "retargeting": {
     "preserve_root_z": false,
@@ -284,17 +284,28 @@
       },
       "base_position_constraint": {
         "enabled": true,
+        "landmarks": [
+          {
+            "source_joint": "L_Hip",
+            "robot_body": "left_hip_roll_link"
+          },
+          {
+            "source_joint": "R_Hip",
+            "robot_body": "right_hip_roll_link"
+          }
+        ],
         "reference_includes_z_offset": true,
         "hard_constraints": true,
+        "z_constraint_mode": "support_contact",
         "max_xy_error": 0.03,
-        "z_offset": -0.5,
+        "z_offset": 0.0,
         "max_z_error": 0.08,
         "centering_weight": 1.0
       },
       "base_orientation_constraint": {
         "enabled": true,
         "hard_constraints": true,
-        "max_orientation_error": 0.15,
+        "max_orientation_error": 0.07,
         "weight": 1.0
       },
       "contact_detection": {
@@ -316,7 +327,7 @@
             "relative_speed_threshold": 2.0,
             "require_normal_alignment": false,
             "anchor_contact_orientation": true,
-            "contact_mode": "AUTO",
+            "contact_mode": "NONE",
             "support_speed_threshold": 0.3,
             "support_max_tangential_travel": 0.035
           },
@@ -325,7 +336,7 @@
             "relative_speed_threshold": 2.0,
             "require_normal_alignment": false,
             "anchor_contact_orientation": true,
-            "contact_mode": "AUTO",
+            "contact_mode": "NONE",
             "support_speed_threshold": 0.3,
             "support_max_tangential_travel": 0.035
           },
@@ -333,13 +344,13 @@
             "distance_threshold": 0.07,
             "relative_speed_threshold": 0.3,
             "contact_mode": "SUPPORT",
-            "anchor_drift_tolerance": 0.05
+            "anchor_tangent_to_tracking": true
           },
           "right_foot": {
             "distance_threshold": 0.07,
             "relative_speed_threshold": 0.3,
             "contact_mode": "SUPPORT",
-            "anchor_drift_tolerance": 0.05
+            "anchor_tangent_to_tracking": true
           }
         }
       },
@@ -347,7 +358,7 @@
         "left_hand": {
           "robot_body": "left_rubber_hand",
           "contact_target_space": "world",
-          "swing_target_space": "limb_morphology_scaled",
+          "swing_target_space": "world",
           "swing_morphology_scale": "auto",
           "reach_reference_body": "left_shoulder_pitch_link",
           "max_swing_reach": 0.43,
@@ -430,7 +441,7 @@
         "right_hand": {
           "robot_body": "right_rubber_hand",
           "contact_target_space": "world",
-          "swing_target_space": "limb_morphology_scaled",
+          "swing_target_space": "world",
           "swing_morphology_scale": "auto",
           "reach_reference_body": "right_shoulder_pitch_link",
           "max_swing_reach": 0.43,
@@ -519,8 +530,9 @@
           "tracking_offset": [
             0.039,
             0.0,
-            -0.035
+            -0.00536677
           ],
+          "track_source_during_contact": true,
           "track_orientation": true,
           "track_swing_heading": true,
           "track_swing_orientation": true,
@@ -545,8 +557,9 @@
           "tracking_offset": [
             0.039,
             0.0,
-            -0.035
+            -0.0053985
           ],
+          "track_source_during_contact": true,
           "track_orientation": true,
           "track_swing_heading": true,
           "track_swing_orientation": true,
