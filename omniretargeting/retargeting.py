@@ -32,6 +32,7 @@ _PRIORITY_FAMILIES = frozenset(
     {
         "support",
         "contact",
+        "foot_swing",
         "swing",
         "orientation",
         "pose_direction",
@@ -52,6 +53,12 @@ _DEFAULT_PRIORITY_LEVELS = (
         "families": ("contact",),
         "relative_tolerance": 0.01,
         "absolute_tolerance": 0.04,
+    },
+    {
+        "name": "foot-swing",
+        "families": ("foot_swing",),
+        "relative_tolerance": 0.005,
+        "absolute_tolerance": 0.005,
     },
     {
         "name": "swing",
@@ -223,6 +230,24 @@ def _resolve_priority_levels(config: Mapping[str, Any]) -> Tuple[Dict[str, Any],
     raw_levels = config.get("priority_levels")
     if raw_levels is None:
         raw_levels = _DEFAULT_PRIORITY_LEVELS
+    else:
+        # Profiles written before the dedicated foot-swing family grouped all
+        # free end effectors under ``swing``. Preserve that contract by
+        # implicitly grouping the new family with their existing swing level.
+        raw_levels = [dict(level) for level in raw_levels]
+        configured_families = {
+            str(family)
+            for level in raw_levels
+            if isinstance(level, Mapping)
+            for family in level.get("families", [])
+        }
+        if "foot_swing" not in configured_families:
+            for level in raw_levels:
+                families = list(level.get("families", []))
+                if "swing" in families:
+                    families.insert(families.index("swing"), "foot_swing")
+                    level["families"] = families
+                    break
     if not isinstance(raw_levels, (list, tuple)) or not raw_levels:
         raise ValueError("end_effector_priority.priority_levels must be a non-empty list.")
 
@@ -415,27 +440,22 @@ def _build_base_position_task(
     target_base_position: np.ndarray,
     config: Mapping[str, Any],
     previous_base_position: np.ndarray | None = None,
-    support_contact_active: bool = False,
 ) -> Tuple[Optional[cp.Expression], List[cp.Constraint]]:
     """Build the source-path base objective and its hard spatial envelope.
 
     ``reference_envelope`` retains the historical behaviour: both XY and Z
     stay inside a hard box around the source-derived base reference.
 
-    ``support_contact`` changes ownership frame by frame.  A load-bearing foot
-    contact removes the source-Z envelope so the reachable sole/scene
-    relationship selects root height.  With no load-bearing foot, source Z is
-    restored as the flight-motion prior; otherwise root height is
-    underdetermined and can jump between contact segments.  Optional temporal
-    continuity only selects among equally good reachable support solutions.
+    ``support_contact`` keeps only the hard XY path envelope.  Root height is
+    then a free coordinate in the higher-priority SUPPORT solve, subject to
+    the robot's actual joint limits.  It has no source-root Z residual; optional
+    temporal continuity only selects among equally good robot-reachable
+    solutions from the preceding frame.
     """
     if not bool(config.get("enabled", False)):
         return None, []
 
     z_constraint_mode = _base_z_constraint_mode(config)
-    support_owns_z = bool(
-        z_constraint_mode == "support_contact" and support_contact_active
-    )
 
     q = np.asarray(q, dtype=float)
     q_a_indices = np.asarray(q_a_indices, dtype=int)
@@ -459,7 +479,7 @@ def _build_base_position_task(
         constraints.append(
             cp.norm(base_new[:2] - base_target[:2], 2) <= max_xy_error
         )
-        if not support_owns_z:
+        if z_constraint_mode == "reference_envelope":
             constraints.extend(
                 [
                     base_new[2] - base_target[2] <= max_z_error,
@@ -469,7 +489,7 @@ def _build_base_position_task(
 
     xy_scale = max(max_xy_error, 1e-6)
     objective = cp.sum_squares((base_new[:2] - base_target[:2]) / xy_scale)
-    if not support_owns_z:
+    if z_constraint_mode == "reference_envelope":
         z_scale = max(max_z_error, 1e-6)
         objective += cp.square((base_new[2] - base_target[2]) / z_scale)
     elif previous_base_position is not None:
@@ -1247,6 +1267,14 @@ class GenericInteractionRetargeter:
             swing_target_space = _validate_swing_target_space(
                 name, spec["swing_target_space"]
             )
+            swing_priority_family = str(
+                spec.get("swing_priority_family", "swing")
+            ).strip()
+            if swing_priority_family not in {"foot_swing", "swing"}:
+                raise ValueError(
+                    f"End-effector '{name}' swing_priority_family must be "
+                    "'foot_swing' or 'swing'."
+                )
 
             self.end_effectors[name] = {
                 "body_name": str(body_name),
@@ -1255,6 +1283,7 @@ class GenericInteractionRetargeter:
                 "contact_offsets": contact_offsets,
                 "contact_target_space": contact_target_space,
                 "swing_target_space": swing_target_space,
+                "swing_priority_family": swing_priority_family,
                 "track_source_during_contact": bool(
                     spec.get("track_source_during_contact", False)
                 ),
@@ -1822,11 +1851,13 @@ class GenericInteractionRetargeter:
         metric tolerance ``sigma`` makes each squared residual dimensionless.
         """
         if not self.end_effector_enabled or not targets:
+            self._last_foot_swing_residual = None
             return None, None, None, None, [], 0, 0, 0, 0
 
         support_terms: List[cp.Expression] = []
         contact_terms: List[cp.Expression] = []
         swing_terms: List[cp.Expression] = []
+        foot_swing_terms: List[cp.Expression] = []
         orientation_terms: List[cp.Expression] = []
         contact_constraints: List[cp.Constraint] = []
         for name, target_data in targets.items():
@@ -2043,6 +2074,8 @@ class GenericInteractionRetargeter:
                         - tracking_target
                     ) / tracking_sigma
                     swing_terms.append(tracking_residual)
+                    if spec["swing_priority_family"] == "foot_swing":
+                        foot_swing_terms.append(tracking_residual)
             else:
                 self._active_contact_offsets.pop(name, None)
                 self._active_contact_segments.pop(name, None)
@@ -2103,6 +2136,8 @@ class GenericInteractionRetargeter:
                     ).reshape(3)
                     residual = position + jacobian @ dqa - target
                 swing_terms.append(residual / sigma)
+                if spec["swing_priority_family"] == "foot_swing":
+                    foot_swing_terms.append(residual / sigma)
                 if (
                     spec.get("track_orientation", False)
                     and spec.get("track_swing_orientation", False)
@@ -2205,6 +2240,9 @@ class GenericInteractionRetargeter:
         support_residual = cp.hstack(support_terms) if support_terms else None
         contact_residual = cp.hstack(contact_terms) if contact_terms else None
         swing_residual = cp.hstack(swing_terms) if swing_terms else None
+        self._last_foot_swing_residual = (
+            cp.hstack(foot_swing_terms) if foot_swing_terms else None
+        )
         orientation_residual = (
             cp.hstack(orientation_terms)
             if orientation_terms
@@ -2871,14 +2909,6 @@ class GenericInteractionRetargeter:
             self.end_effector_config.get("base_position_constraint", {}) or {}
         )
         if target_base_position is not None:
-            support_contact_active = any(
-                name.endswith("foot")
-                and ContactMode[
-                    str(target.get("contact_mode", "NONE")).upper()
-                ]
-                in (ContactMode.SUPPORT, ContactMode.SLIDE)
-                for name, target in (end_effector_targets or {}).items()
-            )
             base_position_obj, base_position_constraints = (
                 _build_base_position_task(
                     dqa,
@@ -2887,7 +2917,6 @@ class GenericInteractionRetargeter:
                     target_base_position,
                     base_cfg,
                     None if q_last is None else q_last[:3],
-                    support_contact_active,
                 )
             )
             constraints.extend(base_position_constraints)
@@ -3239,6 +3268,7 @@ class GenericInteractionRetargeter:
                 priority_residuals = {
                     "support": support_residual,
                     "contact": contact_residual,
+                    "foot_swing": self._last_foot_swing_residual,
                     "swing": swing_residual,
                     "orientation": orientation_residual,
                     "pose_direction": pose_direction_residual,

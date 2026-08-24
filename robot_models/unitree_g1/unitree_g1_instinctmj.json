@@ -61,7 +61,8 @@
     "spine": "Spine3",
     "root_position": "Spine3",
     "orientation_source": "joint_positions",
-    "tilt_policy": "source"
+    "tilt_policy": "support_upright",
+    "support_upright_bridge_frames": 10
   },
   "retargeting": {
     "preserve_root_z": false,
@@ -90,12 +91,41 @@
           "absolute_tolerance": 0.04
         },
         {
-          "name": "interaction-motion-prior",
+          "name": "foot-swing",
           "families": [
-            "interaction",
-            "swing",
-            "orientation",
+            "foot_swing"
+          ],
+          "relative_tolerance": 0.005,
+          "absolute_tolerance": 0.005
+        },
+        {
+          "name": "swing",
+          "families": [
+            "swing"
+          ],
+          "relative_tolerance": 0.01,
+          "absolute_tolerance": 0.04
+        },
+        {
+          "name": "end-effector-orientation",
+          "families": [
+            "orientation"
+          ],
+          "relative_tolerance": 0.01,
+          "absolute_tolerance": 0.04
+        },
+        {
+          "name": "pose-direction",
+          "families": [
             "pose_direction"
+          ],
+          "relative_tolerance": 0.02,
+          "absolute_tolerance": 0.04
+        },
+        {
+          "name": "whole-body-interaction",
+          "families": [
+            "interaction"
           ],
           "relative_tolerance": 0.02,
           "absolute_tolerance": 0.05
@@ -277,9 +307,11 @@
         "reference_includes_z_offset": true,
         "hard_constraints": true,
         "z_constraint_mode": "support_contact",
-        "max_xy_error": 0.03,
+        "max_xy_error": 0.015,
         "z_offset": 0.0,
         "max_z_error": 0.08,
+        "support_z_temporal_weight": 4.0,
+        "support_z_temporal_scale": 0.04,
         "centering_weight": 1.0
       },
       "base_orientation_constraint": {
@@ -321,32 +353,16 @@
             "support_max_tangential_travel": 0.035
           },
           "left_foot": {
-            "distance_threshold": 0.05,
-            "exit_distance_threshold": 0.07,
+            "distance_threshold": 0.07,
             "relative_speed_threshold": 0.3,
-            "allow_sliding": true,
-            "normal_speed_threshold": 0.18,
-            "exit_normal_speed_threshold": 0.3,
-            "contact_mode": "AUTO",
-            "touch_max_frames": 1,
-            "support_speed_threshold": 0.3,
-            "support_max_tangential_travel": 0.06,
-            "support_min_frames": 3,
-            "support_max_gap_frames": 1
+            "contact_mode": "SUPPORT",
+            "anchor_tangent_to_tracking": true
           },
           "right_foot": {
-            "distance_threshold": 0.05,
-            "exit_distance_threshold": 0.07,
+            "distance_threshold": 0.07,
             "relative_speed_threshold": 0.3,
-            "allow_sliding": true,
-            "normal_speed_threshold": 0.18,
-            "exit_normal_speed_threshold": 0.3,
-            "contact_mode": "AUTO",
-            "touch_max_frames": 1,
-            "support_speed_threshold": 0.3,
-            "support_max_tangential_travel": 0.06,
-            "support_min_frames": 3,
-            "support_max_gap_frames": 1
+            "contact_mode": "SUPPORT",
+            "anchor_tangent_to_tracking": true
           }
         }
       },
@@ -521,6 +537,7 @@
           "robot_body": "left_ankle_roll_link",
           "contact_target_space": "world",
           "swing_target_space": "world",
+          "swing_priority_family": "foot_swing",
           "reach_reference_body": "left_hip_roll_link",
           "max_swing_reach": 0.72,
           "tracking_offset": [
@@ -528,28 +545,18 @@
             0.0,
             -0.00536677
           ],
-          "track_source_during_contact": false,
+          "track_source_during_contact": true,
           "track_orientation": true,
           "track_swing_heading": true,
           "track_swing_orientation": true,
           "orientation_sigma": 0.0698131701,
-          "swing_sigma": 0.06,
-          "swing_position_sigma": 0.04,
+          "swing_sigma": 0.025,
+          "swing_position_sigma": 0.02,
           "swing_morphology_scale": 1.0,
           "max_orientation_step": 0.1745329252,
           "contact_offsets": [
             [
-              -0.055,
-              0.0,
-              -0.035
-            ],
-            [
               0.039,
-              0.0,
-              -0.035
-            ],
-            [
-              0.132,
               0.0,
               -0.035
             ]
@@ -559,6 +566,7 @@
           "robot_body": "right_ankle_roll_link",
           "contact_target_space": "world",
           "swing_target_space": "world",
+          "swing_priority_family": "foot_swing",
           "reach_reference_body": "right_hip_roll_link",
           "max_swing_reach": 0.72,
           "tracking_offset": [
@@ -566,28 +574,18 @@
             0.0,
             -0.0053985
           ],
-          "track_source_during_contact": false,
+          "track_source_during_contact": true,
           "track_orientation": true,
           "track_swing_heading": true,
           "track_swing_orientation": true,
           "orientation_sigma": 0.0698131701,
-          "swing_sigma": 0.06,
-          "swing_position_sigma": 0.04,
+          "swing_sigma": 0.025,
+          "swing_position_sigma": 0.02,
           "swing_morphology_scale": 1.0,
           "max_orientation_step": 0.1745329252,
           "contact_offsets": [
             [
-              -0.055,
-              0.0,
-              -0.035
-            ],
-            [
               0.039,
-              0.0,
-              -0.035
-            ],
-            [
-              0.132,
               0.0,
               -0.035
             ]
@@ -602,7 +600,6 @@
     "trajectory_refinement": {
       "enabled": true,
       "hierarchy": true,
-      "group_motion_prior": true,
       "support_priority_relative_tolerance": 0.005,
       "support_priority_absolute_tolerance": 0.005,
       "contact_hierarchy": true,
@@ -611,7 +608,7 @@
       "posture_hierarchy": true,
       "temporal_priority_relative_tolerance": 0.01,
       "temporal_priority_absolute_tolerance": 0.05,
-      "iterations": 16,
+      "iterations": 24,
       "max_joint_deviation": 0.45,
       "contact_position_sigma": 0.012,
       "swing_position_sigma": 0.03,
@@ -711,7 +708,7 @@
           }
         }
       },
-      "trust_region": 0.08,
+      "trust_region": 0.05,
       "solver_tolerance": 1e-05,
       "solver_iterations": 80,
       "step_tolerance": 0.0001,
