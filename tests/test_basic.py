@@ -337,52 +337,6 @@ def test_base_orientation_reference_can_defer_to_joint_position_frame():
     assert reference is None
 
 
-def test_yaw_only_base_orientation_policy_removes_tilt_and_preserves_heading():
-    from omniretargeting.core import _condition_base_orientation_track
-
-    source = Rotation.from_euler(
-        "zyx",
-        [[20.0, 35.0, -15.0], [50.0, -25.0, 30.0]],
-        degrees=True,
-    ).as_quat(scalar_first=True)
-
-    conditioned = _condition_base_orientation_track(
-        source, {"tilt_policy": "yaw_only"}
-    )
-    matrices = Rotation.from_quat(conditioned, scalar_first=True).as_matrix()
-    source_matrices = Rotation.from_quat(source, scalar_first=True).as_matrix()
-
-    np.testing.assert_allclose(matrices[:, :, 2], [[0.0, 0.0, 1.0]] * 2)
-    expected_yaw = np.arctan2(
-        source_matrices[:, 1, 0], source_matrices[:, 0, 0]
-    )
-    actual_yaw = np.arctan2(matrices[:, 1, 0], matrices[:, 0, 0])
-    np.testing.assert_allclose(actual_yaw, expected_yaw, atol=1e-12)
-
-
-def test_support_upright_base_orientation_only_removes_tilt_near_support():
-    from omniretargeting.core import _condition_base_orientation_track
-
-    source = Rotation.from_euler(
-        "yx", np.tile([[35.0, 10.0]], (7, 1)), degrees=True
-    ).as_quat(scalar_first=True)
-    conditioned = _condition_base_orientation_track(
-        source,
-        {
-            "tilt_policy": "support_upright",
-            "support_upright_bridge_frames": 1,
-        },
-        np.asarray([False, False, True, True, True, False, False]),
-    )
-    up = Rotation.from_quat(
-        conditioned, scalar_first=True
-    ).as_matrix()[:, :, 2]
-
-    np.testing.assert_allclose(up[2:5], [[0.0, 0.0, 1.0]] * 3, atol=1e-12)
-    source_up = Rotation.from_quat(source, scalar_first=True).as_matrix()[:, :, 2]
-    np.testing.assert_allclose(up[[0, 6]], source_up[[0, 6]], atol=1e-12)
-
-
 def test_base_orientation_reference_rejects_unknown_source():
     from omniretargeting.main import _base_orientation_reference
 

@@ -271,103 +271,6 @@ def _base_quaternions_wxyz(
     return quaternions
 
 
-def _condition_base_orientation_track(
-    quaternions_wxyz: np.ndarray | None,
-    config: Mapping[str, Any] | None,
-    support_mask: np.ndarray | None = None,
-) -> np.ndarray | None:
-    """Apply the robot profile's floating-base tilt policy.
-
-    A torso-base humanoid must not use floating-base roll or pitch as spare IK
-    coordinates for reaching an end effector.  ``yaw_only`` retains the
-    source heading exactly while aligning the torso's up axis with gravity;
-    source limb/waist directions remain available to the articulated pose
-    tasks.  The source motion itself is never modified.
-    """
-    if quaternions_wxyz is None:
-        return None
-
-    policy = str((config or {}).get("tilt_policy", "source")).strip().lower()
-    if policy == "source":
-        return np.asarray(quaternions_wxyz, dtype=float).copy()
-    if policy not in {"yaw_only", "support_upright"}:
-        raise ValueError(
-            "base_orientation.tilt_policy must be 'source', 'yaw_only', or "
-            "'support_upright', "
-            f"got {policy!r}."
-        )
-
-    rotations = Rotation.from_quat(
-        np.asarray(quaternions_wxyz, dtype=float), scalar_first=True
-    ).as_matrix()
-    headings = rotations[:, :, 0].copy()
-    heading_norms = np.linalg.norm(headings[:, :2], axis=1)
-    # A near-vertical forward axis has no stable projected heading.  Recover
-    # heading from the right axis instead, which is equivalent for an
-    # orthonormal body frame and avoids an arbitrary yaw flip.
-    degenerate = heading_norms < 1e-8
-    if np.any(degenerate):
-        right = rotations[degenerate, :, 1]
-        headings[degenerate, 0] = right[:, 1]
-        headings[degenerate, 1] = -right[:, 0]
-    yaw = np.unwrap(np.arctan2(headings[:, 1], headings[:, 0]))
-    yaw_rotations = Rotation.from_euler("z", yaw[:, None])
-    if policy == "yaw_only":
-        conditioned_rotations = yaw_rotations
-    else:
-        if support_mask is None:
-            raise ValueError(
-                "base_orientation.tilt_policy='support_upright' requires a "
-                "per-frame support mask."
-            )
-        support = np.asarray(support_mask, dtype=bool)
-        if support.shape != (len(rotations),):
-            raise ValueError(
-                "base-orientation support mask must have shape "
-                f"({len(rotations)},), got {support.shape}."
-            )
-        upright_weight = support.astype(float)
-        bridge_frames = max(
-            int((config or {}).get("support_upright_bridge_frames", 5)), 0
-        )
-        if bridge_frames:
-            transitions = np.flatnonzero(
-                np.diff(np.concatenate([[False], support, [False]]))
-            )
-            for start, end in transitions.reshape(-1, 2):
-                pre_start = max(start - bridge_frames, 0)
-                if pre_start < start:
-                    count = start - pre_start
-                    alpha = _minimum_jerk_blend(
-                        np.arange(1, count + 1, dtype=float) / (count + 1)
-                    )
-                    upright_weight[pre_start:start] = np.maximum(
-                        upright_weight[pre_start:start], alpha
-                    )
-                post_end = min(end + bridge_frames, len(support))
-                if end < post_end:
-                    count = post_end - end
-                    alpha = _minimum_jerk_blend(
-                        np.arange(count, 0, -1, dtype=float) / (count + 1)
-                    )
-                    upright_weight[end:post_end] = np.maximum(
-                        upright_weight[end:post_end], alpha
-                    )
-        source_rotations = Rotation.from_matrix(rotations)
-        correction = yaw_rotations * source_rotations.inv()
-        conditioned_rotations = (
-            Rotation.from_rotvec(
-                correction.as_rotvec() * upright_weight[:, None]
-            )
-            * source_rotations
-        )
-    conditioned = conditioned_rotations.as_quat(scalar_first=True)
-    for frame_idx in range(1, len(conditioned)):
-        if np.dot(conditioned[frame_idx - 1], conditioned[frame_idx]) < 0.0:
-            conditioned[frame_idx] *= -1.0
-    return conditioned
-
-
 def _root_positions_aligning_robot_body(
     model: mujoco.MjModel,
     source_body_positions: np.ndarray,
@@ -1893,17 +1796,6 @@ class OmniRetargeter:
                 source_base_quaternions = np.asarray(
                     estimated_quaternions, dtype=float
                 )
-        support_mask = np.zeros(len(source_trajectory), dtype=bool)
-        for task in tasks.values():
-            support_mask |= (
-                np.asarray(task.contact_modes, dtype=np.uint8)
-                == int(ContactMode.SUPPORT)
-            )
-        source_base_quaternions = _condition_base_orientation_track(
-            source_base_quaternions,
-            self.base_orientation_config,
-            support_mask,
-        )
         if needs_body_alignment:
             if source_base_quaternions is None:
                 raise ValueError(

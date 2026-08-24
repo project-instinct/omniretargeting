@@ -134,32 +134,6 @@ def test_support_contact_base_policy_keeps_xy_hard_but_leaves_root_z_reachable()
     assert dqa.value[2] == pytest.approx(-0.30, abs=1e-5)
 
 
-def test_support_contact_base_objective_does_not_center_source_root_z():
-    """The support/sole solve, not source-root Z, selects robot root height."""
-    dqa = cp.Variable(7)
-    q = np.asarray([0.0, 0.0, 1.2, 1.0, 0.0, 0.0, 0.0])
-    objective, constraints = _build_base_position_task(
-        dqa,
-        q,
-        np.arange(7),
-        np.asarray([0.0, 0.0, 4.0]),
-        {
-            "enabled": True,
-            "hard_constraints": True,
-            "z_constraint_mode": "support_contact",
-            "max_xy_error": 0.03,
-            "max_z_error": 0.08,
-        },
-    )
-    problem = cp.Problem(
-        cp.Minimize(objective + cp.square(dqa[2] + 0.3)), constraints
-    )
-    problem.solve(solver=cp.CLARABEL)
-
-    assert problem.status == cp.OPTIMAL
-    assert dqa.value[2] == pytest.approx(-0.3, abs=1e-5)
-
-
 def test_reference_envelope_base_policy_retains_hard_root_z_bound():
     dqa = cp.Variable(7)
     q = np.asarray([0.0, 0.0, 1.2, 1.0, 0.0, 0.0, 0.0])
@@ -333,7 +307,7 @@ def test_g1_profile_gates_world_tracking_on_contact_and_on_the_feet():
         profile = json.load(profile_file)
     priority = profile["retargeting"]["end_effector_priority"]
     assert priority["root_warp"]["enabled"] is False
-    assert priority["lock_base_orientation"] is True
+    assert priority["lock_base_orientation"] is False
     assert (
         priority["base_position_constraint"]["z_constraint_mode"]
         == "support_contact"
@@ -342,8 +316,8 @@ def test_g1_profile_gates_world_tracking_on_contact_and_on_the_feet():
     for name, spec in priority["effectors"].items():
         # Every contact is a real scene interaction and stays in world metres.
         assert spec["contact_target_space"] == "world"
+        assert spec["swing_target_space"] == "world"
         if name.endswith("foot"):
-            assert spec["swing_target_space"] == "world"
             assert spec["swing_morphology_scale"] == pytest.approx(1.0)
             assert spec["track_source_during_contact"] is True
             contact_spec = priority["contact_detection"]["effectors"][name]
@@ -351,7 +325,6 @@ def test_g1_profile_gates_world_tracking_on_contact_and_on_the_feet():
             assert contact_spec["anchor_tangent_to_tracking"] is True
             assert "anchor_drift_tolerance" not in contact_spec
         else:
-            assert spec["swing_target_space"] == "limb_morphology_scaled"
             assert (
                 priority["contact_detection"]["effectors"][name]["contact_mode"]
                 == "NONE"
@@ -840,7 +813,6 @@ def test_framewise_modes_split_support_touch_and_swing_objectives():
                     "contact_offsets": [[1.0, 0.0, 0.0]],
                     "contact_target_space": "world",
                     "swing_target_space": "root_morphology_scaled",
-                    "swing_priority_family": "foot_swing",
                 }
             },
         },
@@ -878,8 +850,6 @@ def test_framewise_modes_split_support_touch_and_swing_objectives():
     assert slide[0] is not None and slide[0].size == 1
     assert slide[1] is None and slide[2] is None
     assert swing[0] is None and swing[1] is None and swing[2] is not None
-    assert retargeter._last_foot_swing_residual is not None
-    assert retargeter._last_foot_swing_residual.size == 3
 
 
 def test_contact_can_track_a_distinct_semantic_source_point():
@@ -2456,16 +2426,16 @@ def test_base_orientation_hard_cone_bounds_a_conflicting_lower_level():
     assert remaining_error >= 0.149
 
 
-def test_priority_level_grouping_is_configurable_between_four_and_eight_levels():
+def test_priority_level_grouping_is_configurable_between_four_and_seven_levels():
     shipped = json.loads(
         (
             Path(__file__).resolve().parents[1]
             / "robot_models/unitree_g1/unitree_g1_instinctmj.json"
         ).read_text(encoding="utf-8")
     )["retargeting"]["end_effector_priority"]
-    eight_levels = _resolve_priority_levels(shipped)
-    assert len(eight_levels) == 8
-    assert eight_levels[0]["families"] == ("support",)
+    seven_levels = _resolve_priority_levels(shipped)
+    assert len(seven_levels) == 7
+    assert seven_levels[0]["families"] == ("support",)
 
     four_config = {
         "priority_levels": [
@@ -2484,7 +2454,6 @@ def test_priority_level_grouping_is_configurable_between_four_and_eight_levels()
     four_levels = _resolve_priority_levels(four_config)
     assert len(four_levels) == 4
     assert four_levels[0]["families"] == ("support", "contact")
-    assert four_levels[1]["families"] == ("foot_swing", "swing")
 
 
 def test_capsule_surface_offsets_follow_the_local_z_axis():

@@ -699,14 +699,9 @@ def main():
                 )
             ),
         )
-        delivered_base_orientation_reference = getattr(
-            retargeter,
-            "last_robot_base_orientation_reference_w",
-            base_orientation_reference,
-        )
-        if delivered_base_orientation_reference is not None:
+        if base_orientation_reference is not None:
             output_payload["robot_base_orientation_reference_w"] = np.asarray(
-                delivered_base_orientation_reference, dtype=float
+                base_orientation_reference, dtype=float
             )
         if object_pose is not None:
             object_pos, object_quat = object_pose

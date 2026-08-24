@@ -1199,14 +1199,6 @@ def refine_joint_trajectory(
                 f"End-effector '{name}' orientation_joint_tokens do not "
                 "match any scalar robot joint."
             )
-        swing_priority_family = str(
-            spec.get("swing_priority_family", "swing")
-        ).strip()
-        if swing_priority_family not in {"foot_swing", "swing"}:
-            raise ValueError(
-                f"End-effector '{name}' swing_priority_family must be "
-                "'foot_swing' or 'swing'."
-            )
         effectors[name] = {
             "task": task,
             "body_id": body_id,
@@ -1214,7 +1206,6 @@ def refine_joint_trajectory(
             "contact_offsets": contact_offsets,
             "contact_target_space": contact_target_space,
             "swing_target_space": swing_target_space,
-            "swing_priority_family": swing_priority_family,
             "track_source_during_contact": bool(
                 spec.get("track_source_during_contact", False)
             ),
@@ -1494,11 +1485,6 @@ def refine_joint_trajectory(
         contact_block_values: list[np.ndarray] = []
         contact_block_rhs: list[float] = []
         contact_row_index = 0
-        foot_swing_block_rows: list[np.ndarray] = []
-        foot_swing_block_columns: list[np.ndarray] = []
-        foot_swing_block_values: list[np.ndarray] = []
-        foot_swing_block_rhs: list[float] = []
-        foot_swing_row_index = 0
         swing_block_rows: list[np.ndarray] = []
         swing_block_columns: list[np.ndarray] = []
         swing_block_values: list[np.ndarray] = []
@@ -1524,8 +1510,7 @@ def refine_joint_trajectory(
             priority: str = "regular",
         ) -> None:
             nonlocal row_index, support_row_index, contact_row_index
-            nonlocal foot_swing_row_index, swing_row_index
-            nonlocal pose_row_index, swivel_row_index
+            nonlocal swing_row_index, pose_row_index, swivel_row_index
             scale = np.sqrt(max(float(weight), 1e-8)) / sigma
             block = np.atleast_2d(np.asarray(jacobian, dtype=float)) * scale
             target = np.asarray(target_delta, dtype=float).reshape(-1) * scale
@@ -1542,22 +1527,7 @@ def refine_joint_trajectory(
                 contact_block_values.append(block[local_rows, local_columns])
                 contact_block_rhs.extend(target.tolist())
                 contact_row_index += block.shape[0]
-            elif priority in {"swing", "foot_swing"} and swing_hierarchy_enabled:
-                if priority == "foot_swing":
-                    foot_swing_block_rows.append(
-                        local_rows + foot_swing_row_index
-                    )
-                    foot_swing_block_columns.append(
-                        frame_idx * num_joints + local_columns
-                    )
-                    foot_swing_block_values.append(
-                        block[local_rows, local_columns]
-                    )
-                    foot_swing_block_rhs.extend(target.tolist())
-                    foot_swing_row_index += block.shape[0]
-                # The combined swing stage remains after foot-swing.  It
-                # optimizes hands without forgetting the already constrained
-                # foot optimum.
+            elif priority == "swing" and swing_hierarchy_enabled:
                 swing_block_rows.append(local_rows + swing_row_index)
                 swing_block_columns.append(
                     frame_idx * num_joints + local_columns
@@ -1748,9 +1718,7 @@ def refine_joint_trajectory(
                             if mode == ContactMode.SUPPORT
                             else "contact"
                             if mode == ContactMode.TOUCH
-                            else (
-                                spec["swing_priority_family"]
-                            )
+                            else "swing"
                         ),
                     )
 
@@ -1783,7 +1751,7 @@ def refine_joint_trajectory(
                         task.tracking_positions[frame_idx] - tracking_point,
                         tracking_sigma * position_sigma_scale,
                         1.0,
-                        spec["swing_priority_family"],
+                        "swing",
                     )
 
                 arm_posture = spec["arm_posture"]
@@ -2210,22 +2178,6 @@ def refine_joint_trajectory(
             ),
             shape=(contact_row_index, num_frames * num_joints),
         ).tocsr()
-        foot_swing_block = sparse.coo_matrix(
-            (
-                np.concatenate(foot_swing_block_values)
-                if foot_swing_block_values
-                else np.zeros(0, dtype=float),
-                (
-                    np.concatenate(foot_swing_block_rows)
-                    if foot_swing_block_rows
-                    else np.zeros(0, dtype=int),
-                    np.concatenate(foot_swing_block_columns)
-                    if foot_swing_block_columns
-                    else np.zeros(0, dtype=int),
-                ),
-            ),
-            shape=(foot_swing_row_index, num_frames * num_joints),
-        ).tocsr()
         swing_block = sparse.coo_matrix(
             (
                 np.concatenate(swing_block_values)
@@ -2516,16 +2468,12 @@ def refine_joint_trajectory(
         has_contact_priority = (
             contact_hierarchy_enabled and contact_row_index > 0
         )
-        has_foot_swing_priority = (
-            swing_hierarchy_enabled and foot_swing_row_index > 0
-        )
         has_swing_priority = swing_hierarchy_enabled and swing_row_index > 0
         has_pose_priority = pose_hierarchy_enabled and pose_row_index > 0
         has_swivel_priority = swivel_hierarchy_enabled and swivel_row_index > 0
         if (
             has_support_priority
             or has_contact_priority
-            or has_foot_swing_priority
             or has_swing_priority
             or has_pose_priority
             or has_swivel_priority
@@ -2673,12 +2621,6 @@ def refine_joint_trajectory(
                 stage_block,
                 stage_rhs_values,
             ) in (
-                (
-                    "foot_swing",
-                    has_foot_swing_priority,
-                    foot_swing_block,
-                    foot_swing_block_rhs,
-                ),
                 (
                     "swing",
                     has_swing_priority,
