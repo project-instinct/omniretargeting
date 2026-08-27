@@ -1174,11 +1174,9 @@ def refine_joint_trajectory(
     step_tolerance = float(config.get("step_tolerance", 1e-4))
     use_acceleration = bool(config.get("acceleration_enabled", True))
     use_jerk = bool(config.get("jerk_enabled", True))
-    root_z_offset = float(
-        (
-            end_effector_config.get("base_position_constraint", {}) or {}
-        ).get("z_offset", 0.0)
-    )
+    from omniretargeting.retargeting import _swing_target_z_offset
+
+    root_z_offset = _swing_target_z_offset(end_effector_config)
 
     # The derivative residuals are per-frame differences, so their sigmas carry
     # implicit units of rad/frame^n.  Rescaling against the framerate they were

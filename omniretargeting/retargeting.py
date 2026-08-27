@@ -26,6 +26,23 @@ from .utils import (
 )
 
 
+def _swing_target_z_offset(end_effector_config: Mapping[str, Any]) -> float:
+    """Vertical offset applied to a root-anchored swing target.
+
+    ``base_position_constraint.z_offset`` is the historical home for this value,
+    and it was read whether or not that block was enabled — a profile that
+    disabled the base envelope still had its swing targets shifted by whatever
+    ``z_offset`` it happened to carry.  ``swing_target_z_offset`` states the
+    intent directly; the old key stays as the fallback so existing profiles keep
+    their behaviour.
+    """
+    cfg = dict(end_effector_config or {})
+    explicit = cfg.get("swing_target_z_offset")
+    if explicit is not None:
+        return float(explicit)
+    return float((cfg.get("base_position_constraint", {}) or {}).get("z_offset", 0.0))
+
+
 def _transform_swing_target(
     tracking_position: np.ndarray,
     source_root_position: np.ndarray | None,
@@ -1161,14 +1178,7 @@ class GenericInteractionRetargeter:
                 target = np.asarray(target_data["tracking_position"], dtype=float).reshape(3)
                 source_root_position = target_data.get("source_root_position")
                 swing_morphology_scale = float(spec["swing_morphology_scale"])
-                root_z_offset = float(
-                    (
-                        self.end_effector_config.get(
-                            "base_position_constraint", {}
-                        )
-                        or {}
-                    ).get("z_offset", 0.0)
-                )
+                root_z_offset = _swing_target_z_offset(self.end_effector_config)
                 # Contact positions remain exact world-space constraints.
                 # Swing targets follow the registered robot root and may also
                 # be scaled root-relatively for morphology.  Root registration

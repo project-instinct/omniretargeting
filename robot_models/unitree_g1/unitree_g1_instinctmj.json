@@ -55,10 +55,10 @@
     "head_top_offset": 0.12
   },
   "base_orientation": {
-    "pelvis": "Pelvis",
-    "left_hip": "L_Hip",
-    "right_hip": "R_Hip",
-    "spine": "Spine3",
+    "pelvis": "Spine3",
+    "left_hip": "L_Shoulder",
+    "right_hip": "R_Shoulder",
+    "spine": "Neck",
     "root_position": "Spine3"
   },
   "retargeting": {
@@ -248,7 +248,7 @@
       "effectors": {
         "left_hand": {
           "robot_body": "left_rubber_hand",
-          "preserve_world_target": true,
+          "preserve_world_target": false,
           "track_swing": false,
           "track_sliding_tangent": false,
           "contact_joint_names": [
@@ -262,7 +262,7 @@
           ],
           "contact_sigma": 0.02,
           "contact_position_sigma": 0.012,
-          "swing_position_sigma": 0.05,
+          "swing_position_sigma": 0.01,
           "refine_orientation": true,
           "orientation_mode": "axes",
           "forward_orientation_sigma": 0.18,
@@ -328,11 +328,12 @@
               -0.0235,
               0.0634
             ]
-          ]
+          ],
+          "swing_morphology_scale": 0.9
         },
         "right_hand": {
           "robot_body": "right_rubber_hand",
-          "preserve_world_target": true,
+          "preserve_world_target": false,
           "track_swing": false,
           "track_sliding_tangent": false,
           "contact_joint_names": [
@@ -346,7 +347,7 @@
           ],
           "contact_sigma": 0.02,
           "contact_position_sigma": 0.012,
-          "swing_position_sigma": 0.05,
+          "swing_position_sigma": 0.01,
           "refine_orientation": true,
           "orientation_mode": "axes",
           "forward_orientation_sigma": 0.18,
@@ -412,7 +413,8 @@
               0.0235,
               0.0634
             ]
-          ]
+          ],
+          "swing_morphology_scale": 0.9
         },
         "left_foot": {
           "robot_body": "left_ankle_roll_link",
@@ -460,17 +462,19 @@
             ]
           ]
         }
-      }
+      },
+      "base_orientation_weight": 150.0,
+      "swing_target_z_offset": -0.28
     },
     "trajectory_smoothing": {
       "enabled": false,
       "sigma_frames": 2.0
     },
     "trajectory_refinement": {
-      "enabled": false,
+      "enabled": true,
       "iterations": 16,
       "contact_position_sigma": 0.012,
-      "swing_position_sigma": 0.03,
+      "swing_position_sigma": 0.015,
       "orientation_sigma": 0.0698131701,
       "reference_sigma": 0.8,
       "acceleration_enabled": true,
@@ -593,8 +597,8 @@
       "xy_smoothing_window": 5,
       "z_smoothing_window": 5,
       "contact_point_height_band": 0.01,
-      "max_xy_correction": 0.08,
-      "max_surface_correction": 0.08,
+      "max_xy_correction": 0.0,
+      "max_surface_correction": 0.0,
       "surface_iterations": 4,
       "wall_red_axis_only": true,
       "wall_normal_z_threshold": 0.35,

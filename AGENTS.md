@@ -22,10 +22,20 @@ rules.
 - Treat the input SMPL-X motion and scene registration as immutable source
   data. Do not rewrite, rescale, globally lift, or otherwise deform the human
   trajectory to make the robot solution easier.
-- Hands and feet are the primary interaction end effectors. Keep their robot
-  targets close to the corresponding SMPL-X world positions and inferred
-  scene-contact locations. Contact targets remain in world coordinates; do not
-  silently convert them to root-relative or morphology-scaled positions.
+- Hands and feet are the primary interaction end effectors. Split the two
+  regimes explicitly:
+  - **In contact.** Keep the robot target on the inferred scene-contact
+    location in world coordinates. Never convert a contact target to a
+    root-relative or morphology-scaled position, and never trade contact
+    accuracy for posture.
+  - **Free (no contact).** The world position of a free-swinging hand is not
+    the objective. Prefer a body-relative, morphology-scaled target so the
+    limb keeps the same pose relative to the robot's own torso as the actor's
+    limb had relative to theirs. A shorter robot will then carry its hand
+    below the actor's in world coordinates; that is accepted, because a
+    coherent whole-body pose reads better than a hand dragged to a world point
+    the body cannot support. Feet keep their world targets in both regimes —
+    they carry the support and the ground contact.
 - Preserve the source root path, timing, motion direction, and recognizable
   whole-body pose as closely as the robot morphology permits. Accept only the
   deviation required by robot reachability, joint limits, collision avoidance,
