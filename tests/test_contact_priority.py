@@ -35,6 +35,7 @@ from omniretargeting.trajectory_refinement import (
     collision_geom_ids,
     geom_surface_offsets,
     measure_scene_penetration,
+    _penetration_depth_weight,
     refine_joint_trajectory,
 )
 from omniretargeting.utils import _densify_smplx_frame_gaps, load_smplx_trajectory
@@ -1537,6 +1538,14 @@ def test_capsule_surface_offsets_follow_the_local_z_axis():
     assert np.isclose(np.max(offsets[:, 2]), 0.25)
     assert np.isclose(np.min(offsets[:, 2]), -0.25)
     assert np.isclose(np.max(np.abs(offsets[:, :2])), 0.05)
+
+
+def test_deep_penetration_samples_receive_bounded_priority_weight():
+    config = {"depth_priority_start": 0.05, "max_depth_weight": 9.0}
+
+    assert _penetration_depth_weight(-0.02, config) == pytest.approx(1.0)
+    assert _penetration_depth_weight(-0.10, config) == pytest.approx(4.0)
+    assert _penetration_depth_weight(-0.20, config) == pytest.approx(9.0)
 
 
 def test_refinement_penalizes_scene_penetration():

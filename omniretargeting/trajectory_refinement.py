@@ -375,6 +375,23 @@ _AXIS_DIRECTIONS = np.array(
 )
 
 
+def _penetration_depth_weight(
+    clearance: float,
+    config: Mapping[str, Any],
+) -> float:
+    """Increase the influence of deep collision samples without a hard cutoff.
+
+    The ordinary quadratic penalty can reduce many shallow intersections while
+    allowing one collision point to become much deeper.  This bounded IRLS
+    weight makes samples beyond ``depth_priority_start`` dominate that tradeoff
+    while keeping the problem a soft least-squares optimization.
+    """
+    depth = max(-float(clearance), 0.0)
+    priority_start = max(float(config.get("depth_priority_start", 0.05)), 1e-8)
+    max_weight = max(float(config.get("max_depth_weight", 9.0)), 1.0)
+    return min(max_weight, max(1.0, (depth / priority_start) ** 2))
+
+
 def geom_surface_offsets(model: mujoco.MjModel, geom_id: int) -> np.ndarray:
     """Return local-frame surface samples for one collision geom.
 
@@ -1696,6 +1713,10 @@ def refine_joint_trajectory(
                     penetration_clearance
                     - frame_penetration["clearance"][index],
                     penetration_sigma,
+                    _penetration_depth_weight(
+                        frame_penetration["clearance"][index],
+                        penetration_cfg,
+                    ),
                 )
                 active_penetration_rows += 1
 

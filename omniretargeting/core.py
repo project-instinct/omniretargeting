@@ -30,6 +30,74 @@ from .trajectory_refinement import (
 )
 
 
+def _select_penetration_safe_refinement(
+    model: mujoco.MjModel,
+    baseline: np.ndarray,
+    refined: np.ndarray,
+    scene_mesh: trimesh.Trimesh,
+    penetration_config: Mapping[str, Any],
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> tuple[np.ndarray, Mapping[str, Any], float]:
+    """Keep the largest refinement blend that avoids a penetration regression.
+
+    Whole-trajectory refinement uses a soft collision penalty, so a lower
+    aggregate least-squares cost can still make one collision point deeper.
+    Ten centimetres is a target, not a hard rejection threshold: when the
+    framewise result is already deeper, a small configured regression remains
+    admissible.  Since refinement changes scalar joints only, blending those
+    coordinates preserves the source-locked floating base exactly.
+    """
+    target_depth = max(
+        float(penetration_config.get("target_max_depth", 0.10)), 0.0
+    )
+    allowed_regression = max(
+        float(penetration_config.get("max_depth_regression", 0.01)), 0.0
+    )
+    max_depth = max(
+        target_depth,
+        float(before["max_depth"]) + allowed_regression,
+    )
+    if float(after["max_depth"]) <= max_depth:
+        return np.asarray(refined, dtype=float), after, 1.0
+
+    raw_blends = penetration_config.get(
+        "acceptance_blends", [0.75, 0.5, 0.25]
+    )
+    blends = sorted(
+        {
+            float(np.clip(value, 0.0, 1.0))
+            for value in raw_blends
+            if 0.0 < float(value) < 1.0
+        },
+        reverse=True,
+    )
+    baseline = np.asarray(baseline, dtype=float)
+    refined = np.asarray(refined, dtype=float)
+    candidates: list[tuple[float, np.ndarray, Mapping[str, Any]]] = [
+        (1.0, refined, after)
+    ]
+    for blend in blends:
+        candidate = baseline.copy()
+        candidate[:, 7:] += blend * (refined[:, 7:] - baseline[:, 7:])
+        stats = measure_scene_penetration(
+            model, candidate, scene_mesh, penetration_config
+        )
+        candidates.append((blend, candidate, stats))
+        if float(stats["max_depth"]) <= max_depth:
+            return candidate, stats, blend
+
+    candidates.append((0.0, baseline, before))
+    safe = [
+        candidate
+        for candidate in candidates
+        if float(candidate[2]["max_depth"]) <= max_depth
+    ]
+    if safe:
+        return max(safe, key=lambda candidate: candidate[0])
+    return min(candidates, key=lambda candidate: float(candidate[2]["max_depth"]))
+
+
 def _partition_end_effector_markers(
     markers: Mapping[str, Dict[str, np.ndarray]],
     config: Mapping[str, Any],
@@ -551,9 +619,10 @@ class OmniRetargeter:
             "joint_limit_safety_fraction",
             float(retargeting_config.get("joint_limit_safety_fraction", 1.0)),
         )
+        penetration_acceptance = None
         if bool(refinement_cfg.get("enabled", False)) and end_effector_tasks:
             penetration_cfg = dict(refinement_cfg.get("penetration", {}) or {})
-            report_penetration = bool(penetration_cfg.get("report", True))
+            penetration_enabled = bool(penetration_cfg.get("enabled", True))
             before = (
                 measure_scene_penetration(
                     self.robot_model,
@@ -561,9 +630,10 @@ class OmniRetargeter:
                     scaled_terrain,
                     penetration_cfg,
                 )
-                if report_penetration
+                if penetration_enabled
                 else None
             )
+            framewise_motion = np.asarray(retargeted_motion, dtype=float).copy()
             source_root_idx = self._resolve_source_root_index()
             retargeted_motion = refine_joint_trajectory(
                 self.robot_model,
@@ -578,66 +648,11 @@ class OmniRetargeter:
                 source_joint_names=self.smplx_joint_names,
             )
             if before is not None:
-                after = measure_scene_penetration(
-                    self.robot_model,
-                    retargeted_motion,
-                    scaled_terrain,
+                penetration_acceptance = (
                     penetration_cfg,
+                    framewise_motion,
+                    before,
                 )
-                # Jerk is part of the refinement objective, so its improvement
-                # is not evidence of a good result.  Penetration is only ever
-                # penalized, which makes it the honest acceptance check.
-                for label, stats in (("before", before), ("after", after)):
-                    print(
-                        f"Scene penetration {label} refinement: "
-                        f"max={stats['max_depth'] * 100.0:.2f} cm, "
-                        f"mean={stats['mean_depth'] * 100.0:.2f} cm, "
-                        f"frames={stats['frames_penetrating']}/{stats['num_frames']}"
-                        + (
-                            f", worst={stats['worst_body']}@{stats['worst_frame']}"
-                            if stats["worst_body"]
-                            else ""
-                        )
-                    )
-                deeper = after["max_depth"] > before["max_depth"] + 1e-4
-                spread_improved = (
-                    after["frames_penetrating"] < before["frames_penetrating"]
-                )
-                if deeper and not spread_improved:
-                    print(
-                        "Scene penetration warning: refinement increased the "
-                        "worst penetration depth without clearing frames. "
-                        "Tighten trajectory_refinement.penetration.sigma or "
-                        "relax acceleration_sigma/jerk_sigma."
-                    )
-                elif deeper:
-                    worst_frame = int(after["worst_frame"])
-                    pinned_by_sticking_contact = any(
-                        0 <= worst_frame < len(task.contact_mask)
-                        and bool(task.contact_mask[worst_frame])
-                        and (
-                            task.contact_modes is None
-                            or str(task.contact_modes[worst_frame]) == "sticking"
-                        )
-                        for task in end_effector_tasks.values()
-                    )
-                    detail = (
-                        f"{after['worst_body']}@{after['worst_frame']} is near a "
-                        "sticking contact anchor, which limits further local "
-                        "correction."
-                        if pinned_by_sticking_contact
-                        else
-                        f"{after['worst_body']}@{after['worst_frame']} was not "
-                        "fully resolved by the bounded local joint correction."
-                    )
-                    print(
-                        "Scene penetration note: the worst point deepened by "
-                        f"{(after['max_depth'] - before['max_depth']) * 100.0:.2f} cm "
-                        f"while penetrating frames fell from "
-                        f"{before['frames_penetrating']} to "
-                        f"{after['frames_penetrating']}. "
-                        + detail
-                    )
         retargeted_motion = self._apply_trajectory_smoothing(
             retargeted_motion,
             framerate=float(framerate or 30.0),
@@ -667,6 +682,72 @@ class OmniRetargeter:
         retargeted_motion = self._clamp_final_joint_safety_limits(
             retargeted_motion
         )
+
+        if penetration_acceptance is not None:
+            penetration_cfg, framewise_motion, before = penetration_acceptance
+            candidate_after = measure_scene_penetration(
+                self.robot_model,
+                retargeted_motion,
+                scaled_terrain,
+                penetration_cfg,
+            )
+            retargeted_motion, after, accepted_blend = (
+                _select_penetration_safe_refinement(
+                    self.robot_model,
+                    framewise_motion,
+                    retargeted_motion,
+                    scaled_terrain,
+                    penetration_cfg,
+                    before,
+                    candidate_after,
+                )
+            )
+            target_max_depth = float(
+                penetration_cfg.get("target_max_depth", 0.10)
+            )
+            allowed_regression = float(
+                penetration_cfg.get("max_depth_regression", 0.01)
+            )
+            blend_depth_limit = max(
+                target_max_depth,
+                float(before["max_depth"]) + allowed_regression,
+            )
+            if accepted_blend < 1.0:
+                print(
+                    "Scene penetration acceptance: rejected the full final "
+                    "trajectory and kept "
+                    f"{accepted_blend * 100.0:.0f}% of its local joint "
+                    "correction because it caused an avoidable maximum-depth "
+                    "regression."
+                )
+            if float(after["max_depth"]) > blend_depth_limit:
+                print(
+                    "Scene penetration note: no tested local joint blend met "
+                    "the soft target without a larger regression; kept the "
+                    "lowest-penetration candidate rather than forcing a "
+                    "motion-distorting correction."
+                )
+            if bool(penetration_cfg.get("report", True)):
+                report_rows = [
+                    ("before", before),
+                    ("candidate final", candidate_after),
+                ]
+                if accepted_blend < 1.0:
+                    report_rows.append(("accepted final", after))
+                for label, stats in report_rows:
+                    print(
+                        f"Scene penetration {label}: "
+                        f"max={stats['max_depth'] * 100.0:.2f} cm, "
+                        f"mean={stats['mean_depth'] * 100.0:.2f} cm, "
+                        f"frames={stats['frames_penetrating']}/"
+                        f"{stats['num_frames']}"
+                        + (
+                            f", worst={stats['worst_body']}@"
+                            f"{stats['worst_frame']}"
+                            if stats["worst_body"]
+                            else ""
+                        )
+                    )
 
         if end_effector_tasks:
             self._report_final_motion_quality(retargeted_motion, end_effector_tasks)

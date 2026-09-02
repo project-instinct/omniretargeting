@@ -123,6 +123,15 @@ def test_compact_instinctmj_profile_expands_algorithm_defaults():
     assert loaded["retargeting"]["trajectory_refinement"][
         "contact_position_sigma"
     ] == pytest.approx(0.008)
+    penetration = loaded["retargeting"]["trajectory_refinement"][
+        "penetration"
+    ]
+    assert penetration["target_max_depth"] == pytest.approx(0.10)
+    assert penetration["max_depth_regression"] == pytest.approx(0.01)
+    assert penetration["sigma"] == pytest.approx(0.008)
+    assert penetration["depth_priority_start"] == pytest.approx(0.05)
+    assert penetration["max_depth_weight"] == pytest.approx(9.0)
+    assert penetration["contact_anchor_exclusion_radius"] == pytest.approx(0.0)
     assert "swing_target_z_offset" not in priority
 
 

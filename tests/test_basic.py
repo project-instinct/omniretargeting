@@ -597,6 +597,70 @@ def test_perform_retargeting_passes_hard_penetration_constraint():
     )
 
 
+def test_penetration_guard_blends_only_joints_to_avoid_regression(monkeypatch):
+    from omniretargeting import core
+
+    baseline = np.zeros((2, 10), dtype=float)
+    refined = baseline.copy()
+    refined[:, 7:] = 1.0
+    before = {"max_depth": 0.09}
+    candidate_after = {"max_depth": 0.13}
+    measured_blends = []
+
+    def fake_measure(model, trajectory, scene_mesh, config):
+        del model, scene_mesh, config
+        blend = float(trajectory[0, 7])
+        measured_blends.append(blend)
+        return {"max_depth": 0.03 + 0.10 * blend}
+
+    monkeypatch.setattr(core, "measure_scene_penetration", fake_measure)
+    selected, stats, blend = core._select_penetration_safe_refinement(
+        Mock(),
+        baseline,
+        refined,
+        Mock(),
+        {
+            "target_max_depth": 0.10,
+            "max_depth_regression": 0.01,
+            "acceptance_blends": [0.75, 0.5, 0.25],
+        },
+        before,
+        candidate_after,
+    )
+
+    assert blend == pytest.approx(0.5)
+    assert stats["max_depth"] == pytest.approx(0.08)
+    assert measured_blends == pytest.approx([0.75, 0.5])
+    np.testing.assert_allclose(selected[:, :7], baseline[:, :7])
+    np.testing.assert_allclose(selected[:, 7:], 0.5)
+
+
+def test_penetration_guard_treats_ten_centimetres_as_soft_target(monkeypatch):
+    from omniretargeting import core
+
+    baseline = np.zeros((2, 10), dtype=float)
+    refined = baseline.copy()
+    refined[:, 7:] = 1.0
+
+    def fail_measure(*args, **kwargs):
+        raise AssertionError("an admissible full refinement must not be blended")
+
+    monkeypatch.setattr(core, "measure_scene_penetration", fail_measure)
+    selected, stats, blend = core._select_penetration_safe_refinement(
+        Mock(),
+        baseline,
+        refined,
+        Mock(),
+        {"target_max_depth": 0.10, "max_depth_regression": 0.01},
+        {"max_depth": 0.15},
+        {"max_depth": 0.155},
+    )
+
+    assert blend == pytest.approx(1.0)
+    assert stats["max_depth"] == pytest.approx(0.155)
+    np.testing.assert_allclose(selected, refined)
+
+
 @pytest.mark.parametrize("lock_initial_xy", [False, True])
 def test_animation_style_root_motion_uses_one_calibrated_initial_offset(
     lock_initial_xy,

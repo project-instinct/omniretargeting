@@ -283,10 +283,15 @@ CONTACT_RETARGETING_DEFAULTS: Dict[str, Any] = {
         "penetration": {
             "enabled": True,
             "report": True,
+            "target_max_depth": 0.10,
+            "max_depth_regression": 0.01,
+            "acceptance_blends": [0.75, 0.5, 0.25],
             "clearance": 0.005,
             "margin": 0.05,
-            "sigma": 0.012,
-            "contact_anchor_exclusion_radius": 0.05,
+            "sigma": 0.008,
+            "depth_priority_start": 0.05,
+            "max_depth_weight": 9.0,
+            "contact_anchor_exclusion_radius": 0.0,
         },
     },
     "foot_stabilization": {
