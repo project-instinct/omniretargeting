@@ -218,6 +218,21 @@ python -m omniretargeting.main \
 
 `--robot-config` defaults to `robot_models/unitree_g1/unitree_g1.json`. The robot URDF path must be set as `urdf_path` in that JSON profile (the CLI does not accept a separate URDF argument).
 
+Dataset clips can be passed directly; a separate source JSON is unnecessary
+for common unambiguous formats:
+
+```bash
+python -m omniretargeting.main \
+  --source-motion /path/to/parc_ms_clip.pkl \
+  --robot-config robot_models/unitree_g1/unitree_g1_instinctmj.json \
+  --output /path/to/retargeted.npz
+```
+
+The CLI infers `.pkl` as `parc_ms` and `.npz` as `smplx`. For an ambiguous
+format such as BVH, add one adapter name, for example
+`--source-type lafan1`; source JSON remains available only for real per-source
+overrides.
+
 Profile fields can include:
 - `joint_mapping`
 - `urdf_path`
@@ -226,6 +241,45 @@ Profile fields can include:
 - `height_estimation`
 - `base_orientation`
 - `retargeting`
+
+Contact, temporal stability, posture preservation, and trajectory refinement
+use algorithm-level defaults. A robot profile only describes its own mapping,
+end-effector geometry, and genuine model-specific overrides:
+
+```json
+{
+  "retargeting": {
+    "end_effector_priority": {
+      "effectors": {
+        "left_hand": {"robot_body": "left_hand_link"},
+        "right_hand": {"robot_body": "right_hand_link"}
+      }
+    }
+  }
+}
+```
+
+Declaring interaction effectors automatically enables the shared policy; there
+is no preset selector or external algorithm-parameter JSON. Nested
+robot-specific objects are merged recursively, while a scalar or list in the
+robot profile replaces the algorithm default. The bundled
+`unitree_g1_instinctmj.json` uses this compact form.
+
+Palm and sole tracking/contact offsets are inferred from the robot's mesh and
+collision geometry when omitted. Profiles only need explicit offsets when the
+model has no usable end-effector geometry or intentionally uses a custom tool
+point.
+
+Arm joint chains, shoulder/elbow/wrist bodies, and upper-arm/forearm lengths
+are likewise inferred from the URDF/MJCF kinematic tree and nominal pose.
+Wrist semantic axes come from its roll/pitch joint axes, while axial waist or
+torso joints receive an automatic neutral safety window inside their model
+limits to prevent whole-body twist drift.
+
+Free-swing targets use the measured robot-root/source-torso registration per
+frame. If a source omits the requested upper-spine joint, the highest available
+spine joint is selected automatically instead of falling back to an unrelated
+array index.
 
 ### Validation
 
@@ -274,6 +328,12 @@ The viewer reads `base_pos_w`, `base_quat_w`, `joint_pos`, and `joint_names`
 from `.npz` outputs. If `object_pos_w/object_quat_w` are present, it can also
 show an object mesh via `--object-mesh`, or infer common OMOMO meshes from
 `~/Datasets/OMOMO/data/captured_objects`.
+
+The Playback tab supports exact-frame inspection with First/Prev/Next/Last,
+direct frame entry, configurable multi-frame jumps, contact-event navigation,
+playback speed, looping, and overlay visibility. Keyboard shortcuts are
+`Space` (play/pause), `Left`/`Right` (one frame), `PageUp`/`PageDown` (jump),
+and `Home`/`End` (first/last frame).
 
 ## API Reference
 

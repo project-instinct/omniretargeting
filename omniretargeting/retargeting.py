@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 from pathlib import Path
 import yourdfpy
 
+from .contact import _is_surface_only_contact_mode
 from .utils import (
     load_terrain_mesh,
     sample_points_on_mesh,
@@ -26,21 +27,26 @@ from .utils import (
 )
 
 
-def _swing_target_z_offset(end_effector_config: Mapping[str, Any]) -> float:
-    """Vertical offset applied to a root-anchored swing target.
+def _swing_target_z_offset(
+    end_effector_config: Mapping[str, Any],
+    *,
+    robot_root_z: float | None = None,
+    source_root_position: np.ndarray | None = None,
+) -> float:
+    """Resolve robot/source root registration for a swing target.
 
-    ``base_position_constraint.z_offset`` is the historical home for this value,
-    and it was read whether or not that block was enabled — a profile that
-    disabled the base envelope still had its swing targets shifted by whatever
-    ``z_offset`` it happened to carry.  ``swing_target_z_offset`` states the
-    intent directly; the old key stays as the fallback so existing profiles keep
-    their behaviour.
+    An explicit value remains available for unusual tools or compatibility.
+    Normally the offset is measured from the current robot root and source
+    torso, so different bodies and poses do not share one tuned constant.
     """
     cfg = dict(end_effector_config or {})
     explicit = cfg.get("swing_target_z_offset")
     if explicit is not None:
         return float(explicit)
-    return float((cfg.get("base_position_constraint", {}) or {}).get("z_offset", 0.0))
+    if robot_root_z is not None and source_root_position is not None:
+        source_root = np.asarray(source_root_position, dtype=float).reshape(3)
+        return float(robot_root_z) - float(source_root[2])
+    return 0.0
 
 
 def _transform_swing_target(
@@ -65,6 +71,113 @@ def _transform_swing_target(
     robot_root_target = source_root.copy()
     robot_root_target[2] += float(robot_root_z_offset)
     return robot_root_target + float(morphology_scale) * (target - source_root)
+
+
+def _calibrated_orientation_target(
+    source_current: np.ndarray,
+    source_reference: np.ndarray,
+    robot_reference: np.ndarray,
+) -> np.ndarray:
+    """Map a source world orientation into a calibrated robot body frame.
+
+    Source skeletons and robot links rarely use the same local axes.  The
+    constant right-side offset aligns their reference poses, while the source
+    world rotation still supplies the complete time-varying body motion.  This
+    is the frame-task convention used by standard whole-body IK retargeters.
+    """
+    source_current = np.asarray(source_current, dtype=float).reshape(3, 3)
+    source_reference = np.asarray(source_reference, dtype=float).reshape(3, 3)
+    robot_reference = np.asarray(robot_reference, dtype=float).reshape(3, 3)
+    return source_current @ source_reference.T @ robot_reference
+
+
+def _relative_orientation_step_magnitude(
+    current_wxyz: np.ndarray,
+    previous_wxyz: np.ndarray,
+) -> float:
+    """Return the shortest SO(3) step between two scalar-first quaternions."""
+    current = Rotation.from_quat(
+        np.asarray(current_wxyz, dtype=float).reshape(4), scalar_first=True
+    )
+    previous = Rotation.from_quat(
+        np.asarray(previous_wxyz, dtype=float).reshape(4), scalar_first=True
+    )
+    return float((previous.inv() * current).magnitude())
+
+
+def _limit_relative_orientation_step(
+    current_wxyz: np.ndarray,
+    previous_wxyz: np.ndarray,
+    max_step: float,
+) -> np.ndarray:
+    """Project a scalar-first quaternion onto an exact shortest-arc step.
+
+    The convex subproblem constrains a first-order angular-velocity model. A
+    later trust-region projection and quaternion normalization can otherwise
+    leave the accepted nonlinear rotation just outside that model's cone.
+    Applying the same envelope on SO(3) makes the per-frame guarantee exact;
+    subsequent SQP iterations can still recover contact accuracy with the
+    remaining joints.
+    """
+    current = Rotation.from_quat(
+        np.asarray(current_wxyz, dtype=float).reshape(4), scalar_first=True
+    )
+    previous_quaternion = np.asarray(previous_wxyz, dtype=float).reshape(4)
+    previous = Rotation.from_quat(previous_quaternion, scalar_first=True)
+    delta = previous.inv() * current
+    delta_rotvec = delta.as_rotvec()
+    magnitude = float(np.linalg.norm(delta_rotvec))
+    limit = max(float(max_step), 0.0)
+    if magnitude > limit and magnitude > 1e-12:
+        current = previous * Rotation.from_rotvec(
+            delta_rotvec * (limit / magnitude)
+        )
+    projected = current.as_quat(scalar_first=True)
+    if np.dot(projected, previous_quaternion) < 0.0:
+        projected *= -1.0
+    return projected
+
+
+def _base_orientation_step_limit(
+    target_wxyz: np.ndarray,
+    previous_target_wxyz: np.ndarray,
+    previous_robot_wxyz: np.ndarray,
+    base_extra_step: float,
+    catchup_gain: float = 0.0,
+    catchup_deadband: float = 0.0,
+    max_extra_step: float | None = None,
+    max_total_step: float | None = None,
+) -> float:
+    """Return a source-aware angular rate limit with bounded error feedback.
+
+    A fixed rate limit prevents snapping but can leave a torso visibly lagging
+    after an incompatible contact phase. The proportional term spends a small
+    part of the already accumulated tracking error on the next frame, while
+    ``max_extra_step`` keeps that recovery from becoming another snap.
+    """
+    source_step = _relative_orientation_step_magnitude(
+        target_wxyz, previous_target_wxyz
+    )
+    previous_tracking_error = _relative_orientation_step_magnitude(
+        previous_target_wxyz, previous_robot_wxyz
+    )
+    catchup_error = max(
+        previous_tracking_error - max(float(catchup_deadband), 0.0), 0.0
+    )
+    extra_step = max(float(base_extra_step), 0.0) + max(
+        float(catchup_gain), 0.0
+    ) * catchup_error
+    if max_extra_step is not None:
+        extra_step = min(extra_step, max(float(max_extra_step), 0.0))
+    allowed_step = source_step + extra_step
+    if max_total_step is not None:
+        # Never clip a deliberate source turn merely because the generic
+        # recovery envelope is lower than this particular captured frame.
+        allowed_step = max(
+            source_step,
+            min(allowed_step, max(float(max_total_step), 0.0)),
+        )
+    return allowed_step
 
 
 def _clamp_target_to_reach(
@@ -335,6 +448,10 @@ class GenericInteractionRetargeter:
         # ambiguous; these tasks select the branch observed in the source.
         self._setup_pose_bones()
 
+        # Full body-frame orientations disambiguate the IK branch in ways
+        # segment positions alone cannot (especially shoulder/elbow twist).
+        self._setup_body_orientations()
+
         # Setup terrain interaction
         self._setup_terrain_interaction()
 
@@ -376,6 +493,15 @@ class GenericInteractionRetargeter:
         self.q_a_indices = np.arange(start_idx, self.nq)
         if self.preserve_root_z and 2 in self.q_a_indices:
             self.q_a_indices = self.q_a_indices[self.q_a_indices != 2]
+        self.lock_root_orientation_to_source = bool(
+            self.end_effector_config.get(
+                "lock_root_orientation_to_source", False
+            )
+        )
+        if self.lock_root_orientation_to_source:
+            self.q_a_indices = self.q_a_indices[
+                ~np.isin(self.q_a_indices, np.asarray([3, 4, 5, 6]))
+            ]
         self.nq_a = len(self.q_a_indices)
         
         print(f"Robot config: nq={self.nq}, nv={self.nv}, nq_a={self.nq_a}")
@@ -383,6 +509,8 @@ class GenericInteractionRetargeter:
             print(f"q_a_indices range: {self.q_a_indices.min()} to {self.q_a_indices.max()}")
         if self.preserve_root_z:
             print("Root z is fixed: qpos[2] is not optimized.")
+        if self.lock_root_orientation_to_source:
+            print("Root orientation is fixed to the source quaternion.")
 
         # Joint limits
         joint_names = [self.robot_model.joint(i).name for i in range(self.robot_model.njnt)]
@@ -464,7 +592,260 @@ class GenericInteractionRetargeter:
         )
         
         # Store smoothness weight (matching original: 0.2)
-        self.smooth_weight = 0.2
+        self.smooth_weight = max(
+            float(self.end_effector_config.get("smooth_weight", 0.2)), 0.0
+        )
+
+    def _setup_body_orientations(self) -> None:
+        """Resolve generic source-joint to robot-body orientation tasks.
+
+        Orientation tracking turns on automatically when the source contract
+        supplies global joint rotations.  The existing positional
+        ``joint_mapping`` is also the default orientation mapping, so this is
+        not a PARC-only feature and a new source does not need its own solver
+        branch.  Robot profiles may override a mapped body, sigma, or weight
+        for morphology-specific link conventions.
+        """
+        cfg = dict(self.end_effector_config.get("body_orientation", {}) or {})
+        source_orientations_available = bool(
+            cfg.get("_source_orientations_available", False)
+        )
+        explicitly_disabled = cfg.get("enabled") is False
+        self.body_orientation_enabled = (
+            source_orientations_available and not explicitly_disabled
+        )
+        self.body_orientation_calibration_iterations = max(
+            int(cfg.get("calibration_iterations", 30)), 1
+        )
+        self.body_orientation_tasks: Dict[str, Dict[str, Any]] = {}
+        self._source_orientation_indices: Dict[str, int] = {}
+        self._source_orientation_references: Dict[str, np.ndarray] = {}
+        self._robot_orientation_references: Dict[str, np.ndarray] = {}
+        if not self.body_orientation_enabled:
+            return
+
+        default_sigma = max(float(cfg.get("sigma", 0.2)), 1e-6)
+        configured_tasks = dict(cfg.get("tasks", {}) or {})
+        base_orientation_source_joint = self.end_effector_config.get(
+            "_base_orientation_source_joint"
+        )
+        task_specs: Dict[str, Any] = {
+            source_name: {"robot_body": robot_body}
+            for source_name, robot_body in self.joint_mapping.items()
+            if source_name != base_orientation_source_joint
+        }
+        for source_name, configured_spec in configured_tasks.items():
+            if source_name == base_orientation_source_joint:
+                continue
+            inherited_spec = task_specs.get(source_name, {})
+            if isinstance(configured_spec, str):
+                task_specs[source_name] = {"robot_body": configured_spec}
+            else:
+                task_specs[source_name] = {
+                    **dict(inherited_spec or {}),
+                    **dict(configured_spec or {}),
+                }
+
+        for source_name, raw_spec in task_specs.items():
+            spec = (
+                {"robot_body": raw_spec}
+                if isinstance(raw_spec, str)
+                else dict(raw_spec or {})
+            )
+            if spec.get("enabled") is False:
+                continue
+            robot_body = str(
+                spec.get("robot_body", self.joint_mapping.get(source_name, ""))
+            )
+            body_id = mujoco.mj_name2id(
+                self.robot_model,
+                mujoco.mjtObj.mjOBJ_BODY,
+                robot_body,
+            )
+            if body_id < 0:
+                raise ValueError(
+                    f"body_orientation task '{source_name}' refers to missing "
+                    f"robot body '{robot_body}'."
+                )
+            weight = max(float(spec.get("weight", 1.0)), 0.0)
+            if weight == 0.0:
+                continue
+            self.body_orientation_tasks[str(source_name)] = {
+                "body_id": int(body_id),
+                "body_name": robot_body,
+                "sigma": max(float(spec.get("sigma", default_sigma)), 1e-6),
+                "weight": weight,
+            }
+
+        if not self.body_orientation_tasks:
+            self.body_orientation_enabled = False
+
+    def configure_source_orientation_reference(
+        self,
+        source_joint_names: List[str],
+        source_reference_orientations: Optional[np.ndarray],
+        source_reference_positions: Optional[np.ndarray] = None,
+        *,
+        reference_base_orientation: Optional[np.ndarray] = None,
+        reference_label: str = "source reference pose",
+    ) -> None:
+        """Calibrate source joint frames against a morphology-matched pose."""
+        if not self.body_orientation_enabled:
+            return
+        if source_reference_orientations is None:
+            print(
+                "Body-orientation tracking requested, but the source provides "
+                "no joint_rest_orientations; continuing with position tasks."
+            )
+            return
+
+        references = np.asarray(source_reference_orientations, dtype=float)
+        if references.shape != (len(source_joint_names), 4):
+            raise ValueError(
+                "source_reference_orientations must have shape "
+                f"({len(source_joint_names)}, 4), got {references.shape}."
+            )
+        name_to_index = {
+            str(name): index for index, name in enumerate(source_joint_names)
+        }
+        missing = [
+            name for name in self.body_orientation_tasks if name not in name_to_index
+        ]
+        if missing:
+            raise ValueError(
+                "body_orientation source joints are missing from the motion: "
+                f"{missing}."
+            )
+
+        current_qpos = self.robot_data.qpos.copy()
+        robot_reference_qpos = np.asarray(
+            self.robot_model.qpos0, dtype=float
+        ).copy()
+        if source_reference_positions is not None:
+            reference_positions = np.asarray(
+                source_reference_positions, dtype=float
+            )
+            if reference_positions.shape != (len(source_joint_names), 3):
+                raise ValueError(
+                    "source_reference_positions must have shape "
+                    f"({len(source_joint_names)}, 3), got "
+                    f"{reference_positions.shape}."
+                )
+            mapped_reference_positions = np.asarray(
+                [reference_positions[name_to_index[name]] for name in self.valid_joint_names],
+                dtype=float,
+            )
+            root_name = "Pelvis" if "Pelvis" in name_to_index else source_joint_names[0]
+            free_joint_ids = np.flatnonzero(
+                self.robot_model.jnt_type == mujoco.mjtJoint.mjJNT_FREE
+            )
+            if len(free_joint_ids):
+                free_body_id = int(
+                    self.robot_model.jnt_bodyid[int(free_joint_ids[0])]
+                )
+                for source_name, robot_body_name in self.joint_mapping.items():
+                    robot_body_id = mujoco.mj_name2id(
+                        self.robot_model,
+                        mujoco.mjtObj.mjOBJ_BODY,
+                        str(robot_body_name),
+                    )
+                    if robot_body_id == free_body_id and source_name in name_to_index:
+                        root_name = source_name
+                        break
+            if len(robot_reference_qpos) >= 3:
+                robot_reference_qpos[:3] = reference_positions[
+                    name_to_index[root_name]
+                ]
+            robot_reference_qpos = self.retarget_frame(
+                mapped_reference_positions,
+                robot_reference_qpos,
+                max_iter=self.body_orientation_calibration_iterations,
+                target_base_orientation=reference_base_orientation,
+            )
+            print(
+                "Solved robot body-orientation calibration pose from source "
+                f"reference ({reference_label}, "
+                f"{self.body_orientation_calibration_iterations} SQP iterations)."
+            )
+
+        self.robot_data.qpos[:] = robot_reference_qpos
+        mujoco.mj_forward(self.robot_model, self.robot_data)
+        try:
+            for source_name, task in self.body_orientation_tasks.items():
+                source_index = int(name_to_index[source_name])
+                source_wxyz = references[source_index]
+                source_norm = float(np.linalg.norm(source_wxyz))
+                if source_norm < 1e-12:
+                    raise ValueError(
+                        f"Reference orientation for '{source_name}' is zero."
+                    )
+                self._source_orientation_indices[source_name] = source_index
+                self._source_orientation_references[source_name] = (
+                    Rotation.from_quat(
+                        source_wxyz / source_norm, scalar_first=True
+                    ).as_matrix()
+                )
+                self._robot_orientation_references[source_name] = (
+                    self.robot_data.xmat[int(task["body_id"])]
+                    .reshape(3, 3)
+                    .copy()
+                )
+        finally:
+            self.robot_data.qpos[:] = current_qpos
+            mujoco.mj_forward(self.robot_model, self.robot_data)
+
+        print(
+            "Calibrated source body orientations: "
+            + ", ".join(
+                f"{name}->{task['body_name']}"
+                for name, task in self.body_orientation_tasks.items()
+            )
+        )
+
+    def _build_body_orientation_residual(
+        self,
+        dqa: cp.Variable,
+        source_joint_orientations: Optional[np.ndarray],
+    ) -> Optional[cp.Expression]:
+        """Linearize calibrated world-frame body orientation targets."""
+        if (
+            not self.body_orientation_enabled
+            or source_joint_orientations is None
+            or not self._source_orientation_indices
+        ):
+            return None
+        source_orientations = np.asarray(source_joint_orientations, dtype=float)
+        if source_orientations.ndim != 2 or source_orientations.shape[1] != 4:
+            raise ValueError(
+                "source_joint_orientations for one frame must have shape (J, 4)."
+            )
+
+        residuals: List[cp.Expression] = []
+        for source_name, task in self.body_orientation_tasks.items():
+            source_index = self._source_orientation_indices[source_name]
+            source_wxyz = source_orientations[source_index]
+            source_norm = float(np.linalg.norm(source_wxyz))
+            if source_norm < 1e-12:
+                continue
+            source_rotation = Rotation.from_quat(
+                source_wxyz / source_norm, scalar_first=True
+            ).as_matrix()
+            target_rotation = _calibrated_orientation_target(
+                source_rotation,
+                self._source_orientation_references[source_name],
+                self._robot_orientation_references[source_name],
+            )
+            body_id = int(task["body_id"])
+            current_rotation = self.robot_data.xmat[body_id].reshape(3, 3)
+            rotation_error = Rotation.from_matrix(
+                target_rotation @ current_rotation.T
+            ).as_rotvec()
+            angular_jacobian = self._body_angular_jacobian(body_id)
+            scale = np.sqrt(float(task["weight"])) / float(task["sigma"])
+            residuals.append(
+                scale * (angular_jacobian @ dqa - rotation_error)
+            )
+        return cp.hstack(residuals) if residuals else None
 
     def _setup_end_effectors(self) -> None:
         """Resolve configured robot palm/sole markers.
@@ -607,6 +988,9 @@ class GenericInteractionRetargeter:
                 "track_sliding_tangent": bool(
                     spec.get("track_sliding_tangent", True)
                 ),
+                "track_transition_tangent": bool(
+                    spec.get("track_transition_tangent", True)
+                ),
                 "reach_reference_body_id": int(reach_reference_body_id),
                 "reach_reference_offset": np.asarray(
                     spec.get("reach_reference_offset", [0.0, 0.0, 0.0]),
@@ -683,24 +1067,41 @@ class GenericInteractionRetargeter:
         self.pose_acceleration_sigma = max(
             float(pose_cfg.get("acceleration_sigma", 0.03)), 1e-6
         )
-        raw_edges = pose_cfg.get(
-            "edges",
-            [
-                ["Spine3", "L_Shoulder"],
-                ["L_Shoulder", "L_Elbow"],
-                ["L_Elbow", "L_Wrist"],
-                ["Spine3", "R_Shoulder"],
-                ["R_Shoulder", "R_Elbow"],
-                ["R_Elbow", "R_Wrist"],
-                ["Spine3", "Spine1"],
-                ["Pelvis", "L_Hip"],
-                ["L_Hip", "L_Knee"],
-                ["L_Knee", "L_Ankle"],
-                ["Pelvis", "R_Hip"],
-                ["R_Hip", "R_Knee"],
-                ["R_Knee", "R_Ankle"],
-            ],
+        raw_edges = list(
+            pose_cfg.get(
+                "edges",
+                [
+                    ["Spine3", "L_Shoulder"],
+                    ["L_Shoulder", "L_Elbow"],
+                    ["L_Elbow", "L_Wrist"],
+                    ["Spine3", "R_Shoulder"],
+                    ["R_Shoulder", "R_Elbow"],
+                    ["R_Elbow", "R_Wrist"],
+                    ["Spine3", "Spine1"],
+                    ["Pelvis", "L_Hip"],
+                    ["L_Hip", "L_Knee"],
+                    ["L_Knee", "L_Ankle"],
+                    ["Pelvis", "R_Hip"],
+                    ["R_Hip", "R_Knee"],
+                    ["R_Knee", "R_Ankle"],
+                ],
+            )
         )
+        base_orientation_source_joint = self.end_effector_config.get(
+            "_base_orientation_source_joint"
+        )
+        torso_edge = ("Pelvis", str(base_orientation_source_joint))
+        if (
+            base_orientation_source_joint
+            and all(name in self.joint_mapping for name in torso_edge)
+            and torso_edge
+            not in {(str(edge[0]), str(edge[1])) for edge in raw_edges}
+        ):
+            # A reduced source such as PARC may expose Spine1 but not the
+            # profile's SMPL-X Spine3.  Restore the pelvis-to-base relationship
+            # so waist posture remains defined after the base joint itself is
+            # removed from duplicate world-orientation tracking.
+            raw_edges.append(list(torso_edge))
         self.pose_bones: List[Tuple[str, str, float]] = []
         if not self.pose_direction_enabled:
             return
@@ -1075,11 +1476,17 @@ class GenericInteractionRetargeter:
                 normal_norm = float(np.linalg.norm(surface_normal))
                 if normal_norm > 1e-8:
                     surface_normal /= normal_norm
-                if contact_mode == "sliding" and normal_norm > 1e-8:
+                if (
+                    _is_surface_only_contact_mode(contact_mode)
+                    and normal_norm > 1e-8
+                ):
                     contact_terms.append(
                         np.sqrt(weight) * (surface_normal @ residual) / sigma
                     )
-                    if spec["track_sliding_tangent"]:
+                    if (
+                        contact_mode == "sliding"
+                        and spec["track_sliding_tangent"]
+                    ):
                         tangent_projection = np.eye(3) - np.outer(
                             surface_normal, surface_normal
                         )
@@ -1099,6 +1506,34 @@ class GenericInteractionRetargeter:
                             * (tangent_projection @ residual)
                             / tangent_sigma
                         )
+                    elif (
+                        contact_mode == "transition"
+                        and spec["track_transition_tangent"]
+                    ):
+                        # A source-labelled touchdown/release provides useful
+                        # contact timing even when video reconstruction puts
+                        # the foot above the surface. Constrain its scene-normal
+                        # component at contact priority, while retaining the
+                        # captured world-space tangent as a lower swing task.
+                        # This avoids both a false no-slip anchor and an
+                        # unconstrained 20+ cm lateral foot drift.
+                        tracking_target = np.asarray(
+                            target_data["tracking_position"], dtype=float
+                        ).reshape(3)
+                        tangent_projection = np.eye(3) - np.outer(
+                            surface_normal, surface_normal
+                        )
+                        transition_residual = (
+                            position + jacobian @ dqa - tracking_target
+                        )
+                        transition_sigma = max(
+                            float(spec["swing_sigma"]), sigma
+                        )
+                        swing_terms.append(
+                            np.sqrt(weight)
+                            * (tangent_projection @ transition_residual)
+                            / transition_sigma
+                        )
                 else:
                     contact_terms.append(np.sqrt(weight) * residual / sigma)
                 if normal_norm > 1e-8:
@@ -1110,9 +1545,9 @@ class GenericInteractionRetargeter:
                         ),
                         0.0,
                     )
-                    # The inferred normal is oriented from the scene toward
-                    # the source SMPL-X surface. Keep the robot marker on that
-                    # same side of the contact plane.
+                    # The detector keeps this normal on the pre-contact side
+                    # even when noisy video reconstruction penetrates the
+                    # scene. Keep the robot marker on that outside half-space.
                     contact_constraints.append(
                         surface_normal @ residual >= -normal_tolerance
                     )
@@ -1178,7 +1613,11 @@ class GenericInteractionRetargeter:
                 target = np.asarray(target_data["tracking_position"], dtype=float).reshape(3)
                 source_root_position = target_data.get("source_root_position")
                 swing_morphology_scale = float(spec["swing_morphology_scale"])
-                root_z_offset = _swing_target_z_offset(self.end_effector_config)
+                root_z_offset = _swing_target_z_offset(
+                    self.end_effector_config,
+                    robot_root_z=float(self.robot_data.qpos[2]),
+                    source_root_position=source_root_position,
+                )
                 # Contact positions remain exact world-space constraints.
                 # Swing targets follow the registered robot root and may also
                 # be scaled root-relatively for morphology.  Root registration
@@ -1383,6 +1822,8 @@ class GenericInteractionRetargeter:
         previous_human_joints: Optional[np.ndarray] = None,
         previous_previous_human_joints: Optional[np.ndarray] = None,
         target_base_orientation: Optional[np.ndarray] = None,
+        previous_target_base_orientation: Optional[np.ndarray] = None,
+        source_joint_orientations: Optional[np.ndarray] = None,
         target_base_position: Optional[np.ndarray] = None,
         end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> np.ndarray:
@@ -1429,6 +1870,8 @@ class GenericInteractionRetargeter:
             previous_human_joints=previous_human_joints,
             previous_previous_human_joints=previous_previous_human_joints,
             target_base_orientation=target_base_orientation,
+            previous_target_base_orientation=previous_target_base_orientation,
+            source_joint_orientations=source_joint_orientations,
             target_base_position=target_base_position,
             end_effector_targets=end_effector_targets,
         )
@@ -1567,6 +2010,8 @@ class GenericInteractionRetargeter:
         previous_human_joints: Optional[np.ndarray] = None,
         previous_previous_human_joints: Optional[np.ndarray] = None,
         target_base_orientation: Optional[np.ndarray] = None,
+        previous_target_base_orientation: Optional[np.ndarray] = None,
+        source_joint_orientations: Optional[np.ndarray] = None,
         target_base_position: Optional[np.ndarray] = None,
         end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> np.ndarray:
@@ -1622,6 +2067,8 @@ class GenericInteractionRetargeter:
                 previous_human_joints,
                 previous_previous_human_joints,
                 target_base_orientation,
+                previous_target_base_orientation,
+                source_joint_orientations,
                 target_base_position,
                 end_effector_targets,
             )
@@ -1663,6 +2110,8 @@ class GenericInteractionRetargeter:
         previous_human_joints: Optional[np.ndarray] = None,
         previous_previous_human_joints: Optional[np.ndarray] = None,
         target_base_orientation: Optional[np.ndarray] = None,
+        previous_target_base_orientation: Optional[np.ndarray] = None,
+        source_joint_orientations: Optional[np.ndarray] = None,
         target_base_position: Optional[np.ndarray] = None,
         end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
     ) -> Tuple[np.ndarray, float]:
@@ -1889,7 +2338,9 @@ class GenericInteractionRetargeter:
                         new_acceleration = new_step - previous_step
                         max_jerk_step = max(
                             float(
-                                temporal_cfg.get("max_joint_jerk_step", 0.005)
+                                temporal_cfg.get(
+                                    "max_joint_jerk_step", 0.005
+                                )
                             ),
                             1e-8,
                         )
@@ -1902,6 +2353,65 @@ class GenericInteractionRetargeter:
                             ]
                         )
 
+            # A contact phase can temporarily pull the floating base away
+            # from its anatomical torso target. When that phase changes, a
+            # pure task hierarchy may recover the accumulated error in one
+            # frame, producing a visibly discontinuous whole-body twist. Cap
+            # only the robot's *extra* angular step beyond the deliberate
+            # source step, so fast captured rotations remain untouched.
+            max_orientation_step_error = temporal_cfg.get(
+                "max_base_orientation_step_error"
+            )
+            if (
+                max_orientation_step_error is not None
+                and target_base_orientation is not None
+                and previous_target_base_orientation is not None
+                and self.robot_model.jnt_type[0]
+                == mujoco.mjtJoint.mjJNT_FREE
+            ):
+                allowed_step = _base_orientation_step_limit(
+                    target_base_orientation,
+                    previous_target_base_orientation,
+                    q_last[3:7],
+                    float(max_orientation_step_error),
+                    catchup_gain=float(
+                        temporal_cfg.get(
+                            "base_orientation_catchup_gain", 0.0
+                        )
+                    ),
+                    catchup_deadband=float(
+                        temporal_cfg.get(
+                            "base_orientation_catchup_deadband", 0.0
+                        )
+                    ),
+                    max_extra_step=temporal_cfg.get(
+                        "max_base_orientation_catchup_step"
+                    ),
+                    max_total_step=temporal_cfg.get(
+                        "max_base_orientation_total_step"
+                    ),
+                )
+                base_body_id = int(self.robot_model.jnt_bodyid[0])
+                current_rotation = self.robot_data.xmat[base_body_id].reshape(
+                    3, 3
+                )
+                last_rotation = Rotation.from_quat(
+                    np.asarray(q_last[3:7], dtype=float), scalar_first=True
+                ).as_matrix()
+                current_step = Rotation.from_matrix(
+                    current_rotation @ last_rotation.T
+                ).as_rotvec()
+                base_angular_jacobian = self._body_angular_jacobian(
+                    base_body_id
+                )
+                constraints.append(
+                    cp.norm(
+                        current_step + base_angular_jacobian @ dqa,
+                        2,
+                    )
+                    <= allowed_step
+                )
+
             base_qa = [
                 int(np.where(self.q_a_indices == index)[0][0])
                 for index in (0, 1, 2)
@@ -1912,15 +2422,57 @@ class GenericInteractionRetargeter:
                 max_base_step = max(
                     float(temporal_cfg.get("max_base_step", 0.05)), 1e-6
                 )
+                source_base_step = np.zeros(3, dtype=float)
+                source_root_idx = (
+                    self.valid_joint_names.index("Pelvis")
+                    if "Pelvis" in self.valid_joint_names
+                    else 0
+                )
+                source_motion_available = (
+                    target_human_joints is not None
+                    and previous_human_joints is not None
+                    and source_root_idx < len(target_human_joints)
+                    and source_root_idx < len(previous_human_joints)
+                )
+                if source_motion_available:
+                    source_base_step = (
+                        np.asarray(target_human_joints[source_root_idx], dtype=float)
+                        - np.asarray(
+                            previous_human_joints[source_root_idx], dtype=float
+                        )
+                    )
+                # Bound only the robot's deviation from the deliberate source
+                # translation.  Bounding the absolute base step makes a fast
+                # captured run or vault accumulate metres of artificial lag.
+                base_step_residual = (
+                    new_base - q_last[:3] - source_base_step
+                )
                 constraints.extend(
                     [
-                        new_base - q_last[:3] <= max_base_step,
-                        q_last[:3] - new_base <= max_base_step,
+                        base_step_residual <= max_base_step,
+                        -base_step_residual <= max_base_step,
                     ]
                 )
                 if q_prev is not None:
                     previous_base_step = q_last[:3] - q_prev[:3]
                     new_base_step = new_base - q_last[:3]
+                    previous_source_base_step = np.zeros(3, dtype=float)
+                    previous_source_motion_available = (
+                        previous_human_joints is not None
+                        and previous_previous_human_joints is not None
+                        and source_root_idx < len(previous_human_joints)
+                        and source_root_idx < len(previous_previous_human_joints)
+                    )
+                    if previous_source_motion_available:
+                        previous_source_base_step = (
+                            np.asarray(
+                                previous_human_joints[source_root_idx], dtype=float
+                            )
+                            - np.asarray(
+                                previous_previous_human_joints[source_root_idx],
+                                dtype=float,
+                            )
+                        )
                     max_base_acceleration_step = max(
                         float(
                             temporal_cfg.get(
@@ -1931,9 +2483,11 @@ class GenericInteractionRetargeter:
                     )
                     constraints.extend(
                         [
-                            new_base_step - previous_base_step
+                            (new_base_step - source_base_step)
+                            - (previous_base_step - previous_source_base_step)
                             <= max_base_acceleration_step,
-                            previous_base_step - new_base_step
+                            (previous_base_step - previous_source_base_step)
+                            - (new_base_step - source_base_step)
                             <= max_base_acceleration_step,
                         ]
                     )
@@ -1948,6 +2502,9 @@ class GenericInteractionRetargeter:
         if target_base_position is not None and bool(base_cfg.get("enabled", False)):
             base_target = np.asarray(target_base_position, dtype=float).reshape(3).copy()
             base_target[2] += float(base_cfg.get("z_offset", 0.0))
+            track_xy = bool(base_cfg.get("track_xy", True))
+            track_z = bool(base_cfg.get("track_z", True))
+            lock_xy = bool(base_cfg.get("lock_xy", False))
             max_xy_error = max(float(base_cfg.get("max_xy_error", 0.08)), 0.0)
             max_z_error = max(float(base_cfg.get("max_z_error", 0.12)), 0.0)
 
@@ -1959,22 +2516,39 @@ class GenericInteractionRetargeter:
                 else:
                     base_new_components.append(cp.Constant(float(q[qpos_idx])))
             base_new = cp.hstack(base_new_components)
-            if bool(base_cfg.get("hard_constraints", True)):
-                constraints.append(
-                    cp.norm(base_new[:2] - base_target[:2], 2) <= max_xy_error
-                )
-                constraints.extend(
-                    [
-                        base_new[2] - base_target[2] <= max_z_error,
-                        base_target[2] - base_new[2] <= max_z_error,
-                    ]
-                )
+            if track_xy and lock_xy:
+                # Floating-base translation is affine in the free-joint
+                # coordinates, so this is an exact path constraint rather
+                # than a linearized kinematic approximation.
+                constraints.append(base_new[:2] == base_target[:2])
+            elif bool(base_cfg.get("hard_constraints", True)):
+                if track_xy:
+                    constraints.append(
+                        cp.norm(base_new[:2] - base_target[:2], 2)
+                        <= max_xy_error
+                    )
+                if track_z:
+                    constraints.extend(
+                        [
+                            base_new[2] - base_target[2] <= max_z_error,
+                            base_target[2] - base_new[2] <= max_z_error,
+                        ]
+                    )
             xy_scale = max(max_xy_error, 1e-6)
             z_scale = max(max_z_error, 1e-6)
-            base_position_obj = (
-                cp.sum_squares((base_new[:2] - base_target[:2]) / xy_scale)
-                + cp.square((base_new[2] - base_target[2]) / z_scale)
-            )
+            base_position_terms = []
+            if track_xy and not lock_xy:
+                base_position_terms.append(
+                    cp.sum_squares(
+                        (base_new[:2] - base_target[:2]) / xy_scale
+                    )
+                )
+            if track_z:
+                base_position_terms.append(
+                    cp.square((base_new[2] - base_target[2]) / z_scale)
+                )
+            if base_position_terms:
+                base_position_obj = sum(base_position_terms)
 
         # Non-penetration constraints against the external scene. Robot
         # self-collision is opt-in and disabled by the project profile.
@@ -2034,6 +2608,7 @@ class GenericInteractionRetargeter:
         # orientation task.  Penalizing raw quaternion components instead mixes
         # a non-metric distance into the objective and pulls along the radial
         # quaternion direction that the kinematics cannot see.
+        base_orientation_residual = None
         if (
             target_base_orientation is not None
             and 3 in self.q_a_indices
@@ -2055,9 +2630,20 @@ class GenericInteractionRetargeter:
             orientation_weight = float(
                 self.end_effector_config.get("base_orientation_weight", 1.25)
             )
-            body_obj += orientation_weight * cp.sum_squares(
+            base_orientation_residual = (
                 base_angular_jacobian @ dqa - base_rotation_error
             )
+            body_obj += orientation_weight * cp.sum_squares(
+                base_orientation_residual
+            )
+
+        body_orientation_residual = self._build_body_orientation_residual(
+            dqa, source_joint_orientations
+        )
+        if body_orientation_residual is not None:
+            body_obj += float(
+                self.end_effector_config.get("body_orientation_weight", 1.0)
+            ) * cp.sum_squares(body_orientation_residual)
 
         last_end_effector_rotations: Dict[str, np.ndarray] = {}
         last_pose_directions: Dict[Tuple[str, str], np.ndarray] = {}
@@ -2225,6 +2811,8 @@ class GenericInteractionRetargeter:
                 contact_residual is not None
                 or swing_residual is not None
                 or swing_orientation_residual is not None
+                or base_orientation_residual is not None
+                or body_orientation_residual is not None
                 or pose_direction_residual is not None
             )
         )
@@ -2337,13 +2925,18 @@ class GenericInteractionRetargeter:
                     )
                     active_constraints.append(contact_level <= contact_bound)
 
-                if swing_residual is not None:
+                def preserve_swing_level() -> bool:
+                    if swing_residual is None:
+                        return True
                     swing_level = cp.norm(swing_residual, 2)
                     swing_problem = solve_stage(
                         swing_level + tie_break * cp.sum_squares(dqa), "swing"
                     )
-                    if swing_problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE):
-                        return q, np.inf
+                    if swing_problem.status not in (
+                        cp.OPTIMAL,
+                        cp.OPTIMAL_INACCURATE,
+                    ):
+                        return False
                     swing_optimum = max(float(swing_level.value), 0.0)
                     swing_relative_tolerance = max(
                         float(
@@ -2368,6 +2961,113 @@ class GenericInteractionRetargeter:
                         + swing_absolute_tolerance
                     )
                     active_constraints.append(swing_level <= swing_bound)
+                    return True
+
+                def preserve_base_orientation_level() -> bool:
+                    if base_orientation_residual is None:
+                        return True
+                    base_orientation_level = cp.norm(
+                        base_orientation_residual, 2
+                    )
+                    base_orientation_problem = solve_stage(
+                        base_orientation_level
+                        + tie_break * cp.sum_squares(dqa),
+                        "base-orientation",
+                    )
+                    if base_orientation_problem.status not in (
+                        cp.OPTIMAL,
+                        cp.OPTIMAL_INACCURATE,
+                    ):
+                        return False
+                    base_orientation_optimum = max(
+                        float(base_orientation_level.value), 0.0
+                    )
+                    base_orientation_relative_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "base_orientation_priority_relative_tolerance",
+                                relative_tolerance,
+                            )
+                        ),
+                        0.0,
+                    )
+                    base_orientation_absolute_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "base_orientation_priority_absolute_tolerance",
+                                0.02,
+                            )
+                        ),
+                        0.0,
+                    )
+                    active_constraints.append(
+                        base_orientation_level
+                        <= (1.0 + base_orientation_relative_tolerance)
+                        * base_orientation_optimum
+                        + base_orientation_absolute_tolerance
+                    )
+                    return True
+
+                # Scene contacts always remain first. Source/robot profiles
+                # may then choose whether free-limb world targets or the
+                # calibrated whole-trunk frame comes next. The legacy order is
+                # retained by default; anatomical torso presets opt into the
+                # latter with a bounded angular allowance.
+                base_before_swing = bool(
+                    self.end_effector_config.get(
+                        "base_orientation_before_swing", False
+                    )
+                )
+                priority_stages = (
+                    (preserve_base_orientation_level, preserve_swing_level)
+                    if base_before_swing
+                    else (preserve_swing_level, preserve_base_orientation_level)
+                )
+                for preserve_stage in priority_stages:
+                    if not preserve_stage():
+                        return q, np.inf
+
+                if body_orientation_residual is not None:
+                    body_orientation_level = cp.norm(
+                        body_orientation_residual, 2
+                    )
+                    body_orientation_problem = solve_stage(
+                        body_orientation_level
+                        + tie_break * cp.sum_squares(dqa),
+                        "body-orientation",
+                    )
+                    if body_orientation_problem.status not in (
+                        cp.OPTIMAL,
+                        cp.OPTIMAL_INACCURATE,
+                    ):
+                        return q, np.inf
+                    body_orientation_optimum = max(
+                        float(body_orientation_level.value), 0.0
+                    )
+                    body_orientation_relative_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "body_orientation_priority_relative_tolerance",
+                                relative_tolerance,
+                            )
+                        ),
+                        0.0,
+                    )
+                    body_orientation_absolute_tolerance = max(
+                        float(
+                            self.end_effector_config.get(
+                                "body_orientation_priority_absolute_tolerance",
+                                0.1,
+                            )
+                        ),
+                        0.0,
+                    )
+                    active_constraints.append(
+                        body_orientation_level
+                        <= (1.0 + body_orientation_relative_tolerance)
+                        * body_orientation_optimum
+                        + body_orientation_absolute_tolerance
+                    )
 
                 if swing_orientation_residual is not None:
                     swing_orientation_level = cp.norm(
@@ -2451,6 +3151,7 @@ class GenericInteractionRetargeter:
                         f"    hierarchy tasks: contact={num_contacts}, "
                         f"swing={num_swings}, "
                         f"swing_orientation={num_swing_orientations}, "
+                        f"body_orientation={len(self._source_orientation_indices)}, "
                         f"pose_bones={len(self.pose_bones)}"
                     )
             else:
@@ -2469,7 +3170,7 @@ class GenericInteractionRetargeter:
                 # point with constraint violations, so enforce the radius and
                 # safety-critical base envelope explicitly before applying it.
                 if hierarchy_enabled:
-                    base_translation_qa = []
+                    protected_base_qa = []
                     if (
                         target_base_position is not None
                         and bool(base_cfg.get("enabled", False))
@@ -2484,41 +3185,58 @@ class GenericInteractionRetargeter:
                                 qa_idx = int(
                                     np.where(self.q_a_indices == qpos_idx)[0][0]
                                 )
-                                base_translation_qa.append(qa_idx)
                                 proposed_base[qpos_idx] += dqa_opt[qa_idx]
 
-                        xy_delta = proposed_base[:2] - base_target[:2]
-                        xy_norm = float(np.linalg.norm(xy_delta))
-                        max_xy_error = max(
-                            float(base_cfg.get("max_xy_error", 0.08)), 0.0
-                        )
-                        if xy_norm > max_xy_error:
-                            proposed_base[:2] = base_target[:2] + (
-                                max_xy_error / max(xy_norm, 1e-12)
-                            ) * xy_delta
-                        max_z_error = max(
-                            float(base_cfg.get("max_z_error", 0.12)), 0.0
-                        )
-                        proposed_base[2] = np.clip(
-                            proposed_base[2],
-                            base_target[2] - max_z_error,
-                            base_target[2] + max_z_error,
-                        )
+                        if bool(base_cfg.get("track_xy", True)):
+                            xy_delta = proposed_base[:2] - base_target[:2]
+                            xy_norm = float(np.linalg.norm(xy_delta))
+                            if bool(base_cfg.get("lock_xy", False)):
+                                proposed_base[:2] = base_target[:2]
+                            else:
+                                max_xy_error = max(
+                                    float(base_cfg.get("max_xy_error", 0.08)),
+                                    0.0,
+                                )
+                                if xy_norm > max_xy_error:
+                                    proposed_base[:2] = base_target[:2] + (
+                                        max_xy_error / max(xy_norm, 1e-12)
+                                    ) * xy_delta
+                            protected_base_qa.extend(
+                                int(np.where(self.q_a_indices == qpos_idx)[0][0])
+                                for qpos_idx in (0, 1)
+                                if qpos_idx in self.q_a_indices
+                            )
+                        if bool(base_cfg.get("track_z", True)):
+                            max_z_error = max(
+                                float(base_cfg.get("max_z_error", 0.12)), 0.0
+                            )
+                            proposed_base[2] = np.clip(
+                                proposed_base[2],
+                                base_target[2] - max_z_error,
+                                base_target[2] + max_z_error,
+                            )
+                            if 2 in self.q_a_indices:
+                                protected_base_qa.append(
+                                    int(np.where(self.q_a_indices == 2)[0][0])
+                                )
                         for qpos_idx in (0, 1, 2):
                             if qpos_idx in self.q_a_indices:
                                 qa_idx = int(
                                     np.where(self.q_a_indices == qpos_idx)[0][0]
                                 )
-                                dqa_opt[qa_idx] = proposed_base[qpos_idx] - q[qpos_idx]
+                                if qa_idx in protected_base_qa:
+                                    dqa_opt[qa_idx] = (
+                                        proposed_base[qpos_idx] - q[qpos_idx]
+                                    )
 
                     fixed_norm_sq = float(
-                        np.sum(np.square(dqa_opt[base_translation_qa]))
+                        np.sum(np.square(dqa_opt[protected_base_qa]))
                     )
                     free_indices = np.array(
                         [
                             idx
                             for idx in range(len(dqa_opt))
-                            if idx not in base_translation_qa
+                            if idx not in protected_base_qa
                         ],
                         dtype=int,
                     )
@@ -2552,6 +3270,53 @@ class GenericInteractionRetargeter:
                     # Flip sign to ensure continuity
                     if np.dot(quat_new, quat_prev) < 0:
                         quat_new = -quat_new
+
+                    max_orientation_step_error = temporal_cfg.get(
+                        "max_base_orientation_step_error"
+                    )
+                    sticking_contact_active = any(
+                        bool(target_data.get("contact", False))
+                        and str(target_data.get("contact_mode", ""))
+                        == "sticking"
+                        for target_data in (end_effector_targets or {}).values()
+                    )
+                    if (
+                        max_orientation_step_error is not None
+                        and target_base_orientation is not None
+                        and previous_target_base_orientation is not None
+                        # An exact post-solve root projection would move a
+                        # world-anchored sticking endpoint. In that regime the
+                        # conic constraint remains active inside the optimizer,
+                        # where the contact task correctly has first priority.
+                        and not sticking_contact_active
+                    ):
+                        allowed_step = _base_orientation_step_limit(
+                            target_base_orientation,
+                            previous_target_base_orientation,
+                            quat_prev,
+                            float(max_orientation_step_error),
+                            catchup_gain=float(
+                                temporal_cfg.get(
+                                    "base_orientation_catchup_gain", 0.0
+                                )
+                            ),
+                            catchup_deadband=float(
+                                temporal_cfg.get(
+                                    "base_orientation_catchup_deadband", 0.0
+                                )
+                            ),
+                            max_extra_step=temporal_cfg.get(
+                                "max_base_orientation_catchup_step"
+                            ),
+                            max_total_step=temporal_cfg.get(
+                                "max_base_orientation_total_step"
+                            ),
+                        )
+                        quat_new = _limit_relative_orientation_step(
+                            quat_new,
+                            quat_prev,
+                            allowed_step,
+                        )
                 
                 q_opt[3:7] = quat_new
 

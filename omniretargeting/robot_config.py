@@ -8,6 +8,8 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List
 
+from omniretargeting.retargeting_defaults import apply_retargeting_defaults
+
 
 def load_robot_config(config_path: str | Path) -> Dict[str, Any]:
     """
@@ -27,11 +29,16 @@ def load_robot_config(config_path: str | Path) -> Dict[str, Any]:
     - retargeting: Optional config forwarded to GenericInteractionRetargeter
     """
     path = Path(config_path)
-    with path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
-
+    with path.open("r", encoding="utf-8") as file:
+        raw = json.load(file)
     if not isinstance(raw, dict):
         raise ValueError(f"Robot config at {path} must be a JSON object.")
+
+    retargeting = raw.get("retargeting", {})
+    if not isinstance(retargeting, dict):
+        raise ValueError("retargeting must be a JSON object.")
+    if retargeting:
+        raw["retargeting"] = apply_retargeting_defaults(retargeting)
 
     if "joint_mapping" not in raw or not isinstance(raw["joint_mapping"], dict) or not raw["joint_mapping"]:
         raise ValueError("Robot config must contain non-empty 'joint_mapping'.")
@@ -86,4 +93,3 @@ def _resolve_urdf_path(urdf_path: Any, config_path: Path) -> str:
         f"Robot config at {config_path} lists no reachable 'urdf_path' on this "
         f"machine. Tried: " + ", ".join(tried)
     )
-

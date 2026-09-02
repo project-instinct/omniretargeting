@@ -23,6 +23,22 @@ SMPLX_BODY_PARENTS = np.array(
     dtype=int,
 )
 
+PARC_MS_BODY_PARENTS = np.array(
+    [-1, 0, 1, 1, 3, 4, 1, 6, 7, 0, 9, 10, 0, 12, 13],
+    dtype=int,
+)
+
+
+def _parc_ms_body_forward(joints: np.ndarray) -> np.ndarray:
+    """Recover PARC's +X body axis from pelvis, torso and hip positions."""
+    joints = np.asarray(joints, dtype=float)
+    up = joints[1] - joints[0]
+    right = joints[9] - joints[12]
+    up /= max(float(np.linalg.norm(up)), 1e-10)
+    right /= max(float(np.linalg.norm(right)), 1e-10)
+    forward = np.cross(up, right)
+    return forward / max(float(np.linalg.norm(forward)), 1e-10)
+
 OMOMO_OBJECT_SCALES = {
     "floorlamp": (1.55 * 0.3793, 1.55 * 0.3793, 1.55 * 0.3793),
     "largebox": (1.55 * 0.3486, 1.55 * 0.3486, 1.55 * 0.3486),
@@ -264,10 +280,12 @@ def _run_viewer(
     contact_forwards: np.ndarray | None = None,
     effector_references: np.ndarray | None = None,
     effector_ups: np.ndarray | None = None,
-    smplx_joints: np.ndarray | None = None,
+    source_joints: np.ndarray | None = None,
+    source_parents: np.ndarray | None = None,
+    source_label: str = "source",
 ) -> None:
     data = mujoco.MjData(model)
-    duration = qpos.shape[0] / framerate
+    duration = max(qpos.shape[0] - 1, 0) / framerate
     server = viser.ViserServer(port=args.port, label="OmniRetargeting mjviser playback")
     # World-space motions are often several metres away from the origin.  A
     # Viser client otherwise starts at the origin as well, which can place the
@@ -301,8 +319,9 @@ def _run_viewer(
                 scene.geom_groups_visible[group_id] = group_id in mesh_groups
             scene._sync_visibilities()
 
+    terrain_handle = None
     if terrain_mesh is not None:
-        server.scene.add_mesh_simple(
+        terrain_handle = server.scene.add_mesh_simple(
             "/terrain",
             vertices=np.asarray(terrain_mesh.vertices),
             faces=np.asarray(terrain_mesh.faces),
@@ -380,28 +399,50 @@ def _run_viewer(
 
     human_points_handle = None
     human_bones_handle = None
-    human_edges = np.array(
-        [
-            [parent, child]
-            for child, parent in enumerate(SMPLX_BODY_PARENTS)
-            if parent >= 0
-        ],
-        dtype=int,
-    )
-    if smplx_joints is not None and not args.no_human:
+    human_forward_handle = None
+    human_forward_tip_handle = None
+    human_edges = np.empty((0, 2), dtype=int)
+    if source_parents is not None:
+        human_edges = np.array(
+            [
+                [parent, child]
+                for child, parent in enumerate(source_parents)
+                if parent >= 0
+            ],
+            dtype=int,
+        ).reshape(-1, 2)
+    if source_joints is not None and not args.no_human:
         human_points_handle = server.scene.add_point_cloud(
-            "/smplx/joints",
-            points=smplx_joints[0],
+            "/source_motion/joints",
+            points=source_joints[0],
             colors=(40, 110, 255),
             point_size=0.035,
             point_shape="circle",
         )
-        human_bones_handle = server.scene.add_line_segments(
-            "/smplx/bones",
-            points=smplx_joints[0][human_edges],
-            colors=(40, 110, 255),
-            line_width=4.0,
-        )
+        if len(human_edges):
+            human_bones_handle = server.scene.add_line_segments(
+                "/source_motion/bones",
+                points=source_joints[0][human_edges],
+                colors=(40, 110, 255),
+                line_width=4.0,
+            )
+        if source_label == "PARC-MS" and source_joints.shape[1] >= 13:
+            forward_origin = source_joints[0, 0]
+            forward_tip = forward_origin + 0.30 * _parc_ms_body_forward(
+                source_joints[0]
+            )
+            human_forward_handle = server.scene.add_line_segments(
+                "/source_motion/body_forward",
+                points=np.array([[forward_origin, forward_tip]]),
+                colors=(255, 70, 40),
+                line_width=7.0,
+            )
+            human_forward_tip_handle = server.scene.add_icosphere(
+                "/source_motion/body_forward_tip",
+                radius=0.045,
+                color=(255, 70, 40),
+                position=forward_tip,
+            )
 
     object_mesh, object_scale = _resolve_object_mesh(args, motion_file)
     object_handle = _add_object(server, object_mesh, object_scale) if not args.no_object else None
@@ -414,7 +455,10 @@ def _run_viewer(
             + ", ".join(contact_names or [])
         )
     if human_points_handle is not None:
-        print("[omniretargeting-mjviser] SMPL-X reference skeleton: blue")
+        print(
+            "[omniretargeting-mjviser] "
+            f"original {source_label} skeleton: blue"
+        )
     if object_handle is not None:
         print(f"[omniretargeting-mjviser] object mesh: {object_mesh}, scale={object_scale}")
     elif object_pos is not None or object_quat is not None:
@@ -426,17 +470,107 @@ def _run_viewer(
     speed = [args.speed]
     looping = [args.loop]
     needs_render = [True]
+    show_contact_targets = [True]
+    show_contact_axes = [True]
 
     tabs = scene.create_visualization_gui()
     with tabs.add_tab("Playback", icon=viser.Icon.PLAYER_PLAY):
-        timeline = server.gui.add_slider("Frame", min=0, max=len(qpos) - 1, step=1, initial_value=frame_idx[0])
         time_label = server.gui.add_html("")
+        timeline = server.gui.add_slider(
+            "Timeline",
+            min=0,
+            max=len(qpos) - 1,
+            step=1,
+            initial_value=frame_idx[0],
+            hint="Pause, then drag to inspect an exact source frame.",
+        )
+        frame_input = server.gui.add_number(
+            "Frame number",
+            initial_value=frame_idx[0],
+            min=0,
+            max=len(qpos) - 1,
+            step=1,
+            hint=f"Enter an integer frame from 0 to {len(qpos) - 1}.",
+        )
+        navigation_btns = server.gui.add_button_group(
+            "Single-frame navigation",
+            options=["First", "Prev", "Next", "Last"],
+            hint="Prev/Next pauses playback and moves by exactly one frame.",
+        )
+        step_input = server.gui.add_number(
+            "Jump step",
+            initial_value=10,
+            min=1,
+            max=max(len(qpos) - 1, 1),
+            step=1,
+            hint="Number of frames used by Back/Forward and PageUp/PageDown.",
+        )
+        jump_btns = server.gui.add_button_group(
+            "Jump navigation",
+            options=["Back", "Forward"],
+        )
         play_btn = server.gui.add_button(
             "Pause" if playing[0] else "Play",
             icon=viser.Icon.PLAYER_PAUSE if playing[0] else viser.Icon.PLAYER_PLAY,
+            hint="Play or pause (Space).",
         )
-        speed_btns = server.gui.add_button_group("Speed", options=["0.25x", "0.5x", "1x", "2x", "4x"])
+        speed_btns = server.gui.add_button_group(
+            "Speed", options=["0.25x", "0.5x", "1x", "2x", "4x"]
+        )
         loop_cb = server.gui.add_checkbox("Loop", initial_value=looping[0])
+        contact_event_btns = None
+        contact_event_frames = np.empty(0, dtype=int)
+        if contact_mask is not None and len(contact_mask):
+            any_contact = np.any(contact_mask, axis=1)
+            contact_changes = np.flatnonzero(
+                np.r_[any_contact[0], any_contact[1:] != any_contact[:-1]]
+            )
+            if len(contact_changes):
+                contact_event_frames = contact_changes
+                contact_event_btns = server.gui.add_button_group(
+                    "Contact events",
+                    options=["Previous event", "Next event"],
+                    hint="Jump to the previous/next frame where contact starts or ends.",
+                )
+        with server.gui.add_folder("Visible overlays", expand_by_default=False):
+            human_cb = (
+                server.gui.add_checkbox(
+                    f"Original {source_label} skeleton",
+                    initial_value=True,
+                )
+                if human_points_handle is not None
+                else None
+            )
+            contacts_cb = (
+                server.gui.add_checkbox(
+                    "Contact targets",
+                    initial_value=True,
+                )
+                if contact_handles
+                else None
+            )
+            contact_axes_cb = (
+                server.gui.add_checkbox(
+                    "Hand/foot reference axes",
+                    initial_value=True,
+                )
+                if any(handle is not None for pair in contact_axis_handles for handle in pair)
+                else None
+            )
+            terrain_cb = (
+                server.gui.add_checkbox("Terrain", initial_value=True)
+                if terrain_handle is not None
+                else None
+            )
+            object_cb = (
+                server.gui.add_checkbox("Object", initial_value=True)
+                if object_handle is not None
+                else None
+            )
+        server.gui.add_markdown(
+            "**Keyboard:** `Space` play/pause · `←`/`→` one frame · "
+            "`PageUp`/`PageDown` jump · `Home`/`End` first/last frame"
+        )
 
     def render_frame(frame: float) -> None:
         frame = float(np.clip(frame, 0.0, len(qpos) - 1))
@@ -486,7 +620,9 @@ def _run_viewer(
                 + alpha * contact_targets[next_idx, effector_idx]
             )
             handle.position = origin
-            handle.visible = bool(contact_mask[idx, effector_idx])
+            handle.visible = show_contact_targets[0] and bool(
+                contact_mask[idx, effector_idx]
+            )
             forward_handle, normal_handle = contact_axis_handles[effector_idx]
             if forward_handle is not None and normal_handle is not None:
                 orientation_ups = (
@@ -518,28 +654,86 @@ def _run_viewer(
                 axis_visible = contact_names[effector_idx].endswith(
                     "_hand"
                 ) or bool(contact_mask[idx, effector_idx])
-                forward_handle.visible = axis_visible
-                normal_handle.visible = axis_visible
+                forward_handle.visible = show_contact_axes[0] and axis_visible
+                normal_handle.visible = show_contact_axes[0] and axis_visible
 
-        if human_points_handle is not None and human_bones_handle is not None:
+        if human_points_handle is not None:
             human_points = (
-                (1.0 - alpha) * smplx_joints[idx]
-                + alpha * smplx_joints[next_idx]
+                (1.0 - alpha) * source_joints[idx]
+                + alpha * source_joints[next_idx]
             )
             human_points_handle.points = human_points
-            human_bones_handle.points = human_points[human_edges]
+            if human_bones_handle is not None:
+                human_bones_handle.points = human_points[human_edges]
+            if (
+                human_forward_handle is not None
+                and human_forward_tip_handle is not None
+            ):
+                forward_origin = human_points[0]
+                forward_tip = forward_origin + 0.30 * _parc_ms_body_forward(
+                    human_points
+                )
+                human_forward_handle.points = np.array(
+                    [[forward_origin, forward_tip]]
+                )
+                human_forward_tip_handle.position = forward_tip
 
         if scene.needs_update:
             scene.refresh_visualization()
 
         t = frame / framerate
-        time_label.content = f"<pre>{t:.2f}s / {duration:.2f}s  frame {frame:.1f}/{len(qpos) - 1}</pre>"
+        time_label.content = (
+            "<div style='font-family: ui-monospace, SFMono-Regular, Menlo, "
+            "monospace; font-variant-numeric: tabular-nums;'>"
+            f"<strong>Frame {int(round(frame)):04d}</strong> / "
+            f"{len(qpos) - 1:04d}&nbsp;&nbsp;·&nbsp;&nbsp;"
+            f"{t:06.2f}s / {duration:06.2f}s"
+            "</div>"
+        )
+
+    def update_play_button() -> None:
+        play_btn.label = "Pause" if playing[0] else "Play"
+        play_btn.icon = (
+            viser.Icon.PLAYER_PAUSE if playing[0] else viser.Icon.PLAYER_PLAY
+        )
+
+    def seek_frame(target: float, *, pause: bool = True) -> None:
+        """Seek to an exact integer frame and request one render."""
+        target_idx = int(np.clip(round(float(target)), 0, len(qpos) - 1))
+        if pause:
+            playing[0] = False
+            update_play_button()
+        frame_idx[0] = target_idx
+        playhead[0] = float(target_idx)
+        timeline.value = target_idx
+        frame_input.value = target_idx
+        needs_render[0] = True
+
+    def toggle_playback() -> None:
+        if not playing[0] and playhead[0] >= len(qpos) - 1:
+            playhead[0] = 0.0
+            frame_idx[0] = 0
+        playing[0] = not playing[0]
+        update_play_button()
 
     @play_btn.on_click
     def _(_) -> None:
-        playing[0] = not playing[0]
-        play_btn.label = "Pause" if playing[0] else "Play"
-        play_btn.icon = viser.Icon.PLAYER_PAUSE if playing[0] else viser.Icon.PLAYER_PLAY
+        toggle_playback()
+
+    @navigation_btns.on_click
+    def _(event) -> None:
+        target = {
+            "First": 0,
+            "Prev": frame_idx[0] - 1,
+            "Next": frame_idx[0] + 1,
+            "Last": len(qpos) - 1,
+        }[event.target.value]
+        seek_frame(target)
+
+    @jump_btns.on_click
+    def _(event) -> None:
+        direction = -1 if event.target.value == "Back" else 1
+        seek_frame(frame_idx[0] + direction * int(step_input.value))
 
     @speed_btns.on_click
     def _(event) -> None:
@@ -550,12 +744,130 @@ def _run_viewer(
         looping[0] = loop_cb.value
 
     @timeline.on_update
-    def _(_) -> None:
-        if playing[0]:
+    def _(event) -> None:
+        # Viser invokes callbacks for both browser edits and server-side
+        # ``.value = ...`` synchronization.  Playback updates the slider every
+        # frame, so only a real client event is allowed to seek/pause.
+        if event.client is None:
             return
-        frame_idx[0] = int(timeline.value)
-        playhead[0] = float(frame_idx[0])
-        needs_render[0] = True
+        seek_frame(timeline.value)
+
+    @frame_input.on_update
+    def _(event) -> None:
+        # Ignore the frame number written by the playback loop itself.  Without
+        # this guard the synchronized number field calls ``seek_frame()``,
+        # which immediately pauses a newly started playback.
+        if event.client is None:
+            return
+        seek_frame(frame_input.value)
+
+    if contact_event_btns is not None:
+
+        @contact_event_btns.on_click
+        def _(event) -> None:
+            if event.target.value == "Previous event":
+                candidates = contact_event_frames[
+                    contact_event_frames < frame_idx[0]
+                ]
+                target = candidates[-1] if len(candidates) else contact_event_frames[0]
+            else:
+                candidates = contact_event_frames[
+                    contact_event_frames > frame_idx[0]
+                ]
+                target = candidates[0] if len(candidates) else contact_event_frames[-1]
+            seek_frame(target)
+
+    if human_cb is not None:
+
+        @human_cb.on_update
+        def _(_) -> None:
+            visible = bool(human_cb.value)
+            human_points_handle.visible = visible
+            if human_bones_handle is not None:
+                human_bones_handle.visible = visible
+            if human_forward_handle is not None:
+                human_forward_handle.visible = visible
+            if human_forward_tip_handle is not None:
+                human_forward_tip_handle.visible = visible
+
+    if contacts_cb is not None:
+
+        @contacts_cb.on_update
+        def _(_) -> None:
+            show_contact_targets[0] = bool(contacts_cb.value)
+            needs_render[0] = True
+
+    if contact_axes_cb is not None:
+
+        @contact_axes_cb.on_update
+        def _(_) -> None:
+            show_contact_axes[0] = bool(contact_axes_cb.value)
+            needs_render[0] = True
+
+    if terrain_cb is not None:
+
+        @terrain_cb.on_update
+        def _(_) -> None:
+            terrain_handle.visible = bool(terrain_cb.value)
+
+    if object_cb is not None:
+
+        @object_cb.on_update
+        def _(_) -> None:
+            object_handle.visible = bool(object_cb.value)
+
+    play_command = server.gui.add_command(
+        "Play / pause",
+        description="Toggle motion playback.",
+        hotkey="space",
+        icon=viser.Icon.PLAYER_PLAY,
+    )
+    previous_command = server.gui.add_command(
+        "Previous frame",
+        description="Pause and move backward by one exact frame.",
+        hotkey="arrowleft",
+        icon=viser.Icon.PLAYER_TRACK_PREV,
+    )
+    next_command = server.gui.add_command(
+        "Next frame",
+        description="Pause and move forward by one exact frame.",
+        hotkey="arrowright",
+        icon=viser.Icon.PLAYER_TRACK_NEXT,
+    )
+    first_command = server.gui.add_command(
+        "First frame",
+        hotkey="home",
+        icon=viser.Icon.PLAYER_SKIP_BACK,
+    )
+    last_command = server.gui.add_command(
+        "Last frame",
+        hotkey="end",
+        icon=viser.Icon.PLAYER_SKIP_FORWARD,
+    )
+    jump_back_command = server.gui.add_command(
+        "Jump backward",
+        description="Move backward by the configured jump step.",
+        hotkey="pageup",
+        icon=viser.Icon.CHEVRONS_LEFT,
+    )
+    jump_forward_command = server.gui.add_command(
+        "Jump forward",
+        description="Move forward by the configured jump step.",
+        hotkey="pagedown",
+        icon=viser.Icon.CHEVRONS_RIGHT,
+    )
+
+    play_command.on_trigger(lambda _: toggle_playback())
+    previous_command.on_trigger(lambda _: seek_frame(frame_idx[0] - 1))
+    next_command.on_trigger(lambda _: seek_frame(frame_idx[0] + 1))
+    first_command.on_trigger(lambda _: seek_frame(0))
+    last_command.on_trigger(lambda _: seek_frame(len(qpos) - 1))
+    jump_back_command.on_trigger(
+        lambda _: seek_frame(frame_idx[0] - int(step_input.value))
+    )
+    jump_forward_command.on_trigger(
+        lambda _: seek_frame(frame_idx[0] + int(step_input.value))
+    )
 
     render_frame(frame_idx[0])
     last_time = time.perf_counter()
@@ -577,6 +889,7 @@ def _run_viewer(
                         play_btn.icon = viser.Icon.PLAYER_PLAY
                 frame_idx[0] = int(np.floor(playhead[0]))
                 timeline.value = frame_idx[0]
+                frame_input.value = frame_idx[0]
                 render_frame(playhead[0])
             elif needs_render[0]:
                 render_frame(frame_idx[0])
@@ -616,7 +929,9 @@ def run(args: argparse.Namespace) -> None:
     contact_forwards = None
     effector_references = None
     effector_ups = None
-    smplx_joints = None
+    source_joints = None
+    source_parents = None
+    source_label = "source"
     if motion_file.suffix == ".npz":
         with np.load(motion_file, allow_pickle=True) as payload:
             required = {"contact_names", "contact_mask", "contact_targets_w"}
@@ -640,8 +955,24 @@ def run(args: argparse.Namespace) -> None:
                     effector_ups = np.asarray(
                         payload["end_effector_up_w"], dtype=float
                     )
-            if "smplx_joints_w" in payload:
-                smplx_joints = np.asarray(payload["smplx_joints_w"], dtype=float)
+            if "source_joints_w" in payload:
+                source_joints = np.asarray(payload["source_joints_w"], dtype=float)
+            elif "smplx_joints_w" in payload:
+                source_joints = np.asarray(payload["smplx_joints_w"], dtype=float)
+
+            source_type = (
+                str(np.asarray(payload["source_type"]).item())
+                if "source_type" in payload
+                else "smplx"
+            ).casefold()
+            if source_type == "parc_ms":
+                source_parents = PARC_MS_BODY_PARENTS
+                source_label = "PARC-MS"
+            elif source_joints is not None and source_joints.shape[1] == len(
+                SMPLX_BODY_PARENTS
+            ):
+                source_parents = SMPLX_BODY_PARENTS
+                source_label = "SMPL-X"
 
     _run_viewer(
         model,
@@ -659,7 +990,9 @@ def run(args: argparse.Namespace) -> None:
         contact_forwards=contact_forwards,
         effector_references=effector_references,
         effector_ups=effector_ups,
-        smplx_joints=smplx_joints,
+        source_joints=source_joints,
+        source_parents=source_parents,
+        source_label=source_label,
     )
 
 

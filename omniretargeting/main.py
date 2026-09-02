@@ -6,8 +6,11 @@ import tempfile
 import os
 import json
 import time
+import yaml
+from scipy.spatial.transform import Rotation
 
 from omniretargeting import OmniRetargeter
+from omniretargeting.data_sources.registry import create_data_source
 from omniretargeting.robot_config import load_robot_config
 from omniretargeting.utils import load_smplx_trajectory, normalize_retargeted_output_path
 from omniretargeting.contact import stack_contact_tasks
@@ -212,7 +215,7 @@ def save_trajectory_video(urdf_path, trajectory, output_path, smplx_trajectory=N
         cam.distance = 5.0
         cam.azimuth = 120.0
         cam.elevation = -20.0
-        cam.lookat[:] = [0.0, 1.0, 0.4]
+        cam.lookat[:] = trajectory[0, :3]
 
         num_frames = len(trajectory)
         try:
@@ -221,6 +224,11 @@ def save_trajectory_video(urdf_path, trajectory, output_path, smplx_trajectory=N
                 for i in range(num_frames):
                     data.qpos[:] = trajectory[i]
                     mujoco.mj_forward(model, data)
+                    # Follow motions with a non-trivial root path.  A fixed
+                    # origin camera loses traversal/parkour clips after only a
+                    # few frames and produces a technically valid but empty
+                    # preview video.
+                    cam.lookat[:] = trajectory[i, :3]
                     renderer.update_scene(data, camera=cam)
                     frame = renderer.render()
                     writer.append_data(frame)
@@ -405,6 +413,232 @@ def extract_omomo_object_pose(motion_path, num_frames):
     object_pos = qpos[:num_frames, 40:43]
     return object_pos, object_quat
 
+
+def load_source_config(config_path):
+    """Read a generic motion-source YAML/JSON config and resolve input paths."""
+    path = Path(config_path)
+    with path.open("r", encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+    if not isinstance(config, dict):
+        raise ValueError(f"Source config at {path} must be a mapping.")
+    source_type = config.get("type")
+    motion_path = config.get("motion")
+    if not source_type or not motion_path:
+        raise ValueError(
+            f"Source config at {path} must define non-empty 'type' and 'motion'."
+        )
+
+    def resolve_input(value):
+        value_path = Path(os.path.expandvars(os.path.expanduser(str(value))))
+        if not value_path.is_absolute():
+            value_path = (path.parent / value_path).resolve()
+        return value_path
+
+    resolved = dict(config)
+    resolved["motion"] = str(resolve_input(motion_path))
+    if config.get("terrain"):
+        resolved["terrain"] = str(resolve_input(config["terrain"]))
+    return resolved
+
+
+def direct_source_config(motion_path, source_type=None):
+    """Build the minimal source config for a motion passed directly to the CLI.
+
+    Common unambiguous formats are inferred so dataset clips do not need a
+    repeated per-file JSON wrapper.  ``--source-type`` remains available for
+    formats such as BVH that are shared by several adapters.
+    """
+    path = Path(
+        os.path.expandvars(os.path.expanduser(str(motion_path)))
+    ).resolve()
+    if source_type is None:
+        inferred_types = {
+            ".pkl": "parc_ms",
+            ".pickle": "parc_ms",
+            ".npz": "smplx",
+        }
+        source_type = inferred_types.get(path.suffix.casefold())
+    if not source_type:
+        raise ValueError(
+            f"Cannot infer the source adapter for '{path.suffix or path.name}'. "
+            "Pass --source-type (for example lafan1, nokov, or bones_seed)."
+        )
+    return {"type": str(source_type), "motion": str(path)}
+
+
+def _resolve_source_torso_mapping(source_motion_data, source_config):
+    """Return an optional source-neutral virtual-torso specification.
+
+    An explicit legacy ``base_orientation_joint`` keeps its historical
+    behaviour. Otherwise a source adapter may advertise a semantic default,
+    while the source config can always override or disable that default.
+    """
+    if "torso_mapping" in source_config:
+        raw_mapping = source_config.get("torso_mapping")
+    elif source_config.get("base_orientation_joint"):
+        return None
+    else:
+        raw_mapping = source_motion_data.metadata.get("torso_mapping")
+
+    if raw_mapping in (None, False):
+        return None
+    if isinstance(raw_mapping, str):
+        mapping = {"preset": raw_mapping}
+    elif isinstance(raw_mapping, dict):
+        mapping = dict(raw_mapping)
+    else:
+        raise ValueError("torso_mapping must be a preset name or a mapping.")
+
+    preset = str(mapping.get("preset", "pelvis_shoulders"))
+    if preset != "pelvis_shoulders":
+        raise ValueError(
+            f"Unsupported torso_mapping preset '{preset}'. Supported presets: "
+            "pelvis_shoulders."
+        )
+    mapping["preset"] = preset
+    mapping.setdefault("origin", "Pelvis")
+    mapping.setdefault("left_shoulder", "L_Shoulder")
+    mapping.setdefault("right_shoulder", "R_Shoulder")
+    mapping.setdefault("source_body", "Spine1")
+    return mapping
+
+
+def _landmark_torso_rotation(
+    positions, name_to_index, *, origin, left_shoulder, right_shoulder
+):
+    """Build world rotations whose axes follow an anatomical torso frame.
+
+    X points forward, Y toward the actor's left shoulder, and Z from the
+    pelvis toward the shoulder midpoint. Using both shoulders retains torso
+    twist while the pelvis-to-shoulder direction represents the silhouette of
+    a multi-segment human spine on a robot with a mostly rigid trunk.
+    """
+    required = (origin, left_shoulder, right_shoulder)
+    missing = [name for name in required if name not in name_to_index]
+    if missing:
+        raise ValueError(
+            "torso_mapping refers to missing source landmarks "
+            f"{missing}; available joints are {list(name_to_index)}."
+        )
+
+    values = np.asarray(positions, dtype=float)
+    if values.shape[-2:] != (len(name_to_index), 3):
+        raise ValueError(
+            "torso_mapping positions must end in shape "
+            f"({len(name_to_index)}, 3), got {values.shape}."
+        )
+    pelvis = values[..., name_to_index[origin], :]
+    left = values[..., name_to_index[left_shoulder], :]
+    right = values[..., name_to_index[right_shoulder], :]
+    up = 0.5 * (left + right) - pelvis
+    lateral_hint = left - right
+
+    up_norm = np.linalg.norm(up, axis=-1, keepdims=True)
+    forward = np.cross(lateral_hint, up)
+    forward_norm = np.linalg.norm(forward, axis=-1, keepdims=True)
+    if np.any(up_norm < 1e-8) or np.any(forward_norm < 1e-8):
+        raise ValueError(
+            "torso_mapping cannot build a frame from coincident or collinear "
+            "pelvis/shoulder landmarks."
+        )
+    up = up / up_norm
+    forward = forward / forward_norm
+    lateral = np.cross(up, forward)
+    lateral_norm = np.linalg.norm(lateral, axis=-1, keepdims=True)
+    if np.any(lateral_norm < 1e-8):
+        raise ValueError("torso_mapping produced a degenerate lateral axis.")
+    lateral = lateral / lateral_norm
+    return np.stack([forward, lateral, up], axis=-1)
+
+
+def _select_landmark_torso_orientations(source_motion_data, mapping):
+    target_names = list(source_motion_data.target_names or [])
+    name_to_index = {str(name): index for index, name in enumerate(target_names)}
+    reference_positions = source_motion_data.metadata.get("joint_rest_positions")
+    if reference_positions is None:
+        raise ValueError(
+            "torso_mapping requires source metadata 'joint_rest_positions' so "
+            "the anatomical frame can be calibrated instead of treating the "
+            "first motion frame as a rest pose."
+        )
+
+    frame_kwargs = {
+        "origin": str(mapping["origin"]),
+        "left_shoulder": str(mapping["left_shoulder"]),
+        "right_shoulder": str(mapping["right_shoulder"]),
+    }
+    current_rotations = _landmark_torso_rotation(
+        source_motion_data.positions,
+        name_to_index,
+        **frame_kwargs,
+    )
+    reference_rotation = _landmark_torso_rotation(
+        np.asarray(reference_positions, dtype=float),
+        name_to_index,
+        **frame_kwargs,
+    )
+    # Apply source motion relative to its authored rest frame to a canonical
+    # robot base frame. This matches rest-pose calibration used by body
+    # orientation retargeters instead of assuming source and robot axes match.
+    target_rotations = current_rotations @ reference_rotation.T
+    quaternions = Rotation.from_matrix(target_rotations).as_quat(
+        scalar_first=True
+    )
+    for frame_index in range(1, len(quaternions)):
+        if np.dot(quaternions[frame_index - 1], quaternions[frame_index]) < 0.0:
+            quaternions[frame_index] *= -1.0
+
+    source_body = str(mapping["source_body"])
+    if source_body not in name_to_index:
+        raise ValueError(
+            f"torso_mapping source_body '{source_body}' is not in the source "
+            f"joint layout {target_names}."
+        )
+    return quaternions, source_body
+
+
+def select_source_base_orientations(source_motion_data, source_config):
+    """Resolve the source body frame that should drive a floating robot base.
+
+    ``MotionData.root_orientations`` follows the source file's root joint,
+    which is commonly the pelvis.  A torso-base robot instead needs the world
+    orientation of the configured torso joint; feeding the pelvis rotation to
+    that base while also tracking the torso creates two incompatible targets
+    during bends and vaults.
+    """
+    torso_mapping = _resolve_source_torso_mapping(
+        source_motion_data, source_config
+    )
+    if torso_mapping is not None:
+        return _select_landmark_torso_orientations(
+            source_motion_data, torso_mapping
+        )
+
+    source_joint = source_config.get("base_orientation_joint")
+    if not source_joint:
+        return source_motion_data.root_orientations, None
+    target_names = list(source_motion_data.target_names or [])
+    if source_joint not in target_names:
+        raise ValueError(
+            f"base_orientation_joint '{source_joint}' is not in the source "
+            f"joint layout {target_names}."
+        )
+    joint_orientations = source_motion_data.metadata.get("joint_orientations")
+    if joint_orientations is None:
+        raise ValueError(
+            f"base_orientation_joint '{source_joint}' requires source global "
+            "joint orientations."
+        )
+    joint_orientations = np.asarray(joint_orientations, dtype=float)
+    expected_shape = (*source_motion_data.positions.shape[:2], 4)
+    if joint_orientations.shape != expected_shape:
+        raise ValueError(
+            "Source global joint orientations must have shape "
+            f"{expected_shape}, got {joint_orientations.shape}."
+        )
+    return joint_orientations[:, target_names.index(source_joint)], str(source_joint)
+
+
 def main():
     parser = argparse.ArgumentParser(description="OmniRetargeting CLI")
     parser.add_argument(
@@ -412,9 +646,35 @@ def main():
         default=DEFAULT_ROBOT_CONFIG_PATH,
         help=f"Path to robot configuration JSON file (default: {DEFAULT_ROBOT_CONFIG_PATH})",
     )
-    parser.add_argument("--smplx_model_dir", required=True, help="Directory containing SMPLX model files")
-    parser.add_argument("--smplx_motion", required=True, help="Path to SMPLX motion file (.npz)")
-    parser.add_argument("--output", required=True, help="Path to save output motion (.npy)")
+    parser.add_argument(
+        "--source-config",
+        default=None,
+        help="Generic motion source YAML/JSON (for example type=parc_ms, motion=clip.pkl).",
+    )
+    parser.add_argument(
+        "--source-motion",
+        default=None,
+        help=(
+            "Direct generic motion path. Common formats are inferred "
+            "(.pkl=parc_ms, .npz=smplx), so no per-clip source JSON is needed."
+        ),
+    )
+    parser.add_argument(
+        "--source-type",
+        default=None,
+        help="Adapter for --source-motion when its format is ambiguous.",
+    )
+    parser.add_argument(
+        "--smplx_model_dir",
+        default=None,
+        help="Directory containing SMPLX model files",
+    )
+    parser.add_argument(
+        "--smplx_motion",
+        default=None,
+        help="Legacy direct path to an SMPLX motion file (.npz)",
+    )
+    parser.add_argument("--output", required=True, help="Path to save output motion (.npz)")
     parser.add_argument("--terrain", help="Path to terrain mesh file (optional, defaults to flat ground)")
     parser.add_argument(
         "--output-scaled-terrain",
@@ -426,6 +686,17 @@ def main():
     parser.add_argument("--vis", action="store_true", help="Visualize the retargeted motion")
     parser.add_argument("--save-video", dest="save_video", default=None, help="Save retargeted motion video to file (e.g. /tmp/out.mp4). Uses offscreen rendering (set MUJOCO_GL=egl for headless).")
     parser.add_argument("--framerate", type=float, default=None, help="Framerate of the motion (optional, defaults to 30.0 or auto-detected)")
+    parser.add_argument(
+        "--output-framerate",
+        type=float,
+        default=None,
+        help="Resample a generic source to this framerate before retargeting.",
+    )
+    parser.add_argument(
+        "--scaled-objects",
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--output-base-link", default="torso_link",
                         help="Robot body link used for saved base_pos_w/base_quat_w.")
     parser.add_argument("--replace-cylinders-with-capsules", dest="replace_cylinders_with_capsules", action="store_true", default=False,
@@ -435,7 +706,23 @@ def main():
     
     args = parser.parse_args()
 
+    source_inputs = (args.source_config, args.source_motion, args.smplx_motion)
+    if sum(value is not None for value in source_inputs) != 1:
+        parser.error(
+            "provide exactly one of --source-config, --source-motion, or "
+            "--smplx_motion"
+        )
+    if args.source_type is not None and args.source_motion is None:
+        parser.error("--source-type is only valid with --source-motion")
+
     args.output = normalize_retargeted_output_path(args.output)
+
+    if args.source_config:
+        source_config = load_source_config(args.source_config)
+    elif args.source_motion:
+        source_config = direct_source_config(args.source_motion, args.source_type)
+    else:
+        source_config = None
 
     # Load robot profile config (default profile path can be overridden by --robot-config).
     robot_config = {}
@@ -451,9 +738,15 @@ def main():
             raise FileNotFoundError(f"Robot config not found: {args.robot_config}")
 
     # Load joint mapping
+    mapping_is_explicit = bool(
+        args.mapping
+        or (source_config is not None and source_config.get("joint_mapping"))
+    )
     if args.mapping:
         with open(args.mapping, 'r') as f:
             joint_mapping = json.load(f)
+    elif source_config is not None and source_config.get("joint_mapping"):
+        joint_mapping = source_config["joint_mapping"]
     elif "joint_mapping" in robot_config:
         joint_mapping = robot_config["joint_mapping"]
     else:
@@ -473,73 +766,223 @@ def main():
     robot_height = robot_config.get("robot_height")
     smplx_joint_names = robot_config.get("smplx_joint_names")
     height_estimation = robot_config.get("height_estimation")
-    base_orientation = robot_config.get("base_orientation")
-    retargeting = robot_config.get("retargeting")
+    base_orientation = dict(robot_config.get("base_orientation") or {})
+    if source_config is not None and source_config.get("base_orientation"):
+        base_orientation.update(dict(source_config["base_orientation"]))
+    retargeting = dict(robot_config.get("retargeting") or {})
 
     # Merge CLI flag into retargeting config
-    if retargeting is None:
-        retargeting = {}
     if args.replace_cylinders_with_capsules:
         retargeting["replace_cylinders_with_capsules"] = True
     if args.penetration_resolver is not None:
         retargeting["penetration_resolver"] = args.penetration_resolver
 
-    # Handle terrain
     temp_terrain_path = None
-    if args.terrain:
-        terrain_path = args.terrain
-    else:
-        print("No terrain provided, creating default flat terrain.")
-        flat_terrain = create_flat_terrain()
-        fd, temp_terrain_path = tempfile.mkstemp(suffix=".obj")
-        os.close(fd)
-        flat_terrain.export(temp_terrain_path)
-        terrain_path = temp_terrain_path
+    source_motion_data = None
+    source_type = "smplx"
+    source_motion_path = Path(args.smplx_motion) if args.smplx_motion else None
 
     try:
-        # Load SMPLX trajectory
-        print(f"Loading SMPLX trajectory from {args.smplx_motion}...")
         end_effector_cfg = dict(
             retargeting.get("end_effector_priority", {}) or {}
         )
         end_effector_markers_enabled = bool(
             end_effector_cfg.get("enabled", False)
             or end_effector_cfg.get("world_tracking_only", False)
+            or end_effector_cfg.get("world_tracking_enabled", False)
         )
-        loaded_motion = load_smplx_trajectory(
-            smplx_file=Path(args.smplx_motion),
-            smplx_model_directory=args.smplx_model_dir,
-            return_end_effectors=end_effector_markers_enabled,
-        )
-        smplx_trajectory, smplx_orientations = loaded_motion[:2]
-        end_effector_markers = (
-            loaded_motion[2] if end_effector_markers_enabled else None
-        )
-        
-        # Try to detect framerate from SMPLX file if not provided
-        framerate = args.framerate
-        if framerate is None:
-            try:
-                smplx_data = np.load(args.smplx_motion, allow_pickle=True)
-                if isinstance(smplx_data, np.lib.npyio.NpzFile):
-                    if "framerate" in smplx_data:
-                        framerate = float(smplx_data["framerate"])
-                        print(f"Detected framerate from file: {framerate}")
-                    elif "mocap_framerate" in smplx_data:
-                        framerate = float(smplx_data["mocap_framerate"])
-                        print(f"Detected mocap_framerate from file: {framerate}")
-                    elif "mocap_frame_rate" in smplx_data:
-                        framerate = float(smplx_data["mocap_frame_rate"])
-                        print(f"Detected mocap_frame_rate from file: {framerate}")
-                    elif "fps" in smplx_data:
-                        framerate = float(smplx_data["fps"])
-                        print(f"Detected fps from file: {framerate}")
-            except Exception:
-                pass
+        base_orientations = None
+        base_translations = None
+        source_reference_joint_orientations = None
+        source_reference_joint_positions = None
+
+        if source_config is not None:
+            source_type = str(source_config["type"])
+            source_motion_path = Path(source_config["motion"])
+            print(
+                f"Loading {source_type} trajectory from {source_motion_path}..."
+            )
+            data_source = create_data_source(
+                source_type,
+                source_motion_path,
+                source_config=source_config,
+            )
+            source_motion_data = data_source.load()
+            if (
+                not mapping_is_explicit
+                and source_motion_data.metadata.get("joint_mapping")
+            ):
+                joint_mapping = dict(
+                    source_motion_data.metadata["joint_mapping"]
+                )
+                print(
+                    f"Using {source_type} adapter's default joint mapping "
+                    f"({len(joint_mapping)} joints)."
+                )
+            adapter_base_orientation = source_motion_data.metadata.get(
+                "base_orientation"
+            )
+            if adapter_base_orientation:
+                base_orientation.update(dict(adapter_base_orientation))
+                if source_config.get("base_orientation"):
+                    base_orientation.update(
+                        dict(source_config["base_orientation"])
+                    )
+            if args.output_framerate is not None:
+                source_motion_data = source_motion_data.resample(
+                    args.output_framerate
+                )
+            smplx_trajectory = source_motion_data.positions
+            smplx_orientations = source_motion_data.metadata.get(
+                "joint_orientations"
+            )
+            source_reference_joint_orientations = source_motion_data.metadata.get(
+                "joint_rest_orientations"
+            )
+            source_reference_joint_positions = source_motion_data.metadata.get(
+                "joint_rest_positions"
+            )
+            base_orientations, base_orientation_source_joint = (
+                select_source_base_orientations(
+                    source_motion_data, source_config
+                )
+            )
+            if base_orientation_source_joint is not None:
+                torso_mapping = _resolve_source_torso_mapping(
+                    source_motion_data, source_config
+                )
+                end_effector_cfg = dict(
+                    retargeting.get("end_effector_priority", {}) or {}
+                )
+                end_effector_cfg["_base_orientation_source_joint"] = (
+                    base_orientation_source_joint
+                )
+                lock_root_orientation = bool(
+                    source_config.get(
+                        "lock_root_orientation_to_source",
+                        True,
+                    )
+                )
+                end_effector_cfg["lock_root_orientation_to_source"] = (
+                    lock_root_orientation
+                )
+                if torso_mapping is not None and not lock_root_orientation:
+                    # Active scene contacts stay lexicographically first. For
+                    # free limbs, preserve the actor's calibrated whole-trunk
+                    # frame before spending the remaining morphology freedom
+                    # on world-space swing targets. A small angular allowance
+                    # keeps this a soft cross-morphology task rather than the
+                    # brittle quaternion hard lock used by the legacy mode.
+                    end_effector_cfg["hierarchy"] = True
+                    end_effector_cfg["base_orientation_before_swing"] = True
+                    end_effector_cfg[
+                        "base_orientation_priority_absolute_tolerance"
+                    ] = float(np.deg2rad(5.0))
+                    temporal_cfg = dict(
+                        end_effector_cfg.get("temporal", {}) or {}
+                    )
+                    temporal_cfg.setdefault(
+                        "max_base_orientation_step_error",
+                        float(np.deg2rad(5.0)),
+                    )
+                    temporal_cfg.setdefault(
+                        "base_orientation_catchup_gain", 0.35
+                    )
+                    temporal_cfg.setdefault(
+                        "base_orientation_catchup_deadband",
+                        float(np.deg2rad(20.0)),
+                    )
+                    temporal_cfg.setdefault(
+                        "max_base_orientation_catchup_step",
+                        float(np.deg2rad(20.0)),
+                    )
+                    temporal_cfg.setdefault(
+                        "max_base_orientation_total_step",
+                        float(np.deg2rad(25.0)),
+                    )
+                    end_effector_cfg["temporal"] = temporal_cfg
+                retargeting["end_effector_priority"] = end_effector_cfg
+                if torso_mapping is not None:
+                    orientation_policy = (
+                        "fixed to source"
+                        if lock_root_orientation
+                        else "soft priority"
+                    )
+                    print(
+                        "Using rest-calibrated anatomical torso preset "
+                        f"'{torso_mapping['preset']}' for the robot-base "
+                        f"orientation frame ({orientation_policy})."
+                    )
+                else:
+                    print(
+                        "Using source joint "
+                        f"'{base_orientation_source_joint}' as the robot-base "
+                        "orientation frame."
+                    )
+            base_translations = source_motion_data.root_translations
+            end_effector_markers = (
+                source_motion_data.metadata.get("end_effector_markers")
+                if end_effector_markers_enabled
+                else None
+            )
+            smplx_joint_names = (
+                source_motion_data.target_names or smplx_joint_names
+            )
+            framerate = args.framerate or source_motion_data.framerate
+        else:
+            if args.output_framerate is not None:
+                raise ValueError(
+                    "--output-framerate currently requires --source-config."
+                )
+            print(f"Loading SMPLX trajectory from {source_motion_path}...")
+            loaded_motion = load_smplx_trajectory(
+                smplx_file=source_motion_path,
+                smplx_model_directory=args.smplx_model_dir,
+                return_end_effectors=end_effector_markers_enabled,
+            )
+            smplx_trajectory, smplx_orientations = loaded_motion[:2]
+            end_effector_markers = (
+                loaded_motion[2] if end_effector_markers_enabled else None
+            )
+
+            # Try to detect framerate from a legacy SMPL-X file.
+            framerate = args.framerate
+            if framerate is None:
+                try:
+                    smplx_data = np.load(source_motion_path, allow_pickle=True)
+                    if isinstance(smplx_data, np.lib.npyio.NpzFile):
+                        for key in (
+                            "framerate",
+                            "mocap_framerate",
+                            "mocap_frame_rate",
+                            "fps",
+                        ):
+                            if key in smplx_data:
+                                framerate = float(smplx_data[key])
+                                print(f"Detected {key} from file: {framerate}")
+                                break
+                except Exception:
+                    pass
         
         if framerate is None:
             framerate = 30.0
             print(f"Using default framerate: {framerate}")
+
+        terrain_path = args.terrain
+        if terrain_path is None and source_config is not None:
+            terrain_path = source_config.get("terrain")
+        if terrain_path is None and source_motion_data is not None:
+            terrain_path = source_motion_data.metadata.get("terrain_mesh")
+        if terrain_path is None:
+            print("No terrain provided, creating default flat terrain.")
+            flat_terrain = create_flat_terrain()
+            fd, temp_terrain_path = tempfile.mkstemp(suffix=".obj")
+            os.close(fd)
+            flat_terrain.export(temp_terrain_path)
+            terrain_path = temp_terrain_path
+        else:
+            terrain_path = str(terrain_path)
+            print(f"Using terrain mesh: {terrain_path}")
 
         print(f"Loaded trajectory with shape: {smplx_trajectory.shape}")
         if smplx_orientations is not None:
@@ -564,6 +1007,13 @@ def main():
         print("Retargeting motion...")
         enable_terrain_scaling = bool(args.output_scaled_terrain)
         retarget_motion_kwargs = dict(
+            base_orientations=base_orientations,
+            base_translations=base_translations,
+            source_joint_orientations=smplx_orientations,
+            source_reference_joint_orientations=(
+                source_reference_joint_orientations
+            ),
+            source_reference_joint_positions=source_reference_joint_positions,
             framerate=framerate,
             visualize_trajectory=args.vis,
             enable_terrain_scaling=enable_terrain_scaling,
@@ -598,7 +1048,13 @@ def main():
             args.output_base_link,
         )
         joint_pos = retargeted_motion[:, 7:]
-        object_pose = extract_omomo_object_pose(args.smplx_motion, len(retargeted_motion))
+        object_pose = (
+            extract_omomo_object_pose(
+                source_motion_path, len(retargeted_motion)
+            )
+            if source_type == "smplx" and source_motion_path is not None
+            else None
+        )
         
         # Convert quaternion to xyzw if needed (standard for many tools)
         # MuJoCo uses wxyz, but many other tools use xyzw.
@@ -622,6 +1078,14 @@ def main():
             joint_pos=joint_pos,
             base_pos_w=base_pos,
             base_quat_w=base_quat, # Saving as wxyz (MuJoCo convention)
+            source_type=np.asarray(source_type),
+            source_file=np.asarray(str(source_motion_path)),
+            source_joint_names=np.asarray(
+                smplx_joint_names or retargeter.smplx_joint_names
+            ),
+            source_joints_w=smplx_trajectory * terrain_scale,
+            terrain_scale=np.asarray(terrain_scale),
+            # Backward-compatible alias retained for existing consumers.
             smplx_joints_w=smplx_trajectory * terrain_scale,
         )
         if object_pose is not None:
@@ -631,6 +1095,7 @@ def main():
         output_payload.update(
             stack_contact_tasks(getattr(retargeter, "last_end_effector_tasks", {}))
         )
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         np.savez(
             args.output,
             **output_payload,

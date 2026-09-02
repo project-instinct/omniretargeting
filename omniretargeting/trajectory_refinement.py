@@ -26,9 +26,14 @@ from scipy import sparse
 from scipy.optimize import lsq_linear
 from scipy.spatial.transform import Rotation
 
-from .contact import SceneContactTask, _iter_true_runs
+from .contact import (
+    SceneContactTask,
+    _is_surface_only_contact_mode,
+    _iter_true_runs,
+)
 from .retargeting import (
     _apply_configured_joint_limits,
+    _apply_joint_limit_safety_fraction,
     _clamp_target_to_reach,
     _transform_swing_target,
 )
@@ -800,6 +805,13 @@ def refine_joint_trajectory(
     qpos_indices, dof_indices, joint_lower, joint_upper = (
         _scalar_joint_coordinates(model)
     )
+    joint_lower, joint_upper = _apply_joint_limit_safety_fraction(
+        model,
+        qpos_indices,
+        joint_lower,
+        joint_upper,
+        float(config.get("joint_limit_safety_fraction", 1.0)),
+    )
     joint_lower, joint_upper = _apply_configured_joint_limits(
         model,
         qpos_indices,
@@ -1036,6 +1048,18 @@ def refine_joint_trajectory(
                 if spec.get("swing_position_sigma") is None
                 else max(float(spec["swing_position_sigma"]), 1e-6)
             ),
+            "track_sliding_tangent": bool(
+                spec.get("track_sliding_tangent", True)
+            ),
+            "sliding_tangent_sigma": max(
+                float(
+                    spec.get(
+                        "sliding_tangent_sigma",
+                        end_effector_config.get("sliding_tangent_sigma", 0.10),
+                    )
+                ),
+                1e-6,
+            ),
             "track_orientation": refine_orientation,
             "orientation_sigma": float(
                 spec.get(
@@ -1176,8 +1200,6 @@ def refine_joint_trajectory(
     use_jerk = bool(config.get("jerk_enabled", True))
     from omniretargeting.retargeting import _swing_target_z_offset
 
-    root_z_offset = _swing_target_z_offset(end_effector_config)
-
     # The derivative residuals are per-frame differences, so their sigmas carry
     # implicit units of rad/frame^n.  Rescaling against the framerate they were
     # tuned at keeps the physical smoothing strength constant when the source
@@ -1315,12 +1337,27 @@ def refine_joint_trajectory(
         for frame_idx in range(num_frames):
             data.qpos[:] = result[frame_idx]
             mujoco.mj_forward(model, data)
+            source_root_position = (
+                None
+                if source_root_positions is None
+                else source_root_positions[frame_idx]
+            )
+            root_z_offset = _swing_target_z_offset(
+                end_effector_config,
+                robot_root_z=float(result[frame_idx, 2]),
+                source_root_position=source_root_position,
+            )
             for name, spec in effectors.items():
                 task: SceneContactTask = spec["task"]
                 body_id = int(spec["body_id"])
                 rotation = data.xmat[body_id].reshape(3, 3).copy()
                 in_contact = bool(task.contact_mask[frame_idx])
                 if in_contact:
+                    contact_mode = (
+                        str(task.contact_modes[frame_idx])
+                        if task.contact_modes is not None
+                        else "sticking"
+                    )
                     target_position = task.contact_positions[frame_idx]
                     offset = spec["contact_offsets"][
                         contact_offset_choice[name][frame_idx]
@@ -1333,12 +1370,15 @@ def refine_joint_trajectory(
                     confidence = max(
                         float(task.contact_confidence[frame_idx]), 0.25
                     )
+                    if task.transition_weights is not None:
+                        confidence *= max(
+                            float(task.transition_weights[frame_idx]), 1e-3
+                        )
                 else:
+                    contact_mode = "none"
                     target_position = _transform_swing_target(
                         task.tracking_positions[frame_idx],
-                        None
-                        if source_root_positions is None
-                        else source_root_positions[frame_idx],
+                        source_root_position,
                         root_z_offset,
                         float(spec["swing_morphology_scale"]),
                         bool(spec["preserve_world_target"]),
@@ -1374,13 +1414,83 @@ def refine_joint_trajectory(
                     point,
                     body_id,
                 )
-                append_block(
-                    frame_idx,
-                    jacobian_position[:, dof_indices],
-                    target_position - point,
-                    position_sigma,
-                    confidence,
-                )
+                position_delta = target_position - point
+                if in_contact and _is_surface_only_contact_mode(contact_mode):
+                    # A surface contact has only one positional coordinate, so
+                    # it can be held more tightly than a full XYZ endpoint
+                    # without overconstraining the limb.  Keep this as an
+                    # internal semantic default: callers still tune the usual
+                    # contact sigma, while noisy-video hands get reliable
+                    # normal placement without another profile knob.
+                    surface_position_sigma = min(position_sigma, 0.006)
+                    surface_normal = np.asarray(
+                        task.surface_normals[frame_idx], dtype=float
+                    )
+                    surface_normal /= max(
+                        float(np.linalg.norm(surface_normal)), 1e-10
+                    )
+                    append_block(
+                        frame_idx,
+                        surface_normal[None, :]
+                        @ jacobian_position[:, dof_indices],
+                        np.asarray([surface_normal @ position_delta]),
+                        surface_position_sigma,
+                        confidence,
+                    )
+                    # Contact confidence and transition fades may soften how
+                    # tightly an uncertain video marker is pulled to the
+                    # surface, but they must never soften the outside
+                    # half-space itself.  Add a one-sided high-priority row
+                    # only while the selected hand/foot marker is deeper than
+                    # the accepted surface tolerance.  This avoids treating a
+                    # noisy penetrated source marker as permission for the
+                    # robot to enter the reconstructed scene.
+                    normal_tolerance = max(
+                        float(
+                            end_effector_config.get(
+                                "contact_normal_tolerance", 0.005
+                            )
+                        ),
+                        0.0,
+                    )
+                    inward_violation = (
+                        float(surface_normal @ position_delta)
+                        - normal_tolerance
+                    )
+                    if inward_violation > 0.0:
+                        append_block(
+                            frame_idx,
+                            surface_normal[None, :]
+                            @ jacobian_position[:, dof_indices],
+                            np.asarray([inward_violation]),
+                            min(surface_position_sigma, 0.002),
+                        )
+                    if (
+                        contact_mode == "sliding"
+                        and spec["track_sliding_tangent"]
+                    ):
+                        tangent_projection = np.eye(3) - np.outer(
+                            surface_normal, surface_normal
+                        )
+                        append_block(
+                            frame_idx,
+                            tangent_projection
+                            @ jacobian_position[:, dof_indices],
+                            tangent_projection @ position_delta,
+                            max(
+                                float(spec["sliding_tangent_sigma"]),
+                                position_sigma,
+                            ),
+                            confidence,
+                        )
+                else:
+                    append_block(
+                        frame_idx,
+                        jacobian_position[:, dof_indices],
+                        position_delta,
+                        position_sigma,
+                        confidence,
+                    )
 
                 arm_posture = spec["arm_posture"]
                 if arm_posture is not None and source_joint_positions is not None:
@@ -1399,9 +1509,7 @@ def refine_joint_trajectory(
                     )
                     shape_endpoint_target = _transform_swing_target(
                         source_endpoint,
-                        None
-                        if source_root_positions is None
-                        else source_root_positions[frame_idx],
+                        source_root_position,
                         root_z_offset,
                         float(spec["swing_morphology_scale"]),
                         bool(spec["preserve_world_target"]),
@@ -1538,18 +1646,23 @@ def refine_joint_trajectory(
             frame_penetration = penetration_frames[frame_idx]
             if frame_penetration is None:
                 continue
-            # An effector held on its scene anchor cannot leave the surface;
-            # a penetration row on near-anchor samples has the same stiffness
-            # as the contact row and only drags the anchored point in a
-            # tug-of-war.  The exemption is by distance, not by body id: the
-            # colliding geoms often live on the wrist/ankle parent body rather
-            # than the configured effector body.  The honest depth still comes
-            # from measure_scene_penetration.
+            # Only a genuinely sticking effector is fixed to a full XYZ scene
+            # anchor.  Transition and sliding contacts constrain the surface
+            # normal only, so their local chain must remain available to move
+            # colliding geometry tangentially out of the scene.  The sticking
+            # exemption is by distance, not by body id: colliding geoms often
+            # live on the wrist/ankle parent body rather than the configured
+            # effector body.  The honest depth still comes from
+            # measure_scene_penetration.
             active_anchor_points = [
                 np.asarray(spec["task"].contact_positions[frame_idx], dtype=float)
                 for spec in effectors.values()
                 if penetration_anchor_radius > 0.0
                 and bool(spec["task"].contact_mask[frame_idx])
+                and (
+                    spec["task"].contact_modes is None
+                    or str(spec["task"].contact_modes[frame_idx]) == "sticking"
+                )
             ]
             # One-sided: only points that violate the requested clearance get a
             # row, and the active set is rebuilt from the current pose at every

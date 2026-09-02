@@ -16,6 +16,15 @@ import numpy as np
 import trimesh
 
 
+_SURFACE_ONLY_CONTACT_MODES = frozenset({"sliding", "transition"})
+_DEFAULT_NORMAL_ORIENTATION_DEADZONE = 0.005
+
+
+def _is_surface_only_contact_mode(contact_mode: str) -> bool:
+    """Whether a contact constrains the scene normal but not all three axes."""
+    return str(contact_mode) in _SURFACE_ONLY_CONTACT_MODES
+
+
 @dataclass(frozen=True)
 class SceneContactTask:
     """Per-frame reference for one human/robot end-effector pair."""
@@ -163,11 +172,34 @@ def _remove_short_runs(mask: np.ndarray, min_contact_frames: int) -> np.ndarray:
     return result
 
 
-def _closest_scene_samples(
+def _apply_contact_hysteresis(
+    enter_mask: np.ndarray,
+    stay_mask: np.ndarray,
+) -> np.ndarray:
+    """Keep an active contact until the looser exit condition is violated."""
+    enter = np.asarray(enter_mask, dtype=bool)
+    stay = np.asarray(stay_mask, dtype=bool)
+    if enter.shape != stay.shape:
+        raise ValueError(
+            "enter_mask and stay_mask must have the same shape, got "
+            f"{enter.shape} and {stay.shape}."
+        )
+    result = np.zeros_like(enter)
+    active = False
+    for frame_idx in range(len(result)):
+        if active:
+            active = bool(stay[frame_idx])
+        elif enter[frame_idx]:
+            active = True
+        result[frame_idx] = active
+    return result
+
+
+def _query_scene_samples(
     scene_mesh: trimesh.Trimesh,
     contact_samples: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Find the closest source sample and scene point at every frame."""
+    """Query every coherent source surface sample against the scene mesh."""
     samples = np.asarray(contact_samples, dtype=float)
     if samples.ndim == 2:
         samples = samples[:, None, :]
@@ -190,9 +222,25 @@ def _closest_scene_samples(
             flat_samples,
         )
 
-    distances = np.asarray(flat_distances, dtype=float).reshape(num_frames, num_samples)
-    closest = np.asarray(closest, dtype=float).reshape(num_frames, num_samples, 3)
-    triangle_ids = np.asarray(triangle_ids, dtype=int).reshape(num_frames, num_samples)
+    return (
+        samples,
+        np.asarray(closest, dtype=float).reshape(num_frames, num_samples, 3),
+        np.asarray(flat_distances, dtype=float).reshape(num_frames, num_samples),
+        np.asarray(triangle_ids, dtype=int).reshape(num_frames, num_samples),
+    )
+
+
+def _select_closest_scene_samples(
+    scene_mesh: trimesh.Trimesh,
+    samples: np.ndarray,
+    closest: np.ndarray,
+    distances: np.ndarray,
+    triangle_ids: np.ndarray,
+    *,
+    normal_orientation_deadzone: float = _DEFAULT_NORMAL_ORIENTATION_DEADZONE,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Select the closest sample while retaining a reliable scene normal."""
+    num_frames = len(samples)
     sample_ids = np.argmin(distances, axis=1)
     frame_ids = np.arange(num_frames)
 
@@ -202,13 +250,18 @@ def _closest_scene_samples(
     selected_triangles = triangle_ids[frame_ids, sample_ids]
 
     normals = np.zeros((num_frames, 3), dtype=float)
-    valid = (selected_triangles >= 0) & (selected_triangles < len(scene_mesh.face_normals))
-    normals[valid] = np.asarray(scene_mesh.face_normals, dtype=float)[selected_triangles[valid]]
+    valid = (selected_triangles >= 0) & (
+        selected_triangles < len(scene_mesh.face_normals)
+    )
+    normals[valid] = np.asarray(scene_mesh.face_normals, dtype=float)[
+        selected_triangles[valid]
+    ]
     missing = np.linalg.norm(normals, axis=1) < 1e-10
+    fallback_normals = missing.copy()
     normals[missing] = selected_samples[missing] - surface_points[missing]
     # Exact on-surface queries can have both an invalid triangle id and a zero
     # point-to-surface offset.  Fall back to the nearest mesh vertex normal so
-    # a valid contact never silently loses its sole-orientation constraint.
+    # a valid contact never silently loses its orientation constraint.
     missing = np.linalg.norm(normals, axis=1) < 1e-10
     if np.any(missing) and len(scene_mesh.vertices):
         _, vertex_ids = scene_mesh.kdtree.query(selected_samples[missing])
@@ -220,14 +273,163 @@ def _closest_scene_samples(
     normal_norms = np.linalg.norm(normals, axis=1, keepdims=True)
     normals = normals / np.maximum(normal_norms, 1e-10)
 
-    # Mesh winding is not guaranteed for reconstructed TSDF scenes.  Orient the
-    # normal toward the source body point whenever the unsigned distance gives
-    # us an unambiguous direction.
+    # Away from contact, orienting the normal toward the source point gives a
+    # useful outside direction.  Near the surface, retain a reliable triangle
+    # normal: exact-on-surface query noise must not override consistent mesh
+    # winding.  Fallback normals and inconsistently wound meshes still use the
+    # source direction because their original orientation is not trustworthy.
     offsets = selected_samples - surface_points
-    flip = np.sum(normals * offsets, axis=1) < 0.0
+    offset_norms = np.linalg.norm(offsets, axis=1)
+    deadzone = max(float(normal_orientation_deadzone), 0.0)
+    orient_toward_source = (
+        fallback_normals
+        | (offset_norms > deadzone)
+        | (not scene_mesh.is_winding_consistent)
+    )
+    flip = orient_toward_source & (np.sum(normals * offsets, axis=1) < 0.0)
     normals[flip] *= -1.0
 
     return selected_samples, surface_points, normals, selected_distances
+
+
+def _closest_scene_samples(
+    scene_mesh: trimesh.Trimesh,
+    contact_samples: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Find the closest source sample and scene point at every frame."""
+    query = _query_scene_samples(scene_mesh, contact_samples)
+    return _select_closest_scene_samples(scene_mesh, *query)
+
+
+def _stabilize_contact_normals(
+    normals: np.ndarray,
+    tracking_positions: np.ndarray,
+    surface_points: np.ndarray,
+    distances: np.ndarray,
+    contact_mask: np.ndarray,
+    *,
+    onset_window_frames: int,
+    smoothing_frames: int,
+    normal_orientation_deadzone: float = _DEFAULT_NORMAL_ORIENTATION_DEADZONE,
+) -> np.ndarray:
+    """Make each contact run use a continuous, outward scene normal.
+
+    Video registration often lets a hand pass a few centimetres through a
+    reconstructed surface.  Orienting every normal toward that penetrating
+    source sample then flips the robot target into the scene.  The approach
+    side at contact onset is the reliable side; subsequent normals are made
+    hemisphere-continuous and optionally median-smoothed without changing the
+    underlying surface tangent plane.
+    """
+    result = np.asarray(normals, dtype=float).copy()
+    tracking = np.asarray(tracking_positions, dtype=float)
+    points = np.asarray(surface_points, dtype=float)
+    distance_values = np.asarray(distances, dtype=float)
+    onset_window = max(int(onset_window_frames), 1)
+    smoothing_window = max(int(smoothing_frames), 1)
+    if smoothing_window % 2 == 0:
+        smoothing_window += 1
+
+    for start, end in _iter_true_runs(contact_mask):
+        context_start = max(0, start - onset_window)
+        context_end = min(end, start + 1)
+        context_indices = np.arange(context_start, context_end)
+        if len(context_indices):
+            finite = np.isfinite(distance_values[context_indices])
+            reliable_indices = context_indices[finite]
+            reference_idx = (
+                int(
+                    reliable_indices[
+                        np.argmax(distance_values[reliable_indices])
+                    ]
+                )
+                if len(reliable_indices)
+                else start
+            )
+        else:
+            reference_idx = start
+        reference = result[reference_idx].copy()
+        reference /= max(float(np.linalg.norm(reference)), 1e-10)
+
+        approach_offsets = (
+            tracking[context_indices] - points[context_indices]
+            if len(context_indices)
+            else tracking[start : start + 1] - points[start : start + 1]
+        )
+        approach_side = np.median(approach_offsets, axis=0)
+        if (
+            float(np.linalg.norm(approach_side))
+            > max(float(normal_orientation_deadzone), 0.0)
+            and float(np.dot(reference, approach_side)) < 0.0
+        ):
+            reference *= -1.0
+
+        previous = reference
+        for frame_idx in range(start, end):
+            normal = result[frame_idx]
+            normal /= max(float(np.linalg.norm(normal)), 1e-10)
+            if float(np.dot(normal, previous)) < 0.0:
+                normal *= -1.0
+            result[frame_idx] = normal
+            previous = normal
+
+        if smoothing_window > 1:
+            smoothed = result[start:end].copy()
+            half_window = smoothing_window // 2
+            for local_idx in range(end - start):
+                lo = max(0, local_idx - half_window)
+                hi = min(end - start, local_idx + half_window + 1)
+                normal = np.median(result[start + lo : start + hi], axis=0)
+                normal /= max(float(np.linalg.norm(normal)), 1e-10)
+                if float(np.dot(normal, reference)) < 0.0:
+                    normal *= -1.0
+                smoothed[local_idx] = normal
+            result[start:end] = smoothed
+
+    return result
+
+
+def _contact_patch_surface_points(
+    scene_mesh: trimesh.Trimesh,
+    all_surface_points: np.ndarray,
+    all_distances: np.ndarray,
+    triangle_ids: np.ndarray,
+    selected_surface_points: np.ndarray,
+    stable_normals: np.ndarray,
+    contact_mask: np.ndarray,
+    *,
+    max_patch_distance: float,
+    spatial_radius: float,
+    normal_angle: float,
+) -> np.ndarray:
+    """Use a robust nearby surface patch instead of one jumping vertex."""
+    result = np.asarray(selected_surface_points, dtype=float).copy()
+    face_normals = np.asarray(scene_mesh.face_normals, dtype=float)
+    normal_cosine = np.cos(max(float(normal_angle), 0.0))
+    for frame_idx in np.flatnonzero(contact_mask):
+        keep = all_distances[frame_idx] <= max_patch_distance
+        if spatial_radius > 0.0:
+            keep &= (
+                np.linalg.norm(
+                    all_surface_points[frame_idx]
+                    - selected_surface_points[frame_idx],
+                    axis=1,
+                )
+                <= spatial_radius
+            )
+        frame_triangles = triangle_ids[frame_idx]
+        valid = (frame_triangles >= 0) & (frame_triangles < len(face_normals))
+        if np.any(valid):
+            alignment = np.zeros(len(frame_triangles), dtype=float)
+            alignment[valid] = np.abs(
+                face_normals[frame_triangles[valid]] @ stable_normals[frame_idx]
+            )
+            keep &= (~valid) | (alignment >= normal_cosine)
+        if np.any(keep):
+            result[frame_idx] = np.median(
+                all_surface_points[frame_idx, keep], axis=0
+            )
+    return result
 
 
 def infer_scene_contact_tasks(
@@ -257,6 +459,15 @@ def infer_scene_contact_tasks(
     anchor_window_frames = max(int(cfg.get("anchor_window_frames", 3)), 1)
     anchor_drift_tolerance = max(float(cfg.get("anchor_drift_tolerance", 0.0)), 0.0)
     clearance = float(cfg.get("surface_clearance", 0.0))
+    normal_orientation_deadzone = max(
+        float(
+            cfg.get(
+                "normal_orientation_deadzone",
+                _DEFAULT_NORMAL_ORIENTATION_DEADZONE,
+            )
+        ),
+        0.0,
+    )
     fps = float(framerate) if framerate and framerate > 0 else 30.0
 
     per_effector_cfg = dict(cfg.get("effectors", {}) or {})
@@ -288,14 +499,67 @@ def infer_scene_contact_tasks(
                 )
             norms = np.linalg.norm(up_directions, axis=1, keepdims=True)
             up_directions = up_directions / np.maximum(norms, 1e-10)
-        selected_samples, surface_points, surface_normals, distances = _closest_scene_samples(
-            scene_mesh,
-            contact_samples,
+        source_contact_mask = marker_data.get("source_contact_mask")
+        if source_contact_mask is not None:
+            source_contact_mask = np.asarray(
+                source_contact_mask, dtype=bool
+            )
+            if source_contact_mask.shape != (len(tracking_positions),):
+                raise ValueError(
+                    f"{name}: source_contact_mask must have shape "
+                    f"({len(tracking_positions)},), got "
+                    f"{source_contact_mask.shape}."
+                )
+        (
+            all_samples,
+            all_surface_points,
+            all_distances,
+            all_triangle_ids,
+        ) = _query_scene_samples(scene_mesh, contact_samples)
+        selected_samples, surface_points, surface_normals, distances = (
+            _select_closest_scene_samples(
+                scene_mesh,
+                all_samples,
+                all_surface_points,
+                all_distances,
+                all_triangle_ids,
+                normal_orientation_deadzone=normal_orientation_deadzone,
+            )
         )
 
         eff_cfg = dict(per_effector_cfg.get(name, {}) or {})
         eff_distance_threshold = float(eff_cfg.get("distance_threshold", distance_threshold))
         eff_speed_threshold = float(eff_cfg.get("relative_speed_threshold", speed_threshold))
+        eff_distance_exit_threshold = max(
+            float(
+                eff_cfg.get(
+                    "distance_exit_threshold",
+                    cfg.get(
+                        "distance_exit_threshold",
+                        max(
+                            eff_distance_threshold + distance_softness,
+                            1.25 * eff_distance_threshold,
+                        ),
+                    ),
+                )
+            ),
+            eff_distance_threshold,
+        )
+        eff_speed_exit_threshold = max(
+            float(
+                eff_cfg.get(
+                    "relative_speed_exit_threshold",
+                    cfg.get(
+                        "relative_speed_exit_threshold",
+                        max(
+                            eff_speed_threshold + speed_softness,
+                            1.25 * eff_speed_threshold,
+                        ),
+                    ),
+                )
+            ),
+            eff_speed_threshold,
+        )
         eff_min_contact_frames = max(
             int(eff_cfg.get("min_contact_frames", min_contact_frames)), 1
         )
@@ -347,6 +611,72 @@ def infer_scene_contact_tasks(
             ),
             1,
         )
+        eff_sliding_normal_speed_threshold = max(
+            float(
+                eff_cfg.get(
+                    "sliding_normal_speed_threshold",
+                    cfg.get(
+                        "sliding_normal_speed_threshold",
+                        max(eff_sticking_normal_speed_threshold, 0.25),
+                    ),
+                )
+            ),
+            eff_sticking_normal_speed_threshold,
+        )
+        eff_min_sliding_frames = max(
+            int(
+                eff_cfg.get(
+                    "min_sliding_frames",
+                    cfg.get("min_sliding_frames", 2),
+                )
+            ),
+            1,
+        )
+        eff_stabilize_contact_normals = bool(
+            eff_cfg.get(
+                "stabilize_contact_normals",
+                cfg.get("stabilize_contact_normals", True),
+            )
+        )
+        eff_contact_normal_smoothing_frames = max(
+            int(
+                eff_cfg.get(
+                    "contact_normal_smoothing_frames",
+                    cfg.get("contact_normal_smoothing_frames", 3),
+                )
+            ),
+            1,
+        )
+        eff_contact_patch_distance = max(
+            float(
+                eff_cfg.get(
+                    "contact_patch_distance",
+                    cfg.get(
+                        "contact_patch_distance",
+                        min(eff_distance_threshold, 0.015),
+                    ),
+                )
+            ),
+            0.0,
+        )
+        eff_contact_patch_spatial_radius = max(
+            float(
+                eff_cfg.get(
+                    "contact_patch_spatial_radius",
+                    cfg.get("contact_patch_spatial_radius", 0.12),
+                )
+            ),
+            0.0,
+        )
+        eff_contact_patch_normal_angle = max(
+            float(
+                eff_cfg.get(
+                    "contact_patch_normal_angle",
+                    cfg.get("contact_patch_normal_angle", np.deg2rad(45.0)),
+                )
+            ),
+            0.0,
+        )
 
         # Selected samples refer to fixed SMPL-X vertex ids, but the nearest id
         # may switch.  The semantic-center velocity is more robust to those
@@ -364,8 +694,11 @@ def infer_scene_contact_tasks(
             (eff_speed_threshold - relative_speeds) / speed_softness
         )
         confidence = distance_score * speed_score
-        contact_mask = (distances <= eff_distance_threshold) & (
+        enter_mask = (distances <= eff_distance_threshold) & (
             relative_speeds <= eff_speed_threshold
+        )
+        stay_mask = (distances <= eff_distance_exit_threshold) & (
+            relative_speeds <= eff_speed_exit_threshold
         )
         require_normal_alignment = bool(
             eff_cfg.get("require_normal_alignment", True)
@@ -384,16 +717,55 @@ def infer_scene_contact_tasks(
             normal_alignment = np.sum(
                 up_directions * surface_normals, axis=1
             ) >= np.cos(max_normal_angle)
-            contact_mask &= normal_alignment
+            enter_mask &= normal_alignment
+            stay_mask &= normal_alignment
             confidence *= np.clip(
                 (np.sum(up_directions * surface_normals, axis=1) + 1.0)
                 * 0.5,
                 0.0,
                 1.0,
             )
-        contact_mask = _close_short_gaps(contact_mask, eff_max_gap_frames)
-        contact_mask = _remove_short_runs(contact_mask, eff_min_contact_frames)
+        if source_contact_mask is None:
+            contact_mask = _apply_contact_hysteresis(enter_mask, stay_mask)
+            contact_mask = _close_short_gaps(contact_mask, eff_max_gap_frames)
+            contact_mask = _remove_short_runs(
+                contact_mask, eff_min_contact_frames
+            )
+        else:
+            # Some source formats carry authored/simulated contact timing.
+            # Preserve that timing exactly and use the scene query only to
+            # recover a robot-side world target and reliable exit normal.
+            # Re-running distance/speed thresholding here would discard the
+            # useful label precisely when video reconstruction is offset.
+            contact_mask = source_contact_mask.copy()
         confidence = np.where(contact_mask, np.maximum(confidence, 0.5), confidence)
+        if source_contact_mask is not None:
+            confidence = np.where(contact_mask, 1.0, confidence)
+
+        if eff_stabilize_contact_normals:
+            surface_normals = _stabilize_contact_normals(
+                surface_normals,
+                tracking_positions,
+                surface_points,
+                distances,
+                contact_mask,
+                onset_window_frames=eff_anchor_window_frames,
+                smoothing_frames=eff_contact_normal_smoothing_frames,
+                normal_orientation_deadzone=normal_orientation_deadzone,
+            )
+        if eff_contact_patch_distance > 0.0:
+            surface_points = _contact_patch_surface_points(
+                scene_mesh,
+                all_surface_points,
+                all_distances,
+                all_triangle_ids,
+                surface_points,
+                surface_normals,
+                contact_mask,
+                max_patch_distance=eff_contact_patch_distance,
+                spatial_radius=eff_contact_patch_spatial_radius,
+                normal_angle=eff_contact_patch_normal_angle,
+            )
 
         normal_speeds = np.abs(np.sum(velocity * surface_normals, axis=1))
         tangential_velocity = velocity - surface_normals * np.sum(
@@ -409,8 +781,17 @@ def infer_scene_contact_tasks(
         sticking_mask = _remove_short_runs(
             sticking_mask, eff_min_sticking_frames
         )
-        contact_modes = np.full(len(contact_mask), "none", dtype="<U8")
-        contact_modes[contact_mask] = "sliding"
+        sliding_mask = (
+            contact_mask
+            & (normal_speeds <= eff_sliding_normal_speed_threshold)
+            & (tangential_speeds > eff_sticking_tangential_speed_threshold)
+        )
+        sliding_mask = _remove_short_runs(
+            sliding_mask, eff_min_sliding_frames
+        )
+        contact_modes = np.full(len(contact_mask), "none", dtype="<U10")
+        contact_modes[contact_mask] = "transition"
+        contact_modes[sliding_mask] = "sliding"
         contact_modes[sticking_mask] = "sticking"
         # Fade the contact weight in and out over a few frames, like a
         # foot-lock blend.  A binary weight switch makes the optimizer jump
@@ -447,9 +828,20 @@ def infer_scene_contact_tasks(
                 run_offsets = (
                     selected_samples[anchor_slice] - surface_points[anchor_slice]
                 )
-                reference_idx = int(np.argmax(np.linalg.norm(run_offsets, axis=1)))
-                reference_normal = run_normals[reference_idx]
+                run_offset_norms = np.linalg.norm(run_offsets, axis=1)
+                if float(np.max(run_offset_norms)) > normal_orientation_deadzone:
+                    reference_idx = int(np.argmax(run_offset_norms))
+                    reference_normal = run_normals[reference_idx]
+                else:
+                    # With all samples effectively on-surface, offset signs are
+                    # numerical noise.  Trust the robust direction of the mesh
+                    # normals instead of letting the largest tiny offset choose
+                    # the hemisphere for the whole contact run.
+                    reference_normal = np.median(run_normals, axis=0)
                 reference_norm = float(np.linalg.norm(reference_normal))
+                if reference_norm < 1e-10:
+                    reference_normal = run_normals[0]
+                    reference_norm = float(np.linalg.norm(reference_normal))
                 if reference_norm < 1e-10:
                     reference_normal = np.array([0.0, 0.0, 1.0])
                 else:
@@ -463,15 +855,10 @@ def infer_scene_contact_tasks(
                     if normal_norm > 1e-10
                     else reference_normal
                 )
-                # Pick the outward hemisphere using the semantic hand/foot
-                # center, which is more reliable than a sampled surface
-                # vertex that may lie exactly on a two-sided TSDF triangle.
-                toward_effector = np.median(
-                    tracking_positions[anchor_slice] - surface_points[anchor_slice],
-                    axis=0,
-                )
-                if float(np.dot(normal, toward_effector)) < 0.0:
-                    normal *= -1.0
+                # The contact-run stabilization has already chosen the
+                # approach side.  Do not reorient this normal toward the
+                # current source center: video reconstruction can put that
+                # center inside the scene during an otherwise valid contact.
                 return anchor, normal
 
             for start, end in _iter_true_runs(sticking_mask):

@@ -47,6 +47,85 @@ def test_load_robot_config_requires_object(tmp_path: Path):
         load_robot_config(config_path)
 
 
+def test_contact_retargeting_defaults_merge_robot_overrides(tmp_path: Path):
+    profile = tmp_path / "robot.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "joint_mapping": {"Pelvis": "pelvis"},
+                "retargeting": {
+                    "end_effector_priority": {
+                        "temporal": {"max_joint_step": 0.1},
+                        "effectors": {
+                            "left_hand": {"robot_body": "test_left_hand"}
+                        },
+                    }
+                },
+            }
+        )
+    )
+
+    loaded = load_robot_config(profile)
+    retargeting = loaded["retargeting"]
+
+    assert retargeting["end_effector_priority"]["temporal"]["enabled"] is True
+    assert retargeting["end_effector_priority"]["temporal"]["max_joint_step"] == 0.1
+    assert (
+        retargeting["end_effector_priority"]["effectors"]["left_hand"][
+            "robot_body"
+        ]
+        == "test_left_hand"
+    )
+    assert (
+        retargeting["end_effector_priority"]["effectors"]["left_hand"][
+            "preserve_world_target"
+        ]
+        is False
+    )
+    assert set(retargeting["end_effector_priority"]["effectors"]) == {"left_hand"}
+    assert retargeting["trajectory_refinement"]["enabled"] is True
+
+
+def test_retargeting_config_requires_object(tmp_path: Path):
+    profile = tmp_path / "robot.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "joint_mapping": {"Pelvis": "pelvis"},
+                "retargeting": [],
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="retargeting must be a JSON object"):
+        load_robot_config(profile)
+
+
+def test_compact_instinctmj_profile_expands_algorithm_defaults():
+    profile = REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1_instinctmj.json"
+
+    loaded = load_robot_config(profile)
+    priority = loaded["retargeting"]["end_effector_priority"]
+
+    assert "retargeting_preset" not in loaded
+    assert loaded["retargeting"]["joint_limit_safety_fraction"] == 0.8
+    assert priority["contact_detection"]["transition_frames"] == 4
+    assert priority["effectors"]["left_hand"]["robot_body"] == "left_rubber_hand"
+    assert priority["effectors"]["left_hand"]["preserve_world_target"] is False
+    assert priority["effectors"]["left_foot"]["preserve_world_target"] is True
+    base_position = priority["base_position_constraint"]
+    assert base_position["enabled"] is True
+    assert base_position["use_initial_offset"] is True
+    assert base_position["lock_initial_xy"] is True
+    assert base_position["track_xy"] is True
+    assert base_position["lock_xy"] is True
+    assert base_position["track_z"] is False
+    assert loaded["retargeting"]["trajectory_refinement"][
+        "contact_position_sigma"
+    ] == pytest.approx(0.008)
+    assert "swing_target_z_offset" not in priority
+
+
 @pytest.mark.parametrize("profile_path", ROBOT_PROFILE_CASES)
 def test_bundled_robot_profiles_match_urdf_bodies(profile_path: Path):
     mujoco = pytest.importorskip("mujoco")

@@ -123,6 +123,38 @@ class MotionData:
                     for name, series in series_by_name.items()
                 }
 
+        marker_sets = new_metadata.get("end_effector_markers")
+        if isinstance(marker_sets, dict):
+            resampled_markers = {}
+            for name, marker in marker_sets.items():
+                if not isinstance(marker, dict):
+                    resampled_markers[name] = marker
+                    continue
+                resampled_marker = {}
+                for key, series in marker.items():
+                    series = np.asarray(series)
+                    if series.shape[0] != T:
+                        resampled_marker[key] = series
+                        continue
+                    if key == "source_contact_mask":
+                        nearest_indices = np.clip(
+                            np.rint(dst_indices).astype(int), 0, T - 1
+                        )
+                        values = np.asarray(
+                            series[nearest_indices], dtype=bool
+                        )
+                    else:
+                        values = linear_interpolate(
+                            series, dst_indices, axis=0
+                        )
+                    if key in ("forward_directions", "up_directions"):
+                        values /= np.maximum(
+                            np.linalg.norm(values, axis=-1, keepdims=True), 1e-10
+                        )
+                    resampled_marker[key] = values
+                resampled_markers[name] = resampled_marker
+            new_metadata["end_effector_markers"] = resampled_markers
+
         rotations = new_metadata.get("link_orientations")
         if isinstance(rotations, dict):
             from scipy.spatial.transform import Rotation, Slerp

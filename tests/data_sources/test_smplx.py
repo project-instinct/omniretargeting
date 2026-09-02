@@ -44,6 +44,12 @@ def test_load_npy_generates_default_names_for_extra_joints(tmp_path):
     assert len(motion.target_names) == trajectory.shape[1]
     assert motion.target_names[:22] == DEFAULT_SMPLX_TARGET_NAMES
     assert motion.target_names[22:] == ["SMPLX_Joint_22", "SMPLX_Joint_23"]
+    assert set(motion.metadata["end_effector_markers"]) == {
+        "left_hand",
+        "right_hand",
+        "left_foot",
+        "right_foot",
+    }
 
 
 def test_compute_world_joint_orientations():

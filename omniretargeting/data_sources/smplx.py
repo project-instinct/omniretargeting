@@ -12,6 +12,8 @@ from scipy.spatial.transform import Rotation
 from omniretargeting.data_sources.base import DataSource, MotionData, MotionFrame
 from omniretargeting.data_sources.registry import register_data_source
 from omniretargeting.utils import (
+    _densify_smplx_frame_gaps,
+    _extract_smplx_end_effector_markers,
     _fallback_end_effector_markers,
     estimate_body_height,
 )
@@ -91,6 +93,20 @@ class SmplxDataSource(DataSource):
             if self.use_smplx_base_pose and root_orient is not None:
                 root_orient_mat = Rotation.from_rotvec(root_orient).as_matrix()
                 root_orient = Rotation.from_matrix(root_orient_mat @ _SMPLX_ROOT_OFFSET).as_quat(scalar_first=True)
+            combined_metadata = {
+                **self.metadata,
+                **metadata,
+                "source_type": "smplx",
+                "joint_orientations": orientations,
+                **self._foot_sole_metadata(orientations),
+            }
+            # End-effector targets are part of the generic MotionData contract,
+            # just like joint orientations.  Never make callers switch back to
+            # the legacy SMPL-X loader merely to activate contact tracking.
+            combined_metadata.setdefault(
+                "end_effector_markers",
+                _fallback_end_effector_markers(positions),
+            )
             self._motion_data = MotionData(
                 positions=positions,
                 target_names=names,
@@ -98,13 +114,7 @@ class SmplxDataSource(DataSource):
                 root_translations=trans if self.use_smplx_base_pose else None,
                 framerate=framerate,
                 source_height=source_height,
-                metadata={
-                    **self.metadata,
-                    **metadata,
-                    "source_type": "smplx",
-                    "joint_orientations": orientations,
-                    **self._foot_sole_metadata(orientations),
-                },
+                metadata=combined_metadata,
             )
         return self._motion_data
 
@@ -398,16 +408,42 @@ class SmplxDataSource(DataSource):
         if betas_tensor.shape[1] > 10:
             betas_tensor = betas_tensor[:, :10]
 
-        num_frames = motion["pose_body"].shape[0]
-        root_orient = motion["root_orient"]
-        trans = motion["trans"]
+        pose_body = np.asarray(motion["pose_body"])
+        root_orient = np.asarray(motion["root_orient"])
+        trans = np.asarray(motion["trans"])
+        pose_hand = np.asarray(motion["pose_hand"]) if "pose_hand" in motion else None
+        if "frame_ids" in motion:
+            original_num_frames = len(trans)
+            trans, root_orient, pose_body, pose_hand, _ = (
+                _densify_smplx_frame_gaps(
+                    motion["frame_ids"],
+                    trans,
+                    root_orient,
+                    pose_body,
+                    pose_hand,
+                )
+            )
+            if len(trans) != original_num_frames:
+                print(
+                    "Restored "
+                    f"{len(trans) - original_num_frames} missing SMPL-X "
+                    "timeline frame(s) from frame_ids."
+                )
+
+        num_frames = pose_body.shape[0]
+        if pose_hand is not None and pose_hand.ndim == 2 and pose_hand.shape[1] >= 90:
+            left_hand_pose = torch.tensor(pose_hand[:, :45]).float()
+            right_hand_pose = torch.tensor(pose_hand[:, 45:90]).float()
+        else:
+            left_hand_pose = torch.zeros(num_frames, 45).float()
+            right_hand_pose = torch.zeros(num_frames, 45).float()
         output = body_model(
             betas=betas_tensor,
             global_orient=torch.tensor(root_orient).float(),
-            body_pose=torch.tensor(motion["pose_body"]).float(),
+            body_pose=torch.tensor(pose_body).float(),
             transl=torch.tensor(trans).float(),
-            left_hand_pose=torch.zeros(num_frames, 45).float(),
-            right_hand_pose=torch.zeros(num_frames, 45).float(),
+            left_hand_pose=left_hand_pose,
+            right_hand_pose=right_hand_pose,
             jaw_pose=torch.zeros(num_frames, 3).float(),
             leye_pose=torch.zeros(num_frames, 3).float(),
             reye_pose=torch.zeros(num_frames, 3).float(),
@@ -426,7 +462,17 @@ class SmplxDataSource(DataSource):
             body_model.parents.cpu().numpy(),
             num_body_joints=22,
         )
-        return joints, orientations, root_orient, trans, framerate, {"betas": betas_tensor.detach().cpu().numpy()[0].tolist()}
+        end_effector_markers = _extract_smplx_end_effector_markers(
+            body_model,
+            output,
+            max_samples=32,
+            world_joint_orientations=orientations,
+            shape_betas=betas_tensor.detach().cpu().numpy(),
+        )
+        return joints, orientations, root_orient, trans, framerate, {
+            "betas": betas_tensor.detach().cpu().numpy()[0].tolist(),
+            "end_effector_markers": end_effector_markers,
+        }
 
     @staticmethod
     def compute_world_joint_orientations(
