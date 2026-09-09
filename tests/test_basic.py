@@ -409,7 +409,23 @@ class TestRealDataIntegration:
                 expected_output_path.unlink()
 
 
-def test_retarget_motion_uses_identity_terrain_scale_by_default():
+@pytest.fixture
+def mock_collision_pipeline(monkeypatch):
+    """These four orchestration tests use 3-column fake motions, not qpos.
+
+    Real FK acceptance and save-order contracts are exercised separately in
+    test_local_collision_repair.py.
+    """
+    from omniretargeting import core
+    monkeypatch.setattr(core.SceneQuery, "from_tasks", lambda *args, **kwargs: Mock())
+    monkeypatch.setattr(core.OmniRetargeter, "_clamp_final_joint_safety_limits", lambda self, q: q)
+    monkeypatch.setattr(core, "select_safe_postprocessing",
+                        lambda model, baseline, candidate, *args, **kwargs: (candidate, {}, {}))
+    monkeypatch.setattr(core, "repair_local_collisions",
+                        lambda model, candidate, *args, **kwargs: (candidate, {"status": "mocked", "events": []}))
+
+
+def test_retarget_motion_uses_identity_terrain_scale_by_default(mock_collision_pipeline):
     from omniretargeting import OmniRetargeter
 
     original_terrain_copy = Mock(name="original_terrain_copy")
@@ -417,6 +433,7 @@ def test_retarget_motion_uses_identity_terrain_scale_by_default():
     processed_trajectory = np.full((2, 22, 3), 7.0, dtype=float)
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter.robot_model = Mock()
     retargeter.terrain_mesh = Mock()
     retargeter.terrain_mesh.copy.return_value = original_terrain_copy
     retargeter._compute_terrain_scale = Mock(return_value=2.5)
@@ -447,13 +464,14 @@ def test_retarget_motion_uses_identity_terrain_scale_by_default():
     )
 
 
-def test_retarget_motion_applies_terrain_scale_when_enabled():
+def test_retarget_motion_applies_terrain_scale_when_enabled(mock_collision_pipeline):
     from omniretargeting import OmniRetargeter
 
     scaled_terrain = Mock(name="scaled_terrain")
     processed_trajectory = np.full((2, 22, 3), 9.0, dtype=float)
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter.robot_model = Mock()
     retargeter.terrain_mesh = Mock()
     retargeter._compute_terrain_scale = Mock(return_value=2.5)
     retargeter._scale_terrain_mesh = Mock(return_value=scaled_terrain)
@@ -482,7 +500,7 @@ def test_retarget_motion_applies_terrain_scale_when_enabled():
     )
 
 
-def test_retarget_motion_applies_foot_stabilization_for_xyz_nudge():
+def test_retarget_motion_applies_foot_stabilization_for_xyz_nudge(mock_collision_pipeline):
     from omniretargeting import OmniRetargeter
 
     original_terrain_copy = Mock(name="original_terrain_copy")
@@ -491,6 +509,7 @@ def test_retarget_motion_applies_foot_stabilization_for_xyz_nudge():
     stabilized_motion = np.array([[1.5, 2.5, 3.5]])
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter.robot_model = Mock()
     retargeter.terrain_mesh = Mock()
     retargeter.terrain_mesh.copy.return_value = original_terrain_copy
     retargeter.retargeting_config = {"penetration_resolver": "xyz_nudge"}
@@ -519,7 +538,7 @@ def test_retarget_motion_applies_foot_stabilization_for_xyz_nudge():
     )
 
 
-def test_retarget_motion_skips_foot_stabilization_for_hard_constraint():
+def test_retarget_motion_skips_foot_stabilization_for_hard_constraint(mock_collision_pipeline):
     from omniretargeting import OmniRetargeter
 
     original_terrain_copy = Mock(name="original_terrain_copy")
@@ -527,6 +546,7 @@ def test_retarget_motion_skips_foot_stabilization_for_hard_constraint():
     raw_motion = np.array([[1.0, 2.0, 3.0]])
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter.robot_model = Mock()
     retargeter.terrain_mesh = Mock()
     retargeter.terrain_mesh.copy.return_value = original_terrain_copy
     retargeter.retargeting_config = {"penetration_resolver": "hard_constraint"}
@@ -597,68 +617,37 @@ def test_perform_retargeting_passes_hard_penetration_constraint():
     )
 
 
-def test_penetration_guard_blends_only_joints_to_avoid_regression(monkeypatch):
+def test_penetration_guard_rolls_back_local_regression_without_joint_blending():
+    from omniretargeting.local_collision_repair import select_safe_postprocessing
+    from tests.test_local_collision_repair import setup_motion
+    model, baseline, scene = setup_motion(30)
+    candidate = baseline.copy()
+    candidate[2:5, 8] += 0.01  # Admissible earlier change must survive.
+    candidate[14:17, 8] = 0.01  # Separate bad interval enters the box.
+    selected, stats, report = select_safe_postprocessing(
+        model, baseline, candidate, scene, {}, {}, {}, framerate=30)
+    assert stats['max_depth'] <= 0.001
+    np.testing.assert_array_equal(selected[2:5], candidate[2:5])
+    np.testing.assert_array_equal(selected[14:17], baseline[14:17])
+    assert 0 < report['accepted_fraction'] < 1
+
+
+def test_penetration_guard_can_retain_improved_known_deep_residual():
     from omniretargeting import core
-
-    baseline = np.zeros((2, 10), dtype=float)
-    refined = baseline.copy()
-    refined[:, 7:] = 1.0
-    before = {"max_depth": 0.09}
-    candidate_after = {"max_depth": 0.13}
-    measured_blends = []
-
-    def fake_measure(model, trajectory, scene_mesh, config):
-        del model, scene_mesh, config
-        blend = float(trajectory[0, 7])
-        measured_blends.append(blend)
-        return {"max_depth": 0.03 + 0.10 * blend}
-
-    monkeypatch.setattr(core, "measure_scene_penetration", fake_measure)
-    selected, stats, blend = core._select_penetration_safe_refinement(
-        Mock(),
-        baseline,
-        refined,
-        Mock(),
-        {
-            "target_max_depth": 0.10,
-            "max_depth_regression": 0.01,
-            "acceptance_blends": [0.75, 0.5, 0.25],
-        },
-        before,
-        candidate_after,
-    )
-
-    assert blend == pytest.approx(0.5)
-    assert stats["max_depth"] == pytest.approx(0.08)
-    assert measured_blends == pytest.approx([0.75, 0.5])
-    np.testing.assert_allclose(selected[:, :7], baseline[:, :7])
-    np.testing.assert_allclose(selected[:, 7:], 0.5)
-
-
-def test_penetration_guard_treats_ten_centimetres_as_soft_target(monkeypatch):
-    from omniretargeting import core
-
-    baseline = np.zeros((2, 10), dtype=float)
-    refined = baseline.copy()
-    refined[:, 7:] = 1.0
-
-    def fail_measure(*args, **kwargs):
-        raise AssertionError("an admissible full refinement must not be blended")
-
-    monkeypatch.setattr(core, "measure_scene_penetration", fail_measure)
-    selected, stats, blend = core._select_penetration_safe_refinement(
-        Mock(),
-        baseline,
-        refined,
-        Mock(),
-        {"target_max_depth": 0.10, "max_depth_regression": 0.01},
-        {"max_depth": 0.15},
-        {"max_depth": 0.155},
-    )
-
-    assert blend == pytest.approx(1.0)
-    assert stats["max_depth"] == pytest.approx(0.155)
-    np.testing.assert_allclose(selected, refined)
+    from tests.test_local_collision_repair import setup_motion
+    from omniretargeting.scene_geometry import measure_scene_penetration
+    import trimesh
+    model, baseline, _ = setup_motion(3)
+    scene = trimesh.creation.box(extents=[0.6]*3)
+    baseline[:, 7:9] = [0, 0.1]
+    candidate = baseline.copy(); candidate[:, 8] += 0.02
+    before = measure_scene_penetration(model, baseline, scene)
+    after = measure_scene_penetration(model, candidate, scene)
+    selected, stats, fraction = core._select_penetration_safe_refinement(
+        model, baseline, candidate, scene, {'target_max_depth': 0.1}, before, after)
+    assert 0.1 < stats['max_depth'] < before['max_depth']
+    assert fraction == 1.0
+    np.testing.assert_array_equal(selected, candidate)
 
 
 @pytest.mark.parametrize("lock_initial_xy", [False, True])

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import threading
 import time
+from functools import wraps
 from pathlib import Path
 
 import mujoco
@@ -14,6 +16,14 @@ from mjviser import ViserMujocoScene
 
 from omniretargeting.main import DEFAULT_ROBOT_CONFIG_PATH
 from omniretargeting.robot_config import load_robot_config
+from omniretargeting.viser_playback import (
+    FramePacer,
+    PlaybackClock,
+    recording_times,
+    serve_recording,
+    use_rigid_instance_updates,
+    write_recording,
+)
 
 
 SUPPORTED_MOTION_SUFFIXES = (".npz", ".npy")
@@ -285,8 +295,25 @@ def _run_viewer(
     source_label: str = "source",
 ) -> None:
     data = mujoco.MjData(model)
+    clock = PlaybackClock(
+        len(qpos), framerate, now=time.perf_counter(), frame=args.start_frame,
+        playing=not args.paused, speed=args.speed, loop=args.loop,
+    )
+    state_lock = threading.RLock()
+    wake = threading.Event()
+
+    def locked(callback):
+        @wraps(callback)
+        def call(*a, **kw):
+            with state_lock:
+                result = callback(*a, **kw)
+            wake.set()
+            return result
+        return call
+
     duration = max(qpos.shape[0] - 1, 0) / framerate
     server = viser.ViserServer(port=args.port, label="OmniRetargeting mjviser playback")
+    server.scene.configure_default_lights(cast_shadow=args.shadows)
     # World-space motions are often several metres away from the origin.  A
     # Viser client otherwise starts at the origin as well, which can place the
     # camera inside an opaque terrain mesh and make a valid scene look empty.
@@ -296,6 +323,8 @@ def _run_viewer(
     server.initial_camera.look_at = tuple(initial_root + np.array([0.0, 0.0, -0.25]))
     server.initial_camera.position = tuple(initial_root + np.array([2.5, -2.5, 1.5]))
     scene = ViserMujocoScene(server, model, num_envs=1)
+    rigid_groups = use_rigid_instance_updates(scene)
+    print(f"[playback] {rigid_groups} singleton mesh groups use direct Viser node poses", flush=True)
     # mjviser defaults to shifting every robot body by -root_position so the
     # tracked body stays at the origin.  Custom world-space overlays (terrain,
     # SMPL-X, contact targets) are not shifted, which makes the robot appear
@@ -328,8 +357,8 @@ def _run_viewer(
             color=(155, 165, 175),
             opacity=args.terrain_opacity,
             side="double",
-            cast_shadow=True,
-            receive_shadow=True,
+            cast_shadow=args.shadows,
+            receive_shadow=args.shadows,
         )
 
     contact_colors = {
@@ -465,10 +494,6 @@ def _run_viewer(
         print("[WARN] Motion contains object poses but no object mesh was resolved. Pass --object-mesh to show it.")
 
     frame_idx = [min(max(args.start_frame, 0), len(qpos) - 1)]
-    playhead = [float(frame_idx[0])]
-    playing = [not args.paused]
-    speed = [args.speed]
-    looping = [args.loop]
     needs_render = [True]
     show_contact_targets = [True]
     show_contact_axes = [True]
@@ -510,14 +535,14 @@ def _run_viewer(
             options=["Back", "Forward"],
         )
         play_btn = server.gui.add_button(
-            "Pause" if playing[0] else "Play",
-            icon=viser.Icon.PLAYER_PAUSE if playing[0] else viser.Icon.PLAYER_PLAY,
+            "Pause" if clock.playing else "Play",
+            icon=viser.Icon.PLAYER_PAUSE if clock.playing else viser.Icon.PLAYER_PLAY,
             hint="Play or pause (Space).",
         )
         speed_btns = server.gui.add_button_group(
             "Speed", options=["0.25x", "0.5x", "1x", "2x", "4x"]
         )
-        loop_cb = server.gui.add_checkbox("Loop", initial_value=looping[0])
+        loop_cb = server.gui.add_checkbox("Loop", initial_value=clock.loop)
         contact_event_btns = None
         contact_event_frames = np.empty(0, dtype=int)
         if contact_mask is not None and len(contact_mask):
@@ -572,7 +597,19 @@ def _run_viewer(
             "`PageUp`/`PageDown` jump · `Home`/`End` first/last frame"
         )
 
-    def render_frame(frame: float) -> None:
+    # Precompute tangent-space displacements, preserving source sample poses.
+    interpolation_steps = np.zeros((max(len(qpos) - 1, 0), model.nv))
+    for idx in range(len(interpolation_steps)):
+        mujoco.mj_differentiatePos(model, interpolation_steps[idx], 1.0, qpos[idx], qpos[idx + 1])
+
+    def render_frame(frame: float, *, update_ui: bool = True) -> None:
+        # Include overlays in mjviser's nested atomic context, so the robot
+        # and source skeleton for this timestamp are submitted together.
+        with server.atomic():
+            _render_frame(frame, update_ui=update_ui)
+        server.flush()
+
+    def _render_frame(frame: float, *, update_ui: bool) -> None:
         frame = float(np.clip(frame, 0.0, len(qpos) - 1))
         idx = int(np.floor(frame))
         next_idx = min(idx + 1, len(qpos) - 1)
@@ -584,16 +621,8 @@ def _run_viewer(
         # joints, avoiding the visible stop-go "jitter" of frame stepping.
         interpolated_qpos = qpos[idx].copy()
         if alpha > 1e-8 and next_idx != idx:
-            interpolation_velocity = np.zeros(model.nv, dtype=float)
-            mujoco.mj_differentiatePos(
-                model,
-                interpolation_velocity,
-                1.0,
-                qpos[idx],
-                qpos[next_idx],
-            )
             mujoco.mj_integratePos(
-                model, interpolated_qpos, interpolation_velocity, alpha
+                model, interpolated_qpos, interpolation_steps[idx], alpha
             )
         data.qpos[:] = interpolated_qpos
         data.qvel[:] = 0.0
@@ -615,16 +644,22 @@ def _run_viewer(
                 object_handle.wxyz = quat / max(float(np.linalg.norm(quat)), 1e-10)
 
         for effector_idx, handle in enumerate(contact_handles):
+            handle.visible = show_contact_targets[0] and bool(contact_mask[idx, effector_idx])
             origin = (
                 (1.0 - alpha) * contact_targets[idx, effector_idx]
                 + alpha * contact_targets[next_idx, effector_idx]
             )
-            handle.position = origin
-            handle.visible = show_contact_targets[0] and bool(
-                contact_mask[idx, effector_idx]
-            )
+            if handle.visible:
+                handle.position = origin
             forward_handle, normal_handle = contact_axis_handles[effector_idx]
             if forward_handle is not None and normal_handle is not None:
+                axis_visible = show_contact_axes[0] and (
+                    contact_names[effector_idx].endswith("_hand")
+                    or bool(contact_mask[idx, effector_idx])
+                )
+                forward_handle.visible = normal_handle.visible = axis_visible
+                if not axis_visible:
+                    continue
                 orientation_ups = (
                     effector_ups if effector_ups is not None else contact_normals
                 )
@@ -651,13 +686,8 @@ def _run_viewer(
                 normal_handle.points = np.array(
                     [[axis_origin, axis_origin + 0.12 * normal]]
                 )
-                axis_visible = contact_names[effector_idx].endswith(
-                    "_hand"
-                ) or bool(contact_mask[idx, effector_idx])
-                forward_handle.visible = show_contact_axes[0] and axis_visible
-                normal_handle.visible = show_contact_axes[0] and axis_visible
 
-        if human_points_handle is not None:
+        if human_points_handle is not None and human_points_handle.visible:
             human_points = (
                 (1.0 - alpha) * source_joints[idx]
                 + alpha * source_joints[next_idx]
@@ -681,6 +711,10 @@ def _run_viewer(
         if scene.needs_update:
             scene.refresh_visualization()
 
+        if not update_ui:
+            return
+        timeline.value = int(np.floor(frame))
+        frame_input.value = int(np.floor(frame))
         t = frame / framerate
         time_label.content = (
             "<div style='font-family: ui-monospace, SFMono-Regular, Menlo, "
@@ -692,28 +726,26 @@ def _run_viewer(
         )
 
     def update_play_button() -> None:
-        play_btn.label = "Pause" if playing[0] else "Play"
+        play_btn.label = "Pause" if clock.playing else "Play"
         play_btn.icon = (
-            viser.Icon.PLAYER_PAUSE if playing[0] else viser.Icon.PLAYER_PLAY
+            viser.Icon.PLAYER_PAUSE if clock.playing else viser.Icon.PLAYER_PLAY
         )
 
-    def seek_frame(target: float, *, pause: bool = True) -> None:
+    @locked
+    def seek_frame(target: float) -> None:
         """Seek to an exact integer frame and request one render."""
         target_idx = int(np.clip(round(float(target)), 0, len(qpos) - 1))
-        if pause:
-            playing[0] = False
-            update_play_button()
+        clock.seek(target_idx, time.perf_counter())
+        update_play_button()
         frame_idx[0] = target_idx
-        playhead[0] = float(target_idx)
         timeline.value = target_idx
         frame_input.value = target_idx
         needs_render[0] = True
 
+    @locked
     def toggle_playback() -> None:
-        if not playing[0] and playhead[0] >= len(qpos) - 1:
-            playhead[0] = 0.0
-            frame_idx[0] = 0
-        playing[0] = not playing[0]
+        clock.toggle(time.perf_counter())
+        needs_render[0] = True
         update_play_button()
 
     @play_btn.on_click
@@ -736,12 +768,15 @@ def _run_viewer(
         seek_frame(frame_idx[0] + direction * int(step_input.value))
 
     @speed_btns.on_click
+    @locked
     def _(event) -> None:
-        speed[0] = float(event.target.value.replace("x", ""))
+        clock.set_speed(float(event.target.value.replace("x", "")), time.perf_counter())
 
     @loop_cb.on_update
+    @locked
     def _(_) -> None:
-        looping[0] = loop_cb.value
+        clock.sample(time.perf_counter())
+        clock.loop = loop_cb.value
 
     @timeline.on_update
     def _(event) -> None:
@@ -780,6 +815,7 @@ def _run_viewer(
     if human_cb is not None:
 
         @human_cb.on_update
+        @locked
         def _(_) -> None:
             visible = bool(human_cb.value)
             human_points_handle.visible = visible
@@ -789,10 +825,12 @@ def _run_viewer(
                 human_forward_handle.visible = visible
             if human_forward_tip_handle is not None:
                 human_forward_tip_handle.visible = visible
+            needs_render[0] = True
 
     if contacts_cb is not None:
 
         @contacts_cb.on_update
+        @locked
         def _(_) -> None:
             show_contact_targets[0] = bool(contacts_cb.value)
             needs_render[0] = True
@@ -800,6 +838,7 @@ def _run_viewer(
     if contact_axes_cb is not None:
 
         @contact_axes_cb.on_update
+        @locked
         def _(_) -> None:
             show_contact_axes[0] = bool(contact_axes_cb.value)
             needs_render[0] = True
@@ -869,36 +908,91 @@ def _run_viewer(
         lambda _: seek_frame(frame_idx[0] + int(step_input.value))
     )
 
-    render_frame(frame_idx[0])
-    last_time = time.perf_counter()
+    cached_server = None
+    render_frame(0 if args.playback_dir else frame_idx[0])
     try:
+        if args.playback_dir:
+            started = time.perf_counter()
+            serializer = server.get_scene_serializer()
+            times = recording_times(len(qpos), framerate, args.refresh_hz)
+            previous = 0.0
+            for timestamp in times[1:]:
+                serializer.insert_sleep(float(timestamp - previous))
+                render_frame(float(timestamp * framerate), update_ui=False)
+                previous = timestamp
+            if len(qpos) > 1:
+                serializer.insert_sleep(1.0 / framerate)
+            payload = serializer.serialize()
+            manifest = write_recording(
+                Path(args.playback_dir), payload,
+                camera_position=server.initial_camera.position,
+                camera_look_at=server.initial_camera.look_at,
+                metadata={"source": str(motion_file), "source_frames": len(qpos),
+                          "source_fps": framerate, "display_hz": args.refresh_hz,
+                          "samples": len(times), "motion_duration_s": duration,
+                          "loop_duration_s": len(qpos) / framerate if len(qpos) > 1 else 0,
+                          "shadows": args.shadows},
+            )
+            print(f"[cached-playback] {len(times)} samples, {manifest['bytes'] / 1e6:.2f} MB, "
+                  f"prepared in {time.perf_counter() - started:.2f}s", flush=True)
+            if args.playback_port is not None:
+                cached_server = serve_recording(Path(args.playback_dir), args.playback_port)
+                server.gui.add_markdown(
+                    f"**Smooth cached playback:** open this server's address on port "
+                    f"**{args.playback_port}**. Download once, then play locally in your browser. "
+                    "Use this live viewer for exact-frame and overlay inspection."
+                )
+                print(f"[cached-playback] http://localhost:{args.playback_port}/", flush=True)
+            if args.export_only:
+                return
+            render_frame(frame_idx[0])
+
+        clock.rebase(time.perf_counter())
+        pacer = FramePacer(args.refresh_hz, time.perf_counter())
+        last_ui = 0.0
+        last_rendered = None
+        stats_start = time.perf_counter()
+        render_costs = []
+
+        @server.on_client_connect
+        def _(_client):
+            wake.set()
+
         while True:
             now = time.perf_counter()
-            wall_dt = now - last_time
-            last_time = now
-
-            if playing[0]:
-                playhead[0] += wall_dt * speed[0] * framerate
-                if playhead[0] >= len(qpos) - 1:
-                    if looping[0]:
-                        playhead[0] %= len(qpos)
-                    else:
-                        playhead[0] = float(len(qpos) - 1)
-                        playing[0] = False
-                        play_btn.label = "Play"
-                        play_btn.icon = viser.Icon.PLAYER_PLAY
-                frame_idx[0] = int(np.floor(playhead[0]))
-                timeline.value = frame_idx[0]
-                frame_input.value = frame_idx[0]
-                render_frame(playhead[0])
-            elif needs_render[0]:
-                render_frame(frame_idx[0])
-                needs_render[0] = False
-
-            time.sleep(1.0 / 60.0)
+            with state_lock:
+                connected = bool(server.get_clients())
+                if connected:
+                    frame = clock.sample(now)
+                    frame_idx[0] = int(np.floor(frame))
+                    if frame != last_rendered or needs_render[0] or scene.needs_update:
+                        update_ui = now - last_ui >= 0.1 or needs_render[0] or not clock.playing
+                        render_frame(frame, update_ui=update_ui)
+                        if update_ui:
+                            last_ui = now
+                            update_play_button()
+                        last_rendered = frame
+                        needs_render[0] = False
+                        render_costs.append(time.perf_counter() - now)
+                else:
+                    clock.rebase(now)
+                active = connected and clock.playing and len(qpos) > 1
+            if now - stats_start >= 5.0:
+                if args.playback_stats and render_costs:
+                    print(f"[playback] submitted_hz={len(render_costs) / (now - stats_start):.1f} "
+                          f"render_ms_p95={np.percentile(render_costs, 95) * 1000:.2f} "
+                          f"clients={len(server.get_clients())}", flush=True)
+                render_costs.clear()
+                stats_start = now
+            delay = pacer.delay(time.perf_counter()) if active else 0.1
+            wake.wait(delay)
+            wake.clear()
     except KeyboardInterrupt:
         print("\n[omniretargeting-mjviser] stopped.")
     finally:
+        if cached_server is not None:
+            cached_server.shutdown()
+            cached_server.server_close()
         server.stop()
 
 
@@ -1034,6 +1128,13 @@ def main() -> None:
     )
     parser.add_argument("--root-z-offset", type=float, default=0.0, help="Visualization-only offset added to root z.")
     parser.add_argument("--port", type=int, default=8081)
+    parser.add_argument("--refresh-hz", type=float, default=60.0,
+                        help="Display refresh target; independent of source fps.")
+    parser.add_argument("--shadows", action="store_true", help="Enable dynamic shadows (higher GPU cost).")
+    parser.add_argument("--playback-stats", action="store_true", help="Log server submission timing every 5 seconds.")
+    parser.add_argument("--playback-dir", type=Path, help="Export a portable browser-cached 3D playback bundle.")
+    parser.add_argument("--playback-port", type=int, help="Also serve the cached bundle on this HTTP port.")
+    parser.add_argument("--export-only", action="store_true", help="Write --playback-dir and exit.")
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument(
         "--track-robot",
@@ -1044,7 +1145,16 @@ def main() -> None:
     parser.add_argument("--paused", action="store_true")
     parser.add_argument("--loop", dest="loop", action="store_true", default=True)
     parser.add_argument("--no-loop", dest="loop", action="store_false")
-    run(parser.parse_args())
+    args = parser.parse_args()
+    if (args.playback_port is not None or args.export_only) and args.playback_dir is None:
+        parser.error("--playback-port and --export-only require --playback-dir")
+    if not np.isfinite(args.refresh_hz) or not 1 <= args.refresh_hz <= 120:
+        parser.error("--refresh-hz must be between 1 and 120")
+    if args.playback_port == args.port:
+        parser.error("--playback-port must differ from the live --port")
+    if args.export_only and args.playback_port is not None:
+        parser.error("--export-only cannot be combined with --playback-port")
+    run(args)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,14 @@
 """Tests for the SMPL-X data-source adapter."""
 
 import numpy as np
+import pytest
 from scipy.spatial.transform import Rotation
 
 from omniretargeting.data_sources.smplx import (
     DEFAULT_SMPLX_TARGET_NAMES,
     SmplxDataSource,
     compute_world_joint_orientations,
+    create_smplx_data_source,
     validate_smplx_trajectory,
 )
 
@@ -78,4 +80,76 @@ def test_compute_world_joint_orientations():
             root_quat,
             -expected_quat,
             atol=1e-6,
+        )
+
+
+def _raw_timeline(frame_ids):
+    count = len(frame_ids)
+    return {
+        "frame_ids": np.asarray(frame_ids),
+        "trans": np.arange(count * 3, dtype=np.float32).reshape(count, 3),
+        "root_orient": np.zeros((count, 3), dtype=np.float32),
+        "pose_body": np.zeros((count, 63), dtype=np.float32),
+        "pose_hand": np.zeros((count, 90), dtype=np.float64),
+    }
+
+
+def test_provenance_ids_preserve_published_rows_and_original_id_mapping(tmp_path):
+    arrays = _raw_timeline(["0000", "0001", "0002", "0004", "0005"])
+    motion_path = tmp_path / "published.npz"
+    np.savez(motion_path, **arrays, mocap_frame_rate=25.0)
+    source = create_smplx_data_source(
+        motion_path, {"adapter_options": {"frame_id_semantics": "provenance"}}
+    )
+    with np.load(motion_path) as motion:
+        fps = source._detect_framerate(motion)
+        trans, root, body, hand, metadata = source._prepare_raw_timeline(motion, fps)
+
+    assert fps == 25.0
+    for actual, key in zip((trans, root, body, hand), ("trans", "root_orient", "pose_body", "pose_hand")):
+        np.testing.assert_array_equal(actual, arrays[key], strict=True)
+    assert metadata["frame_id_semantics"] == "provenance"
+    np.testing.assert_array_equal(metadata["original_frame_ids"], arrays["frame_ids"], strict=True)
+    assert "timestamps" not in metadata
+    assert len(trans) == 5
+
+
+def test_default_timeline_still_restores_short_missing_frames(tmp_path):
+    arrays = _raw_timeline(["0070", "0072"])
+    source = create_smplx_data_source(tmp_path / "source.npz")
+    trans, root, body, hand, metadata = source._prepare_raw_timeline(arrays, 30.0)
+    assert len(trans) == len(root) == len(body) == len(hand) == 3
+    np.testing.assert_array_equal(trans[[0, 2]], arrays["trans"])
+    np.testing.assert_allclose(trans[1], (arrays["trans"][0] + arrays["trans"][1]) / 2)
+    np.testing.assert_array_equal(metadata["original_frame_ids"], arrays["frame_ids"])
+    assert metadata["frame_id_semantics"] == "timeline"
+
+
+@pytest.mark.parametrize("fps", [None, 0.0, -1.0, np.nan, np.inf])
+def test_provenance_ids_require_published_framerate(tmp_path, fps):
+    source = SmplxDataSource(tmp_path / "source.npz", frame_id_semantics="provenance")
+    with pytest.raises(ValueError, match="finite, positive published framerate"):
+        source._prepare_raw_timeline(_raw_timeline(["0000", "0002"]), fps)
+
+
+def test_provenance_ids_reject_sparse_person_timeline(tmp_path):
+    arrays = _raw_timeline(["0000", "0002"])
+    arrays["person_timeline_sparse"] = np.bool_(True)
+    source = SmplxDataSource(tmp_path / "source.npz", frame_id_semantics="provenance")
+    with pytest.raises(ValueError, match="sparse person timeline"):
+        source._prepare_raw_timeline(arrays, 30.0)
+
+
+def test_provenance_ids_reject_misaligned_mapping(tmp_path):
+    arrays = _raw_timeline(["0000", "0001"])
+    arrays["frame_ids"] = np.asarray(["0000"])
+    source = SmplxDataSource(tmp_path / "source.npz", frame_id_semantics="provenance")
+    with pytest.raises(ValueError, match="one ID per published motion row"):
+        source._prepare_raw_timeline(arrays, 30.0)
+
+
+def test_invalid_frame_id_semantics_is_explicit_error(tmp_path):
+    with pytest.raises(ValueError, match="frame_id_semantics"):
+        create_smplx_data_source(
+            tmp_path / "source.npz", {"adapter_options": {"frame_id_semantics": "guessed"}}
         )

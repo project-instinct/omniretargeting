@@ -24,6 +24,11 @@ from .contact import (
     build_world_tracking_tasks,
     infer_scene_contact_tasks,
 )
+from .scene_geometry import SceneQuery, geom_surface_offsets
+from .local_collision_repair import (
+    local_repair_config, repair_local_collisions, select_safe_postprocessing,
+    diagnostics_json, trajectory_digest,
+)
 from .trajectory_refinement import (
     measure_scene_penetration,
     refine_joint_trajectory,
@@ -39,63 +44,13 @@ def _select_penetration_safe_refinement(
     before: Mapping[str, Any],
     after: Mapping[str, Any],
 ) -> tuple[np.ndarray, Mapping[str, Any], float]:
-    """Keep the largest refinement blend that avoids a penetration regression.
-
-    Whole-trajectory refinement uses a soft collision penalty, so a lower
-    aggregate least-squares cost can still make one collision point deeper.
-    Ten centimetres is a target, not a hard rejection threshold: when the
-    framewise result is already deeper, a small configured regression remains
-    admissible.  Since refinement changes scalar joints only, blending those
-    coordinates preserves the source-locked floating base exactly.
-    """
-    target_depth = max(
-        float(penetration_config.get("target_max_depth", 0.10)), 0.0
+    """Compatibility entry point: joint acceptance with local rollback, no blends."""
+    result, stats, report = select_safe_postprocessing(
+        model, baseline, refined, scene_mesh, {}, {}, penetration_config,
     )
-    allowed_regression = max(
-        float(penetration_config.get("max_depth_regression", 0.01)), 0.0
-    )
-    max_depth = max(
-        target_depth,
-        float(before["max_depth"]) + allowed_regression,
-    )
-    if float(after["max_depth"]) <= max_depth:
-        return np.asarray(refined, dtype=float), after, 1.0
-
-    raw_blends = penetration_config.get(
-        "acceptance_blends", [0.75, 0.5, 0.25]
-    )
-    blends = sorted(
-        {
-            float(np.clip(value, 0.0, 1.0))
-            for value in raw_blends
-            if 0.0 < float(value) < 1.0
-        },
-        reverse=True,
-    )
-    baseline = np.asarray(baseline, dtype=float)
-    refined = np.asarray(refined, dtype=float)
-    candidates: list[tuple[float, np.ndarray, Mapping[str, Any]]] = [
-        (1.0, refined, after)
-    ]
-    for blend in blends:
-        candidate = baseline.copy()
-        candidate[:, 7:] += blend * (refined[:, 7:] - baseline[:, 7:])
-        stats = measure_scene_penetration(
-            model, candidate, scene_mesh, penetration_config
-        )
-        candidates.append((blend, candidate, stats))
-        if float(stats["max_depth"]) <= max_depth:
-            return candidate, stats, blend
-
-    candidates.append((0.0, baseline, before))
-    safe = [
-        candidate
-        for candidate in candidates
-        if float(candidate[2]["max_depth"]) <= max_depth
-    ]
-    if safe:
-        return max(safe, key=lambda candidate: candidate[0])
-    return min(candidates, key=lambda candidate: float(candidate[2]["max_depth"]))
+    if not stats:
+        stats = dict(before)
+    return result, stats, float(report['accepted_fraction'])
 
 
 def _partition_end_effector_markers(
@@ -359,6 +314,7 @@ class OmniRetargeter:
         visualize_trajectory: bool = True,
         enable_terrain_scaling: bool = False,
         end_effector_markers: Optional[Dict[str, Dict[str, np.ndarray]]] = None,
+        surface_tasks=None,
     ) -> Tuple[float, np.ndarray]:
         """
         Retarget SMPLX motion to the robot on the terrain.
@@ -384,6 +340,9 @@ class OmniRetargeter:
                 keep the original terrain mesh and use a scale factor of 1.0.
             end_effector_markers: Optional SMPL-X palm/sole centers and body
                 surface samples, as returned by ``load_smplx_trajectory``.
+            surface_tasks: Optional verified SurfaceTasks in metric world coordinates.
+                Adapters without real surfaces and corresponding reference poses
+                leave this disabled; joint markers do not fabricate bindings.
 
         Returns:
             Tuple of (terrain_scale, retargeted_trajectory)
@@ -556,6 +515,39 @@ class OmniRetargeter:
                 "end-effector markers were supplied; using whole-body retargeting."
             )
         self.last_end_effector_tasks = end_effector_tasks
+        local_cfg = local_repair_config(
+            retargeting_config.get("local_collision_repair", {}),
+            priority=end_effector_cfg,
+            joint_limit_safety_fraction=float(retargeting_config.get("joint_limit_safety_fraction", 1.0)),
+            self_collision_enabled=bool(retargeting_config.get("self_collision_enabled", False)),
+        )
+        self.scene_query = SceneQuery.from_tasks(
+            scaled_terrain, end_effector_tasks, full_geometry=local_cfg["full_geometry"]
+        )
+        effective_config = dict(retargeting_config, local_collision_repair=local_cfg)
+        effective_config["active_stages"] = dict(
+            robot_scale=1.0, scene_scale=float(terrain_scale),
+            framewise_scene_constraints=retargeting_config.get("penetration_resolver", "hard_constraint") == "hard_constraint",
+            self_collision=bool(retargeting_config.get("self_collision_enabled", False)),
+            trajectory_refinement=bool(retargeting_config.get("trajectory_refinement", {}).get("enabled", False) and end_effector_tasks),
+            smoothing=bool(retargeting_config.get("trajectory_smoothing", {}).get("enabled", False)),
+            local_collision_repair=bool(local_cfg["enabled"]),
+            local_bidirectional=bool(local_cfg["enabled"] and local_cfg["bidirectional_enabled"] and local_cfg["iterations"]),
+            surface_enhancement=bool(surface_tasks is not None),
+            foot_stabilization=(
+                not any("foot" in name and np.any(task.contact_mask) for name, task in end_effector_tasks.items())
+                and (bool(retargeting_config.get("foot_stabilization", {}).get("enabled", False))
+                     or retargeting_config.get("penetration_resolver") == "xyz_nudge")
+            ),
+            contact_effectors=sorted(name for name, task in end_effector_tasks.items() if np.any(task.contact_mask)),
+            tracking_effectors=sorted(end_effector_tasks),
+        )
+        effective_config["trajectory_refinement"] = dict(
+            retargeting_config.get("trajectory_refinement", {}) or {}
+        )
+        effective_config["trajectory_refinement"].setdefault("joint_limit_safety_fraction", local_cfg["joint_limit_safety_fraction"])
+        self.last_effective_config = effective_config
+        print("Effective retargeting configuration:\n" + diagnostics_json(effective_config))
 
         # Option Step:
         if visualize_trajectory:
@@ -612,6 +604,7 @@ class OmniRetargeter:
             retargeted_motion = self._perform_retargeting(
                 processed_trajectory, scaled_terrain, **retargeting_kwargs
             )
+        framewise_motion = np.asarray(retargeted_motion, dtype=float).copy()
         refinement_cfg = dict(
             retargeting_config.get("trajectory_refinement", {}) or {}
         )
@@ -619,21 +612,7 @@ class OmniRetargeter:
             "joint_limit_safety_fraction",
             float(retargeting_config.get("joint_limit_safety_fraction", 1.0)),
         )
-        penetration_acceptance = None
         if bool(refinement_cfg.get("enabled", False)) and end_effector_tasks:
-            penetration_cfg = dict(refinement_cfg.get("penetration", {}) or {})
-            penetration_enabled = bool(penetration_cfg.get("enabled", True))
-            before = (
-                measure_scene_penetration(
-                    self.robot_model,
-                    retargeted_motion,
-                    scaled_terrain,
-                    penetration_cfg,
-                )
-                if penetration_enabled
-                else None
-            )
-            framewise_motion = np.asarray(retargeted_motion, dtype=float).copy()
             source_root_idx = self._resolve_source_root_index()
             retargeted_motion = refine_joint_trajectory(
                 self.robot_model,
@@ -642,17 +621,12 @@ class OmniRetargeter:
                 end_effector_cfg,
                 refinement_cfg,
                 scene_mesh=scaled_terrain,
+                scene_query=self.scene_query,
                 framerate=float(framerate or 30.0),
                 source_root_positions=processed_trajectory[:, source_root_idx],
                 source_joint_positions=processed_trajectory,
                 source_joint_names=self.smplx_joint_names,
             )
-            if before is not None:
-                penetration_acceptance = (
-                    penetration_cfg,
-                    framewise_motion,
-                    before,
-                )
         retargeted_motion = self._apply_trajectory_smoothing(
             retargeted_motion,
             framerate=float(framerate or 30.0),
@@ -683,76 +657,89 @@ class OmniRetargeter:
             retargeted_motion
         )
 
-        if penetration_acceptance is not None:
-            penetration_cfg, framewise_motion, before = penetration_acceptance
-            candidate_after = measure_scene_penetration(
-                self.robot_model,
-                retargeted_motion,
-                scaled_terrain,
-                penetration_cfg,
-            )
-            retargeted_motion, after, accepted_blend = (
-                _select_penetration_safe_refinement(
-                    self.robot_model,
-                    framewise_motion,
-                    retargeted_motion,
-                    scaled_terrain,
-                    penetration_cfg,
-                    before,
-                    candidate_after,
-                )
-            )
-            target_max_depth = float(
-                penetration_cfg.get("target_max_depth", 0.10)
-            )
-            allowed_regression = float(
-                penetration_cfg.get("max_depth_regression", 0.01)
-            )
-            blend_depth_limit = max(
-                target_max_depth,
-                float(before["max_depth"]) + allowed_regression,
-            )
-            if accepted_blend < 1.0:
-                print(
-                    "Scene penetration acceptance: rejected the full final "
-                    "trajectory and kept "
-                    f"{accepted_blend * 100.0:.0f}% of its local joint "
-                    "correction because it caused an avoidable maximum-depth "
-                    "regression."
-                )
-            if float(after["max_depth"]) > blend_depth_limit:
-                print(
-                    "Scene penetration note: no tested local joint blend met "
-                    "the soft target without a larger regression; kept the "
-                    "lowest-penetration candidate rather than forcing a "
-                    "motion-distorting correction."
-                )
-            if bool(penetration_cfg.get("report", True)):
-                report_rows = [
-                    ("before", before),
-                    ("candidate final", candidate_after),
-                ]
-                if accepted_blend < 1.0:
-                    report_rows.append(("accepted final", after))
-                for label, stats in report_rows:
-                    print(
-                        f"Scene penetration {label}: "
-                        f"max={stats['max_depth'] * 100.0:.2f} cm, "
-                        f"mean={stats['mean_depth'] * 100.0:.2f} cm, "
-                        f"frames={stats['frames_penetrating']}/"
-                        f"{stats['num_frames']}"
-                        + (
-                            f", worst={stats['worst_body']}@"
-                            f"{stats['worst_frame']}"
-                            if stats["worst_body"]
-                            else ""
-                        )
-                    )
+        # All legacy mutation stages run before the joint guard and local repair.
+        # The baseline also observes final mechanical/task bounds; any clamp is
+        # measured again below, never treated as a contact-preserving operation.
+        framewise_motion = self._clamp_final_joint_safety_limits(framewise_motion)
+        validation_tasks, validation_priority, fallback_feet = self._validation_foot_references(
+            framewise_motion, end_effector_tasks, end_effector_cfg,
+        )
+        effective_config["validation_only_robot_foot_references"] = fallback_feet
+        effective_config["validation_end_effector_priority"] = validation_priority
+        if fallback_feet:
+            print("Preserving existing robot foot world markers without inventing a contact plan: "
+                  + ", ".join(fallback_feet))
+        # Geometry/model/evidence remain fixed across these two stages. Reuse
+        # exact-pose collision results; each stage still checks its own contacts.
+        geometry_cache = {}
+        retargeted_motion, _, postprocess_report = select_safe_postprocessing(
+            self.robot_model, framewise_motion, retargeted_motion, scaled_terrain,
+            validation_tasks, validation_priority, local_cfg,
+            framerate=float(framerate or 30.0), scene_query=self.scene_query,
+            geometry_cache=geometry_cache,
+        )
+        retargeted_motion, local_report = repair_local_collisions(
+            self.robot_model, retargeted_motion, scaled_terrain,
+            validation_tasks, validation_priority, local_cfg,
+            framerate=float(framerate or 30.0), scene_query=self.scene_query,
+            geometry_cache=geometry_cache,
+            **({"surface_tasks": surface_tasks} if surface_tasks is not None else {}),
+        )
+        self.last_collision_diagnostics = dict(
+            effective_config=effective_config, postprocessing=postprocess_report,
+            local_repair=local_report,
+            accepted_qpos_sha256=trajectory_digest(retargeted_motion),
+            execution_order=["framewise", "trajectory_refinement", "optional_smoothing",
+                             "foot_stabilization", "joint_clamp", "joint_acceptance",
+                             "local_collision_repair", "final_verification", "save"],
+        )
+        print("Local collision repair: " + diagnostics_json({
+            "status": local_report["status"],
+            "events": [{k: e.get(k) for k in ("window", "method", "reason", "iterations")}
+                       for e in local_report["events"]],
+            "unresolved": local_report.get("unresolved"),
+            "unresolved_reasons": local_report.get("unresolved_reasons", [local_report.get("reason")]),
+            "seconds": local_report.get("seconds"),
+            "query_points": local_report.get("query_points"),
+        }))
 
         if end_effector_tasks:
             self._report_final_motion_quality(retargeted_motion, end_effector_tasks)
 
         return terrain_scale, retargeted_motion
+
+    def _validation_foot_references(self, trajectory, tasks, priority):
+        """Conservatively preserve feet when a legacy profile has no source tasks.
+
+        Reuse the existing foot-body and sole-marker resolvers. These references
+        describe the incoming *robot* motion and are only used for validation;
+        they are never exported as human anchors or assigned contact modes.
+        """
+        validated = dict(tasks)
+        specs = dict(priority.get("effectors", {}) or {})
+        fallback = []
+        if not getattr(self, "valid_joint_mapping", None):
+            return validated, dict(priority), fallback
+        body_ids = self._resolve_foot_body_ids(self._get_foot_stabilization_config())
+        data = mujoco.MjData(self.robot_model)
+        for side, body_id in body_ids.items():
+            name = f"{side}_foot"
+            if name in tasks or body_id < 0:
+                continue
+            marker = self._infer_foot_marker_offset(body_id)
+            if marker is None:
+                continue
+            offset = np.asarray(marker[0], dtype=float)
+            positions = []
+            for q in trajectory:
+                data.qpos[:] = q
+                mujoco.mj_forward(self.robot_model, data)
+                positions.append(data.xpos[body_id] + data.xmat[body_id].reshape(3, 3) @ offset)
+            validated.update(build_world_tracking_tasks({name: {"tracking_positions": np.asarray(positions)}}))
+            specs[name] = dict(robot_body=self.robot_model.body(body_id).name,
+                               tracking_offset=offset.tolist(), preserve_world_target=True)
+            fallback.append(name)
+        return validated, dict(priority, effectors=specs), fallback
 
     def _clamp_final_joint_safety_limits(
         self, trajectory: np.ndarray
@@ -895,8 +882,8 @@ class OmniRetargeter:
         End-effector world-position errors, contact residuals, and temporal
         jitter are reported separately and after every post-processing stage,
         so the numbers describe the motion actually written to disk (scene
-        penetration is reported by the refinement stage against the same
-        trajectory unless smoothing is enabled afterwards).
+        penetration is reported by the final validator against this exact
+        trajectory).
         """
         end_effector_cfg = dict(
             self.retargeting_config.get("end_effector_priority", {}) or {}
@@ -905,6 +892,7 @@ class OmniRetargeter:
         if not tasks or not specs or len(trajectory) == 0:
             return
         data = mujoco.MjData(self.robot_model)
+        choices = getattr(self, "last_collision_diagnostics", {}).get("local_repair", {}).get("contact_offset_choice", {})
         sticking_errors: Dict[str, List[float]] = {name: [] for name in tasks}
         sliding_normal_errors: Dict[str, List[float]] = {
             name: [] for name in tasks
@@ -943,10 +931,10 @@ class OmniRetargeter:
                     candidates = (
                         data.xpos[body_id][None, :] + contact_offsets @ rotation.T
                     )
-                    residuals = (
-                        candidates
-                        - task.contact_positions[frame_idx][None, :]
-                    )
+                    if name in choices:
+                        chosen = int(choices[name][frame_idx])
+                        candidates = candidates[chosen:chosen+1]
+                    residuals = candidates - task.frame(frame_idx)["contact_position"][None, :]
                     contact_mode = (
                         str(task.contact_modes[frame_idx])
                         if task.contact_modes is not None
@@ -954,7 +942,7 @@ class OmniRetargeter:
                     )
                     if _is_surface_only_contact_mode(contact_mode):
                         normal = np.asarray(
-                            task.surface_normals[frame_idx], dtype=float
+                            task.surface_normals[frame_idx].copy(), dtype=float
                         )
                         normal /= max(float(np.linalg.norm(normal)), 1e-10)
                         signed_normal_errors = residuals @ normal
@@ -1206,6 +1194,7 @@ class OmniRetargeter:
             hard_penetration_constraint=self.retargeting_config.get("penetration_resolver", "hard_constraint") == "hard_constraint",
             **retargeter_kwargs,
         )
+        retargeter.scene_query = getattr(self, "scene_query", None)
         if source_joint_orientations is not None:
             reference_orientations = source_reference_joint_orientations
             reference_positions = source_reference_joint_positions
@@ -1236,10 +1225,15 @@ class OmniRetargeter:
                 reference_positions,
                 reference_base_orientation=reference_base_orientation,
                 reference_label=reference_label,
+                preserve_core_reference=(
+                    source_reference_joint_orientations is not None
+                    and source_reference_joint_positions is not None
+                ),
             )
 
         # Retarget each frame
         retargeted_trajectory = []
+        previous_effector_directions = {}
         self._last_estimated_quat = None
         
         # Start from the model's nominal configuration.  Joint-range midpoints
@@ -1295,21 +1289,6 @@ class OmniRetargeter:
                     q_opt = np.asarray(
                         reference_trajectory[frame_idx], dtype=float
                     ).copy()
-                    if retargeted_trajectory:
-                        q_opt = retargeter._project_actuated_temporal_step(
-                            q_opt,
-                            retargeted_trajectory[-1],
-                            (
-                                retargeted_trajectory[-2]
-                                if len(retargeted_trajectory) > 1
-                                else None
-                            ),
-                            (
-                                retargeted_trajectory[-3]
-                                if len(retargeted_trajectory) > 2
-                                else None
-                            ),
-                        )
                     if (
                         base_position_enabled
                         and use_initial_base_offset
@@ -1335,6 +1314,18 @@ class OmniRetargeter:
                 else:
                     # Use the configured root position as initial guess
                     q_init[:3] = human_joints[root_position_idx]
+
+                if (
+                    base_position_enabled
+                    and lock_initial_base_xy
+                    and bool(base_position_cfg.get("track_xy", True))
+                ):
+                    # A model translation is not necessarily its anatomical
+                    # root position (SMPL-X includes a shaped joint offset).
+                    # Start inside the requested registration constraint;
+                    # otherwise the first trust region can be infeasible and
+                    # its failed pose becomes a spurious permanent offset.
+                    q_init[:2] = human_joints[root_position_idx, :2]
 
                 # Initialize base orientation
                 if base_orientations is not None:
@@ -1365,11 +1356,55 @@ class OmniRetargeter:
                     quat_xyzw = self._estimate_base_orientation_from_joints(human_joints)
                     if quat_xyzw is not None:
                         q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
-            # For subsequent frames, q_init already contains the previous optimized configuration
+            if (
+                frame_idx > 0
+                and reference_trajectory is None
+                and self.retargeting_config.get("end_effector_priority", {}).get(
+                    "source_root_prediction", False
+                )
+            ):
+                predict_source_root = bool(
+                    self.retargeting_config.get("end_effector_priority", {}).get(
+                        "source_root_prediction", False
+                    )
+                )
+                if predict_source_root:
+                    q_init[:3] += (
+                        human_joints[root_position_idx]
+                        - processed_trajectory[frame_idx - 1, root_position_idx]
+                    )
+                if (
+                    base_position_enabled
+                    and bool(base_position_cfg.get("track_xy", True))
+                    and bool(base_position_cfg.get("lock_xy", False))
+                ):
+                    q_init[:2] = human_joints[root_position_idx, :2]
+                    if source_to_robot_base_offset is not None:
+                        q_init[:2] += source_to_robot_base_offset[:2]
+                if predict_source_root and base_orientations is not None:
+                    # Predict the root's deliberate source rotation while
+                    # retaining the previous tracking error. The optimizer
+                    # still owns the result; this is not an orientation lock.
+                    # q_last remains the actual prior output for all temporal
+                    # and contact constraints.
+                    current_source = Rotation.from_quat(
+                        base_orientations[frame_idx], scalar_first=True
+                    )
+                    previous_source = Rotation.from_quat(
+                        base_orientations[frame_idx - 1], scalar_first=True
+                    )
+                    previous_robot = Rotation.from_quat(
+                        q_last[3:7], scalar_first=True
+                    )
+                    q_init[3:7] = (
+                        current_source * previous_source.inv() * previous_robot
+                    ).as_quat(scalar_first=True)
+
+            # A configured hard lock remains distinct from the predictor.
             if lock_root_orientation and base_orientations is not None:
                 source_root_quaternion = np.asarray(
                     base_orientations[frame_idx], dtype=float
-                ).reshape(4)
+                ).reshape(4).copy()
                 source_root_quaternion /= max(
                     float(np.linalg.norm(source_root_quaternion)), 1e-12
                 )
@@ -1461,7 +1496,7 @@ class OmniRetargeter:
             if base_orientations is not None:
                 target_quat_wxyz = np.asarray(
                     base_orientations[frame_idx], dtype=float
-                ).reshape(4)
+                ).reshape(4).copy()
                 target_quat_wxyz /= max(
                     float(np.linalg.norm(target_quat_wxyz)), 1e-12
                 )
@@ -1489,7 +1524,7 @@ class OmniRetargeter:
             if base_orientations is not None and frame_idx > 0:
                 previous_target_quaternion = np.asarray(
                     base_orientations[frame_idx - 1], dtype=float
-                ).reshape(4)
+                ).reshape(4).copy()
                 previous_target_quaternion /= max(
                     float(np.linalg.norm(previous_target_quaternion)), 1e-12
                 )
@@ -1516,7 +1551,18 @@ class OmniRetargeter:
                     frame_kwargs["target_base_position"] = target_base_position
                 frame_kwargs["end_effector_targets"] = {}
                 for name, task in end_effector_tasks.items():
-                    target_payload = task.frame(frame_idx)
+                    target_payload = dict(task.frame(frame_idx))
+                    directions = {}
+                    for axis in ("forward_direction", "up_direction"):
+                        value = target_payload.get(axis)
+                        if value is not None:
+                            directions[axis] = np.asarray(value, dtype=float).copy()
+                        previous = previous_effector_directions.get(name, {}).get(axis)
+                        if previous is not None:
+                            target_payload["previous_" + axis] = previous.copy()
+                    # Capture the chronological source plan before solving. Do
+                    # not rerun contact inference or read a robot-derived pose.
+                    previous_effector_directions[name] = directions
                     target_payload["source_root_position"] = human_joints[
                         root_position_idx
                     ]
@@ -1569,12 +1615,6 @@ class OmniRetargeter:
                 )
                 q_opt[3:7] /= max(
                     float(np.linalg.norm(q_opt[3:7])), 1e-12
-                )
-                q_opt = retargeter._project_actuated_temporal_step(
-                    q_opt,
-                    frame_kwargs.get("q_last"),
-                    frame_kwargs.get("q_prev"),
-                    frame_kwargs.get("q_prevprev"),
                 )
             if lock_root_orientation and base_orientations is not None:
                 q_opt[3:7] = q_init[3:7]
@@ -2104,7 +2144,6 @@ class OmniRetargeter:
             effectors[name] = spec
 
         priority["effectors"] = effectors
-        self._infer_core_posture_constraints(priority)
         retargeting["end_effector_priority"] = priority
         self.retargeting_config = retargeting
 
@@ -2252,47 +2291,6 @@ class OmniRetargeter:
             },
         }
 
-    def _infer_core_posture_constraints(self, priority: Dict[str, Any]) -> None:
-        """Keep weakly observed axial core joints near their URDF neutral pose."""
-        posture_limits = dict(priority.get("joint_posture_limits", {}) or {})
-        regularization = dict(
-            priority.get("joint_regularization_weights", {}) or {}
-        )
-        for joint_id in range(self.robot_model.njnt):
-            joint_name = mujoco.mj_id2name(
-                self.robot_model, mujoco.mjtObj.mjOBJ_JOINT, joint_id
-            )
-            if not joint_name:
-                continue
-            name_lower = joint_name.lower()
-            if "yaw" not in name_lower or not (
-                "waist" in name_lower or "torso" in name_lower
-            ):
-                continue
-            if not bool(self.robot_model.jnt_limited[joint_id]):
-                continue
-            lower, upper = np.asarray(
-                self.robot_model.jnt_range[joint_id], dtype=float
-            )
-            qpos_index = int(self.robot_model.jnt_qposadr[joint_id])
-            neutral = float(self.robot_model.qpos0[qpos_index])
-            # Use the central 30% of the mechanical range. For G1's ±150°
-            # waist this recovers the previous neutral ±45° safeguard.
-            half_width = 0.15 * float(upper - lower)
-            posture_limits.setdefault(
-                str(joint_name),
-                [
-                    max(float(lower), neutral - half_width),
-                    min(float(upper), neutral + half_width),
-                ],
-            )
-            regularization.setdefault(str(joint_name), 5.0)
-
-        if posture_limits:
-            priority["joint_posture_limits"] = posture_limits
-        if regularization:
-            priority["joint_regularization_weights"] = regularization
-
     def _infer_foot_marker_offset(
         self, body_id: int
     ) -> Tuple[List[float], List[List[float]]] | None:
@@ -2342,67 +2340,7 @@ class OmniRetargeter:
 
     def _sample_geom_points_in_body_frame(self, geom_id: int) -> np.ndarray:
         """Sample support candidate points for one geom in the owning body frame."""
-        geom_type = int(self.robot_model.geom_type[geom_id])
-        size = np.asarray(self.robot_model.geom_size[geom_id], dtype=float)
-
-        if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
-            mesh_id = int(self.robot_model.geom_dataid[geom_id])
-            if mesh_id < 0:
-                points_local = np.zeros((1, 3), dtype=float)
-            else:
-                vert_start = int(self.robot_model.mesh_vertadr[mesh_id])
-                vert_count = int(self.robot_model.mesh_vertnum[mesh_id])
-                points_local = np.asarray(
-                    self.robot_model.mesh_vert[vert_start : vert_start + vert_count],
-                    dtype=float,
-                )
-        elif geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
-            radius = size[0]
-            points_local = np.array([
-                [0.0, 0.0, -radius],
-                [0.0, 0.0, radius],
-                [radius, 0.0, 0.0],
-                [-radius, 0.0, 0.0],
-                [0.0, radius, 0.0],
-                [0.0, -radius, 0.0],
-            ])
-        elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
-            hx, hy, hz = size
-            corners = []
-            for sx in (-hx, hx):
-                for sy in (-hy, hy):
-                    for sz in (-hz, hz):
-                        corners.append([sx, sy, sz])
-            corners.extend([[0.0, 0.0, -hz], [0.0, 0.0, hz]])
-            points_local = np.asarray(corners, dtype=float)
-        elif geom_type in (mujoco.mjtGeom.mjGEOM_CYLINDER, mujoco.mjtGeom.mjGEOM_CAPSULE):
-            radius = size[0]
-            half_length = size[1]
-            theta = np.linspace(0.0, 2.0 * np.pi, 12, endpoint=False)
-            rings = []
-            for z in (-half_length, 0.0, half_length):
-                ring = np.column_stack([
-                    radius * np.cos(theta),
-                    radius * np.sin(theta),
-                    np.full_like(theta, z),
-                ])
-                rings.append(ring)
-            endpoints = np.array([[0.0, 0.0, -half_length], [0.0, 0.0, half_length]], dtype=float)
-            if geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
-                endpoints = np.vstack([endpoints, [[0.0, 0.0, -half_length - radius], [0.0, 0.0, half_length + radius]]])
-            points_local = np.vstack(rings + [endpoints])
-        elif geom_type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
-            rx, ry, rz = size
-            points_local = np.array([
-                [0.0, 0.0, -rz],
-                [0.0, 0.0, rz],
-                [rx, 0.0, 0.0],
-                [-rx, 0.0, 0.0],
-                [0.0, ry, 0.0],
-                [0.0, -ry, 0.0],
-            ])
-        else:
-            points_local = np.zeros((1, 3), dtype=float)
+        points_local = geom_surface_offsets(self.robot_model, geom_id)
 
         geom_pos = np.asarray(self.robot_model.geom_pos[geom_id], dtype=float)
         geom_quat = np.asarray(self.robot_model.geom_quat[geom_id], dtype=float)

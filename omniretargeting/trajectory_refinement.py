@@ -26,6 +26,9 @@ from scipy import sparse
 from scipy.optimize import lsq_linear
 from scipy.spatial.transform import Rotation
 
+from .scene_geometry import (SceneQuery, ScenePenetrationProbe, collision_geom_ids,
+                             geom_surface_offsets, measure_scene_penetration)
+
 from .contact import (
     SceneContactTask,
     _is_surface_only_contact_mode,
@@ -55,8 +58,6 @@ def _scalar_joint_coordinates(
         ):
             continue
         qpos_index = int(model.jnt_qposadr[joint_id])
-        if qpos_index < 7:
-            continue
         qpos_indices.append(qpos_index)
         dof_indices.append(int(model.jnt_dofadr[joint_id]))
         if model.jnt_limited[joint_id]:
@@ -363,18 +364,6 @@ def _difference_operator(num_frames: int, order: int) -> sparse.csr_matrix:
     )
 
 
-_AXIS_DIRECTIONS = np.array(
-    [
-        [1.0, 0.0, 0.0],
-        [-1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.0, -1.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [0.0, 0.0, -1.0],
-    ]
-)
-
-
 def _penetration_depth_weight(
     clearance: float,
     config: Mapping[str, Any],
@@ -390,365 +379,6 @@ def _penetration_depth_weight(
     priority_start = max(float(config.get("depth_priority_start", 0.05)), 1e-8)
     max_weight = max(float(config.get("max_depth_weight", 9.0)), 1.0)
     return min(max_weight, max(1.0, (depth / priority_start) ** 2))
-
-
-def geom_surface_offsets(model: mujoco.MjModel, geom_id: int) -> np.ndarray:
-    """Return local-frame surface samples for one collision geom.
-
-    MuJoCo capsules and cylinders are aligned with the geom's local **z** axis,
-    so the barrel rings and end caps are placed along z.  The offsets only
-    depend on the geom's size, so they are computed once and reused for every
-    frame instead of being rebuilt per query.
-    """
-    geom_type = int(model.geom_type[geom_id])
-    size = np.asarray(model.geom_size[geom_id], dtype=float)
-
-    if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
-        return _AXIS_DIRECTIONS * float(size[0])
-    if geom_type in (
-        mujoco.mjtGeom.mjGEOM_BOX,
-        mujoco.mjtGeom.mjGEOM_ELLIPSOID,
-    ):
-        return _AXIS_DIRECTIONS * size[:3]
-    if geom_type in (
-        mujoco.mjtGeom.mjGEOM_CAPSULE,
-        mujoco.mjtGeom.mjGEOM_CYLINDER,
-    ):
-        radius = float(size[0])
-        half_length = float(size[1])
-        angles = np.arange(4) * (np.pi / 2.0)
-        ring = np.column_stack(
-            [radius * np.cos(angles), radius * np.sin(angles), np.zeros(4)]
-        )
-        cap = (
-            half_length + radius
-            if geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE
-            else half_length
-        )
-        return np.vstack(
-            [
-                ring + [0.0, 0.0, -half_length],
-                ring,
-                ring + [0.0, 0.0, half_length],
-                [[0.0, 0.0, -cap], [0.0, 0.0, cap]],
-            ]
-        )
-    if geom_type == mujoco.mjtGeom.mjGEOM_MESH:
-        mesh_id = int(model.geom_dataid[geom_id])
-        if mesh_id >= 0:
-            start = int(model.mesh_vertadr[mesh_id])
-            count = int(model.mesh_vertnum[mesh_id])
-            vertices = np.asarray(
-                model.mesh_vert[start : start + count], dtype=float
-            )
-            if len(vertices) > 64:
-                # A dense collision mesh does not need every vertex to detect
-                # scene penetration.  A deterministic stride bounds the query
-                # count without biasing the samples toward one region.
-                vertices = vertices[:: int(np.ceil(len(vertices) / 64.0))]
-            return vertices
-    if geom_type == mujoco.mjtGeom.mjGEOM_PLANE:
-        return np.zeros((0, 3), dtype=float)
-    return np.zeros((1, 3), dtype=float)
-
-
-def collision_geom_ids(
-    model: mujoco.MjModel,
-    geom_groups: Any = None,
-    body_tokens: Any = None,
-) -> np.ndarray:
-    """Return the geoms that should be tested against the scene mesh.
-
-    The default is every geom MuJoCo itself would collide, which for a humanoid
-    URDF is the primitive collision shell rather than the visual meshes.
-    ``geom_groups`` and ``body_tokens`` narrow the set further.
-    """
-    groups = None if geom_groups is None else {int(g) for g in geom_groups}
-    tokens = (
-        None
-        if body_tokens is None
-        else tuple(str(token).lower() for token in body_tokens)
-    )
-    selected: list[int] = []
-    for geom_id in range(model.ngeom):
-        if groups is None:
-            if (
-                int(model.geom_contype[geom_id]) == 0
-                and int(model.geom_conaffinity[geom_id]) == 0
-            ):
-                continue
-        elif int(model.geom_group[geom_id]) not in groups:
-            continue
-        if tokens is not None:
-            body_id = int(model.geom_bodyid[geom_id])
-            body_name = (
-                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_id) or ""
-            )
-            if not any(token in body_name.lower() for token in tokens):
-                continue
-        selected.append(geom_id)
-    return np.asarray(selected, dtype=int)
-
-
-class ScenePenetrationProbe:
-    """Signed scene clearance for the robot's collision geoms.
-
-    Reconstructed scene meshes are rarely watertight, so ``signed_distance``
-    cannot be trusted.  TSDF scans do have consistent winding, which makes the
-    closest triangle's normal a usable side test once its global orientation is
-    fixed.  That global sign is resolved from the trajectory itself: almost
-    every robot geom is far from the scene and unambiguously on the free side,
-    so the median offset direction reveals which way the normals point.
-
-    Queries are batched over the whole trajectory.  A cheap bounding-sphere
-    pass on geom centres removes the geoms that cannot reach the scene before
-    the expensive surface query runs, and ``geom_rbound`` bounds every sample
-    point, so that prefilter can never discard a penetrating geom.
-    """
-
-    def __init__(
-        self,
-        model: mujoco.MjModel,
-        scene_mesh: trimesh.Trimesh,
-        geom_ids: np.ndarray,
-        margin: float,
-    ) -> None:
-        self.model = model
-        self.scene_mesh = scene_mesh
-        self.geom_ids = np.asarray(geom_ids, dtype=int)
-        self.margin = float(margin)
-        self.body_ids = np.asarray(
-            [int(model.geom_bodyid[gid]) for gid in self.geom_ids], dtype=int
-        )
-        self.offsets = [geom_surface_offsets(model, gid) for gid in self.geom_ids]
-        self.bounding_radii = np.asarray(
-            [float(model.geom_rbound[gid]) for gid in self.geom_ids], dtype=float
-        )
-        self.orientation_sign = 0.0
-
-    def _closest(self, points: np.ndarray):
-        if len(points) == 0:
-            return (
-                np.zeros((0, 3), dtype=float),
-                np.zeros(0, dtype=float),
-                np.zeros(0, dtype=int),
-            )
-        try:
-            closest, distances, triangle_ids = trimesh.proximity.closest_point(
-                self.scene_mesh, points
-            )
-        except (ImportError, ModuleNotFoundError):
-            closest, distances, triangle_ids = (
-                trimesh.proximity.closest_point_naive(self.scene_mesh, points)
-            )
-        return (
-            np.asarray(closest, dtype=float),
-            np.asarray(distances, dtype=float),
-            np.asarray(triangle_ids, dtype=int),
-        )
-
-    def _resolve_orientation(self, centers: np.ndarray) -> None:
-        """Fix the global normal orientation from far-field geom centres."""
-        if self.orientation_sign != 0.0:
-            return
-        closest, distances, triangle_ids = self._closest(centers)
-        valid = (
-            (distances > 1e-6)
-            & (triangle_ids >= 0)
-            & (triangle_ids < len(self.scene_mesh.face_normals))
-        )
-        if not np.any(valid):
-            self.orientation_sign = 1.0
-            return
-        normals = np.asarray(self.scene_mesh.face_normals, dtype=float)[
-            triangle_ids[valid]
-        ]
-        offsets = centers[valid] - closest[valid]
-        offsets = offsets / np.linalg.norm(offsets, axis=1, keepdims=True)
-        median_cosine = float(np.median(np.sum(offsets * normals, axis=1)))
-        self.orientation_sign = -1.0 if median_cosine < 0.0 else 1.0
-
-    def _clearance(
-        self, points: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Return signed clearance and the direction that increases it.
-
-        The direction is the gradient of the signed clearance with respect to
-        the sample point, so a Gauss--Newton step along it moves the point away
-        from the scene no matter which side of the surface it currently is on.
-        """
-        closest, distances, triangle_ids = self._closest(points)
-        if len(points) == 0:
-            return np.zeros(0, dtype=float), np.zeros((0, 3), dtype=float)
-
-        offsets = points - closest
-        norms = np.linalg.norm(offsets, axis=1)
-
-        normals = np.zeros_like(offsets)
-        valid = (triangle_ids >= 0) & (
-            triangle_ids < len(self.scene_mesh.face_normals)
-        )
-        normals[valid] = np.asarray(self.scene_mesh.face_normals, dtype=float)[
-            triangle_ids[valid]
-        ]
-        normals = normals * (self.orientation_sign or 1.0)
-
-        side = np.where(np.sum(offsets * normals, axis=1) >= 0.0, 1.0, -1.0)
-        signed = side * distances
-
-        # Away from the surface the unsigned-distance gradient is the accurate
-        # push direction; exactly on the surface that gradient is undefined and
-        # the triangle normal is the only usable direction.
-        directions = np.where(
-            norms[:, None] > 1e-9,
-            offsets / np.maximum(norms, 1e-9)[:, None] * side[:, None],
-            normals,
-        )
-        direction_norms = np.linalg.norm(directions, axis=1, keepdims=True)
-        return signed, np.where(
-            direction_norms > 1e-9,
-            directions / np.maximum(direction_norms, 1e-9),
-            np.array([0.0, 0.0, 1.0]),
-        )
-
-    def probe_trajectory(
-        self, trajectory: np.ndarray
-    ) -> list[dict[str, np.ndarray]]:
-        """Return per-frame sample points near the scene with their clearance."""
-        trajectory = np.asarray(trajectory, dtype=float)
-        num_frames = len(trajectory)
-        empty = {
-            "points": np.zeros((0, 3), dtype=float),
-            "body_ids": np.zeros(0, dtype=int),
-            "directions": np.zeros((0, 3), dtype=float),
-            "clearance": np.zeros(0, dtype=float),
-        }
-        if num_frames == 0 or len(self.geom_ids) == 0:
-            return [dict(empty) for _ in range(num_frames)]
-
-        data = mujoco.MjData(self.model)
-        centers = np.zeros((num_frames, len(self.geom_ids), 3), dtype=float)
-        for frame_idx, qpos in enumerate(trajectory):
-            data.qpos[:] = qpos
-            mujoco.mj_forward(self.model, data)
-            centers[frame_idx] = data.geom_xpos[self.geom_ids]
-
-        flat_centers = centers.reshape(-1, 3)
-        self._resolve_orientation(flat_centers)
-        _, center_distances, _ = self._closest(flat_centers)
-        near = center_distances.reshape(num_frames, -1) <= (
-            self.bounding_radii + self.margin
-        )[None, :]
-
-        frame_points: list[np.ndarray] = []
-        frame_owners: list[np.ndarray] = []
-        counts = np.zeros(num_frames, dtype=int)
-        for frame_idx, qpos in enumerate(trajectory):
-            data.qpos[:] = qpos
-            mujoco.mj_forward(self.model, data)
-            points: list[np.ndarray] = []
-            owners: list[np.ndarray] = []
-            for local_index in np.flatnonzero(near[frame_idx]):
-                offsets = self.offsets[local_index]
-                if len(offsets) == 0:
-                    continue
-                geom_id = int(self.geom_ids[local_index])
-                rotation = data.geom_xmat[geom_id].reshape(3, 3)
-                points.append(
-                    data.geom_xpos[geom_id][None, :] + offsets @ rotation.T
-                )
-                owners.append(np.full(len(offsets), local_index, dtype=int))
-            if points:
-                frame_points.append(np.concatenate(points, axis=0))
-                frame_owners.append(np.concatenate(owners))
-            else:
-                frame_points.append(np.zeros((0, 3), dtype=float))
-                frame_owners.append(np.zeros(0, dtype=int))
-            counts[frame_idx] = len(frame_points[-1])
-
-        all_points = np.concatenate(frame_points, axis=0)
-        all_owners = np.concatenate(frame_owners)
-        signed, directions = self._clearance(all_points)
-
-        boundaries = np.cumsum(counts)[:-1]
-        return [
-            {
-                "points": chunk_points,
-                "body_ids": self.body_ids[chunk_owners],
-                "directions": chunk_directions,
-                "clearance": chunk_signed,
-            }
-            for chunk_points, chunk_owners, chunk_directions, chunk_signed in zip(
-                np.split(all_points, boundaries),
-                np.split(all_owners, boundaries),
-                np.split(directions, boundaries),
-                np.split(signed, boundaries),
-            )
-        ]
-
-
-def measure_scene_penetration(
-    model: mujoco.MjModel,
-    trajectory: np.ndarray,
-    scene_mesh: trimesh.Trimesh,
-    config: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Report how deep the robot's collision geoms enter the scene mesh.
-
-    Depths are positive when a sample point is inside the scene.  This is the
-    independent check for the refinement stage: acceleration and jerk are part
-    of the objective and are expected to improve, whereas penetration is only
-    ever penalized and therefore has to be verified after the fact.
-    """
-    cfg = dict(config or {})
-    trajectory = np.asarray(trajectory, dtype=float)
-    geom_ids = collision_geom_ids(
-        model, cfg.get("geom_groups"), cfg.get("body_tokens")
-    )
-    summary: dict[str, Any] = {
-        "max_depth": 0.0,
-        "mean_depth": 0.0,
-        "frames_penetrating": 0,
-        "num_frames": int(len(trajectory)),
-        "worst_frame": -1,
-        "worst_body": "",
-        "per_frame_depth": np.zeros(len(trajectory), dtype=float),
-    }
-    if len(geom_ids) == 0 or len(trajectory) == 0:
-        return summary
-
-    probe = ScenePenetrationProbe(
-        model, scene_mesh, geom_ids, float(cfg.get("margin", 0.05))
-    )
-    per_frame_depth = np.zeros(len(trajectory), dtype=float)
-    worst_body_id = -1
-    worst_depth = 0.0
-    for frame_idx, frame in enumerate(probe.probe_trajectory(trajectory)):
-        if len(frame["clearance"]) == 0:
-            continue
-        depths = np.maximum(-frame["clearance"], 0.0)
-        worst = int(np.argmax(depths))
-        per_frame_depth[frame_idx] = float(depths[worst])
-        if per_frame_depth[frame_idx] > worst_depth:
-            worst_depth = per_frame_depth[frame_idx]
-            worst_body_id = int(frame["body_ids"][worst])
-
-    penetrating = per_frame_depth > 1e-6
-    summary.update(
-        max_depth=float(np.max(per_frame_depth)),
-        mean_depth=float(np.mean(per_frame_depth[penetrating]))
-        if np.any(penetrating)
-        else 0.0,
-        frames_penetrating=int(np.count_nonzero(penetrating)),
-        worst_frame=int(np.argmax(per_frame_depth)),
-        worst_body=(
-            mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, worst_body_id) or ""
-        )
-        if worst_body_id >= 0
-        else "",
-        per_frame_depth=per_frame_depth,
-    )
-    return summary
 
 
 def _lock_contact_offsets(
@@ -807,6 +437,7 @@ def refine_joint_trajectory(
     source_root_positions: np.ndarray | None = None,
     source_joint_positions: np.ndarray | None = None,
     source_joint_names: list[str] | tuple[str, ...] | None = None,
+    scene_query: SceneQuery | None = None,
 ) -> np.ndarray:
     """Jointly refine scalar joints over time with sparse Gauss--Newton.
 
@@ -1259,6 +890,7 @@ def refine_joint_trajectory(
                 scene_mesh,
                 geom_ids,
                 max(float(penetration_cfg.get("margin", 0.05)), 1e-6),
+                query=scene_query,
             )
 
     contact_offset_choice = _lock_contact_offsets(model, result, effectors)
@@ -1441,7 +1073,7 @@ def refine_joint_trajectory(
                     # normal placement without another profile knob.
                     surface_position_sigma = min(position_sigma, 0.006)
                     surface_normal = np.asarray(
-                        task.surface_normals[frame_idx], dtype=float
+                        task.surface_normals[frame_idx].copy(), dtype=float
                     )
                     surface_normal /= max(
                         float(np.linalg.norm(surface_normal)), 1e-10
@@ -1685,7 +1317,8 @@ def refine_joint_trajectory(
             # row, and the active set is rebuilt from the current pose at every
             # Gauss--Newton iteration.
             for index in np.flatnonzero(
-                frame_penetration["clearance"] < penetration_clearance
+                (frame_penetration["clearance"] < penetration_clearance)
+                & ~frame_penetration["uncertain"]
             ):
                 if any(
                     float(

@@ -1,4 +1,5 @@
 import argparse
+import mujoco
 import numpy as np
 import trimesh
 from pathlib import Path
@@ -597,6 +598,28 @@ def _select_landmark_torso_orientations(source_motion_data, mapping):
     return quaternions, source_body
 
 
+def _source_config_with_profile_torso(source_motion_data, source_config, base_orientation):
+    """Apply an anatomical frame declared by a robot profile when supported.
+
+    Explicit source choices win. Positions-only adapters keep their original
+    path when they cannot provide the authored rest landmarks for calibration.
+    """
+    result = dict(source_config)
+    profile_mapping = base_orientation.get("torso_mapping")
+    if (
+        not profile_mapping
+        or "torso_mapping" in result
+        or result.get("base_orientation_joint")
+    ):
+        return result
+    if source_motion_data.metadata.get("joint_rest_positions") is None:
+        print("Profile torso calibration unavailable: source has no rest landmarks; retaining its original orientation path.")
+        return result
+    result["torso_mapping"] = profile_mapping
+    result.setdefault("lock_root_orientation_to_source", False)
+    return result
+
+
 def select_source_base_orientations(source_motion_data, source_config):
     """Resolve the source body frame that should drive a floating robot base.
 
@@ -637,6 +660,39 @@ def select_source_base_orientations(source_motion_data, source_config):
             f"{expected_shape}, got {joint_orientations.shape}."
         )
     return joint_orientations[:, target_names.index(source_joint)], str(source_joint)
+
+
+def select_mapped_source_base_pose(source_motion_data, model, joint_mapping, *, position_source=None):
+    """Use the source body corresponding to the compiled floating robot body.
+
+    The adapter owns coordinate calibration. Raw source joint quaternions must
+    not be interpreted as robot base frames. Explicit caller policies are
+    resolved before this optional automatic path.
+    """
+    orientations = source_motion_data.metadata.get("body_aligned_joint_orientations")
+    if orientations is None:
+        return None
+    free = np.flatnonzero(model.jnt_type == mujoco.mjtJoint.mjJNT_FREE)
+    if len(free) != 1:
+        return None
+    body = model.body(int(model.jnt_bodyid[free[0]])).name
+    names = list(source_motion_data.target_names or [])
+    matches = [name for name, target in joint_mapping.items() if target == body and name in names]
+    if len(matches) != 1:
+        raise ValueError(f"Floating body '{body}' needs one unambiguous source mapping; got {matches}.")
+    values = np.asarray(orientations, dtype=float)
+    if values.shape != (*source_motion_data.positions.shape[:2], 4):
+        raise ValueError("body_aligned_joint_orientations must have shape (frames, joints, 4).")
+    index = names.index(matches[0])
+    selected = values[:, index].copy()
+    norms = np.linalg.norm(selected, axis=1)
+    if not np.isfinite(selected).all() or np.any(norms < 1e-12):
+        raise ValueError("Mapped base orientations must be finite nonzero quaternions.")
+    selected /= norms[:, None]
+    if position_source is not None and position_source not in names:
+        raise ValueError(f"Root position source '{position_source}' is not in the source joint layout.")
+    position_index = names.index(position_source) if position_source is not None else index
+    return selected, np.asarray(source_motion_data.positions[:, position_index]).copy(), matches[0]
 
 
 def main():
@@ -842,6 +898,9 @@ def main():
             source_reference_joint_positions = source_motion_data.metadata.get(
                 "joint_rest_positions"
             )
+            source_config = _source_config_with_profile_torso(
+                source_motion_data, source_config, base_orientation
+            )
             base_orientations, base_orientation_source_joint = (
                 select_source_base_orientations(
                     source_motion_data, source_config
@@ -866,7 +925,17 @@ def main():
                 end_effector_cfg["lock_root_orientation_to_source"] = (
                     lock_root_orientation
                 )
-                if torso_mapping is not None and not lock_root_orientation:
+                balanced_torso = (
+                    torso_mapping is not None
+                    and not lock_root_orientation
+                    and end_effector_cfg.get("free_motion_priority") == "balanced"
+                )
+                if balanced_torso:
+                    # The frame choice must not silently add stricter root
+                    # rate limits to balanced free motion. Preserve explicit
+                    # temporal settings, with trusted contacts still first.
+                    end_effector_cfg["hierarchy"] = True
+                if torso_mapping is not None and not lock_root_orientation and not balanced_torso:
                     # Active scene contacts stay lexicographically first. For
                     # free limbs, preserve the actor's calibrated whole-trunk
                     # frame before spending the remaining morphology freedom
@@ -1002,6 +1071,32 @@ def main():
             base_orientation=base_orientation,
             retargeting=retargeting,
         )
+        position_anchor = base_orientation.get("root_position")
+        if position_anchor:
+            retargeter.retargeting_config.setdefault("end_effector_priority", {})[
+                "_position_anchor_source_joint"
+            ] = position_anchor
+
+        if (
+            source_motion_data is not None
+            and not source_config.get("base_orientation_joint")
+            and _resolve_source_torso_mapping(source_motion_data, source_config) is None
+            and source_config.get("auto_mapped_base_pose", True)
+        ):
+            mapped_pose = select_mapped_source_base_pose(
+                source_motion_data, retargeter.robot_model, joint_mapping,
+                position_source=base_orientation.get("root_position"),
+            )
+            if mapped_pose is not None:
+                base_orientations, base_translations, mapped_body = mapped_pose
+                # This body already has the calibrated base task. A second
+                # orientation task calibrated through a different pose can
+                # conflict with it during a whole-body rotation.
+                retargeter.retargeting_config.setdefault("end_effector_priority", {})[
+                    "_base_orientation_source_joint"
+                ] = mapped_body
+                position_source = base_orientation.get("root_position", mapped_body)
+                print(f"Robot base orientation follows calibrated '{mapped_body}'; position anchor is '{position_source}' (no hard orientation lock).")
 
         # Perform retargeting
         print("Retargeting motion...")
@@ -1096,6 +1191,14 @@ def main():
             stack_contact_tasks(getattr(retargeter, "last_end_effector_tasks", {}))
         )
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        diagnostics = getattr(retargeter, "last_collision_diagnostics", None)
+        if diagnostics is not None:
+            from .local_collision_repair import diagnostics_json, trajectory_digest
+            if trajectory_digest(retargeted_motion) != diagnostics["accepted_qpos_sha256"]:
+                raise RuntimeError("Output qpos changed after final collision/contact validation")
+            diagnostic_path = Path(args.output).with_suffix(".diagnostics.json")
+            diagnostic_path.write_text(diagnostics_json(diagnostics), encoding="utf-8")
+            print(f"Saved collision/contact diagnostics to {diagnostic_path}")
         np.savez(
             args.output,
             **output_payload,

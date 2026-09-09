@@ -335,6 +335,47 @@ playback speed, looping, and overlay visibility. Keyboard shortcuts are
 `Space` (play/pause), `Left`/`Right` (one frame), `PageUp`/`PageDown` (jump),
 and `Home`/`End` (first/last frame).
 
+For smooth viewing of a saved motion over a remote connection, also export and
+serve a **browser-cached Viser playback**:
+
+```bash
+omniretargeting-mjviser /path/to/retargeted_motion.npz \
+  --robot-config robot_models/unitree_g1/unitree_g1_instinctmj.json \
+  --terrain /path/to/scene.obj --port 8130 \
+  --playback-dir out/cached_playback --playback-port 8131
+```
+
+Open port **8131** for cached playback. This reuses Viser's official `.viser`
+recording format and the frontend installed with the same Viser version. The
+browser downloads the recording with a progress indicator, then plays locally;
+camera orbit, pause, speed, and timeline controls remain interactive. This is
+download-before-play caching, not progressive playback or a WebRTC video stream.
+Each browser has its own playback clock. Port **8130** retains the live viewer's
+exact source-frame controls and overlay toggles; live clients share controls.
+
+The recording contains the original scene once, all source timestamps, and
+MuJoCo-interpolated display samples at `--refresh-hz` (60 by default). It does
+not filter or rewrite the motion. The last pose is held for one source frame
+before looping, without blending the end into the start. Preparing the complete
+cache uses memory proportional to clip length; use live mode for very long clips.
+Cached playback uses the stock Viser controls and loops by default; live-only
+`--paused`, `--speed`, `--start-frame`, and `--no-loop` do not configure that player.
+
+Live mode uses monotonic deadline scheduling, skips missed display refreshes,
+groups robot and source overlays in one Viser atomic update, and updates timeline
+text at 10 Hz. It stops rendering when no clients are connected. Singleton robot
+mesh instances use Viser's direct node pose
+updates instead of changing React-managed batch arrays; genuine batches retain
+mjviser's original path, and all geometry, LOD, and transforms are preserved. Shadows
+are off by default; `--shadows` restores them. `--playback-stats` logs server
+submission rate and processing cost, which are not browser render FPS. Viser
+coalesces pending updates, but live mode does not implement browser acknowledgments
+or a bound on data already queued in the network/browser.
+
+Use `--playback-dir out/cached_playback --export-only` to export and exit. The
+resulting directory can be served by an ordinary HTTP server; it includes the
+version-matched frontend and a manifest. No external CDN is needed.
+
 ## API Reference
 
 ### `OmniRetargeter`
@@ -402,6 +443,23 @@ declared priority up to the configured numerical tolerances. The generated
 `.npz` additionally stores `contact_names`, `contact_mask`,
 `contact_confidence`, `contact_targets_w`, and `end_effector_reference_w` for
 downstream robot policy training or evaluation.
+
+Fixed per-frame joint velocity, acceleration, and jerk caps have been removed
+so deliberate fast source motion can pass through. Neither the framewise
+optimization nor its output applies these caps; old configuration keys cannot
+re-enable them.
+Mechanical joint ranges, scene/contact constraints, and the per-iteration
+optimization trust region remain active. Source-relative base-motion bounds
+and soft smoothing are configured separately.
+
+The default joint range is the full mechanical range. Core joints no longer
+receive automatic extra range reductions or name-based neutral-pose penalties;
+explicit profile overrides remain supported. For sources with an authored bind
+pose, orientation calibration preserves the model's neutral core relationship
+and the declared base reference orientation. A positional fit across different
+body proportions therefore cannot bake an incidental waist twist into every
+frame's orientation target. First-frame fallback calibration keeps its existing
+semantics when the source has no authored bind pose.
 
 ## TODO / Limitations
 

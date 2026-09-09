@@ -150,10 +150,8 @@ def test_end_effector_offsets_are_inferred_from_robot_geometry():
     assert effectors["left_foot"]["tracking_offset"] == [0.04, 0.0, -0.035]
     assert effectors["left_foot"]["contact_offsets"] == [[0.04, 0.0, -0.035]]
     priority = retargeter.retargeting_config["end_effector_priority"]
-    assert priority["joint_posture_limits"]["waist_yaw_joint"] == pytest.approx(
-        [-0.6, 0.6]
-    )
-    assert priority["joint_regularization_weights"]["waist_yaw_joint"] == 5.0
+    assert "joint_posture_limits" not in priority
+    assert "joint_regularization_weights" not in priority
 
 
 def test_explicit_end_effector_offsets_override_geometry_inference():
@@ -706,6 +704,22 @@ def test_configured_joint_regularization_uses_exact_joint_name():
     np.testing.assert_allclose(weights, [0.5])
 
 
+def test_waist_uses_mechanical_range_without_implicit_neutral_bias():
+    mujoco = pytest.importorskip("mujoco")
+    model = mujoco.MjModel.from_xml_string(AUTO_END_EFFECTOR_GEOMETRY_XML)
+    solver = GenericInteractionRetargeter(
+        model, mujoco.MjData(model), trimesh.creation.box(),
+        {"source_root": "root", "source_core": "torso"}, 1.0,
+        terrain_sample_seed=0,
+    )
+    joint = model.joint("waist_yaw_joint")
+    coordinate = int(np.flatnonzero(solver.q_a_indices == model.jnt_qposadr[joint.id])[0])
+    np.testing.assert_allclose(
+        [solver.q_a_lb[coordinate], solver.q_a_ub[coordinate]], model.jnt_range[joint.id]
+    )
+    assert solver.Q_diag[coordinate] == pytest.approx(0.001)
+
+
 def test_joint_limit_safety_fraction_keeps_last_twenty_percent_unused():
     mujoco = pytest.importorskip("mujoco")
     model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
@@ -720,70 +734,6 @@ def test_joint_limit_safety_fraction_keeps_last_twenty_percent_unused():
 
     np.testing.assert_allclose(lower, [-0.48])
     np.testing.assert_allclose(upper, [0.48])
-
-
-def test_temporal_projection_cannot_push_joint_past_safe_limit():
-    mujoco = pytest.importorskip("mujoco")
-    model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
-    retargeter = GenericInteractionRetargeter.__new__(GenericInteractionRetargeter)
-    retargeter.robot_model = model
-    retargeter.end_effector_config = {
-        "temporal": {
-            "enabled": True,
-            "max_joint_step": 0.18,
-            "max_joint_acceleration_step": 0.08,
-        }
-    }
-    retargeter.q_a_indices = np.arange(model.nq)
-    retargeter.q_a_lb = np.full(model.nq, -1e6)
-    retargeter.q_a_ub = np.full(model.nq, 1e6)
-    ankle_qpos = int(model.jnt_qposadr[model.joint("ankle").id])
-    retargeter.q_a_lb[ankle_qpos] = -0.48
-    retargeter.q_a_ub[ankle_qpos] = 0.48
-    q_prev = np.asarray(model.qpos0, dtype=float).copy()
-    q_last = q_prev.copy()
-    candidate = q_prev.copy()
-    q_prev[ankle_qpos] = 0.37
-    q_last[ankle_qpos] = 0.45
-    candidate[ankle_qpos] = 0.60
-
-    projected = retargeter._project_actuated_temporal_step(
-        candidate, q_last, q_prev, None
-    )
-
-    assert projected[ankle_qpos] == pytest.approx(0.48)
-
-
-def test_temporal_projection_brakes_before_safe_joint_limit():
-    mujoco = pytest.importorskip("mujoco")
-    model = mujoco.MjModel.from_xml_string(ANKLE_ARM_XML)
-    retargeter = GenericInteractionRetargeter.__new__(GenericInteractionRetargeter)
-    retargeter.robot_model = model
-    retargeter.end_effector_config = {
-        "temporal": {
-            "enabled": True,
-            "max_joint_step": 0.18,
-            "max_joint_acceleration_step": 0.08,
-        }
-    }
-    retargeter.q_a_indices = np.arange(model.nq)
-    retargeter.q_a_lb = np.full(model.nq, -1e6)
-    retargeter.q_a_ub = np.full(model.nq, 1e6)
-    ankle_qpos = int(model.jnt_qposadr[model.joint("ankle").id])
-    retargeter.q_a_lb[ankle_qpos] = -0.48
-    retargeter.q_a_ub[ankle_qpos] = 0.48
-    q_prev = np.asarray(model.qpos0, dtype=float).copy()
-    q_last = q_prev.copy()
-    candidate = q_prev.copy()
-    q_prev[ankle_qpos] = 0.22
-    q_last[ankle_qpos] = 0.30
-    candidate[ankle_qpos] = 0.48
-
-    projected = retargeter._project_actuated_temporal_step(
-        candidate, q_last, q_prev, None
-    )
-
-    assert projected[ankle_qpos] <= 0.430001
 
 
 def test_transported_arm_segments_preserve_shape_and_aim_chord_at_hand():

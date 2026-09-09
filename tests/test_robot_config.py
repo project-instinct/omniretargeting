@@ -55,7 +55,7 @@ def test_contact_retargeting_defaults_merge_robot_overrides(tmp_path: Path):
                 "joint_mapping": {"Pelvis": "pelvis"},
                 "retargeting": {
                     "end_effector_priority": {
-                        "temporal": {"max_joint_step": 0.1},
+                        "temporal": {"max_base_step": 0.1},
                         "effectors": {
                             "left_hand": {"robot_body": "test_left_hand"}
                         },
@@ -69,7 +69,12 @@ def test_contact_retargeting_defaults_merge_robot_overrides(tmp_path: Path):
     retargeting = loaded["retargeting"]
 
     assert retargeting["end_effector_priority"]["temporal"]["enabled"] is True
-    assert retargeting["end_effector_priority"]["temporal"]["max_joint_step"] == 0.1
+    temporal = retargeting["end_effector_priority"]["temporal"]
+    assert temporal["max_base_step"] == 0.1
+    assert "hard_joint_motion_limits_enabled" not in temporal
+    assert "max_joint_step" not in temporal
+    assert "max_joint_acceleration_step" not in temporal
+    assert "max_joint_jerk_step" not in temporal
     assert (
         retargeting["end_effector_priority"]["effectors"]["left_hand"][
             "robot_body"
@@ -108,7 +113,7 @@ def test_compact_instinctmj_profile_expands_algorithm_defaults():
     priority = loaded["retargeting"]["end_effector_priority"]
 
     assert "retargeting_preset" not in loaded
-    assert loaded["retargeting"]["joint_limit_safety_fraction"] == 0.8
+    assert loaded["retargeting"]["joint_limit_safety_fraction"] == 1.0
     assert priority["contact_detection"]["transition_frames"] == 4
     assert priority["effectors"]["left_hand"]["robot_body"] == "left_rubber_hand"
     assert priority["effectors"]["left_hand"]["preserve_world_target"] is False
@@ -127,7 +132,9 @@ def test_compact_instinctmj_profile_expands_algorithm_defaults():
         "penetration"
     ]
     assert penetration["target_max_depth"] == pytest.approx(0.10)
-    assert penetration["max_depth_regression"] == pytest.approx(0.01)
+    assert "max_depth_regression" not in penetration
+    assert "acceptance_blends" not in penetration
+    assert loaded["retargeting"]["local_collision_repair"]["enabled"] is True
     assert penetration["sigma"] == pytest.approx(0.008)
     assert penetration["depth_priority_start"] == pytest.approx(0.05)
     assert penetration["max_depth_weight"] == pytest.approx(9.0)

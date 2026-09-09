@@ -55,9 +55,14 @@ class SmplxDataSource(DataSource):
     betas: list[float] | None = None
     use_smplx_base_pose: bool = True
     metadata: dict = field(default_factory=dict)
+    # Some exporters retain pre-resampling frame IDs only as provenance. Those
+    # IDs must not introduce frames into the already published output cadence.
+    frame_id_semantics: str = "timeline"
 
     def __post_init__(self) -> None:
         self.motion_file = Path(self.motion_file)
+        if self.frame_id_semantics not in {"timeline", "provenance"}:
+            raise ValueError("frame_id_semantics must be 'timeline' or 'provenance'.")
         self._motion_data: MotionData | None = None
 
     @property
@@ -100,6 +105,16 @@ class SmplxDataSource(DataSource):
                 "joint_orientations": orientations,
                 **self._foot_sole_metadata(orientations),
             }
+            if self.use_smplx_base_pose and orientations is not None:
+                # Calibrated frames for any mapped floating body, not just the
+                # SMPL-X pelvis. Keep raw joint rotations intact for other tasks.
+                aligned = Rotation.from_quat(
+                    np.asarray(orientations).reshape(-1, 4), scalar_first=True
+                ).as_matrix() @ _SMPLX_ROOT_OFFSET
+                combined_metadata["body_aligned_joint_orientations"] = (
+                    Rotation.from_matrix(aligned).as_quat(scalar_first=True)
+                    .reshape(np.asarray(orientations).shape)
+                )
             # End-effector targets are part of the generic MotionData contract,
             # just like joint orientations.  Never make callers switch back to
             # the legacy SMPL-X loader merely to activate contact tracking.
@@ -386,6 +401,48 @@ class SmplxDataSource(DataSource):
             print("Warning: Cannot compute orientations from .npz file (missing full_pose, root_orient, or model directory). Returning None for orientations.")
         return joints, orientations, root_orient, trans, framerate, {}
 
+    def _prepare_raw_timeline(
+        self,
+        motion: np.lib.npyio.NpzFile,
+        framerate: float | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None, dict]:
+        """Interpret frame IDs before FK, without modifying the source arrays.
+
+        ``provenance`` is an explicit assertion that rows already follow the
+        published cadence; it is never inferred just from gaps in frame IDs.
+        Original IDs remain metadata, not replacement timestamps. In particular,
+        a sparse person timeline cannot be treated as dense published rows.
+        """
+        pose_body = np.asarray(motion["pose_body"])
+        root_orient = np.asarray(motion["root_orient"])
+        trans = np.asarray(motion["trans"])
+        pose_hand = np.asarray(motion["pose_hand"]) if "pose_hand" in motion else None
+        timeline_metadata = {"frame_id_semantics": self.frame_id_semantics}
+        if "frame_ids" in motion:
+            timeline_metadata["original_frame_ids"] = np.array(motion["frame_ids"], copy=True)
+
+        if self.frame_id_semantics == "provenance":
+            if framerate is None or not np.isfinite(framerate) or framerate <= 0:
+                raise ValueError("Provenance frame IDs require a finite, positive published framerate.")
+            if bool(np.asarray(motion.get("person_timeline_sparse", False)).item()):
+                raise ValueError("Provenance frame IDs cannot describe a sparse person timeline.")
+            if "frame_ids" in motion and np.asarray(motion["frame_ids"]).shape != (len(trans),):
+                raise ValueError("Provenance frame_ids must contain one ID per published motion row.")
+            return trans, root_orient, pose_body, pose_hand, timeline_metadata
+
+        if "frame_ids" in motion:
+            original_num_frames = len(trans)
+            trans, root_orient, pose_body, pose_hand, _ = _densify_smplx_frame_gaps(
+                motion["frame_ids"], trans, root_orient, pose_body, pose_hand
+            )
+            if len(trans) != original_num_frames:
+                print(
+                    "Restored "
+                    f"{len(trans) - original_num_frames} missing SMPL-X "
+                    "timeline frame(s) from frame_ids."
+                )
+        return trans, root_orient, pose_body, pose_hand, timeline_metadata
+
     def _load_raw_npz(
         self,
         motion: np.lib.npyio.NpzFile,
@@ -394,6 +451,9 @@ class SmplxDataSource(DataSource):
         import smplx
         import torch
 
+        trans, root_orient, pose_body, pose_hand, timeline_metadata = self._prepare_raw_timeline(
+            motion, framerate
+        )
         body_model = smplx.create(
             self.model_directory,
             "smplx",
@@ -407,28 +467,6 @@ class SmplxDataSource(DataSource):
             betas_tensor = torch.tensor([self.betas]).float()
         if betas_tensor.shape[1] > 10:
             betas_tensor = betas_tensor[:, :10]
-
-        pose_body = np.asarray(motion["pose_body"])
-        root_orient = np.asarray(motion["root_orient"])
-        trans = np.asarray(motion["trans"])
-        pose_hand = np.asarray(motion["pose_hand"]) if "pose_hand" in motion else None
-        if "frame_ids" in motion:
-            original_num_frames = len(trans)
-            trans, root_orient, pose_body, pose_hand, _ = (
-                _densify_smplx_frame_gaps(
-                    motion["frame_ids"],
-                    trans,
-                    root_orient,
-                    pose_body,
-                    pose_hand,
-                )
-            )
-            if len(trans) != original_num_frames:
-                print(
-                    "Restored "
-                    f"{len(trans) - original_num_frames} missing SMPL-X "
-                    "timeline frame(s) from frame_ids."
-                )
 
         num_frames = pose_body.shape[0]
         if pose_hand is not None and pose_hand.ndim == 2 and pose_hand.shape[1] >= 90:
@@ -469,9 +507,26 @@ class SmplxDataSource(DataSource):
             world_joint_orientations=orientations,
             shape_betas=betas_tensor.detach().cpu().numpy(),
         )
+        # A clip can start mid-flip: its first pose is not a bind pose. Evaluate
+        # the same shaped model at rest only for orientation calibration. This
+        # separate reference does not transform the captured world trajectory.
+        with torch.no_grad():
+            reference = body_model(
+                betas=betas_tensor,
+                global_orient=torch.zeros(1, 3),
+                body_pose=torch.zeros(1, 63),
+                transl=torch.zeros(1, 3),
+            )
         return joints, orientations, root_orient, trans, framerate, {
+            **timeline_metadata,
             "betas": betas_tensor.detach().cpu().numpy()[0].tolist(),
             "end_effector_markers": end_effector_markers,
+            "joint_rest_positions": reference.joints.detach().cpu().numpy()[0, :22] @ _SMPLX_ROOT_OFFSET,
+            "joint_rest_orientations": np.tile(
+                Rotation.from_matrix(_SMPLX_ROOT_OFFSET.T).as_quat(scalar_first=True), (22, 1)
+            ),
+            "joint_reference_pose": "SMPL-X shaped zero body pose, calibrated Z-up reference",
+            "joint_reference_canonical_to_reference": _SMPLX_ROOT_OFFSET.T.copy(),
         }
 
     @staticmethod
@@ -555,6 +610,7 @@ def create_smplx_data_source(
         target_names_override=target_names,
         betas=option("betas", "smplx_betas"),
         use_smplx_base_pose=option("use_smplx_base_pose", default=False),
+        frame_id_semantics=option("frame_id_semantics", default="timeline"),
     )
 
 

@@ -100,9 +100,10 @@ class MotionData:
         new_object_points = linear_interpolate(self.object_points, dst_indices, axis=0) if self.object_points is not None else None
 
         new_metadata = dict(self.metadata)
-        jo = new_metadata.get("joint_orientations")
-        if jo is not None and isinstance(jo, np.ndarray) and jo.shape[0] == T:
-            new_metadata["joint_orientations"] = slerp_interpolate(jo, dst_indices, axis=0)
+        for key in ("joint_orientations", "body_aligned_joint_orientations"):
+            jo = new_metadata.get(key)
+            if jo is not None and isinstance(jo, np.ndarray) and jo.shape[0] == T:
+                new_metadata[key] = slerp_interpolate(jo, dst_indices, axis=0)
 
         for key in ("object_translations", "object_scales"):
             val = new_metadata.get(key)

@@ -27,10 +27,22 @@
     "left_hip": "L_Shoulder",
     "right_hip": "R_Shoulder",
     "spine": "Neck",
-    "root_position": "Spine3"
+    "root_position": "Pelvis"
   },
   "retargeting": {
     "end_effector_priority": {
+      "body_orientation": {
+        "frame": "parent_relative",
+        "tasks": {
+          "Spine1": {"enabled": false},
+          "L_Hip": {"robot_body": "left_hip_yaw_link"},
+          "R_Hip": {"robot_body": "right_hip_yaw_link"},
+          "L_Shoulder": {"robot_body": "left_shoulder_yaw_link"},
+          "R_Shoulder": {"robot_body": "right_shoulder_yaw_link"},
+          "L_Wrist": {"robot_body": "left_wrist_yaw_link"},
+          "R_Wrist": {"robot_body": "right_wrist_yaw_link"}
+        }
+      },
       "effectors": {
         "left_hand": {
           "robot_body": "left_rubber_hand"
