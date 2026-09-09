@@ -383,7 +383,7 @@ class GenericInteractionRetargeter:
         ps = penetration_slack or {}
         self.penetration_slack_enabled = penetration_slack is not None
         self.penetration_soft_tolerance = float(ps.get("soft_tolerance", 1e-3))
-        self.penetration_hard_bound = float(ps.get("hard_bound", 0.03))
+        self.penetration_hard_bound = float(ps.get("hard_bound", 0.1))
         self.penetration_slack_penalty = float(ps.get("slack_penalty", 1e5))
         self.base_position_tracking_weight = float(base_position_tracking_weight)
         self.base_position_tracking_weight_z = float(base_position_tracking_weight_z)
