@@ -563,6 +563,18 @@ def _set_tangent_test_pose(model, q):
         q[model.jnt_qposadr[joint_id]] = value
 
 
+def test_open3d_terrain_query_returns_closest_points_and_triangle_ids():
+    retargeter, _, _ = _make_tangent_test_retargeter()
+    points = np.array([[0.0, 0.0, 0.1], [0.3, -0.2, -0.1]])
+
+    closest, distances, triangle_ids = retargeter._closest_points_on_terrain(points)
+
+    np.testing.assert_allclose(closest[:, :2], points[:, :2], atol=1e-6)
+    np.testing.assert_allclose(closest[:, 2], 0.0, atol=1e-6)
+    np.testing.assert_allclose(distances, [0.1, 0.1], atol=1e-6)
+    assert np.all(np.isin(triangle_ids, [0, 1]))
+
+
 def test_mujoco_tangent_jacobian_matches_integrated_point_displacement():
     import mujoco
 

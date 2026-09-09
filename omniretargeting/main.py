@@ -1,4 +1,6 @@
 import argparse
+import cProfile
+from contextlib import contextmanager
 import numpy as np
 import trimesh
 from pathlib import Path
@@ -20,6 +22,24 @@ from omniretargeting.visualizer import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ROBOT_CONFIG_PATH = REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json"
+
+
+@contextmanager
+def cprofile_context(profile_path: str | None):
+    """Profile the enclosed CLI work when an output path is supplied."""
+    if profile_path is None:
+        yield
+        return
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+    try:
+        yield
+    finally:
+        profiler.disable()
+        output_path = Path(profile_path).expanduser()
+        profiler.dump_stats(str(output_path))
+        print(f"Saved cProfile statistics to {output_path}")
 
 
 def load_source_config(yaml_path: Path) -> dict:
@@ -106,41 +126,7 @@ def export_scaled_objects(
     return mesh_path, pose_path
 
 
-def main():
-    parser = argparse.ArgumentParser(description="OmniRetargeting CLI")
-    parser.add_argument(
-        "--robot-config",
-        default=DEFAULT_ROBOT_CONFIG_PATH,
-        help=f"Path to robot configuration JSON file (default: {DEFAULT_ROBOT_CONFIG_PATH})",
-    )
-    parser.add_argument(
-        "--source-config",
-        required=True,
-        help="Path to YAML source configuration file (see config_templates/ for examples)",
-    )
-    parser.add_argument("--output", required=True, help="Path to save output motion (.npy)")
-    scaling_group = parser.add_mutually_exclusive_group()
-    scaling_group.add_argument(
-        "--enable-scene-scaling",
-        action="store_true",
-        help="Scale the source motion, terrain, and objects, and export the scaled scene beside the output motion.",
-    )
-    scaling_group.add_argument(
-        "--scale-factor",
-        type=float,
-        default=None,
-        help="Scale the source motion, terrain, and objects by this factor without exporting a scaled scene.",
-    )
-    parser.add_argument("--vis", action="store_true", help="Visualize the retargeted motion")
-    parser.add_argument("--save-video", dest="save_video", default=None, help="Save retargeted motion video to file (e.g. /tmp/out.mp4). Uses offscreen rendering (set MUJOCO_GL=egl for headless).")
-    parser.add_argument("--framerate", type=float, default=None, help="Framerate of the motion (optional, defaults to 30.0 or auto-detected)")
-    parser.add_argument("--output-framerate", dest="output_framerate", type=float, default=None,
-                        help="Resample motion to this framerate before retargeting (e.g. 30 to downsample 120fps data)")
-    parser.add_argument("--progress", action="store_true",
-                        help="Show a progress bar while retargeting frames")
-
-    args = parser.parse_args()
-
+def _run(args, parser: argparse.ArgumentParser):
     if args.scale_factor is not None and (not np.isfinite(args.scale_factor) or args.scale_factor <= 0):
         parser.error("--scale-factor must be a finite positive number")
 
@@ -375,6 +361,50 @@ def main():
         for temp_terrain_path in temp_terrain_paths:
             if os.path.exists(temp_terrain_path):
                 os.remove(temp_terrain_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="OmniRetargeting CLI")
+    parser.add_argument(
+        "--robot-config",
+        default=DEFAULT_ROBOT_CONFIG_PATH,
+        help=f"Path to robot configuration JSON file (default: {DEFAULT_ROBOT_CONFIG_PATH})",
+    )
+    parser.add_argument(
+        "--source-config",
+        required=True,
+        help="Path to YAML source configuration file (see config_templates/ for examples)",
+    )
+    parser.add_argument("--output", required=True, help="Path to save output motion (.npy)")
+    scaling_group = parser.add_mutually_exclusive_group()
+    scaling_group.add_argument(
+        "--enable-scene-scaling",
+        action="store_true",
+        help="Scale the source motion, terrain, and objects, and export the scaled scene beside the output motion.",
+    )
+    scaling_group.add_argument(
+        "--scale-factor",
+        type=float,
+        default=None,
+        help="Scale the source motion, terrain, and objects by this factor without exporting a scaled scene.",
+    )
+    parser.add_argument("--vis", action="store_true", help="Visualize the retargeted motion")
+    parser.add_argument("--save-video", dest="save_video", default=None, help="Save retargeted motion video to file (e.g. /tmp/out.mp4). Uses offscreen rendering (set MUJOCO_GL=egl for headless).")
+    parser.add_argument("--framerate", type=float, default=None, help="Framerate of the motion (optional, defaults to 30.0 or auto-detected)")
+    parser.add_argument("--output-framerate", dest="output_framerate", type=float, default=None,
+                        help="Resample motion to this framerate before retargeting (e.g. 30 to downsample 120fps data)")
+    parser.add_argument("--progress", action="store_true",
+                        help="Show a progress bar while retargeting frames")
+    parser.add_argument(
+        "--cprofile",
+        metavar="PROFILE_FILE_PATH",
+        help="Write cProfile statistics for the complete retargeting run to this file.",
+    )
+
+    args = parser.parse_args()
+    with cprofile_context(args.cprofile):
+        _run(args, parser)
+
 
 if __name__ == "__main__":
     main()
