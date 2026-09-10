@@ -1192,6 +1192,9 @@ def main():
         )
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         diagnostics = getattr(retargeter, "last_collision_diagnostics", None)
+        relation_tasks = getattr(retargeter, "last_body_relation_tasks", None)
+        if relation_tasks is not None and diagnostics is not None:
+            diagnostics["body_relations"]["stages"]["final_save"] = relation_tasks.metrics(retargeted_motion)
         if diagnostics is not None:
             from .local_collision_repair import diagnostics_json, trajectory_digest
             if trajectory_digest(retargeted_motion) != diagnostics["accepted_qpos_sha256"]:

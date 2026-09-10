@@ -53,6 +53,7 @@ def _foot_defaults() -> Dict[str, Any]:
 
 
 CONTACT_RETARGETING_DEFAULTS: Dict[str, Any] = {
+    "body_relations": {"enabled": False, "weight": 1.0, "sigma": 0.12},
     "preserve_root_z": False,
     "collision_detection_threshold": 0.1,
     "terrain_sample_points": 100,

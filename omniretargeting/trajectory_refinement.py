@@ -438,6 +438,7 @@ def refine_joint_trajectory(
     source_joint_positions: np.ndarray | None = None,
     source_joint_names: list[str] | tuple[str, ...] | None = None,
     scene_query: SceneQuery | None = None,
+    body_relation_tasks=None,
 ) -> np.ndarray:
     """Jointly refine scalar joints over time with sparse Gauss--Newton.
 
@@ -991,6 +992,9 @@ def refine_joint_trajectory(
                 if source_root_positions is None
                 else source_root_positions[frame_idx]
             )
+            if body_relation_tasks is not None:
+                for weight, residual, jacobian in body_relation_tasks.rows(result[frame_idx], frame_idx, dof_indices):
+                    append_block(frame_idx, jacobian, -residual, 1.0, weight)
             root_z_offset = _swing_target_z_offset(
                 end_effector_config,
                 robot_root_z=float(result[frame_idx, 2]),

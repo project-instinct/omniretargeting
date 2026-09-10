@@ -30,9 +30,42 @@
     "root_position": "Pelvis"
   },
   "retargeting": {
+    "body_relations": {"enabled": false, "reference_source": "Spine3"},
     "end_effector_priority": {
       "body_orientation": {
         "frame": "parent_relative",
+        "_reference_pose_note": "Declared T-pose bind, radians, mirrored left/right. Arms match the SMPL-X rest-pose bone directions; shoulder_yaw is fixed at 0 as the explicit no-twist convention, because bone directions alone cannot observe rotation about the upper-arm axis. Remove this key to fall back to the solved calibration pose.",
+        "reference_pose": {
+          "waist_pitch_joint": 0.0,
+          "waist_roll_joint": 0.0,
+          "waist_yaw_joint": 0.0,
+          "left_hip_pitch_joint": 0.0,
+          "left_hip_roll_joint": 0.0,
+          "left_hip_yaw_joint": 0.0,
+          "left_knee_joint": 0.0,
+          "left_ankle_pitch_joint": 0.0,
+          "left_ankle_roll_joint": 0.0,
+          "right_hip_pitch_joint": 0.0,
+          "right_hip_roll_joint": 0.0,
+          "right_hip_yaw_joint": 0.0,
+          "right_knee_joint": 0.0,
+          "right_ankle_pitch_joint": 0.0,
+          "right_ankle_roll_joint": 0.0,
+          "left_shoulder_pitch_joint": 0.484858,
+          "left_shoulder_roll_joint": 1.466499,
+          "left_shoulder_yaw_joint": 0.0,
+          "left_elbow_joint": 1.376607,
+          "left_wrist_roll_joint": 0.0,
+          "left_wrist_pitch_joint": 0.0,
+          "left_wrist_yaw_joint": 0.0,
+          "right_shoulder_pitch_joint": 0.484858,
+          "right_shoulder_roll_joint": -1.466499,
+          "right_shoulder_yaw_joint": 0.0,
+          "right_elbow_joint": 1.376607,
+          "right_wrist_roll_joint": 0.0,
+          "right_wrist_pitch_joint": 0.0,
+          "right_wrist_yaw_joint": 0.0
+        },
         "tasks": {
           "Spine1": {"enabled": false},
           "L_Hip": {"robot_body": "left_hip_yaw_link"},

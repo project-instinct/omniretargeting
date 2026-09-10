@@ -619,10 +619,18 @@ class GenericInteractionRetargeter:
         self.body_orientation_calibration_iterations = max(
             int(cfg.get("calibration_iterations", 30)), 1
         )
+        # A positional fit cannot observe rotation about a bone's own axis, so
+        # a solved bind pose leaves that twist wherever the optimizer stopped,
+        # independently per side. A declared pose fixes it and is mirrorable.
+        self.body_orientation_reference_pose = dict(
+            cfg.get("reference_pose", {}) or {}
+        )
         self.body_orientation_tasks: Dict[str, Dict[str, Any]] = {}
         self._source_orientation_indices: Dict[str, int] = {}
         self._source_orientation_references: Dict[str, np.ndarray] = {}
         self._robot_orientation_references: Dict[str, np.ndarray] = {}
+        self.robot_reference_qpos = None
+        self.body_relation_tasks = None
         if not self.body_orientation_enabled:
             return
 
@@ -819,36 +827,37 @@ class GenericInteractionRetargeter:
                 robot_reference_qpos[:3] = reference_positions[
                     name_to_index[root_name]
                 ]
-            # Reference-pose calibration is independent of the clip's scene.
-            # Use a complete graph of reference joints, without environment
-            # vertices or scene constraints. This also works for coplanar rest
-            # poses where a tetrahedralization would be degenerate.
-            adjacency = [
-                [j for j in range(len(mapped_reference_positions)) if j != i]
-                for i in range(len(mapped_reference_positions))
-            ]
-            reference_laplacian = calculate_laplacian_coordinates(
-                mapped_reference_positions, adjacency, uniform_weight=True
-            )
-            collision_policy = self.hard_penetration_constraint
-            try:
-                self.hard_penetration_constraint = False
-                robot_reference_qpos = self._optimize_configuration(
-                    robot_reference_qpos,
-                    reference_laplacian,
-                    adjacency,
-                    np.empty((0, 3)),
-                    target_human_joints=mapped_reference_positions,
-                    max_iter=self.body_orientation_calibration_iterations,
-                    target_base_orientation=reference_base_orientation,
+            if not self.body_orientation_reference_pose:
+                # Reference-pose calibration is independent of the clip's scene.
+                # Use a complete graph of reference joints, without environment
+                # vertices or scene constraints. This also works for coplanar rest
+                # poses where a tetrahedralization would be degenerate.
+                adjacency = [
+                    [j for j in range(len(mapped_reference_positions)) if j != i]
+                    for i in range(len(mapped_reference_positions))
+                ]
+                reference_laplacian = calculate_laplacian_coordinates(
+                    mapped_reference_positions, adjacency, uniform_weight=True
                 )
-            finally:
-                self.hard_penetration_constraint = collision_policy
-            print(
-                "Solved robot body-orientation calibration pose from source "
-                f"reference ({reference_label}, "
-                f"{self.body_orientation_calibration_iterations} SQP iterations)."
-            )
+                collision_policy = self.hard_penetration_constraint
+                try:
+                    self.hard_penetration_constraint = False
+                    robot_reference_qpos = self._optimize_configuration(
+                        robot_reference_qpos,
+                        reference_laplacian,
+                        adjacency,
+                        np.empty((0, 3)),
+                        target_human_joints=mapped_reference_positions,
+                        max_iter=self.body_orientation_calibration_iterations,
+                        target_base_orientation=reference_base_orientation,
+                    )
+                finally:
+                    self.hard_penetration_constraint = collision_policy
+                print(
+                    "Solved robot body-orientation calibration pose from source "
+                    f"reference ({reference_label}, "
+                    f"{self.body_orientation_calibration_iterations} SQP iterations)."
+                )
 
         if preserve_core_reference:
             # A positional fit between differently proportioned bind poses
@@ -879,6 +888,57 @@ class GenericInteractionRetargeter:
                         width = 4 if self.robot_model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_BALL else 1
                         robot_reference_qpos[qadr:qadr + width] = self.robot_model.qpos0[qadr:qadr + width]
 
+        if self.body_orientation_reference_pose:
+            # Applied after any core reset, so a declared joint always wins and
+            # a mirrored declaration stays an exact mirror on the robot side.
+            free_ids = np.flatnonzero(
+                self.robot_model.jnt_type == mujoco.mjtJoint.mjJNT_FREE
+            )
+            if len(free_ids) == 1 and reference_base_orientation is not None:
+                free_qpos = int(self.robot_model.jnt_qposadr[int(free_ids[0])])
+                orientation = np.asarray(reference_base_orientation, dtype=float)
+                robot_reference_qpos[free_qpos + 3:free_qpos + 7] = (
+                    orientation / np.linalg.norm(orientation)
+                )
+            for joint_name, angle in self.body_orientation_reference_pose.items():
+                joint_id = mujoco.mj_name2id(
+                    self.robot_model, mujoco.mjtObj.mjOBJ_JOINT, str(joint_name)
+                )
+                if joint_id < 0:
+                    raise ValueError(
+                        "body_orientation.reference_pose names missing robot "
+                        f"joint '{joint_name}'."
+                    )
+                if self.robot_model.jnt_type[joint_id] not in (
+                    mujoco.mjtJoint.mjJNT_HINGE,
+                    mujoco.mjtJoint.mjJNT_SLIDE,
+                ):
+                    raise ValueError(
+                        "body_orientation.reference_pose only accepts scalar "
+                        f"joints; '{joint_name}' is not one."
+                    )
+                value = float(angle)
+                lower, upper = (
+                    float(x) for x in self.robot_model.jnt_range[joint_id]
+                )
+                if not np.isfinite(value) or (
+                    bool(self.robot_model.jnt_limited[joint_id])
+                    and not lower <= value <= upper
+                ):
+                    raise ValueError(
+                        f"body_orientation.reference_pose['{joint_name}'] = "
+                        f"{angle} is not a finite in-range joint value."
+                    )
+                robot_reference_qpos[
+                    int(self.robot_model.jnt_qposadr[joint_id])
+                ] = value
+            print(
+                "Declared robot body-orientation calibration pose from the robot "
+                f"profile ({len(self.body_orientation_reference_pose)} joints); "
+                "no positional fit, so bind twist is not left to the optimizer."
+            )
+
+        self.robot_reference_qpos = robot_reference_qpos.copy()
         self.robot_data.qpos[:] = robot_reference_qpos
         mujoco.mj_forward(self.robot_model, self.robot_data)
         try:
@@ -1974,6 +2034,7 @@ class GenericInteractionRetargeter:
         source_joint_orientations: Optional[np.ndarray] = None,
         target_base_position: Optional[np.ndarray] = None,
         end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        relation_frame: int | None = None,
     ) -> np.ndarray:
         """
         Retarget a single frame of human motion to robot motion.
@@ -2022,6 +2083,7 @@ class GenericInteractionRetargeter:
             source_joint_orientations=source_joint_orientations,
             target_base_position=target_base_position,
             end_effector_targets=end_effector_targets,
+            relation_frame=relation_frame,
         )
         return q_opt
 
@@ -2043,6 +2105,7 @@ class GenericInteractionRetargeter:
         source_joint_orientations: Optional[np.ndarray] = None,
         target_base_position: Optional[np.ndarray] = None,
         end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        relation_frame: int | None = None,
     ) -> np.ndarray:
         """
         Optimize robot configuration using SQP with interaction mesh constraints.
@@ -2100,6 +2163,7 @@ class GenericInteractionRetargeter:
                 source_joint_orientations,
                 target_base_position,
                 end_effector_targets,
+                relation_frame,
             )
             
             if show_debug and iteration < 3:
@@ -2143,6 +2207,7 @@ class GenericInteractionRetargeter:
         source_joint_orientations: Optional[np.ndarray] = None,
         target_base_position: Optional[np.ndarray] = None,
         end_effector_targets: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        relation_frame: int | None = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Single SQP optimization step.
@@ -2778,6 +2843,17 @@ class GenericInteractionRetargeter:
         )
         if temporal_residual is not None and temporal_weight > 0.0:
             body_obj += temporal_weight * cp.sum_squares(temporal_residual)
+
+        # Same source targets and nv rows are shared with refinement and local
+        # candidates. Convert only here to this solver's active qpos increments.
+        # This soft term belongs to the existing free-motion body objective;
+        # the existing contact optimum and constraints retain their priority.
+        if self.body_relation_tasks is not None and relation_frame is not None:
+            rows = list(self.body_relation_tasks.rows(q, relation_frame, np.arange(self.robot_model.nv)))
+            if rows:
+                transform = self._build_transform_qdot_to_qvel_fast()[:, self.q_a_indices]
+                for weight, residual, jacobian in rows:
+                    body_obj += weight * cp.sum_squares(residual + jacobian @ transform @ dqa)
 
         hierarchy_enabled = bool(
             self.end_effector_enabled

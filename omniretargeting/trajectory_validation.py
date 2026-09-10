@@ -149,7 +149,7 @@ def _summary(depths, model):
 
 class TrajectoryValidator:
     def __init__(self, model, reference, query, tasks, priority, config, framerate,
-                 surface_tasks=None, *, geometry_cache=None):
+                 surface_tasks=None, *, geometry_cache=None, body_relation_tasks=None):
         self.model, self.reference, self.query = (
             model,
             np.asarray(reference).copy(),
@@ -157,6 +157,10 @@ class TrajectoryValidator:
         )
         self.cfg, self.fps, self.tasks = config, float(framerate), tasks
         self.surface_tasks, self.frame_start = surface_tasks, 0
+        self.body_relation_tasks = body_relation_tasks
+        if body_relation_tasks is not None:
+            if body_relation_tasks.model is not model or len(body_relation_tasks.targets) != len(self.reference):
+                raise ValueError("Body relations must use the same model and original timeline")
         if surface_tasks is not None and surface_tasks.kinematics.model is not model:
             raise ValueError("Surface bindings belong to a different compiled robot model")
         if surface_tasks is not None and len(surface_tasks.targets) != len(self.reference):
@@ -271,6 +275,16 @@ class TrajectoryValidator:
         return sum(weight * float(residual @ residual)
                    for frame, pose in enumerate(poses)
                    for weight, residual, _ in self.surface_rows(pose, frame, self.di))
+
+    def relation_rows(self, pose, frame, dofs):
+        if self.body_relation_tasks is None:
+            return ()
+        return self.body_relation_tasks.rows(pose, self.frame_start + frame, dofs)
+
+    def relation_score(self, poses):
+        return sum(weight * float(residual @ residual)
+                   for frame, pose in enumerate(poses)
+                   for weight, residual, _ in self.relation_rows(pose, frame, self.di))
 
     def phase(self, frame, joints=None):
         phases = []
@@ -430,6 +444,8 @@ class TrajectoryValidator:
         )
         if self.surface_tasks is not None:
             metrics["surface_normal_cost"] = self.surface_score(candidate)
+        if self.body_relation_tasks is not None:
+            metrics["body_relations"] = self.body_relation_tasks.metrics(candidate, self.frame_start)
         metrics["joints"] = {
             self.model.joint(int(jid)).name: {
                 "unit": "m"

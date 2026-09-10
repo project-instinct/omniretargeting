@@ -515,6 +515,8 @@ class OmniRetargeter:
                 "end-effector markers were supplied; using whole-body retargeting."
             )
         self.last_end_effector_tasks = end_effector_tasks
+        self.last_body_relation_tasks = None
+        self.last_body_relation_diagnostics = {"status": "disabled", "reason": "experiment_disabled"}
         local_cfg = local_repair_config(
             retargeting_config.get("local_collision_repair", {}),
             priority=end_effector_cfg,
@@ -605,6 +607,14 @@ class OmniRetargeter:
                 processed_trajectory, scaled_terrain, **retargeting_kwargs
             )
         framewise_motion = np.asarray(retargeted_motion, dtype=float).copy()
+        relation_tasks = self.last_body_relation_tasks
+        relation_stages = {}
+
+        def record_relations(stage, motion):
+            if relation_tasks is not None:
+                relation_stages[stage] = relation_tasks.metrics(motion)
+
+        record_relations("framewise", framewise_motion)
         refinement_cfg = dict(
             retargeting_config.get("trajectory_refinement", {}) or {}
         )
@@ -626,7 +636,9 @@ class OmniRetargeter:
                 source_root_positions=processed_trajectory[:, source_root_idx],
                 source_joint_positions=processed_trajectory,
                 source_joint_names=self.smplx_joint_names,
+                **({"body_relation_tasks": relation_tasks} if relation_tasks is not None else {}),
             )
+        record_relations("refinement", retargeted_motion)
         retargeted_motion = self._apply_trajectory_smoothing(
             retargeted_motion,
             framerate=float(framerate or 30.0),
@@ -672,23 +684,30 @@ class OmniRetargeter:
         # Geometry/model/evidence remain fixed across these two stages. Reuse
         # exact-pose collision results; each stage still checks its own contacts.
         geometry_cache = {}
+        record_relations("postprocessing_candidate", retargeted_motion)
         retargeted_motion, _, postprocess_report = select_safe_postprocessing(
             self.robot_model, framewise_motion, retargeted_motion, scaled_terrain,
             validation_tasks, validation_priority, local_cfg,
             framerate=float(framerate or 30.0), scene_query=self.scene_query,
             geometry_cache=geometry_cache,
+            **({"body_relation_tasks": relation_tasks} if relation_tasks is not None else {}),
         )
+        record_relations("before_local_repair", retargeted_motion)
         retargeted_motion, local_report = repair_local_collisions(
             self.robot_model, retargeted_motion, scaled_terrain,
             validation_tasks, validation_priority, local_cfg,
             framerate=float(framerate or 30.0), scene_query=self.scene_query,
             geometry_cache=geometry_cache,
             **({"surface_tasks": surface_tasks} if surface_tasks is not None else {}),
+            **({"body_relation_tasks": relation_tasks} if relation_tasks is not None else {}),
         )
+        record_relations("after_local_repair", retargeted_motion)
+        effective_config["body_relations_runtime"] = self.last_body_relation_diagnostics
         self.last_collision_diagnostics = dict(
             effective_config=effective_config, postprocessing=postprocess_report,
             local_repair=local_report,
             accepted_qpos_sha256=trajectory_digest(retargeted_motion),
+            body_relations=dict(configuration=self.last_body_relation_diagnostics, stages=relation_stages),
             execution_order=["framewise", "trajectory_refinement", "optional_smoothing",
                              "foot_stabilization", "joint_clamp", "joint_acceptance",
                              "local_collision_repair", "final_verification", "save"],
@@ -1231,6 +1250,23 @@ class OmniRetargeter:
                 ),
             )
 
+        if self.retargeting_config.get("body_relations", {}).get("enabled", False):
+            from .body_relations import build_body_relation_tasks
+
+            # Reuse the SAME fixed graph/targets for a contact overlay pass.
+            # No calibration from an already retargeted (possibly wrong) frame.
+            if getattr(self, "last_body_relation_tasks", None) is None:
+                tasks, report = build_body_relation_tasks(
+                    self.robot_model, self.retargeting_config["body_relations"],
+                    self.valid_joint_mapping, self.retargeting_config.get("end_effector_priority", {}),
+                    self.smplx_joint_names, processed_trajectory, source_joint_orientations,
+                    source_reference_joint_positions, source_reference_joint_orientations,
+                    retargeter.robot_reference_qpos,
+                )
+                self.last_body_relation_tasks, self.last_body_relation_diagnostics = tasks, report
+                print("Body relations: " + diagnostics_json(report))
+            retargeter.body_relation_tasks = self.last_body_relation_tasks
+
         # Retarget each frame
         retargeted_trajectory = []
         previous_effector_directions = {}
@@ -1587,6 +1623,8 @@ class OmniRetargeter:
                     if frame_idx > 1
                     else None
                 )
+            if getattr(self, "last_body_relation_tasks", None) is not None:
+                frame_kwargs["relation_frame"] = frame_idx
             q_opt = retargeter.retarget_frame(mapped_joints, q_init, **frame_kwargs)
             if reference_trajectory is not None:
                 blend_weight = max(

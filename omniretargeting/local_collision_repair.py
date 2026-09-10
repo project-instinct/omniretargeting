@@ -352,6 +352,8 @@ def _optimize_window(
             mujoco.mj_forward(v.model, original_data)
             for weight, residual, jac in v.surface_rows(iterate[f], f, dofs):
                 objective += weight * cp.sum_squares(residual + jac @ step[row])
+            for weight, residual, jac in v.relation_rows(iterate[f], f, dofs):
+                objective += weight * cp.sum_squares(residual + jac @ step[row])
             for name, spec in v.specs.items():
                 payload = spec["task"].frame(f)
                 point = v.point(data, name, f)
@@ -543,7 +545,7 @@ def _optimize_window(
             # may relinearize an improved residual; this is not a proof of infeasibility.
             def correction_cost(q):
                 delta = q[:, joints] - v.reference[:, joints]
-                return (v.surface_score(q) + np.sum((delta / cfg["max_joint_correction"])**2)
+                return (v.surface_score(q) + v.relation_score(q) + np.sum((delta / cfg["max_joint_correction"])**2)
                         + np.sum((np.diff(delta, axis=0)*v.fps / cfg["correction_velocity"])**2)
                         + np.sum((np.diff(delta, n=2, axis=0)*v.fps**2 / cfg["correction_acceleration"])**2))
 
@@ -610,6 +612,7 @@ def repair_local_collisions(
     scene_query=None,
     surface_tasks=None,
     geometry_cache=None,
+    body_relation_tasks=None,
 ):
     start_time = perf_counter()
     cfg = local_repair_config(config, priority=end_effector_config)
@@ -640,6 +643,7 @@ def repair_local_collisions(
     v = TrajectoryValidator(
         model, reference, query, tasks, end_effector_config, cfg, framerate, surface_tasks,
         geometry_cache=geometry_cache,
+        body_relation_tasks=body_relation_tasks,
     )
     try:
         original = v.geometry(reference)
@@ -911,6 +915,7 @@ def select_safe_postprocessing(
     framerate=30,
     scene_query=None,
     geometry_cache=None,
+    body_relation_tasks=None,
 ):
     """Jointly accept existing refinement/postprocessing; never mix joint angles.
 
@@ -924,7 +929,7 @@ def select_safe_postprocessing(
         scene_query if scene_query is not None else SceneQuery.from_tasks(scene, tasks, full_geometry=cfg["full_geometry"])
     )
     v = TrajectoryValidator(model, baseline, query, tasks, priority, cfg, framerate,
-                            geometry_cache=geometry_cache)
+                            geometry_cache=geometry_cache, body_relation_tasks=body_relation_tasks)
     result = np.asarray(baseline).copy()
     decisions = []
     try:

@@ -83,6 +83,7 @@ def _evaluate(v, poses, start):
                             )
         score += (_depth(stats) / v.cfg["penetration_tolerance"]) ** 2
         score += view.surface_score(poses)
+        score += view.relation_score(poses)
         return (np.inf if reasons else score), sorted(set(reasons)), stats
 
 
@@ -143,6 +144,8 @@ def _solve_pose(v, frame, warm, previous_delta, joints, planes):
             (correction - previous_delta) / cfg["max_joint_correction"]
         )
         for weight, residual, jac in v.surface_rows(pose, frame, dofs):
+            objective += weight * cp.sum_squares(residual + jac @ step)
+        for weight, residual, jac in v.relation_rows(pose, frame, dofs):
             objective += weight * cp.sum_squares(residual + jac @ step)
         for name, spec in v.specs.items():
             payload = spec["task"].frame(frame)
