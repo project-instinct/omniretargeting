@@ -700,6 +700,24 @@ def test_tangent_step_bounds_respect_physical_joint_limits():
     np.testing.assert_allclose(lb[hip_opt], -0.4, atol=1e-12)
 
 
+def test_reaches_joint_limit_detects_scalar_joint_bounds():
+    import mujoco
+
+    retargeter, model, _ = _make_tangent_test_retargeter()
+    q = model.qpos0.copy()
+    hip_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "hip")
+    hip_qpos = int(model.jnt_qposadr[hip_id])
+    hip_min, hip_max = model.jnt_range[hip_id]
+
+    assert not retargeter.reaches_joint_limit(q)
+
+    q[hip_qpos] = hip_min
+    assert retargeter.reaches_joint_limit(q)
+
+    q[hip_qpos] = hip_max
+    assert retargeter.reaches_joint_limit(q)
+
+
 def test_relative_contact_jacobian_cancels_rigid_base_translation():
     import mujoco
 
@@ -1315,6 +1333,7 @@ def test_retarget_frame_uses_root_pose_for_frame_zero_init_when_present():
     state = RetargetingStreamState(
         retargeter=inner_retargeter,
         q_init=np.zeros(7, dtype=float),
+        q_default=np.zeros(7, dtype=float),
         q_last=None,
         last_estimated_quat=None,
         frame_idx=0,
@@ -1372,6 +1391,7 @@ def test_retarget_frame_falls_back_to_estimated_root_pose_when_absent():
     state = RetargetingStreamState(
         retargeter=inner_retargeter,
         q_init=np.zeros(7, dtype=float),
+        q_default=np.zeros(7, dtype=float),
         q_last=previous_q,
         last_estimated_quat=np.array([1.0, 0.0, 0.0, 0.0], dtype=float),
         frame_idx=0,
@@ -1394,6 +1414,60 @@ def test_retarget_frame_falls_back_to_estimated_root_pose_when_absent():
     np.testing.assert_array_equal(state.q_init, q_result)
     np.testing.assert_array_equal(state.q_last, q_result)
     np.testing.assert_array_equal(result, q_result)
+
+
+def test_retarget_frame_retries_with_default_initial_guess_at_joint_limit():
+    from omniretargeting.core import RetargetingStreamState
+    from omniretargeting import OmniRetargeter
+
+    estimated_quat_wxyz = np.array([0.2, 0.3, 0.4, 0.8], dtype=float)
+    estimated_quat_wxyz /= np.linalg.norm(estimated_quat_wxyz)
+    mapped_targets = np.arange(12, dtype=float).reshape(4, 3)
+    previous_q = np.full(8, 9.0, dtype=float)
+    default_q = np.arange(8, dtype=float)
+    q_at_limit = np.arange(8, dtype=float) + 20.0
+    q_recovered = np.arange(8, dtype=float) + 30.0
+
+    inner_retargeter = Mock()
+    inner_retargeter.retarget_frame.side_effect = [q_at_limit, q_recovered]
+    inner_retargeter.reaches_joint_limit.return_value = True
+
+    retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter.retargeting_config = {}
+    retargeter._estimate_base_orientation_from_joints = Mock(return_value=estimated_quat_wxyz)
+    retargeter._extract_mapped_source_targets = Mock(return_value=mapped_targets)
+
+    state = RetargetingStreamState(
+        retargeter=inner_retargeter,
+        q_init=previous_q.copy(),
+        q_default=default_q,
+        q_last=previous_q.copy(),
+        last_estimated_quat=None,
+        frame_idx=1,
+        scaled_terrain=Mock(),
+    )
+    root_translation = np.array([1.0, 2.0, 3.0], dtype=float)
+    root_orientation = Rotation.from_rotvec([0.0, 0.0, np.pi / 2.0]).as_quat(scalar_first=True)
+    frame = MotionFrame(
+        positions=np.zeros((4, 3), dtype=float),
+        root_orientation=root_orientation,
+        root_translation=root_translation,
+    )
+
+    result = retargeter.retarget_frame(frame, state)
+
+    first_call, second_call = inner_retargeter.retarget_frame.call_args_list
+    np.testing.assert_array_equal(first_call.args[1], previous_q)
+    q_default = second_call.args[1]
+    np.testing.assert_allclose(q_default[:3], root_translation)
+    np.testing.assert_allclose(q_default[3:7], root_orientation)
+    assert q_default[7] == default_q[7]
+    np.testing.assert_array_equal(first_call.kwargs["q_last"], previous_q)
+    np.testing.assert_array_equal(second_call.kwargs["q_last"], previous_q)
+    inner_retargeter.reaches_joint_limit.assert_called_once_with(q_at_limit)
+    np.testing.assert_array_equal(state.q_default, default_q)
+    np.testing.assert_array_equal(state.q_init, q_recovered)
+    np.testing.assert_array_equal(result, q_recovered)
 
 
 def test_create_stream_state_passes_hard_penetration_constraint():

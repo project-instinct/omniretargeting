@@ -656,6 +656,14 @@ class GenericInteractionRetargeter:
             ub[opt_idx] = min(ub[opt_idx], range_max - q[qpos_adr])
         return lb, ub
 
+    def reaches_joint_limit(self, q: np.ndarray, tolerance: float = 1e-6) -> bool:
+        """Whether an optimized scalar joint is at either configured URDF bound."""
+        return any(
+            q[qpos_adr] <= range_min + tolerance
+            or q[qpos_adr] >= range_max - tolerance
+            for _, qpos_adr, range_min, range_max in self.limited_joint_dofs
+        )
+
     def _integrate_optimized_step(
         self,
         q: np.ndarray,

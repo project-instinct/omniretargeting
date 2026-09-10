@@ -7,7 +7,7 @@ from collections.abc import Iterable, Iterator
 
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union, Any
+from typing import Any, Dict, List, Optional, Tuple, Union
 import trimesh
 import mujoco
 import yourdfpy
@@ -29,6 +29,7 @@ from .utils import (
 class RetargetingStreamState:
     retargeter: Any
     q_init: np.ndarray
+    q_default: np.ndarray
     q_last: np.ndarray | None
     last_estimated_quat: np.ndarray | None
     frame_idx: int
@@ -358,6 +359,7 @@ class OmniRetargeter:
         return RetargetingStreamState(
             retargeter=retargeter,
             q_init=q_init,
+            q_default=q_init.copy(),
             q_last=None,
             last_estimated_quat=None,
             frame_idx=0,
@@ -447,6 +449,24 @@ class OmniRetargeter:
             quat_wxyz = -quat_wxyz
         return quat_wxyz
 
+    @staticmethod
+    def _align_initial_root_pose(
+        q_init: np.ndarray,
+        source_positions: np.ndarray,
+        root_translation: np.ndarray | None,
+        root_orientation: np.ndarray | None,
+        estimated_quat_wxyz: np.ndarray | None,
+    ) -> None:
+        """Align an initial configuration's free root with the source frame."""
+        if root_translation is not None:
+            q_init[:3] = root_translation
+        else:
+            q_init[:3] = source_positions[0]
+        if root_orientation is not None:
+            q_init[3:7] = root_orientation
+        elif estimated_quat_wxyz is not None:
+            q_init[3:7] = estimated_quat_wxyz
+
     def retarget_frame(self, frame: MotionFrame | np.ndarray, state: RetargetingStreamState) -> np.ndarray:
         positions = frame.positions if isinstance(frame, MotionFrame) else frame
         root_orientation = frame.root_orientation if isinstance(frame, MotionFrame) else None
@@ -460,14 +480,13 @@ class OmniRetargeter:
         )
 
         if state.frame_idx == 0:
-            if root_translation is not None:
-                q_init[:3] = root_translation
-            else:
-                q_init[:3] = source_positions[0]
-            if root_orientation is not None:
-                q_init[3:7] = root_orientation
-            elif estimated_quat_wxyz is not None:
-                q_init[3:7] = estimated_quat_wxyz
+            self._align_initial_root_pose(
+                q_init,
+                source_positions,
+                root_translation,
+                root_orientation,
+                estimated_quat_wxyz,
+            )
 
         mapped_source_targets = self._extract_mapped_source_targets(source_positions)
 
@@ -487,15 +506,28 @@ class OmniRetargeter:
         else:
             max_iter = 10
 
-        q_opt = state.retargeter.retarget_frame(
-            mapped_source_targets,
-            q_init,
-            max_iter=max_iter,
-            q_last=state.q_last,
-            target_base_orientation=target_quat_wxyz,
-            object_points=object_points,
-            root_translation=root_translation,
-        )
+        def solve(q_seed: np.ndarray) -> np.ndarray:
+            return state.retargeter.retarget_frame(
+                mapped_source_targets,
+                q_seed,
+                max_iter=max_iter,
+                q_last=state.q_last,
+                target_base_orientation=target_quat_wxyz,
+                object_points=object_points,
+                root_translation=root_translation,
+            )
+
+        q_opt = solve(q_init)
+        if state.frame_idx > 0 and state.retargeter.reaches_joint_limit(q_opt):
+            q_default = state.q_default.copy()
+            self._align_initial_root_pose(
+                q_default,
+                source_positions,
+                root_translation,
+                root_orientation,
+                estimated_quat_wxyz,
+            )
+            q_opt = solve(q_default)
         state.q_init = q_opt
         state.q_last = q_opt
         state.frame_idx += 1
