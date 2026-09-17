@@ -527,7 +527,9 @@ class OmniRetargeter:
                 root_orientation,
                 estimated_quat_wxyz,
             )
-            q_opt = solve(q_default)
+            retry_q_opt = solve(q_default)
+            if state.retargeter.last_solve_diagnostics["success"]:
+                q_opt = retry_q_opt
         state.q_init = q_opt
         state.q_last = q_opt
         state.frame_idx += 1
