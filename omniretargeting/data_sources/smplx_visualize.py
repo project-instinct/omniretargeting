@@ -1,489 +1,692 @@
-"""Visualize default SMPL-X joints against robot links from a robot config."""
+"""Visualize an SMPL-X body mesh together with a terrain mesh.
+
+Reconstructs per-frame SMPL-X mesh vertices from a raw AMASS-style ``.npz``
+motion file and renders the body surface in the same 3D axes as a terrain
+mesh. The script is intentionally standalone: it does not depend on the robot
+config or the retargeting pipeline.
+
+Example
+-------
+.. code-block:: bash
+
+    python -m omniretargeting.data_sources.smplx_visualize \\
+        --smplx-model-dir /home/ziwen/Datasets/smplx \\
+        --motion motion.npz \\
+        --terrain terrain.obj \\
+        --frame 0 \\
+        --output /tmp/smplx_terrain.png
+"""
 
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import matplotlib
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
-import mujoco
 import numpy as np
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from omniretargeting.robot_config import load_robot_config
-from omniretargeting.utils import load_robot_urdf_with_floating_base, resolve_robot_height
+# SMPL-X body frame: +X left, +Y up, +Z forward.
+# Repo/world frame used by the terrain meshes: +X forward, +Y left, +Z up.
+# This permutation maps (X_world, Y_world, Z_world) = (Z_smplx, X_smplx, Y_smplx).
+SMPLX_TO_WORLD_AXES = (2, 0, 1)
 
-
-SMPLX_JOINT_NAMES = [
-    "Pelvis", "L_Hip", "R_Hip", "Spine1", "L_Knee", "R_Knee",
-    "Spine2", "L_Ankle", "R_Ankle", "Spine3", "L_Foot", "R_Foot",
-    "Neck", "L_Collar", "R_Collar", "Head", "L_Shoulder", "R_Shoulder",
-    "L_Elbow", "R_Elbow", "L_Wrist", "R_Wrist",
-]
-
-SMPLX_BONES = [
-    (0, 3), (3, 6), (6, 9), (9, 12), (12, 15),
-    (0, 1), (1, 4), (4, 7), (7, 10),
-    (0, 2), (2, 5), (5, 8), (8, 11),
-    (9, 13), (13, 16), (16, 18), (18, 20),
-    (9, 14), (14, 17), (17, 19), (19, 21),
-]
-
-DEFAULT_SMPLX_OFFSETS = np.array([
-    [0.0, 0.0, 0.0],
-    [0.0, 0.1, -0.1],
-    [0.0, -0.1, -0.1],
-    [0.0, 0.0, 0.2],
-    [0.0, 0.1, -0.5],
-    [0.0, -0.1, -0.5],
-    [0.0, 0.0, 0.4],
-    [0.0, 0.1, -0.9],
-    [0.0, -0.1, -0.9],
-    [0.0, 0.0, 0.6],
-    [0.05, 0.1, -0.95],
-    [0.05, -0.1, -0.95],
-    [0.0, 0.0, 0.8],
-    [0.0, 0.15, 0.75],
-    [0.0, -0.15, 0.75],
-    [0.0, 0.0, 0.95],
-    [0.0, 0.3, 0.75],
-    [0.0, -0.3, 0.75],
-    [0.0, 0.55, 0.75],
-    [0.0, -0.55, 0.75],
-    [0.0, 0.75, 0.75],
-    [0.0, -0.75, 0.75],
-], dtype=float)
-
-DEFAULT_SMPLX_HEIGHT = float(DEFAULT_SMPLX_OFFSETS[:, 2].max() - DEFAULT_SMPLX_OFFSETS[:, 2].min())
+DEFAULT_AZIMUTH = -60.0
+DEFAULT_ELEVATION = 20.0
+DEFAULT_SOURCE_COLOR = (0.80, 0.66, 0.55)  # skin-like
+DEFAULT_TERRAIN_COLOR = (0.62, 0.62, 0.66)  # light gray
 
 
-def _joint_color(name: str) -> tuple[float, float, float]:
-    if name.startswith("L_"):
-        return (0.20, 0.55, 0.90)
-    if name.startswith("R_"):
-        return (0.90, 0.40, 0.25)
-    if name in {"Head", "Neck"}:
-        return (0.80, 0.70, 0.25)
-    return (0.65, 0.65, 0.65)
-
-
-def _apply_default_joint_positions(
-    model: mujoco.MjModel,
-    data: mujoco.MjData,
-    default_joint_positions: dict[str, float] | None,
-) -> None:
-    if not default_joint_positions:
-        return
-
-    for joint_name, joint_value in default_joint_positions.items():
-        joint_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
-        if joint_id < 0:
-            raise ValueError(f"Robot joint '{joint_name}' from default_joint_positions was not found in the URDF.")
-        if model.jnt_type[joint_id] == mujoco.mjtJoint.mjJNT_FREE:
-            raise ValueError(f"Robot joint '{joint_name}' in default_joint_positions cannot be a free joint.")
-        qpos_adr = int(model.jnt_qposadr[joint_id])
-        next_qpos_adr = model.nq
-        for next_joint_id in range(joint_id + 1, model.njnt):
-            candidate = int(model.jnt_qposadr[next_joint_id])
-            if candidate > qpos_adr:
-                next_qpos_adr = candidate
-                break
-        qpos_width = next_qpos_adr - qpos_adr
-        if qpos_width != 1:
-            raise ValueError(
-                f"Robot joint '{joint_name}' in default_joint_positions must map to exactly one qpos entry, got {qpos_width}."
-            )
-        data.qpos[qpos_adr] = float(joint_value)
-
-
-def _load_robot_default_pose(
-    urdf_path: str | Path,
-    default_joint_positions: dict[str, float] | None = None,
-) -> tuple[mujoco.MjModel, mujoco.MjData, dict[str, int], np.ndarray, np.ndarray]:
-    model = load_robot_urdf_with_floating_base(str(urdf_path))
-    data = mujoco.MjData(model)
-    mujoco.mj_resetData(model, data)
-    if model.njnt > 0 and model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE and model.nq >= 7:
-        data.qpos[3:7] = np.array([1.0, 0.0, 0.0, 0.0])
-    _apply_default_joint_positions(model, data, default_joint_positions)
-    mujoco.mj_forward(model, data)
-
-    body_ids = {}
-    body_positions = np.zeros((model.nbody, 3), dtype=float)
-    body_rotations = np.zeros((model.nbody, 3, 3), dtype=float)
-    for body_idx in range(model.nbody):
-        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, body_idx)
-        if body_name:
-            body_ids[body_name] = body_idx
-        body_positions[body_idx] = data.xpos[body_idx].copy()
-        body_rotations[body_idx] = data.xmat[body_idx].reshape(3, 3).copy()
-
-    return model, data, body_ids, body_positions, body_rotations
-
-
-def _build_default_smplx_pose(pelvis_position: np.ndarray, robot_height: float | None) -> np.ndarray:
-    scale = 1.0
-    if robot_height is not None and robot_height > 0:
-        scale = float(robot_height) / DEFAULT_SMPLX_HEIGHT
-    return pelvis_position[None, :] + DEFAULT_SMPLX_OFFSETS * scale
-
-
-SMPLX_MODEL_SEARCH_PATHS = [
-    "/localhdd/Datasets/smplx",
-    "/localhdd/Datasets/",
-    "data/body_models/smplx",
-]
-
-
-def _load_smplx_joints_from_betas(
-    betas: list[float],
-    smplx_model_dir: str | None = None,
-) -> np.ndarray | None:
+def _require_optional_libs():
+    """Import heavy dependencies lazily so ``--help`` works without them."""
     try:
-        import smplx as smplx_lib
+        import smplx
         import torch
-    except ImportError:
-        print("[visualize_offsets] smplx/torch not available, falling back to hardcoded template")
+        import trimesh
+    except ImportError as exc:  # pragma: no cover - depends on environment
+        raise SystemExit(
+            "This visualization requires the 'smplx', 'torch', and 'trimesh' "
+            f"packages (see the omniretargeting conda environment). Missing: {exc}"
+        ) from exc
+    return smplx, torch, trimesh
+
+
+def resolve_smplx_model_dir(model_dir: Path) -> Path:
+    """Resolve *model_dir* to the directory containing ``SMPLX_*.npz`` files."""
+    model_dir = model_dir.expanduser().resolve()
+    candidates = [model_dir, model_dir / "smplx"]
+    for candidate in candidates:
+        if candidate.is_dir() and any(candidate.glob("SMPLX_*.npz")):
+            return candidate
+    raise FileNotFoundError(
+        f"No SMPL-X model files (SMPLX_*.npz) found under {model_dir}. "
+        "Pass the directory that contains them (or its parent)."
+    )
+
+
+def _detect_framerate(motion: np.lib.npyio.NpzFile) -> float:
+    for key in ("mocap_frame_rate", "framerate", "mocap_framerate"):
+        if key in motion:
+            value = np.asarray(motion[key]).reshape(-1)
+            if value.size:
+                return float(value[0])
+    return 30.0
+
+
+def _load_motion(motion_path: Path) -> dict:
+    motion = np.load(motion_path, allow_pickle=True)
+
+    def arr(*names):
+        for name in names:
+            if name in motion:
+                return np.asarray(motion[name], dtype=np.float32)
         return None
 
-    import os
-    search_paths = [smplx_model_dir] if smplx_model_dir else []
-    search_paths.extend(SMPLX_MODEL_SEARCH_PATHS)
-    model_path = next((p for p in search_paths if p and os.path.exists(p)), None)
-    if model_path is None:
-        print("[visualize_offsets] SMPL-X model files not found, falling back to hardcoded template")
-        return None
+    body_pose = arr("pose_body", "body_pose")
+    root_orient = arr("root_orient", "global_orient")
+    transl = arr("trans", "transl")
+    if body_pose is None or root_orient is None or transl is None:
+        raise ValueError(
+            "Motion file must contain raw SMPL-X pose keys "
+            "('pose_body'/'body_pose', 'root_orient'/'global_orient', "
+            "'trans'/'transl'). Processed joint-only npz files cannot be "
+            "used to reconstruct a body mesh."
+        )
 
-    num_betas = len(betas)
-    model = smplx_lib.SMPLX(model_path, num_betas=num_betas, use_hands=False, use_face=False)
-    betas_tensor = torch.tensor([betas], dtype=torch.float32)
+    num_frames = body_pose.shape[0]
+
+    betas = arr("betas")
+    if betas is None:
+        betas = np.zeros((1, 10), dtype=np.float32)
+    betas = betas.reshape(1, -1) if betas.ndim == 1 else betas[:1]
+
+    hand = arr("pose_hand")
+    if hand is not None and hand.ndim == 2 and hand.shape[1] >= 90:
+        left_hand = hand[:, :45]
+        right_hand = hand[:, 45:90]
+    else:
+        left_hand = arr("left_hand_pose")
+        right_hand = arr("right_hand_pose")
+
+    eye = arr("pose_eye")
+    leye = eye[:, :3] if eye is not None and eye.shape[1] >= 6 else arr("leye_pose")
+    reye = eye[:, 3:6] if eye is not None and eye.shape[1] >= 6 else arr("reye_pose")
+
+    gender = str(motion["gender"]) if "gender" in motion else "neutral"
+
+    return {
+        "body_pose": body_pose,
+        "root_orient": root_orient,
+        "transl": transl,
+        "betas": betas,
+        "left_hand": left_hand,
+        "right_hand": right_hand,
+        "jaw": arr("pose_jaw", "jaw_pose"),
+        "leye": leye,
+        "reye": reye,
+        "expression": arr("expression"),
+        "num_frames": num_frames,
+        "framerate": _detect_framerate(motion),
+        "gender": gender,
+    }
+
+
+def _pose_tensor(arr, num_frames: int, dims: int):
+    torch = _require_optional_libs()[1]
+    if arr is not None and arr.shape[0] == num_frames:
+        return torch.as_tensor(arr, dtype=torch.float32)
+    return torch.zeros(num_frames, dims, dtype=torch.float32)
+
+
+def _forward_frames(body_model, motion: dict, frame_indices, chunk_size: int = 64):
+    """Return ``(vertices, faces)`` for the requested frames.
+
+    Vertices are in SMPL-X world coordinates (Y-up), shape ``(N, V, 3)``.
+    """
+    _, torch, _ = _require_optional_libs()
+
+    frame_indices = np.asarray(frame_indices, dtype=np.int64)
+    if frame_indices.size == 0:
+        raise ValueError("No frames selected for visualization.")
+
+    num_frames = motion["num_frames"]
+    betas = torch.as_tensor(motion["betas"], dtype=torch.float32)
+    body_pose = torch.as_tensor(motion["body_pose"], dtype=torch.float32)
+    root_orient = torch.as_tensor(motion["root_orient"], dtype=torch.float32)
+    transl = torch.as_tensor(motion["transl"], dtype=torch.float32)
+
+    vertices_chunks = []
     with torch.no_grad():
-        out = model(betas=betas_tensor)
-    joints_smplx = out.joints[0, :22].numpy()
+        for start in range(0, frame_indices.size, chunk_size):
+            idx = torch.as_tensor(frame_indices[start:start + chunk_size], dtype=torch.long)
+            batch = idx.numel()
+            out = body_model(
+                betas=betas.expand(batch, -1),
+                global_orient=root_orient[idx],
+                body_pose=body_pose[idx],
+                transl=transl[idx],
+                left_hand_pose=_pose_tensor(motion["left_hand"], num_frames, 45)[idx],
+                right_hand_pose=_pose_tensor(motion["right_hand"], num_frames, 45)[idx],
+                jaw_pose=_pose_tensor(motion["jaw"], num_frames, 3)[idx],
+                leye_pose=_pose_tensor(motion["leye"], num_frames, 3)[idx],
+                reye_pose=_pose_tensor(motion["reye"], num_frames, 3)[idx],
+                expression=_pose_tensor(motion["expression"], num_frames, 10)[idx],
+                return_verts=True,
+            )
+            vertices_chunks.append(out.vertices.detach().cpu().numpy())
 
-    # Transform from SMPL-X convention (+X left, +Y up, +Z forward)
-    # to robot convention (+X forward, +Y left, +Z up)
-    joints_robot = np.zeros_like(joints_smplx)
-    joints_robot[:, 0] = joints_smplx[:, 2]   # X_robot = Z_smplx (forward)
-    joints_robot[:, 1] = joints_smplx[:, 0]   # Y_robot = X_smplx (left)
-    joints_robot[:, 2] = joints_smplx[:, 1]   # Z_robot = Y_smplx (up)
-
-    return joints_robot
+    faces = body_model.faces
+    if hasattr(faces, "detach"):
+        faces = faces.detach().cpu().numpy()
+    faces = np.asarray(faces, dtype=np.int64)
+    return np.concatenate(vertices_chunks, axis=0), faces
 
 
-def _set_equal_axes(ax, points: np.ndarray) -> None:
-    mins = points.min(axis=0)
-    maxs = points.max(axis=0)
+def _load_terrain(terrain_path: Path, max_faces: int | None):
+    _, _, trimesh = _require_optional_libs()
+    mesh = trimesh.load(str(terrain_path), force="mesh")
+    if isinstance(mesh, trimesh.Scene):
+        geoms = [g for g in mesh.geometry.values() if hasattr(g, "faces") and len(g.faces) > 0]
+        if not geoms:
+            raise ValueError(f"Terrain file {terrain_path} contains no mesh geometry.")
+        mesh = trimesh.util.concatenate(geoms)
+    if not isinstance(mesh, trimesh.Trimesh) or len(mesh.vertices) == 0:
+        raise ValueError(f"Terrain file {terrain_path} did not load as a mesh.")
+    if max_faces and len(mesh.faces) > max_faces:
+        try:
+            mesh = mesh.simplify_quadric_decimation(max_faces)
+        except Exception:
+            pass
+    return mesh
+
+
+def _convert_vertices(vertices: np.ndarray, coords: str) -> np.ndarray:
+    if coords == "smplx":
+        return vertices
+    return vertices[..., SMPLX_TO_WORLD_AXES]
+
+
+def _simplify_source(vertices: np.ndarray, faces: np.ndarray, max_faces: int | None):
+    _, _, trimesh = _require_optional_libs()
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+    if max_faces and len(mesh.faces) > max_faces:
+        try:
+            mesh = mesh.simplify_quadric_decimation(max_faces)
+        except Exception:
+            pass
+    return mesh
+
+
+def _set_axes_bounds(ax, points: list[np.ndarray]) -> None:
+    mins = np.min([np.asarray(p).reshape(-1, 3).min(axis=0) for p in points], axis=0)
+    maxs = np.max([np.asarray(p).reshape(-1, 3).max(axis=0) for p in points], axis=0)
     center = (mins + maxs) / 2.0
-    radius = max(float((maxs - mins).max()) / 2.0, 0.5)
+    radius = float((maxs - mins).max() / 2.0) or 0.5
     ax.set_xlim(center[0] - radius, center[0] + radius)
     ax.set_ylim(center[1] - radius, center[1] + radius)
     ax.set_zlim(center[2] - radius, center[2] + radius)
     ax.set_box_aspect((1, 1, 1))
 
 
-def _plot_visualization(
-    smplx_joints: np.ndarray,
-    model: mujoco.MjModel,
-    body_positions: np.ndarray,
-    body_rotations: np.ndarray,
-    joint_mapping: dict[str, str],
-    link_offset_map: dict[str, object] | None,
-    output_path: Path | None = None,
-) -> None:
-    fig = plt.figure(figsize=(14, 11))
+def _add_mesh_collection(ax, vertices: np.ndarray, faces: np.ndarray, color, alpha: float):
+    _, _, trimesh = _require_optional_libs()
+    mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
+    collection = Poly3DCollection(
+        mesh.triangles,
+        facecolor=color,
+        edgecolor="none",
+        alpha=alpha,
+    )
+    ax.add_collection3d(collection)
+    return collection
+
+
+def _render_static(vertices: np.ndarray, faces: np.ndarray, terrain, args) -> None:
+    body = _simplify_source(vertices, faces, args.source_max_faces)
+
+    fig = plt.figure(figsize=(12, 10))
     ax = fig.add_subplot(111, projection="3d")
+    _add_mesh_collection(ax, np.asarray(terrain.vertices), np.asarray(terrain.faces), DEFAULT_TERRAIN_COLOR, args.terrain_alpha)
+    _add_mesh_collection(ax, np.asarray(body.vertices), np.asarray(body.faces), DEFAULT_SOURCE_COLOR, args.source_alpha)
 
-    mapped_link_legend = Line2D(
-        [0],
-        [0],
-        linestyle="None",
-        marker="X",
-        markersize=10,
-        markerfacecolor="#8a2be2",
-        markeredgecolor="black",
-        markeredgewidth=0.9,
-        label="Mapped robot links",
-    )
-    offset_target_legend = Line2D(
-        [0],
-        [0],
-        linestyle="None",
-        marker="o",
-        markersize=8,
-        markerfacecolor="#00a896",
-        markeredgecolor="black",
-        markeredgewidth=0.8,
-        label="Offset target positions",
-    )
-
-    if model.nbody > 1:
-        ax.scatter(
-            body_positions[1:, 0],
-            body_positions[1:, 1],
-            body_positions[1:, 2],
-            facecolors="none",
-            edgecolors="#111111",
-            s=95,
-            linewidths=1.4,
-            alpha=0.95,
-            label="Robot links",
-        )
-
-    for body_idx in range(1, model.nbody):
-        parent_idx = int(model.body_parentid[body_idx])
-        p0 = body_positions[parent_idx]
-        p1 = body_positions[body_idx]
-        ax.plot(
-            [p0[0], p1[0]],
-            [p0[1], p1[1]],
-            [p0[2], p1[2]],
-            color=(0.75, 0.75, 0.75),
-            linewidth=1.0,
-            alpha=0.5,
-        )
-
-    for parent_idx, child_idx in SMPLX_BONES:
-        p0 = smplx_joints[parent_idx]
-        p1 = smplx_joints[child_idx]
-        ax.plot(
-            [p0[0], p1[0]],
-            [p0[1], p1[1]],
-            [p0[2], p1[2]],
-            color=(0.15, 0.15, 0.15),
-            linewidth=2.0,
-            alpha=0.9,
-        )
-
-    joint_colors = [_joint_color(name) for name in SMPLX_JOINT_NAMES]
-    ax.scatter(
-        smplx_joints[:, 0],
-        smplx_joints[:, 1],
-        smplx_joints[:, 2],
-        c=joint_colors,
-        s=90,
-        depthshade=True,
-        edgecolors="white",
-        linewidths=0.9,
-        alpha=0.98,
-        label="Default SMPL-X joints",
-    )
-
-    smplx_name_to_index = {name: idx for idx, name in enumerate(SMPLX_JOINT_NAMES)}
-    offset_target_points = []
-    for smplx_name, body_name in joint_mapping.items():
-        joint_idx = smplx_name_to_index.get(smplx_name)
-        if joint_idx is None:
-            continue
-        body_idx = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-        if body_idx < 0:
-            continue
-        smplx_point = smplx_joints[joint_idx]
-        robot_point = body_positions[body_idx]
-        color = _joint_color(smplx_name)
-        ax.plot(
-            [smplx_point[0], robot_point[0]],
-            [smplx_point[1], robot_point[1]],
-            [smplx_point[2], robot_point[2]],
-            linestyle="--",
-            linewidth=1.6,
-            color=color,
-            alpha=0.9,
-        )
-        ax.scatter(
-            [robot_point[0]],
-            [robot_point[1]],
-            [robot_point[2]],
-            c=[color],
-            s=135,
-            marker="X",
-            edgecolors="black",
-            linewidths=0.9,
-            zorder=12,
-        )
-        ax.text(
-            robot_point[0],
-            robot_point[1],
-            robot_point[2] + 0.03,
-            body_name,
-            fontsize=7,
-            color="black",
-        )
-        if link_offset_map and body_name in link_offset_map:
-            offset_local = np.asarray(link_offset_map[body_name], dtype=float).reshape(3)
-            offset_world = body_rotations[body_idx] @ offset_local
-            offset_target = robot_point + offset_world
-            offset_target_points.append(offset_target)
-            ax.plot(
-                [robot_point[0], offset_target[0]],
-                [robot_point[1], offset_target[1]],
-                [robot_point[2], offset_target[2]],
-                linestyle="-",
-                linewidth=2.0,
-                color="#00a896",
-                alpha=0.85,
-            )
-            ax.scatter(
-                [offset_target[0]],
-                [offset_target[1]],
-                [offset_target[2]],
-                c=["#00a896"],
-                s=85,
-                marker="o",
-                edgecolors="black",
-                linewidths=0.8,
-                zorder=13,
-            )
-
-    for joint_name in ["Pelvis", "Head", "L_Wrist", "R_Wrist", "L_Ankle", "R_Ankle"]:
-        point = smplx_joints[smplx_name_to_index[joint_name]]
-        ax.text(point[0], point[1], point[2] + 0.03, joint_name, fontsize=8)
-
-    all_points = [smplx_joints, body_positions]
-    if offset_target_points:
-        all_points.append(np.asarray(offset_target_points, dtype=float))
-    all_points = np.vstack(all_points)
-    _set_equal_axes(ax, all_points)
+    _set_axes_bounds(ax, [terrain.vertices, body.vertices])
+    ax.view_init(elev=args.elevation, azim=args.azimuth)
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
-    ax.set_title("Default SMPL-X joints vs robot links")
-    ax.grid(True, alpha=0.3)
-    ax.view_init(elev=20, azim=35)
-    handles, labels = ax.get_legend_handles_labels()
-    handles.append(mapped_link_legend)
-    labels.append("Mapped robot links")
-    if offset_target_points:
-        handles.append(offset_target_legend)
-        labels.append("Offset target positions")
-    ax.legend(handles, labels, loc="upper right")
-    plt.tight_layout()
-    if output_path is not None:
-        fig.savefig(output_path, dpi=180, bbox_inches="tight")
-        plt.close(fig)
+    ax.set_title(f"SMPL-X mesh + terrain (frame {args.frame})")
+
+    if args.output:
+        fig.savefig(args.output, dpi=150, bbox_inches="tight")
+        print(f"Saved static visualization to {args.output}")
     else:
         plt.show()
 
 
-def main() -> None:
+def _render_animation(vertices_all: np.ndarray, faces: np.ndarray, terrain, args) -> None:
+    from matplotlib.animation import FuncAnimation
+
+    body = _simplify_source(vertices_all[0], faces, args.source_max_faces)
+
+    fig = plt.figure(figsize=(12, 10))
+    ax = fig.add_subplot(111, projection="3d")
+    _add_mesh_collection(ax, np.asarray(terrain.vertices), np.asarray(terrain.faces), DEFAULT_TERRAIN_COLOR, args.terrain_alpha)
+
+    collection = Poly3DCollection([], facecolor=DEFAULT_SOURCE_COLOR, edgecolor="none", alpha=args.source_alpha)
+    ax.add_collection3d(collection)
+
+    # Use the shared body topology; only vertex positions change per frame.
+    body_topology = body.copy()
+    all_points = [terrain.vertices]
+    for frame_vertices in vertices_all:
+        all_points.append(frame_vertices)
+    _set_axes_bounds(ax, all_points)
+    ax.view_init(elev=args.elevation, azim=args.azimuth)
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Y (m)")
+    ax.set_zlabel("Z (m)")
+
+    def update(frame_idx: int):
+        body_topology.vertices = vertices_all[frame_idx]
+        collection.set_verts(body_topology.triangles)
+        return (collection,)
+
+    ani = FuncAnimation(fig, update, frames=len(vertices_all), interval=1000.0 / args.fps, blit=False)
+
+    if args.output:
+        suffix = Path(args.output).suffix.lower()
+        if suffix == ".gif":
+            ani.save(args.output, writer="pillow", fps=args.fps, dpi=100)
+        elif suffix in (".mp4", ".mov"):
+            ani.save(args.output, writer="ffmpeg", fps=args.fps, dpi=150)
+        else:
+            raise SystemExit("Animation output must end in .gif, .mp4, or .mov.")
+        print(f"Saved animation ({len(vertices_all)} frames) to {args.output}")
+    else:
+        plt.show()
+
+
+def _pv_faces(faces: np.ndarray) -> np.ndarray:
+    """Convert an (N, 3) face array to PyVista's padded face format."""
+    faces = np.asarray(faces, dtype=np.int64)
+    return np.hstack((np.full((len(faces), 1), 3, dtype=np.int64), faces)).astype(np.int64, copy=False)
+
+
+def _ask_open_motion() -> str | None:
+    """Open the OS-native file dialog and return the selected motion path.
+
+    On Linux this uses Zenity (GNOME) or KDialog (KDE) so the standard desktop
+    file picker is shown. Tkinter is kept only as a fallback.
+    """
+    initial_dir = os.path.expanduser("~/Datasets")
+    if not os.path.isdir(initial_dir):
+        initial_dir = os.path.expanduser("~")
+
+    if shutil.which("zenity"):
+        result = subprocess.run(
+            [
+                "zenity",
+                "--file-selection",
+                "--title=Select SMPL-X motion file",
+                "--file-filter=SMPL-X motion (*.npz) | *.npz",
+                f"--filename={initial_dir}",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        path = result.stdout.strip()
+        return path or None
+
+    if shutil.which("kdialog"):
+        result = subprocess.run(
+            [
+                "kdialog",
+                "--getopenfilename",
+                initial_dir,
+                "*.npz",
+                "--title",
+                "Select SMPL-X motion file",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() or None
+
+    # Fallback for systems without Zenity/KDialog (e.g. Windows/macOS).
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        root.attributes("-topmost", True)
+        return filedialog.askopenfilename(
+            title="Select SMPL-X motion file",
+            initialdir=initial_dir,
+            filetypes=[("SMPL-X motion (*.npz)", "*.npz"), ("All files", "*.*")],
+        ) or None
+    finally:
+        root.destroy()
+
+
+def _rest_pose_template(args):
+    """Return ``(template_vertices, faces)`` for a neutral rest-pose placeholder."""
+    model_dir = resolve_smplx_model_dir(args.smplx_model_dir)
+    smplx, _, _ = _require_optional_libs()
+    gender = args.gender or "neutral"
+    model = smplx.SMPLX(str(model_dir), gender=gender, num_betas=10, use_pca=False)
+
+    template = model.v_template
+    if hasattr(template, "detach"):
+        template = template.detach().cpu().numpy()
+    template = _convert_vertices(np.asarray(template, dtype=np.float32), args.coords)
+
+    faces = model.faces
+    if hasattr(faces, "detach"):
+        faces = faces.detach().cpu().numpy()
+    faces = np.asarray(faces, dtype=np.int64)
+    return template, faces
+
+
+def _prepare_body(motion_path: Path, args):
+    """Load a motion file and reconstruct body vertices in the chosen frame.
+
+    Returns ``(vertices, faces, motion)``; ``vertices`` has shape ``(N, V, 3)``.
+    """
+    model_dir = resolve_smplx_model_dir(args.smplx_model_dir)
+    motion = _load_motion(motion_path)
+    smplx, _, _ = _require_optional_libs()
+    gender = args.gender or motion["gender"]
+    body_model = smplx.SMPLX(
+        str(model_dir),
+        gender=gender,
+        num_betas=int(motion["betas"].shape[1]),
+        use_pca=False,
+    )
+    frame_indices = _select_frames(motion, args)
+    vertices_smplx, faces = _forward_frames(body_model, motion, frame_indices)
+
+    vertices = _convert_vertices(vertices_smplx, args.coords)
+    if args.scale != 1.0:
+        vertices = vertices * args.scale
+    if args.coords == "zup" and args.z_offset:
+        vertices = vertices + np.array([0.0, 0.0, args.z_offset], dtype=vertices.dtype)
+    return vertices, faces, motion
+
+
+def _add_motion_picker(plotter, state: dict, body, slider, args) -> None:
+    """Add a bottom-left button that opens a file dialog to load a motion."""
+    holder = {}
+
+    def reset_button() -> None:
+        holder["busy"] = True
+        holder["widget"].GetRepresentation().SetState(0)
+        holder["busy"] = False
+
+    def on_click(checked: bool) -> None:
+        if holder.get("busy"):
+            return
+        if not checked:
+            return
+
+        path = _ask_open_motion()
+        if not path:
+            reset_button()
+            return
+
+        try:
+            vertices, _faces, _motion = _prepare_body(Path(path), args)
+        except Exception as exc:
+            print(f"[select motion] failed to load {path}: {exc}")
+            reset_button()
+            return
+
+        state["vertices"] = vertices
+        state["frame"] = int(args.frame % len(vertices))
+        state["playing"] = True
+        body.points = np.ascontiguousarray(vertices[state["frame"]])
+        body.compute_normals(inplace=True)
+
+        rep = slider.GetRepresentation()
+        rep.SetMinimumValue(0)
+        rep.SetMaximumValue(len(vertices) - 1)
+        rep.SetValue(state["frame"])
+
+        print(f"[select motion] loaded {path} ({len(vertices)} frames)")
+        plotter.render()
+        reset_button()
+
+    holder["widget"] = plotter.add_checkbox_button_widget(
+        on_click,
+        value=False,
+        position=(10, 10),
+        size=50,
+        color_on="blue",
+        color_off="grey",
+        background_color="white",
+    )
+    plotter.add_text("Select motion file", position=(70, 18), font_size=10, viewport=False)
+
+
+def _render_interactive(
+    vertices_all: np.ndarray | None,
+    faces: np.ndarray,
+    terrain,
+    args,
+    initial_vertices: np.ndarray | None = None,
+) -> None:
+    """Open an interactive PyVista window: drag to orbit, scrub/play frames."""
+    import pyvista as pv
+
+    if initial_vertices is None:
+        if vertices_all is not None:
+            initial_vertices = vertices_all[0]
+        else:
+            initial_vertices = np.zeros((int(faces.max()) + 1, 3), dtype=np.float32)
+
+    body = pv.PolyData(np.ascontiguousarray(initial_vertices), _pv_faces(faces))
+    # Skip normals for an all-zero placeholder (degenerate triangles).
+    if np.ptp(np.asarray(initial_vertices)) > 0:
+        body.compute_normals(inplace=True)
+
+    terrain_pd = pv.PolyData(
+        np.ascontiguousarray(np.asarray(terrain.vertices, dtype=np.float64)),
+        _pv_faces(np.asarray(terrain.faces)),
+    )
+    terrain_pd.compute_normals(inplace=True)
+
+    plotter = pv.Plotter()
+    plotter.add_mesh(
+        terrain_pd,
+        color=DEFAULT_TERRAIN_COLOR,
+        opacity=args.terrain_alpha,
+        name="terrain",
+        show_edges=False,
+        specular=0.1,
+        diffuse=0.85,
+    )
+    plotter.add_mesh(
+        body,
+        color=DEFAULT_SOURCE_COLOR,
+        opacity=args.source_alpha,
+        name="body",
+        smooth_shading=True,
+        specular=0.2,
+        diffuse=0.85,
+    )
+    plotter.add_text(
+        "Drag: rotate | Shift+drag: pan | Scroll: zoom\n"
+        "Space: play/pause | Slider: scrub | Q: quit",
+        position="upper_left",
+        font_size=10,
+    )
+
+    state = {
+        "vertices": vertices_all,
+        "frame": int(args.frame % len(vertices_all)) if vertices_all is not None else 0,
+        "playing": True,
+    }
+
+    def show_frame(frame_idx: int) -> None:
+        v = state["vertices"]
+        if v is None or len(v) == 0:
+            return
+        frame_idx = int(round(frame_idx)) % len(v)
+        state["frame"] = frame_idx
+        body.points = np.ascontiguousarray(v[frame_idx])
+        body.compute_normals(inplace=True)
+
+    slider = plotter.add_slider_widget(
+        show_frame,
+        [0, max((len(state["vertices"]) - 1) if state["vertices"] is not None else 0, 0)],
+        value=state["frame"],
+        title="frame",
+        pointa=(0.25, 0.94),
+        pointb=(0.75, 0.94),
+        interaction_event="always",
+        fmt="%.0f",
+    )
+
+    def toggle_play():
+        state["playing"] = not state["playing"]
+
+    plotter.add_key_event("space", toggle_play)
+
+    interval_ms = max(int(round(1000.0 / args.fps)), 16)
+
+    def timer_cb(_step: int) -> None:
+        v = state["vertices"]
+        if state["playing"] and v is not None and len(v) > 0:
+            next_frame = (state["frame"] + 1) % len(v)
+            show_frame(next_frame)
+            slider.GetRepresentation().SetValue(float(next_frame))
+        plotter.render()
+
+    plotter.add_timer_event(max_steps=10**7, duration=interval_ms, callback=timer_cb)
+
+    if vertices_all is None:
+        _add_motion_picker(plotter, state, body, slider, args)
+
+    print("Interactive window opened: close it (or press Q) to finish.")
+    plotter.show()
+
+
+def _select_frames(motion: dict, args) -> list[int]:
+    """Select frame indices for the requested render mode."""
+    num_frames = motion["num_frames"]
+
+    # The interactive PyVista viewer always scrubs/plays a frame range.
+    multi_frame = bool(args.animate) or (args.output is None and args.viewer == "pyvista")
+    if not multi_frame:
+        return [args.frame % num_frames]
+
+    step = max(int(args.frame_step), 1)
+    indices = list(range(0, num_frames, step))
+    if args.max_frames is not None and len(indices) > args.max_frames:
+        indices = indices[: args.max_frames]
+    return indices
+
+
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Visualize the default SMPL-X pose against robot links from a robot config."
+        description="Visualize an SMPL-X body mesh together with a terrain mesh.",
     )
-    parser.add_argument(
-        "--robot_config",
-        "--robot-config",
-        dest="robot_config",
-        required=True,
-        help="Path to robot config JSON.",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default=None,
-        help="Optional output PNG path.",
-    )
-    parser.add_argument(
-        "--smplx_model_dir",
-        "--smplx-model-dir",
-        dest="smplx_model_dir",
-        type=str,
-        default=None,
-        help="Path to SMPL-X model directory (overrides search paths).",
-    )
-    parser.add_argument(
-        "--scale-with-robot", dest="scale_with_robot", action="store_true", default=False,
-        help="Scale source positions to match robot height.",
-    )
-    args = parser.parse_args()
+    parser.add_argument("--smplx-model-dir", "--smplx_model_dir", dest="smplx_model_dir",
+                        required=True, type=Path,
+                        help="Directory containing SMPLX_*.npz model files (or its parent).")
+    parser.add_argument("--motion", type=Path, default=None,
+                        help="Raw SMPL-X motion .npz (AMASS-style pose keys). "
+                             "Optional in the interactive PyVista viewer: a button is shown "
+                             "to select the file from a dialog.")
+    parser.add_argument("--terrain", required=True, type=Path,
+                        help="Terrain mesh file (.obj/.stl/.ply/.glb).")
+    parser.add_argument("--frame", type=int, default=0,
+                        help="Motion frame to show in static mode (default: 0).")
+    parser.add_argument("--animate", action="store_true",
+                        help="Animate all selected frames instead of showing one frame.")
+    parser.add_argument("--frame-step", type=int, default=1,
+                        help="Frame stride for multi-frame rendering "
+                             "(--animate or the interactive viewer, default: 1).")
+    parser.add_argument("--max-frames", type=int, default=None,
+                        help="Maximum frames to load for --animate or the interactive "
+                             "viewer (default: load all frames).")
+    parser.add_argument("--fps", type=float, default=None,
+                        help="Animation FPS (default: motion framerate, else 30).")
+    parser.add_argument("--gender", default=None,
+                        help="SMPL-X gender (default: read from the motion file, else neutral).")
+    parser.add_argument("--coords", choices=("zup", "smplx"), default="zup",
+                        help="SMPL-X mesh coordinate frame: 'zup' converts to +Z-up "
+                             "world frame to match terrain (default), 'smplx' keeps native Y-up.")
+    parser.add_argument("--scale", type=float, default=1.0,
+                        help="Uniform scale applied to the SMPL-X mesh (default: 1.0).")
+    parser.add_argument("--z-offset", type=float, default=0.0,
+                        help="Vertical offset (meters) added to the SMPL-X mesh in Z-up mode.")
+    parser.add_argument("--source-alpha", type=float, default=1.0,
+                        help="Opacity of the SMPL-X body mesh (default: 1.0, fully opaque).")
+    parser.add_argument("--terrain-alpha", type=float, default=0.75)
+    parser.add_argument("--source-max-faces", type=int, default=None,
+                        help="Decimate the SMPL-X mesh to this many faces for faster rendering.")
+    parser.add_argument("--terrain-max-faces", type=int, default=None,
+                        help="Decimate the terrain mesh to this many faces for faster rendering.")
+    parser.add_argument("--azimuth", type=float, default=DEFAULT_AZIMUTH)
+    parser.add_argument("--elevation", type=float, default=DEFAULT_ELEVATION)
+    parser.add_argument("--viewer", choices=("pyvista", "matplotlib"), default="pyvista",
+                        help="Interactive viewer used when --output is omitted. "
+                             "'pyvista' (default) opens a window you can drag and scrub; "
+                             "'matplotlib' uses the static 3D axes.")
+    parser.add_argument("--output", type=Path, default=None,
+                        help="Output path: .png for a static image, .gif/.mp4/.mov for animation.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
 
     if args.output:
         matplotlib.use("Agg", force=True)
 
-    config_path = Path(args.robot_config).expanduser().resolve()
-    robot_config = load_robot_config(config_path)
-    robot_urdf_path = robot_config.get("urdf_path")
-    if not robot_urdf_path:
-        raise ValueError("Robot config must define 'urdf_path'.")
+    if args.motion is None and (args.output is not None or args.viewer == "matplotlib"):
+        raise SystemExit("--motion is required for --output and --viewer matplotlib.")
 
-    joint_mapping = robot_config.get("joint_mapping")
-    if not isinstance(joint_mapping, dict) or not joint_mapping:
-        raise ValueError("Robot config must define a non-empty 'joint_mapping'.")
+    terrain = _load_terrain(args.terrain, args.terrain_max_faces)
 
-    all_poses = robot_config.get("default_joint_positions", {})
-    default_joint_positions = all_poses
-    if all_poses and isinstance(next(iter(all_poses.values()), None), dict):
-        pose_name = "T-Pose"  # default for SMPL-X
-        default_joint_positions = all_poses.get(pose_name, next(iter(all_poses.values())))
-    model, data, body_ids, body_positions, body_rotations = _load_robot_default_pose(
-        robot_urdf_path,
-        default_joint_positions=default_joint_positions if default_joint_positions else None,
-    )
-    # Normalize joint_mapping: handle mixed string/dict values and build link offset map
-    normalized_mapping = {}
-    link_offset_map = {}
-    for src_name, value in joint_mapping.items():
-        if isinstance(value, dict):
-            link = value["robot_link"]
-            normalized_mapping[src_name] = link
-            offset = value.get("offset", [0.0, 0.0, 0.0])
-            if np.any(np.asarray(offset, dtype=float) != 0):
-                link_offset_map[link] = offset
+    # Interactive PyVista mode may start without a motion and load it on demand.
+    if args.viewer == "pyvista" and args.output is None:
+        if args.motion is None:
+            initial_vertices, faces = _rest_pose_template(args)
+            vertices = None
+            args.fps = float(args.fps if args.fps else 30.0)
         else:
-            normalized_mapping[src_name] = value
-    joint_mapping = normalized_mapping
+            vertices, faces, motion = _prepare_body(args.motion, args)
+            initial_vertices = vertices[0]
+            args.fps = float(args.fps if args.fps else motion["framerate"])
+            print(f"Motion: {args.motion} ({motion['num_frames']} frames, {motion['framerate']:.2f} fps, gender={motion['gender']})")
+        print(f"Terrain: {args.terrain} ({len(terrain.vertices)} vertices, {len(terrain.faces)} faces)")
+        print(f"Rendering interactive viewer, coords={args.coords}, scale={args.scale}, z_offset={args.z_offset}")
+        _render_interactive(vertices, faces, terrain, args, initial_vertices)
+        return
 
-    missing_bodies = sorted({body_name for body_name in joint_mapping.values() if body_name not in body_ids})
-    if missing_bodies:
-        raise ValueError(f"Mapped robot bodies were not found in the URDF: {missing_bodies}")
+    # Non-interactive paths require a motion file.
+    vertices, faces, motion = _prepare_body(args.motion, args)
+    args.fps = float(args.fps if args.fps else motion["framerate"])
+    print(f"Model: {resolve_smplx_model_dir(args.smplx_model_dir)}")
+    print(f"Motion: {args.motion} ({motion['num_frames']} frames, {motion['framerate']:.2f} fps, gender={motion['gender']})")
+    print(f"Terrain: {args.terrain} ({len(terrain.vertices)} vertices, {len(terrain.faces)} faces)")
+    print(f"Rendering {len(vertices)} frame(s), coords={args.coords}, scale={args.scale}, z_offset={args.z_offset}")
 
-    if args.scale_with_robot:
-        robot_height = resolve_robot_height(robot_config, model, data)
+    if args.output:
+        if args.animate:
+            _render_animation(vertices, faces, terrain, args)
+        else:
+            _render_static(vertices[0], faces, terrain, args)
+    elif args.animate:
+        _render_animation(vertices, faces, terrain, args)
     else:
-        robot_height = None
-
-    pelvis_body_name = joint_mapping.get("Pelvis")
-    pelvis_position = body_positions[body_ids[pelvis_body_name]] if pelvis_body_name else np.zeros(3, dtype=float)
-
-    smplx_betas = robot_config.get("smplx_betas")
-    smplx_joints = None
-    if smplx_betas is not None:
-        raw_joints = _load_smplx_joints_from_betas(smplx_betas, smplx_model_dir=args.smplx_model_dir)
-        if raw_joints is not None and robot_height is not None:
-            smplx_height = float(raw_joints[:, 2].max() - raw_joints[:, 2].min())
-            scale = robot_height / smplx_height if smplx_height > 0 else 1.0
-            smplx_joints = pelvis_position[None, :] + (raw_joints - raw_joints[0:1]) * scale
-            print(f"[visualize_offsets] using SMPL-X model (scaled) with {len(smplx_betas)} betas, scale={scale:.3f}")
-        elif raw_joints is not None:
-            smplx_joints = pelvis_position[None, :] + (raw_joints - raw_joints[0:1])
-            print(f"[visualize_offsets] using SMPL-X model (unscaled) with {len(smplx_betas)} betas")
-
-    if smplx_joints is None:
-        smplx_joints = _build_default_smplx_pose(pelvis_position=pelvis_position, robot_height=robot_height)
-        scaled = "scaled" if robot_height else "unscaled"
-        print(f"[visualize_offsets] using hardcoded SMPL-X template ({scaled})")
-
-    output_path = Path(args.output) if args.output else None
-    _plot_visualization(
-        smplx_joints=smplx_joints,
-        model=model,
-        body_positions=body_positions,
-        body_rotations=body_rotations,
-        joint_mapping=joint_mapping,
-        link_offset_map=link_offset_map,
-        output_path=output_path,
-    )
-
-    print(f"[visualize_offsets] robot_config={config_path}")
-    print(f"[visualize_offsets] robot_urdf={robot_urdf_path}")
-    print(f"[visualize_offsets] default_joint_positions={0 if not default_joint_positions else len(default_joint_positions)}")
-    print(f"[visualize_offsets] smplx_betas={'none' if not smplx_betas else len(smplx_betas)}")
-    robot_height_str = f"{robot_height:.3f}" if robot_height else "none (unscaled)"
-    print(f"[visualize_offsets] robot_height={robot_height_str} m")
-    print(f"[visualize_offsets] mapped_links={len(joint_mapping)}")
-    print(f"[visualize_offsets] link_offsets={0 if not link_offset_map else len(link_offset_map)}")
-    if output_path is not None:
-        print(f"[visualize_offsets] output={output_path}")
+        _render_static(vertices[0], faces, terrain, args)
 
 
 if __name__ == "__main__":
