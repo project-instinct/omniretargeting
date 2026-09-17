@@ -8,6 +8,95 @@
 - CLI: YAML `--source-config` mode + legacy CLI compatibility
 - Visualization: MuJoCo offscreen rendering, object mesh injection, `--save-video`
 
+## Current Work (2026-09-07)
+
+### `hard_constraint_slack` correction-allocation fix
+
+- Implemented the plan in `agents/HARD_CONSTRAINT_SLACK_ANALYSIS.md`:
+  - `hard_constraint_slack` now enables its documented defaults even when
+    `penetration_slack` is omitted; stale slack parameters do not activate
+    slack for other resolvers, and all slack values are validated.
+  - The complete SQP now uses native MuJoCo tangent coordinates (`nv`): point
+    Jacobians remain in velocity coordinates, configuration residuals use
+    `mj_differentiatePos`, and accepted steps use `mj_integratePos`. Floating
+    quaternions therefore stay valid by construction.
+  - Replaced the mixed-unit global trust region with physical per-DOF bounds
+    and configurable translation, rotation, and joint correction weights.
+    Joint weights can be normalized by legal range, and the source root (or
+    frame-entry pose) supplies a fixed per-frame base reference.
+  - Added nonlinear candidate re-evaluation, feasibility-aware backtracking,
+    convergence based on applied scaled step plus the true hard bound, explicit
+    failure diagnostics, and heavily penalized restoration variables for poses
+    that cannot become feasible in one physical step.
+  - Added optional structured solver diagnostics for contact-row Jacobian
+    support, slack/restoration values, correction norms by robot block,
+    iteration count, backtracks, feasibility, and runtime.
+  - Unified terrain and foot-stabilization primitive sampling. MuJoCo cylinders
+    and capsules now use local Z, with correct cap centers/poles; spheres,
+    boxes, and ellipsoids share the same helper.
+  - Removed the unsafe unsigned center prefilter from nonlinear terrain checks.
+    Nearby faces remain local constraints, while deep signed constraints are
+    retained only for upward-facing support surfaces so non-watertight distant
+    walls do not create global half-space obstacles.
+- Added regression coverage for resolver defaults and validation, tangent-space
+  finite differences, quaternion validity, physical joint limits, bent-leg
+  Jacobian support, articulated correction allocation, rigid-translation
+  cancellation in self-contact, primitive surfaces, and nonlinear feasibility.
+- Updated README documentation for all three penetration resolvers,
+  `penetration_correction`, defaults/precedence, restoration, and diagnostics.
+
+### Ziwen data-source correction
+
+- Updated OMOMO runnable configs, integration-test resources, adapter defaults,
+  and examples to use the datasets that actually exist on
+  `ziwen-galaxea-desktop`:
+  - OMOMO: `/home/ziwen/Datasets/OMOMO`
+  - SMPL-X models: `/home/ziwen/Datasets/smplx`
+- Remote OMOMO integration verification: **9 passed**.
+
+### Verification completed on `ziwen-galaxea-desktop`
+
+- Focused solver suite: **71 passed, 12 skipped**.
+- Final full remote suite: **149 passed, 12 skipped, 3 deprecation
+  warnings** in 40.71 seconds.
+- Real case 1, unscaled: 173 frames, maximum sampled penetration 1.070 mm,
+  zero 30 mm hard-bound violations, zero joint-limit violations, quaternion
+  norm error below `7e-16`.
+- Real case 1, scaled (`0.900355`): maximum penetration 1.020 mm, zero hard
+  violations, zero joint-limit violations. A seeded constrained/unconstrained
+  A/B showed non-Z-only correction across base translation/rotation, legs,
+  waist, and arms; mean base-Z correction was 43.4 mm.
+- Real OMOMO case 2, sequence 318, unscaled and scaled (`0.853570`): the scaled
+  result's maximum penetration was 1.005 mm with zero hard-bound and joint-limit
+  violations.
+- Real case 3: 514 frames, maximum penetration 1.002 mm, zero hard-bound and
+  joint-limit violations.
+- Real case 4: 781 frames, completed through the longer-timeout batch path;
+  maximum penetration 29.408 mm, zero 30 mm hard-bound violations, zero
+  joint-limit violations, and quaternion norm error below `1.2e-15`.
+- EDP batch case 5: `omniretargeting.batch` processed all **9/9** SMPL-X files
+  serially (`--max-workers 1`), totaling 4,256 frames in about 97 minutes.
+  All nine NPZ outputs were written and all logs were free of tracebacks,
+  timeouts, kills, and error markers.
+- Independent post-run analysis passed for all nine batch outputs. Maximum
+  sampled penetration ranged from 1.002 mm to 29.408 mm; every trajectory had
+  zero 30 mm hard-bound violations, zero solver hard violations, zero
+  joint-limit violations, and quaternion norm error at or below `1.12e-15`.
+- Remote results are under
+  `/tmp/omniretargeting-hard-slack-Loy6rD`; ask before deleting them.
+- The protected remote `kengo.json` has only been read. No `edp_batch.py`
+  exists in the local or remote checkout.
+
+### Verification notes
+
+- Final code/path follow-ups were synchronized to the remote test checkout
+  before the full suite.
+- The remote environment does not have Black installed and this repository has
+  no pre-commit configuration, so no formatter was installed or run. Local
+  `git diff --check` passed.
+- Remote long-running commands use redirected logs under the result directory;
+  this avoids losing test output when the SSH transport disconnects.
+
 ## Recent Changes (2026-07-28)
 
 ### Base Position Tracking to Fix kengo Base Drift

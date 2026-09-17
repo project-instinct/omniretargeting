@@ -73,8 +73,8 @@ class OmomoDataSource(DataSource):
     def _resolve_model_directory(self) -> str:
         search_paths = [
             self.model_directory,
-            "/localhdd/Datasets/smplx",
-            "/localhdd/Datasets",
+            "~/Datasets/smplx",
+            "~/Datasets",
             "data/body_models/smplx",
         ]
         for candidate in search_paths:
@@ -82,7 +82,7 @@ class OmomoDataSource(DataSource):
                 return str(candidate)
         raise FileNotFoundError(
             "Could not locate SMPL-X model directory for OMOMO. "
-            "Provide model_directory or install the models under /localhdd/Datasets/smplx or /localhdd/Datasets."
+            "Provide model_directory or install the models under a configured dataset root."
         )
 
     def _sample_object_points(self) -> np.ndarray:
@@ -232,7 +232,7 @@ def create_omomo_data_source(motion_file, source_config, runtime_options):
         return default
 
     sequence_index = runtime_options.get("sequence_index", 0)
-    data_root = runtime_options.get("data_root", "/localhdd/Datasets/OMOMO")
+    data_root = runtime_options.get("data_root", "/home/ziwen/Datasets/OMOMO")
     n_object_samples = runtime_options.get("n_object_samples", 100)
     target_names_override = runtime_options.get("target_names_override", None)
     model_directory = runtime_options.get("model_directory", None)

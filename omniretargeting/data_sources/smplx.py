@@ -121,10 +121,11 @@ class SmplxDataSource(DataSource):
         except ImportError:
             return None
 
-        import os
-        search_paths = [self.model_directory] if self.model_directory else []
-        search_paths.extend(["/localhdd/Datasets/smplx", "/localhdd/Datasets/", "data/body_models/smplx"])
-        model_path = next((p for p in search_paths if p and os.path.exists(p)), None)
+        if not self.model_directory:
+            return None
+        model_directory = Path(self.model_directory)
+        search_paths = [model_directory / "smplx", model_directory]
+        model_path = next((path for path in search_paths if path.exists()), None)
         if model_path is None:
             return None
 

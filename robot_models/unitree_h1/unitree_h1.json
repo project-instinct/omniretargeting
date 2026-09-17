@@ -538,7 +538,12 @@
     "collision_detection_threshold": 0.1,
     "solver_max_iter": {"first_frame": 50, "subsequent": 10},
     "terrain_sample_points": 120,
-    "penetration_resolver": "hard_constraint",
+    "penetration_resolver": "hard_constraint_slack",
+    "penetration_slack": {
+      "soft_tolerance": 0.001,
+      "hard_bound": 0.1,
+      "slack_penalty": 1e5
+    },
     "foot_stabilization": {
       "enabled": true,
       "clearance": 0.01,

@@ -76,6 +76,7 @@ class TestCaseLoader:
             sequence_index=config["omomo_sequence_index"],
             data_root=config["omomo_data_root"],
             n_object_samples=config.get("n_object_samples", 100),
+            model_directory=config.get("smplx_model_directory"),
         )
         motion_data = source.load()
         return source, motion_data
@@ -130,7 +131,7 @@ class TestOmomoCoordinateConventions:
     """Regression checks for OMOMO coordinate and object-transform semantics."""
 
     def test_reconstructed_pelvis_uses_expected_joint_names(self):
-        omomo_root = "/localhdd/Datasets/OMOMO"
+        omomo_root = "/home/ziwen/Datasets/OMOMO"
         sequence_file = f"{omomo_root}/data/test_diffusion_manip_seq_joints24.p"
 
         if not Path(sequence_file).exists():
@@ -141,6 +142,7 @@ class TestOmomoCoordinateConventions:
             sequence_index=318,
             data_root=omomo_root,
             n_object_samples=20,
+            model_directory="/home/ziwen/Datasets/smplx",
         )
         motion_data = source.load()
 
@@ -152,7 +154,7 @@ class TestOmomoCoordinateConventions:
         np.testing.assert_allclose(motion_data.root_translations, motion_data.positions[:, 0, :], atol=5e-3)
 
     def test_object_points_follow_recorded_object_com(self):
-        omomo_root = "/localhdd/Datasets/OMOMO"
+        omomo_root = "/home/ziwen/Datasets/OMOMO"
         sequence_file = f"{omomo_root}/data/test_diffusion_manip_seq_joints24.p"
 
         if not Path(sequence_file).exists():
@@ -163,6 +165,7 @@ class TestOmomoCoordinateConventions:
             sequence_index=318,
             data_root=omomo_root,
             n_object_samples=20,
+            model_directory="/home/ziwen/Datasets/smplx",
         )
         motion_data = source.load()
 
@@ -177,7 +180,7 @@ class TestOmomoDataValidation:
     
     def test_omomo_data_structure(self):
         """Test basic OMOMO data loading without retargeting."""
-        omomo_root = "/localhdd/Datasets/OMOMO"
+        omomo_root = "/home/ziwen/Datasets/OMOMO"
         sequence_file = f"{omomo_root}/data/train_diffusion_manip_seq_joints24.p"
         
         if not Path(sequence_file).exists():
@@ -188,6 +191,7 @@ class TestOmomoDataValidation:
             sequence_index=0,
             data_root=omomo_root,
             n_object_samples=50,
+            model_directory="/home/ziwen/Datasets/smplx",
         )
         
         motion_data = source.load()
@@ -209,7 +213,7 @@ class TestOmomoDataValidation:
     
     def test_omomo_all_objects_loadable(self):
         """Test that all 15 OMOMO objects can be loaded."""
-        omomo_root = "/localhdd/Datasets/OMOMO"
+        omomo_root = "/home/ziwen/Datasets/OMOMO"
         sequence_file = f"{omomo_root}/data/train_diffusion_manip_seq_joints24.p"
         
         if not Path(sequence_file).exists():
@@ -238,6 +242,7 @@ class TestOmomoDataValidation:
                     sequence_index=seq_idx,
                     data_root=omomo_root,
                     n_object_samples=20,
+                    model_directory="/home/ziwen/Datasets/smplx",
                 )
                 motion_data = source.load()
                 print(f"  ✓ {obj_name:20s} - {motion_data.object_points.shape[1]} samples")

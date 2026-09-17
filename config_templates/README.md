@@ -21,14 +21,16 @@ For OMOMO dataset sequences with object manipulation. Includes object mesh loadi
 - `motion`: Path to .p sequence file
 - `sequence_index`: Which sequence to load
 - `data_root`: OMOMO dataset root directory
+- `model_directory`: SMPL-X model directory used for body reconstruction
 - `n_object_samples`: Number of points to sample from object mesh
 
 **Example:**
 ```yaml
 type: omomo
-motion: /localhdd/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p
+motion: ~/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p
 sequence_index: 318
-data_root: /localhdd/Datasets/OMOMO
+data_root: ~/Datasets/OMOMO
+model_directory: ~/Datasets/smplx
 n_object_samples: 100
 ```
 
@@ -42,14 +44,17 @@ For SMPL-X motion data with 22 body joints. Supports both raw parameters and pro
 - `motion`: Path to .npz or .npy file
 - `model_directory`: Path to SMPL-X model files
 - `gender`: "neutral", "male", or "female"
+- `use_smplx_base_pose`: Keep the SMPL-X root (pelvis) pose so the floating
+  base can be anchored to the source motion (`true` recommended)
 - `betas`: Shape parameters (10 values)
 
 **Example:**
 ```yaml
 type: smplx
 motion: /path/to/motion.npz
-model_directory: /localhdd/Datasets/smplx
+model_directory: ~/Datasets/smplx
 gender: neutral
+use_smplx_base_pose: true
 betas: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 ```
 

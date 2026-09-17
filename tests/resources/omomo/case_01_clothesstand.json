@@ -1,9 +1,10 @@
 {
     "name": "clothesstand_manipulation",
     "description": "Human manipulating clothesstand with G1 robot retargeting",
-    "omomo_sequence_file": "/localhdd/Datasets/OMOMO/data/train_diffusion_manip_seq_joints24.p",
+    "omomo_sequence_file": "/home/ziwen/Datasets/OMOMO/data/train_diffusion_manip_seq_joints24.p",
     "omomo_sequence_index": 0,
-    "omomo_data_root": "/localhdd/Datasets/OMOMO",
+    "omomo_data_root": "/home/ziwen/Datasets/OMOMO",
+    "smplx_model_directory": "/home/ziwen/Datasets/smplx",
     "n_object_samples": 100,
     "robot_config": "robot_models/unitree_g1/unitree_g1.json",
     "terrain": {

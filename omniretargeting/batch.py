@@ -2,7 +2,7 @@
 Batch processing script for OmniRetargeting.
 
 Scans a folder of motion files, writes per-motion source configs,
-and executes main.py for each file with scaled terrain and video export.
+and executes main.py for each file with optional fixed scaling and video export.
 
 Usage:
     python -m omniretargeting.batch \
@@ -62,14 +62,17 @@ def main() -> None:
                         help="Exclude files ending with this suffix (e.g. '_M.bvh' for mirrored files)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip motions whose retargeted output already exists")
-    parser.add_argument("--no-video", action="store_true",
-                        help="Skip video rendering (useful for headless servers)")
+    parser.add_argument("--video", action="store_true",
+                        help="Render a video for each motion (offscreen; requires imageio[ffmpeg])")
+    parser.add_argument("--progress", action="store_true",
+                        help="Show a progress bar for each motion's frame retargeting")
     parser.add_argument("--output-framerate", type=float, default=None,
                         help="Resample motion to this framerate before retargeting (e.g. 30 to downsample 120fps data)")
     parser.add_argument("--scale-factor", type=float, default=None,
                         help="Force one source-to-robot scale factor for every motion "
                              "(instead of per-motion height estimates), so all motions and "
-                             "their scaled terrains stay consistent.")
+                             "their terrain stay consistent. The scaled terrain is saved "
+                             "once under OUTPUT_DIR/terrain/.")
 
     args = parser.parse_args()
 
@@ -122,8 +125,7 @@ def main() -> None:
 
     # Resume: skip motions whose retargeted output already exists
     if args.resume:
-        source_root = source_folder if args.recursive else None
-        completed = [f for f in motion_files if _output_exists(f, output_dir, source_root)]
+        completed = [f for f in motion_files if _output_exists(f, output_dir)]
         if completed:
             print(f"Resume: skipping {len(completed)} already-processed motion(s)")
         completed_set = set(completed)
@@ -157,9 +159,10 @@ def main() -> None:
         timeout=args.timeout,
         reserved_memory_ratio=args.reserved_memory_ratio,
         source_folder=source_folder if args.recursive else None,
-        save_video=not args.no_video,
+        save_video=args.video,
         output_framerate=args.output_framerate,
         scale_factor=args.scale_factor,
+        progress=args.progress,
     )
 
     failed = _summarize(results)

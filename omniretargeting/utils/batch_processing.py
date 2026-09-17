@@ -98,12 +98,9 @@ def _resolve_rel_subdir(motion_file: Path, source_folder: Path | None) -> str | 
 def _output_exists(
     motion_file: Path,
     output_dir: Path,
-    source_folder: Path | None = None,
 ) -> bool:
     """Return True if the retargeted .npz for *motion_file* already exists."""
-    rel_subdir = _resolve_rel_subdir(motion_file, source_folder)
-    motion_dir = output_dir / "motions" / (rel_subdir or "") / motion_file.stem
-    return (motion_dir / f"{motion_file.stem}_retargeted.npz").is_file()
+    return (output_dir / "motions" / f"{motion_file.stem}_retargeted.npz").is_file()
 
 
 def write_source_config(
@@ -325,15 +322,12 @@ def _build_command(
     motion_stem: str,
     framerate: float | None = None,
     output_framerate: float | None = None,
-    rel_subdir: str | None = None,
-    save_video: bool = True,
+    save_video: bool = False,
     scale_factor: float | None = None,
+    progress: bool = False,
 ) -> list[str]:
     """Build the main.py argument list for one motion file."""
-    if rel_subdir:
-        motion_dir = output_dir / "motions" / rel_subdir / motion_stem
-    else:
-        motion_dir = output_dir / "motions" / motion_stem
+    motion_dir = output_dir / "motions"
     motion_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
@@ -341,7 +335,6 @@ def _build_command(
         "--robot-config", robot_config_path,
         "--source-config", str(source_config_path),
         "--output", str(motion_dir / f"{motion_stem}_retargeted.npz"),
-        "--scaled-objects", str(motion_dir / f"{motion_stem}_scaled_objects"),
     ]
     if scale_factor is not None:
         # Uniform scale: motions scale with one shared factor and the scaled
@@ -353,6 +346,8 @@ def _build_command(
         cmd.extend(["--framerate", str(framerate)])
     if output_framerate is not None:
         cmd.extend(["--output-framerate", str(output_framerate)])
+    if progress:
+        cmd.append("--progress")
     return cmd
 
 
@@ -470,13 +465,14 @@ def _run_test_job(
     framerate: float | None | FramerateResolver,
     timeout: float,
     source_folder: Path | None = None,
-    save_video: bool = True,
+    save_video: bool = False,
     output_framerate: float | None = None,
     config_path_resolver: ConfigPathResolver | None = None,
     download_key: str | None = None,
     download_fn: DownloadFn | None = None,
     delete_after: bool = False,
     scale_factor: float | None = None,
+    progress: bool = False,
 ) -> dict:
     """Run the first motion as a probe job.  Returns timing info for batch-size tuning."""
     first = motion_files[0]
@@ -498,7 +494,17 @@ def _run_test_job(
         config_path = write_source_config(first, source_type, output_dir, terrain_path, extra_options, rel_subdir)
     if callable(framerate):
         framerate = framerate(first)
-    cmd = _build_command(config_path, robot_config_path, output_dir, first.stem, framerate, output_framerate, rel_subdir, save_video=save_video, scale_factor=scale_factor)
+    cmd = _build_command(
+        config_path,
+        robot_config_path,
+        output_dir,
+        first.stem,
+        framerate,
+        output_framerate,
+        save_video=save_video,
+        scale_factor=scale_factor,
+        progress=progress,
+    )
     log_file = output_dir / "logs" / (f"{rel_subdir}/{first.stem}.log" if rel_subdir else f"{first.stem}.log")
 
     print(f"  Command: {' '.join(cmd)}")
@@ -557,13 +563,14 @@ def _run_one_motion(
     framerate: float | None | FramerateResolver,
     timeout: float,
     source_folder: Path | None = None,
-    save_video: bool = True,
+    save_video: bool = False,
     output_framerate: float | None = None,
     config_path_resolver: ConfigPathResolver | None = None,
     download_key: str | None = None,
     download_fn: DownloadFn | None = None,
     delete_after: bool = False,
     scale_factor: float | None = None,
+    progress: bool = False,
 ) -> dict:
     """Process a single motion file (called from worker processes)."""
     if download_key is not None:
@@ -583,7 +590,17 @@ def _run_one_motion(
         config_path = write_source_config(motion_file, source_type, output_dir, terrain_path, extra_options, rel_subdir)
     if callable(framerate):
         framerate = framerate(motion_file)
-    cmd = _build_command(config_path, robot_config_path, output_dir, motion_stem, framerate, output_framerate, rel_subdir, save_video=save_video, scale_factor=scale_factor)
+    cmd = _build_command(
+        config_path,
+        robot_config_path,
+        output_dir,
+        motion_stem,
+        framerate,
+        output_framerate,
+        save_video=save_video,
+        scale_factor=scale_factor,
+        progress=progress,
+    )
     log_file = output_dir / "logs" / (f"{rel_subdir}/{motion_stem}.log" if rel_subdir else f"{motion_stem}.log")
     result = run_single_job(cmd, activation_prefix, log_file, timeout)
     result["motion_file"] = str(motion_file)
@@ -607,7 +624,7 @@ def process_batch(
     timeout: float = 3600,
     reserved_memory_ratio: float = 0.4,
     source_folder: Path | None = None,
-    save_video: bool = True,
+    save_video: bool = False,
     output_framerate: float | None = None,
     config_path_resolver: ConfigPathResolver | None = None,
     download_keys: dict[Path, str] | None = None,
@@ -617,6 +634,7 @@ def process_batch(
     worker_initializer: Callable[..., None] | None = None,
     worker_initargs: tuple = (),
     scale_factor: float | None = None,
+    progress: bool = False,
 ) -> list[dict]:
     """Process every motion file, returning per-file results.
 
@@ -667,6 +685,7 @@ def process_batch(
             download_fn=download_fn,
             delete_after=delete_downloads,
             scale_factor=scale_factor,
+            progress=progress,
         )
         results.append(test_result)
         if on_result is not None:
@@ -693,8 +712,12 @@ def process_batch(
     print(f"Processing {len(remaining)} remaining files with {num_workers} parallel workers\n")
 
     if num_workers == 1:
+        completed_before_remaining = len(results)
         for i, motion_file in enumerate(remaining):
-            print(f"[{i + len(results) + 1}/{len(motion_files)}] Processing: {motion_file.name}")
+            print(
+                f"[{completed_before_remaining + i + 1}/{len(motion_files)}] "
+                f"Processing: {motion_file.name}"
+            )
             result = _run_one_motion(
                 motion_file, source_type, robot_config_path, output_dir,
                 activation_prefix, terrain_path, extra_options, framerate, timeout,
@@ -705,6 +728,7 @@ def process_batch(
                 download_fn=download_fn,
                 delete_after=delete_downloads,
                 scale_factor=scale_factor,
+                progress=progress,
             )
             results.append(result)
             if on_result is not None:
@@ -733,6 +757,7 @@ def process_batch(
                     download_fn=download_fn,
                     delete_after=delete_downloads,
                     scale_factor=scale_factor,
+                    progress=progress,
                 )
                 future_to_motion[future] = motion_file
 
@@ -776,7 +801,9 @@ def export_shared_scaled_terrain(
 
     scaled_terrain = trimesh.load(terrain_path, force="mesh")
     scaled_terrain.apply_scale(scale_factor)
-    shared_path = output_dir / filename
+    terrain_output_dir = output_dir / "terrain"
+    terrain_output_dir.mkdir(parents=True, exist_ok=True)
+    shared_path = terrain_output_dir / filename
     scaled_terrain.export(shared_path)
     print(f"Saved shared scaled terrain mesh to {shared_path} "
           f"(uniform scale factor {scale_factor})")

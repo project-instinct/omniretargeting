@@ -14,7 +14,7 @@
 type: omomo
 
 # Required: Path to OMOMO sequence file (.p file)
-motion: /localhdd/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p
+motion: ~/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p
 
 # Required: Sequence index to load from the file
 # Each .p file contains multiple sequences, specify which one to use
@@ -22,12 +22,12 @@ sequence_index: 318
 
 # Required: Root directory of OMOMO dataset
 # Used to locate object meshes in data/captured_objects/
-data_root: /localhdd/Datasets/OMOMO
+data_root: ~/Datasets/OMOMO
 
 # Required: Path to SMPL-X model directory
 # OMOMO uses SMPL body parameters that require SMPL-X forward kinematics
 # Should contain SMPLX_{gender}.pkl files
-model_directory: /localhdd/Datasets/smplx
+model_directory: ~/Datasets/smplx
 
 # Optional: Path to terrain mesh file
 # If not specified, a flat ground plane will be used

@@ -3,9 +3,10 @@
 # Sequence: sub17_floorlamp_023 (73 frames, ~2.4 seconds at 30fps)
 
 type: omomo
-motion: /localhdd/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p
+motion: ~/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p
 sequence_index: 318
-data_root: /localhdd/Datasets/OMOMO
+data_root: ~/Datasets/OMOMO
+model_directory: ~/Datasets/smplx
 n_object_samples: 50
 
 # This sequence shows a person manipulating a floor lamp

@@ -353,7 +353,7 @@ Main arguments:
 | `--vis` | off | Launch a MuJoCo viewer on the retargeted motion. |
 | `--save-video PATH` | off | Render the retargeted motion to video (requires `imageio[ffmpeg]`, and `MUJOCO_GL=egl`/`osmesa` for headless). |
 | `--replace-cylinders-with-capsules` | off | Swap cylinder collision geoms for capsules (IsaacLab/PhysX convention). |
-| `--penetration-resolver {hard_constraint,xyz_nudge}` | `xyz_nudge` | Contact handling mode; overrides the value in the profile. |
+| `--penetration-resolver {hard_constraint,hard_constraint_slack,xyz_nudge}` | `xyz_nudge` | Contact handling mode; overrides the value in the profile. Slack mode uses configured values or its documented defaults. |
 
 Legacy source-loading flags:
 
@@ -432,8 +432,56 @@ Current shipped profiles use a flat schema:
   - `collision_detection_threshold`
   - `terrain_sample_points`
   - `replace_cylinders_with_capsules`
-  - `penetration_resolver`: `"hard_constraint"` or `"xyz_nudge"`
+  - `penetration_resolver`: `"hard_constraint"`, `"hard_constraint_slack"`, or `"xyz_nudge"`
+  - `penetration_slack`: optional overrides for slack mode (`soft_tolerance`, `hard_bound`, `slack_penalty`); omitting the block still enables slack defaults
+  - `penetration_correction`: physical tangent-space correction metric and per-block limits (example below)
+  - `solver_diagnostics`: retain detailed contact-row and correction-allocation diagnostics on the inner retargeter's `last_solve_diagnostics` (default `false`)
   - `foot_stabilization`: nested block (see `robot_models/unitree_g1/unitree_g1.json`) that controls the post-processing XYZ-nudge pass (`enabled`, `clearance`, `surface_clearance`, `contact_clearance`, `xy_correction_gain`, smoothing windows, wall-contact thresholds, etc.)
+
+The hard-constraint solvers optimize physical MuJoCo tangent DOFs rather than
+the four ambient quaternion coordinates. Their correction allocation can be
+configured independently for translation, rotation, and articulated joints:
+
+```json
+{
+  "retargeting": {
+    "penetration_resolver": "hard_constraint_slack",
+    "penetration_slack": {
+      "soft_tolerance": 0.001,
+      "hard_bound": 0.03,
+      "slack_penalty": 100000.0
+    },
+    "penetration_correction": {
+      "base_translation_weights": [0.001, 0.001, 1.0],
+      "base_rotation_weight": 5.0,
+      "joint_weight": 0.001,
+      "joint_range_normalization": true,
+      "base_translation_step": [0.2, 0.2, 0.05],
+      "base_rotation_step": 0.2,
+      "joint_step_fraction": 0.1,
+      "step_tolerance": 0.00001,
+      "feasibility_tolerance": 0.000001,
+      "max_backtracks": 6,
+      "restoration_penalty": 10000000.0
+    }
+  }
+}
+```
+
+The listed values are the defaults when `penetration_correction` is omitted;
+`base_translation_step` X/Y and `base_rotation_step` otherwise inherit the
+solver's `step_size`. Joint weights are divided by squared joint range when
+range normalization is enabled. A matching `joint_regularization_boost.joints`
+entry takes the larger weight for that joint. The legacy
+`base_position_tracking_weight` takes precedence over X/Y translation weights
+when explicit source-root translation is available, and
+`base_position_tracking_weight_z` takes precedence over the Z translation
+weight in the same case; otherwise Z keeps the independent
+`penetration_correction` weight and remains movable.
+When a frame starts outside the hard bound by more than one allowed physical
+step, the SQP uses heavily penalized restoration variables to make monotone
+progress over multiple iterations. A solve is still reported successful only
+after nonlinear geometry satisfies the actual hard bound.
 
 `load_robot_config()` also accepts the newer nested profile shape with `robot`, `retargeting.solver`, `active_source`, and `source` entries. The loader normalizes both shapes into the same keys used above.
 
@@ -529,8 +577,9 @@ holosoma_retargeting project to work with generic robots and terrains:
 2. **Generic Robot Support**: Works with any URDF through automatic model loading, body-name validation, and auto-detected height.
 3. **Interaction Mesh**: Builds a tetrahedral interaction mesh from mapped source targets and terrain sample points.
 4. **Optimization**: Per-frame SQP optimization with Laplacian-deformation objective, joint limits, and a target base-orientation term for smoothness.
-5. **Collision / Penetration Handling**: Two modes selectable via `retargeting.penetration_resolver`:
+5. **Collision / Penetration Handling**: Three modes selectable via `retargeting.penetration_resolver`:
    - `hard_constraint` – penetration inequalities inside the SQP.
+   - `hard_constraint_slack` – hard backstop plus penalized soft-tolerance slack inside the SQP.
    - `xyz_nudge` – post-optimization foot stabilization that projects probe points out of the terrain and smooths XY drift (see `foot_stabilization` in the profile).
 6. **Joint Limits**: Respects robot joint limits throughout.
 

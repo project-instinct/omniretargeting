@@ -1,9 +1,10 @@
 {
     "name": "floorlamp_fast",
     "description": "Floor lamp manipulation - fastest test",
-    "omomo_sequence_file": "/localhdd/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p",
+    "omomo_sequence_file": "/home/ziwen/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p",
     "omomo_sequence_index": 318,
-    "omomo_data_root": "/localhdd/Datasets/OMOMO",
+    "omomo_data_root": "/home/ziwen/Datasets/OMOMO",
+    "smplx_model_directory": "/home/ziwen/Datasets/smplx",
     "n_object_samples": 50,
     "terrain": {
         "type": "flat",

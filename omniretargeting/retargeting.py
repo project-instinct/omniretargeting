@@ -7,11 +7,12 @@ import mujoco
 import clarabel
 from scipy import sparse as sp
 from scipy.spatial import Delaunay
-from scipy.spatial.transform import Rotation
 import trimesh
+import open3d as o3d
 from typing import Any, Dict, List, Optional, Tuple
 from pathlib import Path
 import fnmatch
+import time
 
 from .utils import (
     sample_points_on_mesh,
@@ -21,6 +22,7 @@ from .utils import (
     calculate_exponential_edge_weights,
     calculate_laplacian_coordinates,
     calculate_laplacian_matrix,
+    sample_mujoco_geom_local_points,
 )
 from .data_sources.base import validate_motion_positions
 
@@ -101,22 +103,22 @@ def compute_bone_direction_residual_and_jacobian(
     targets: np.ndarray,
     eps: float = 1e-8,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Robot-side bone-direction residual and its Jacobian w.r.t. dqa.
+    """Robot-side bone-direction residual and its Jacobian w.r.t. tangent DOFs.
 
     For bone (a->b) with segment e = p_b - p_a, L = ||e||, d = e / L:
         dd/dq = (I - d d^T) / L @ (J_b - J_a)
     For an adjacent pair (k, l) the residual is (d_k - d_l) - target and its
-    Jacobian is Jd_k - Jd_l, so residual(q + dq) ~= res + J @ dqa.
+    Jacobian is Jd_k - Jd_l, so ``res(q ⊕ delta_v) ~= res + J @ delta_v``.
 
     Args:
         robot_points: (N, 3) current robot link point positions (mapped order).
-        J_V: (3N, nq_a) stacked translational Jacobians (same order).
+        J_V: (3N, nv_a) stacked translational Jacobians (same order).
         triples: Adjacent bone triples (a, b, c).
         targets: (3P,) source-side (d_k - d_l) from compute_bone_direction_targets.
         eps: Lower bound for segment lengths when normalizing.
 
     Returns:
-        (res, J): residual (3P,) and Jacobian (3P, nq_a).
+        (res, J): residual (3P,) and Jacobian (3P, nv_a).
     """
     n_pairs = len(triples)
     res = np.zeros(3 * n_pairs)
@@ -156,7 +158,7 @@ def _solve_qp_clarabel(
     This is the exact same KKT system CVXPY sends to CLARABEL for the
     per-iteration SQP subproblem (same solver, same default settings), but
     assembled with numpy/scipy directly: the Laplacian error definition
-    ``lap_var = lap0 + J_L @ dqa`` is substituted into the objective, so the
+    ``lap_var = lap0 + J_L @ delta_v`` is substituted into the objective, so the
     problem keeps only ``len(c)`` scalar variables instead of carrying the
     3*num_vertices auxiliary ``lap_var`` variables plus equality constraints.
 
@@ -236,6 +238,10 @@ class GenericInteractionRetargeter:
         bone_direction: Optional[Dict] = None,
         penetration_slack: Optional[Dict] = None,
         base_position_tracking_weight: float = 0.0,
+        base_position_tracking_weight_z: float = 0.0,
+        penetration_correction: Optional[Dict] = None,
+        solver_diagnostics: bool = False,
+        terrain_deep_penetration_depth: float = 0.5,
     ):
         """Initialize the generic retargeter.
 
@@ -291,6 +297,11 @@ class GenericInteractionRetargeter:
                 - soft_tolerance (float, paper 0.001): tau, soft penetration margin
                 - hard_bound (float, paper 0.03): b, hard penetration backstop
                 - slack_penalty (float, paper 1e5): w_s, quadratic slack penalty
+            penetration_correction: Optional physical tangent-space state metric
+                and per-block step limits used by the SQP.
+            solver_diagnostics: Retain detailed per-contact and per-DOF-block
+                diagnostics on ``last_solve_diagnostics``. Summary success and
+                feasibility fields are always retained.
         """
         self.robot_model = robot_model
         self.robot_data = robot_data
@@ -367,17 +378,104 @@ class GenericInteractionRetargeter:
                 "penetration_slack requires hard_penetration_constraint=True "
                 "(penetration_resolver 'hard_constraint_slack')."
             )
+        if penetration_slack is not None and not isinstance(penetration_slack, dict):
+            raise ValueError("penetration_slack must be a dictionary when provided.")
         ps = penetration_slack or {}
         self.penetration_slack_enabled = penetration_slack is not None
         self.penetration_soft_tolerance = float(ps.get("soft_tolerance", 1e-3))
-        self.penetration_hard_bound = float(ps.get("hard_bound", 0.03))
+        self.penetration_hard_bound = float(ps.get("hard_bound", 0.1))
         self.penetration_slack_penalty = float(ps.get("slack_penalty", 1e5))
         self.base_position_tracking_weight = float(base_position_tracking_weight)
-        if self.penetration_slack_enabled and self.penetration_hard_bound <= self.penetration_soft_tolerance:
-            raise ValueError(
-                f"penetration_slack.hard_bound ({self.penetration_hard_bound}) must be "
-                f"greater than soft_tolerance ({self.penetration_soft_tolerance})."
+        self.base_position_tracking_weight_z = float(base_position_tracking_weight_z)
+        self.solver_diagnostics = bool(solver_diagnostics)
+        if self.penetration_slack_enabled:
+            slack_values = np.array(
+                [
+                    self.penetration_soft_tolerance,
+                    self.penetration_hard_bound,
+                    self.penetration_slack_penalty,
+                ]
             )
+            if not np.isfinite(slack_values).all():
+                raise ValueError("penetration_slack values must be finite.")
+            if self.penetration_soft_tolerance < 0:
+                raise ValueError("penetration_slack.soft_tolerance must be non-negative.")
+            if self.penetration_hard_bound <= self.penetration_soft_tolerance:
+                raise ValueError(
+                    f"penetration_slack.hard_bound ({self.penetration_hard_bound}) must be "
+                    f"greater than soft_tolerance ({self.penetration_soft_tolerance})."
+                )
+            if self.penetration_slack_penalty <= 0:
+                raise ValueError("penetration_slack.slack_penalty must be positive.")
+
+        if penetration_correction is not None and not isinstance(penetration_correction, dict):
+            raise ValueError("penetration_correction must be a dictionary when provided.")
+        correction = penetration_correction or {}
+        self.base_translation_weights = np.asarray(
+            correction.get("base_translation_weights", [1e-3, 1e-3, 1.0]),
+            dtype=float,
+        )
+        self.base_translation_step = np.asarray(
+            correction.get("base_translation_step", [step_size, step_size, min(step_size, 0.05)]),
+            dtype=float,
+        )
+        if self.base_translation_weights.shape != (3,):
+            raise ValueError("penetration_correction.base_translation_weights must contain 3 values.")
+        if self.base_translation_step.shape != (3,):
+            raise ValueError("penetration_correction.base_translation_step must contain 3 values.")
+        self.base_rotation_weight = float(correction.get("base_rotation_weight", 5.0))
+        self.base_rotation_step = float(correction.get("base_rotation_step", step_size))
+        self.joint_weight = float(
+            correction.get(
+                "joint_weight",
+                (joint_regularization_boost or {}).get("default", 1e-3),
+            )
+        )
+        self.joint_range_normalization = bool(
+            correction.get("joint_range_normalization", True)
+        )
+        self.joint_step_fraction = float(correction.get("joint_step_fraction", 0.1))
+        self.sqp_step_tolerance = float(correction.get("step_tolerance", 1e-5))
+        self.sqp_feasibility_tolerance = float(
+            correction.get("feasibility_tolerance", 1e-6)
+        )
+        self.sqp_max_backtracks = int(correction.get("max_backtracks", 6))
+        self.restoration_penalty = float(
+            correction.get("restoration_penalty", 1e7)
+        )
+        correction_values = np.concatenate(
+            [
+                self.base_translation_weights,
+                self.base_translation_step,
+                np.array(
+                    [
+                        self.base_rotation_weight,
+                        self.base_rotation_step,
+                        self.joint_weight,
+                        self.joint_step_fraction,
+                        self.sqp_step_tolerance,
+                        self.sqp_feasibility_tolerance,
+                        self.restoration_penalty,
+                    ]
+                ),
+            ]
+        )
+        if not np.isfinite(correction_values).all():
+            raise ValueError("penetration_correction values must be finite.")
+        if np.any(self.base_translation_weights < 0) or self.base_rotation_weight < 0:
+            raise ValueError("penetration_correction weights must be non-negative.")
+        if self.joint_weight < 0:
+            raise ValueError("penetration_correction.joint_weight must be non-negative.")
+        if np.any(self.base_translation_step <= 0) or self.base_rotation_step <= 0:
+            raise ValueError("penetration_correction base step limits must be positive.")
+        if self.joint_step_fraction <= 0:
+            raise ValueError("penetration_correction.joint_step_fraction must be positive.")
+        if self.sqp_step_tolerance <= 0 or self.sqp_feasibility_tolerance < 0:
+            raise ValueError("penetration_correction SQP tolerances are invalid.")
+        if self.sqp_max_backtracks < 0:
+            raise ValueError("penetration_correction.max_backtracks must be non-negative.")
+        if self.restoration_penalty <= 0:
+            raise ValueError("penetration_correction.restoration_penalty must be positive.")
 
         # Validate that all mapped robot links exist.
         # This is a final safety check - fail fast if links are missing.
@@ -424,90 +522,168 @@ class GenericInteractionRetargeter:
             print(f"Replaced {n_replaced} cylinder geom(s) with capsules for collision.")
 
     def _setup_robot_config(self):
-        """Setup robot configuration parameters."""
-        self.nq = self.robot_model.nq
-        self.nv = self.robot_model.nv
-        # Determine which qpos indices are optimized.
-        # q_a_init_idx follows the original convention:
-        #   -7: include floating base (0..nq)
-        #    0: start at actuated joints (after floating base)
-        #   12: start at waist, etc.
-        # This assumes standard MuJoCo convention:
-        # qpos structure: [floating_base (7), joint1 (1), joint2 (1), ...]
-        start_idx = 7 + self.q_a_init_idx
-        start_idx = int(np.clip(start_idx, 0, self.nq))
-        self.q_a_indices = np.arange(start_idx, self.nq)
-        self.nq_a = len(self.q_a_indices)
-        
-        print(f"Robot config: nq={self.nq}, nv={self.nv}, nq_a={self.nq_a}")
-        print(f"q_a_indices range: {self.q_a_indices.min()} to {self.q_a_indices.max()}")
+        """Map the configured optimization slice to physical MuJoCo DOFs."""
+        m = self.robot_model
+        self.nq = m.nq
+        self.nv = m.nv
+        self.neutral_qpos = m.qpos0.copy()
 
-        # Joint limits
-        joint_names = [self.robot_model.joint(i).name for i in range(self.robot_model.njnt)]
-        actuated_joints = [(i, name) for i, name in enumerate(joint_names) if name]
-        
-        large_number = 1e6
-        # Construct full limits array matching nq size
-        # Start with floating base limits (unbounded)
-        full_lower_limits = -large_number * np.ones(self.nq)
-        full_upper_limits = large_number * np.ones(self.nq)
-        
-        # Fill in limits for actuated joints
-        # This assumes joint addresses are contiguous after the base
-        # Depending on the robot model, we might need to be more careful here
-        # But for standard humanoids this usually holds
-        
-        # Typically self.robot_model.jnt_qposadr gives the index in qpos for each joint
-        for i in range(self.robot_model.njnt):
-            qpos_adr = self.robot_model.jnt_qposadr[i]
-            if qpos_adr >= 7: # Skip root joint(s) if they are part of the base
-                # For 1-DOF joints
-                full_lower_limits[qpos_adr] = self.robot_model.jnt_range[i, 0]
-                full_upper_limits[qpos_adr] = self.robot_model.jnt_range[i, 1]
+        start_qpos = int(np.clip(7 + self.q_a_init_idx, 0, self.nq))
+        dof_indices: List[int] = []
+        self.root_joint_id: Optional[int] = None
+        self.root_qpos_adr: Optional[int] = None
+        self.root_dof_adr: Optional[int] = None
 
-        self.q_a_lb = full_lower_limits[self.q_a_indices]
-        self.q_a_ub = full_upper_limits[self.q_a_indices]
+        for joint_id in range(m.njnt):
+            joint_type = m.jnt_type[joint_id]
+            qpos_adr = int(m.jnt_qposadr[joint_id])
+            dof_adr = int(m.jnt_dofadr[joint_id])
+            if joint_type == mujoco.mjtJoint.mjJNT_FREE:
+                dof_width = 6
+                if self.root_joint_id is None:
+                    self.root_joint_id = joint_id
+                    self.root_qpos_adr = qpos_adr
+                    self.root_dof_adr = dof_adr
+                if start_qpos <= qpos_adr:
+                    dof_indices.extend(range(dof_adr, dof_adr + dof_width))
+            elif joint_type == mujoco.mjtJoint.mjJNT_BALL:
+                if qpos_adr >= start_qpos:
+                    dof_indices.extend(range(dof_adr, dof_adr + 3))
+            elif qpos_adr >= start_qpos:
+                dof_indices.append(dof_adr)
 
-        # Joint cost weights - configurable per-robot via joint_regularization_boost
-        boost_cfg = self.joint_regularization_boost or {}
-        default_weight = float(boost_cfg.get("default", 1e-3))
-        self.Q_diag = np.ones(self.nq_a) * default_weight
+        self.dof_indices = np.asarray(dof_indices, dtype=int)
+        self.nv_a = len(self.dof_indices)
+        if self.nv_a == 0:
+            raise ValueError("q_a_init_idx selects no physical robot DOFs.")
+        self._dof_to_opt = {dof: i for i, dof in enumerate(self.dof_indices)}
 
-        # Reduce weight for floating base to allow free movement
-        base_weight = float(boost_cfg.get("base", 0.001))
-        base_indices_in_qa = []
-        for base_idx in range(7):
-            if base_idx in self.q_a_indices:
-                idx_in_qa = np.where(self.q_a_indices == base_idx)[0]
-                if len(idx_in_qa) > 0:
-                    base_indices_in_qa.append(idx_in_qa[0])
-        
-        if len(base_indices_in_qa) > 0:
-            self.Q_diag[base_indices_in_qa] = base_weight
-        
-        # Store smoothness weight (matching original: 0.2)
+        print(f"Robot config: nq={self.nq}, nv={self.nv}, nv_a={self.nv_a}")
+        print(f"dof_indices range: {self.dof_indices.min()} to {self.dof_indices.max()}")
+
+        self.base_translation_opt_indices: List[int] = []
+        self.base_rotation_opt_indices: List[int] = []
+        if self.root_dof_adr is not None and self.root_dof_adr in self._dof_to_opt:
+            self.base_translation_opt_indices = [
+                self._dof_to_opt[self.root_dof_adr + i] for i in range(3)
+            ]
+            self.base_rotation_opt_indices = [
+                self._dof_to_opt[self.root_dof_adr + 3 + i] for i in range(3)
+            ]
+
+        self.joint_regularization_diag = np.zeros(self.nv_a)
+        self.step_limits = np.full(self.nv_a, self.step_size, dtype=float)
+        self.limited_joint_dofs: List[Tuple[int, int, float, float]] = []
+
+        if self.base_translation_opt_indices:
+            self.step_limits[self.base_translation_opt_indices] = self.base_translation_step
+            self.step_limits[self.base_rotation_opt_indices] = self.base_rotation_step
+
+        boost_joints = (self.joint_regularization_boost or {}).get("joints") or {}
+        self.dof_group_indices: Dict[str, List[int]] = {
+            "base_translation": list(self.base_translation_opt_indices),
+            "base_rotation": list(self.base_rotation_opt_indices),
+            "legs": [],
+            "waist": [],
+            "arms": [],
+            "other_joints": [],
+        }
+        for joint_id in range(m.njnt):
+            joint_type = m.jnt_type[joint_id]
+            if joint_type == mujoco.mjtJoint.mjJNT_FREE:
+                continue
+            dof_adr = int(m.jnt_dofadr[joint_id])
+            dof_width = 3 if joint_type == mujoco.mjtJoint.mjJNT_BALL else 1
+            opt_indices = [
+                self._dof_to_opt[dof_adr + offset]
+                for offset in range(dof_width)
+                if dof_adr + offset in self._dof_to_opt
+            ]
+            if not opt_indices:
+                continue
+            qpos_adr = int(m.jnt_qposadr[joint_id])
+            limited = bool(m.jnt_limited[joint_id])
+            range_min, range_max = map(float, m.jnt_range[joint_id])
+            range_width = (
+                range_max - range_min
+                if limited and joint_type != mujoco.mjtJoint.mjJNT_BALL
+                else 0.0
+            )
+
+            joint_weight = self.joint_weight
+            joint_name = m.joint(joint_id).name or ""
+            for pattern, boost_value in boost_joints.items():
+                if fnmatch.fnmatch(joint_name.lower(), pattern.lower()):
+                    joint_weight = max(joint_weight, float(boost_value))
+                    break
+            if self.joint_range_normalization and range_width > 0:
+                joint_weight /= range_width**2
+            self.joint_regularization_diag[opt_indices] = joint_weight
+
+            joint_name_lower = joint_name.lower()
+            if any(token in joint_name_lower for token in ("hip", "knee", "ankle", "leg", "toe")):
+                group = "legs"
+            elif any(token in joint_name_lower for token in ("waist", "torso", "spine")):
+                group = "waist"
+            elif any(token in joint_name_lower for token in ("shoulder", "elbow", "wrist", "arm")):
+                group = "arms"
+            else:
+                group = "other_joints"
+            self.dof_group_indices[group].extend(opt_indices)
+
+            if range_width > 0:
+                opt_idx = opt_indices[0]
+                self.step_limits[opt_idx] = self.joint_step_fraction * range_width
+                self.limited_joint_dofs.append(
+                    (opt_idx, qpos_adr, range_min, range_max)
+                )
+
+        # Store smoothness weight (matching the previous solver).
         self.smooth_weight = 0.2
 
-        # Per-joint regularization boost (constant across SQP iterations).
-        # Modify Q_diag for specific joints (matching original MANUAL_COST logic).
-        Q_diag_modified = self.Q_diag.copy()
-        boost_joints = (self.joint_regularization_boost or {}).get("joints") or {}
-        for i in range(self.robot_model.njnt):
-            joint_name = self.robot_model.joint(i).name
-            if not joint_name:
-                continue
-            joint_name_lower = joint_name.lower()
-            for pattern, boost_value in boost_joints.items():
-                if fnmatch.fnmatch(joint_name_lower, pattern.lower()):
-                    qpos_adr = self.robot_model.jnt_qposadr[i]
-                    if qpos_adr in self.q_a_indices:
-                        idx_in_qa = np.where(self.q_a_indices == qpos_adr)[0]
-                        if len(idx_in_qa) > 0:
-                            Q_diag_modified[idx_in_qa[0]] = max(
-                                Q_diag_modified[idx_in_qa[0]], float(boost_value)
-                            )
-                    break
-        self.Q_diag_modified = Q_diag_modified
+    def _configuration_residual(self, reference: np.ndarray, q: np.ndarray) -> np.ndarray:
+        """Return the optimized tangent displacement from ``reference`` to ``q``."""
+        residual = np.zeros(self.nv)
+        mujoco.mj_differentiatePos(self.robot_model, residual, 1.0, reference, q)
+        return residual[self.dof_indices]
+
+    def _step_bounds(self, q: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Return physical per-DOF step and joint-position bounds at ``q``."""
+        lb = -self.step_limits.copy()
+        ub = self.step_limits.copy()
+        for opt_idx, qpos_adr, range_min, range_max in self.limited_joint_dofs:
+            lb[opt_idx] = max(lb[opt_idx], range_min - q[qpos_adr])
+            ub[opt_idx] = min(ub[opt_idx], range_max - q[qpos_adr])
+        return lb, ub
+
+    def reaches_joint_limit(self, q: np.ndarray, tolerance: float = 1e-6) -> bool:
+        """Whether an optimized scalar joint is at either configured URDF bound."""
+        return any(
+            q[qpos_adr] <= range_min + tolerance
+            or q[qpos_adr] >= range_max - tolerance
+            for _, qpos_adr, range_min, range_max in self.limited_joint_dofs
+        )
+
+    def _integrate_optimized_step(
+        self,
+        q: np.ndarray,
+        delta_v: np.ndarray,
+        scale: float = 1.0,
+    ) -> np.ndarray:
+        """Integrate an optimized tangent step and return a valid ``qpos``."""
+        full_delta_v = np.zeros(self.nv)
+        full_delta_v[self.dof_indices] = np.asarray(delta_v, dtype=float) * scale
+        q_new = q.copy()
+        mujoco.mj_integratePos(self.robot_model, q_new, full_delta_v, 1.0)
+        return q_new
+
+    def _dof_block_norms(self, values: np.ndarray) -> Dict[str, float]:
+        """Return Euclidean norms for generic robot DOF groups."""
+        values = np.asarray(values, dtype=float)
+        return {
+            group: float(np.linalg.norm(values[indices])) if indices else 0.0
+            for group, indices in self.dof_group_indices.items()
+        }
     
     def _validate_joint_mapping(self):
         """Validate that all mapped robot links exist. Raise error if any are missing.
@@ -525,33 +701,51 @@ class GenericInteractionRetargeter:
         """Setup terrain interaction parameters."""
         # Sample points on terrain for interaction mesh
         self.terrain_points = sample_points_on_mesh(self.terrain_mesh, self.terrain_sample_points)
-
-        # Conservative bounding-sphere radius per geom, used to skip terrain
-        # proximity queries for geoms that provably cannot be within
-        # collision_detection_threshold of the terrain. Computed from the
-        # (possibly cylinder->capsule replaced) geom types, so it must not be
-        # cached before _replace_cylinders_with_capsules runs.
-        self._geom_bounding_radii = np.array(
-            [self._geom_bounding_radius(gi) for gi in range(self.robot_model.ngeom)]
+        self._terrain_face_normals = np.asarray(
+            self.terrain_mesh.face_normals, dtype=float
+        ).copy()
+        terrain_vertices = np.ascontiguousarray(
+            self.terrain_mesh.vertices, dtype=np.float32
         )
+        terrain_faces = np.ascontiguousarray(
+            self.terrain_mesh.faces, dtype=np.uint32
+        )
+        self._terrain_scene = o3d.t.geometry.RaycastingScene()
+        self._terrain_scene.add_triangles(
+            o3d.core.Tensor(terrain_vertices),
+            o3d.core.Tensor(terrain_faces),
+        )
+        self._terrain_collision_geoms: List[Tuple[int, np.ndarray]] = []
+        for geom_id in range(self.robot_model.ngeom):
+            if (
+                self.robot_model.geom_contype[geom_id] == 0
+                and self.robot_model.geom_conaffinity[geom_id] == 0
+            ):
+                continue
+            points_local = sample_mujoco_geom_local_points(
+                int(self.robot_model.geom_type[geom_id]),
+                self.robot_model.geom_size[geom_id],
+            )
+            if len(points_local):
+                self._terrain_collision_geoms.append((geom_id, points_local))
 
-    def _geom_bounding_radius(self, geom_id: int) -> float:
-        """Conservative world-space bounding-sphere radius of one geom."""
-        m = self.robot_model
-        geom_type = m.geom_type[geom_id]
-        size = m.geom_size[geom_id]
-        if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
-            return float(size[0])
-        if geom_type in (mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_CYLINDER):
-            # radius + half-length (conservative for cylinder, exact for capsule)
-            return float(size[0] + size[1])
-        if geom_type == mujoco.mjtGeom.mjGEOM_BOX:
-            return float(np.linalg.norm(size[:3]))
-        # Other types (mesh, ...): fall back to MuJoCo's bounding radius; if
-        # unavailable, return inf so the geom is never prefiltered away.
-        rbound = float(m.geom_rbound[geom_id])
-        return rbound if rbound > 0 else np.inf
+    def _closest_points_on_terrain(
+        self,
+        points: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return closest terrain points through Open3D's CPU acceleration structure."""
+        points = np.asarray(points, dtype=float)
+        if len(points) == 0:
+            return points.copy(), np.empty(0), np.empty(0, dtype=int)
 
+        query_points = np.ascontiguousarray(points, dtype=np.float32)
+        result = self._terrain_scene.compute_closest_points(
+            o3d.core.Tensor(query_points), nthreads=1
+        )
+        closest = np.asarray(result["points"].numpy(), dtype=float)
+        tri_ids = np.asarray(result["primitive_ids"].numpy(), dtype=int)
+        dists = np.linalg.norm(points - closest, axis=1)
+        return closest, dists, tri_ids
 
     def create_interaction_mesh(
         self,
@@ -699,7 +893,14 @@ class GenericInteractionRetargeter:
         Returns:
             Optimized configuration
         """
+        solve_started = time.perf_counter()
+        self._last_qp_diagnostics = {}
         q = q_init.copy()
+        base_position_reference = q_init.copy()
+        if root_translation is not None and self.root_qpos_adr is not None:
+            base_position_reference[
+                self.root_qpos_adr : self.root_qpos_adr + 3
+            ] = root_translation
 
         # Warm-init stage (TopoRetarget Eq. 2): refine the initial guess toward
         # the source's relative bone directions before the main refinement.
@@ -707,8 +908,17 @@ class GenericInteractionRetargeter:
             q = self._warm_init_bone_direction(q, bone_targets, q_last)
 
         last_cost = np.inf
+        current_violation = self._nonlinear_penetration_violation(q)
+        converged = False
+        solver_failed = False
+        backtrack_failed = False
+        accepted_any = False
+        iterations = 0
+        accepted_step = np.zeros(self.nv_a)
+        total_backtracks = 0
 
         for iteration in range(max_iter):
+            iterations = iteration + 1
             # Single optimization step
             q_new, cost = self._single_optimization_step(
                 q,
@@ -721,20 +931,94 @@ class GenericInteractionRetargeter:
                 object_points=object_points,
                 bone_targets=bone_targets,
                 root_translation=root_translation,
+                base_position_reference=base_position_reference,
             )
 
             # Solver failure at this linearization point: an identical retry
             # cannot help, so stop instead of burning the remaining iterations.
             if not np.isfinite(cost):
+                solver_failed = True
                 break
 
-            # Check convergence
-            if abs(cost - last_cost) < 1e-6:
-                break
+            accepted_step = self._configuration_residual(q, q_new)
+            candidate_violation = self._nonlinear_penetration_violation(q_new)
+
+            if candidate_violation > current_violation + self.sqp_feasibility_tolerance:
+                backtrack_accepted = False
+                for backtrack in range(1, self.sqp_max_backtracks + 1):
+                    total_backtracks += 1
+                    scale = 0.5**backtrack
+                    q_backtracked = self._integrate_optimized_step(q, accepted_step, scale)
+                    backtracked_violation = self._nonlinear_penetration_violation(q_backtracked)
+                    if backtracked_violation <= current_violation + self.sqp_feasibility_tolerance:
+                        q_new = q_backtracked
+                        accepted_step = accepted_step * scale
+                        candidate_violation = backtracked_violation
+                        backtrack_accepted = True
+                        break
+                if not backtrack_accepted:
+                    # No positive backtracking scale preserves the nonlinear
+                    # hard bound. If no usable step has been accepted yet, the
+                    # frame has not moved and must be reported as failed instead
+                    # of silently accepted. Otherwise, keep the previously
+                    # accepted feasible pose and treat the zero step as
+                    # convergence.
+                    if not accepted_any:
+                        backtrack_failed = True
+                        q_new = q
+                        accepted_step = np.zeros_like(accepted_step)
+                        candidate_violation = current_violation
+                        last_cost = cost
+                        break
+                    q_new = q
+                    accepted_step = np.zeros_like(accepted_step)
+                    candidate_violation = current_violation
 
             q = q_new
+            current_violation = candidate_violation
+            if np.linalg.norm(accepted_step) > 0.0:
+                accepted_any = True
+            scaled_step_norm = float(
+                np.linalg.norm(accepted_step / self.step_limits)
+            )
+            feasible = current_violation <= self.sqp_feasibility_tolerance
+            if feasible and scaled_step_norm <= self.sqp_step_tolerance:
+                converged = True
+                last_cost = cost
+                break
             last_cost = cost
 
+        feasible = current_violation <= self.sqp_feasibility_tolerance
+        net_delta = self._configuration_residual(q_init, q)
+        if solver_failed:
+            failure_reason = "qp_solver_failed"
+        elif backtrack_failed:
+            failure_reason = "nonlinear_step_rejected"
+        elif not feasible:
+            failure_reason = "nonlinear_hard_bound_violation"
+        else:
+            failure_reason = None
+        self.last_solve_diagnostics = {
+            "success": bool(feasible and not solver_failed and not backtrack_failed),
+            "converged": converged,
+            "solver_failed": solver_failed,
+            "backtrack_failed": backtrack_failed,
+            "failure_reason": failure_reason,
+            "iterations": iterations,
+            "cost": float(last_cost),
+            "max_hard_violation": float(current_violation),
+            "accepted_delta_v": accepted_step.copy(),
+            "net_delta_v": net_delta.copy(),
+            "runtime_seconds": float(time.perf_counter() - solve_started),
+            **getattr(self, "_last_qp_diagnostics", {}),
+        }
+        if self.solver_diagnostics:
+            self.last_solve_diagnostics.update(
+                {
+                    "backtrack_attempts": total_backtracks,
+                    "correction_block_norms": self._dof_block_norms(net_delta),
+                }
+            )
         return q
 
     def _warm_init_bone_direction(
@@ -753,9 +1037,8 @@ class GenericInteractionRetargeter:
         """
         q = q_init.copy()
         q_ref = q_last if q_last is not None else q_init
-        ref_a = q_ref[self.q_a_indices]
 
-        n = self.nq_a
+        n = self.nv_a
         for _ in range(self.bone_warm_init_iters):
             self.robot_data.qpos[:] = q
             mujoco.mj_forward(self.robot_model, self.robot_data)
@@ -765,28 +1048,23 @@ class GenericInteractionRetargeter:
                 robot_points, J_V, self.bone_triples, bone_targets
             )
 
-            q_a_current = q[self.q_a_indices]
-            # min lambda_warm * ||res + J dqa||^2 + lambda_smooth * ||dqa + q_a - ref_a||^2
+            reference_residual = self._configuration_residual(q_ref, q)
+            # min lambda_warm * ||res + J dv||^2
+            #   + lambda_smooth * ||reference_residual + dv||^2
             P = 2.0 * self.lambda_warm * (J.T @ J) + 2.0 * self.lambda_smooth * np.eye(n)
-            c = 2.0 * self.lambda_warm * (J.T @ res) + 2.0 * self.lambda_smooth * (q_a_current - ref_a)
+            c = 2.0 * self.lambda_warm * (J.T @ res) + 2.0 * self.lambda_smooth * reference_residual
+            lb, ub = self._step_bounds(q)
 
-            dqa_opt, ok = _solve_qp_clarabel(
+            delta_v, ok = _solve_qp_clarabel(
                 sp.csr_matrix(P),
                 c,
-                lb=self.q_a_lb - q_a_current,
-                ub=self.q_a_ub - q_a_current,
-                trust_region_dim=n,
-                step_size=self.step_size,
+                lb=lb,
+                ub=ub,
             )
             if not ok:
                 break
 
-            q[self.q_a_indices] = q_a_current + dqa_opt
-            # Keep the base quaternion a valid unit quaternion between iterations
-            quat = q[3:7]
-            norm = np.linalg.norm(quat)
-            if norm > 1e-12:
-                q[3:7] = quat / norm
+            q = self._integrate_optimized_step(q, delta_v)
 
         return q
 
@@ -802,13 +1080,14 @@ class GenericInteractionRetargeter:
         object_points: Optional[np.ndarray] = None,
         bone_targets: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
+        base_position_reference: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, float]:
         """
         Single SQP optimization step.
 
         The QP is assembled directly and solved with CLARABEL (see
         _solve_qp_clarabel): the auxiliary Laplacian variables are substituted
-        out, leaving a small QP in dqa (plus optional penetration slack).
+        out, leaving a small QP in ``delta_v`` (plus optional penetration slack).
 
         Args:
             q: Current configuration
@@ -829,11 +1108,8 @@ class GenericInteractionRetargeter:
         self.robot_data.qpos[:] = q
         mujoco.mj_forward(self.robot_model, self.robot_data)
 
-        # qdot->qvel transform depends only on q; build once per iteration.
-        T_qvel = self._build_transform_qdot_to_qvel_fast()
-
         # Compute Jacobians for mapped robot link points.
-        J_V, p_V, _ = self._compute_robot_jacobians(q, T=T_qvel)
+        J_V, p_V, _ = self._compute_robot_jacobians(q)
 
         # CRITICAL: Ensure robot_points are in the SAME ORDER as source_target_positions passed to retarget_frame.
         # The order MUST match: source_target_positions[i] corresponds to robot_points[i] for all i.
@@ -884,22 +1160,14 @@ class GenericInteractionRetargeter:
         # Top part: J_V (robot points), Bottom part: 0 (environment points, static)
         J_full_vertices = sp.vstack([
             sp.csr_matrix(J_V),  # Jacobians for robot points
-            sp.csr_matrix((3 * num_env_points, self.nq_a))  # Zeros for environment points (terrain + objects)
+            sp.csr_matrix((3 * num_env_points, self.nv_a))  # Zeros for environment points (terrain + objects)
         ])
 
-        # J_L maps dqa to Laplacian-coordinate deltas: (3*V, nq_a)
+        # J_L maps delta_v to Laplacian-coordinate deltas: (3*V, nv_a)
         J_L = Kron @ J_full_vertices
 
-        # ---- Assemble the QP in dqa (+ optional penetration slack vars) ----
-        # Objective terms (matching the previous CVXPY formulation exactly):
-        #   ||sqrt(W) (lap0 + J_L dqa - target)||^2          (Laplacian)
-        #   + lambda_bone ||res + J_bone dqa||^2             (bone prior)
-        #   + ||sqrt(Q_diag) (dqa + q_a)||^2                 (joint regularization)
-        #   + smooth_weight ||dqa - dqa_smooth||^2           (temporal smoothness)
-        #   + sum_i w_orient (dqa[i] + q[i] - target[i])^2   (base orientation)
-        #   + (w_slack/2) sum((span * s_unit)^2)             (penetration slack)
-        n = self.nq_a
-        q_a_current = q[self.q_a_indices]
+        # ---- Assemble the QP in delta_v (+ optional penetration slacks) ----
+        n = self.nv_a
 
         lap0_vec = (L @ vertices).reshape(-1)
         target_lap_vec = target_laplacian.reshape(-1)
@@ -923,70 +1191,75 @@ class GenericInteractionRetargeter:
             P = P + 2.0 * self.lambda_bone * sp.csr_matrix(bone_J.T @ bone_J)
             c = c + 2.0 * self.lambda_bone * (bone_J.T @ bone_res)
 
-        # Joint regularization cost (keep joints near zero/neutral).
-        # Q_diag_modified is precomputed once in _setup_robot_config.
-        # All diagonal Hessian contributions are collected into one vector and
-        # added once below (scalar += on sparse matrices is not portable).
-        P_diag_extra = 2.0 * self.Q_diag_modified
-        c = c + 2.0 * self.Q_diag_modified * q_a_current
+        # Joint regularization uses a valid neutral qpos and a tangent residual.
+        neutral_residual = self._configuration_residual(self.neutral_qpos, q)
+        P_diag_extra = 2.0 * self.joint_regularization_diag
+        c = c + 2.0 * self.joint_regularization_diag * neutral_residual
 
-        # Smoothness cost: use previous frame's velocity, not current guess
-        dqa_smooth = None
+        # Temporal smoothness is also expressed in tangent coordinates.
+        smooth_residual = None
         if q_last is not None:
-            dqa_smooth = q_last[self.q_a_indices] - q_a_current
+            smooth_residual = self._configuration_residual(q_last, q)
             P_diag_extra = P_diag_extra + 2.0 * self.smooth_weight
-            c = c - 2.0 * self.smooth_weight * dqa_smooth
+            c = c + 2.0 * self.smooth_weight * smooth_residual
 
-        # Base orientation tracking cost: keep the base orientation close to
-        # the target estimated from source target positions.
-        orientation_weight = 5.0  # Strong preference to maintain orientation
-        orient_terms: List[Tuple[int, float]] = []
-        if target_base_orientation is not None and 3 in self.q_a_indices:
-            # Find quaternion indices in q_a_indices
-            quat_indices_in_qa = []
-            for quat_idx in [3, 4, 5, 6]:  # wxyz quaternion
-                if quat_idx in self.q_a_indices:
-                    idx_in_qa = np.where(self.q_a_indices == quat_idx)[0]
-                    if len(idx_in_qa) > 0:
-                        quat_indices_in_qa.append(idx_in_qa[0])
+        # Base orientation tracking uses the three-dimensional free-joint
+        # rotational tangent instead of four ambient quaternion components.
+        orientation_residual = None
+        if (
+            target_base_orientation is not None
+            and self.root_qpos_adr is not None
+            and self.base_rotation_opt_indices
+        ):
+            orientation_target = q.copy()
+            orientation_target[
+                self.root_qpos_adr + 3 : self.root_qpos_adr + 7
+            ] = target_base_orientation
+            orientation_residual_full = self._configuration_residual(
+                orientation_target, q
+            )
+            orientation_residual = orientation_residual_full[
+                self.base_rotation_opt_indices
+            ]
+            for i, opt_idx in enumerate(self.base_rotation_opt_indices):
+                P_diag_extra[opt_idx] += 2.0 * self.base_rotation_weight
+                c[opt_idx] += 2.0 * self.base_rotation_weight * orientation_residual[i]
 
-            if len(quat_indices_in_qa) == 4:
-                quat_current = q[3:7]  # Current quaternion
-                for i, qa_idx in enumerate(quat_indices_in_qa):
-                    diff = float(quat_current[i] - target_base_orientation[i])
-                    P_diag_extra[qa_idx] += 2.0 * orientation_weight
-                    c[qa_idx] += 2.0 * orientation_weight * diff
-                    orient_terms.append((qa_idx, diff))
-
-        # Base position tracking cost: keep the floating-base x-y origin close
-        # to the source root translation when it is available. This compensates
-        # for the loss of global x-y anchoring that happens with distance-
-        # weighted Laplacian edges (TopoRetarget), where static terrain
-        # vertices receive very low weights. We intentionally skip Z so the
-        # optimizer can still respect the robot's leg kinematics and terrain
-        # penetration constraints.
-        if root_translation is not None and self.base_position_tracking_weight > 0.0:
-            w_pos = self.base_position_tracking_weight
-            for pos_idx in [0, 1]:
-                if pos_idx in self.q_a_indices:
-                    idx_in_qa = int(np.where(self.q_a_indices == pos_idx)[0][0])
-                    diff = float(q_a_current[idx_in_qa] - root_translation[pos_idx])
-                    # Add 2*w to the diagonal and 2*w*diff to the linear term
-                    # so the QP cost is w * (dqa[idx] + diff)^2.
-                    P_diag_extra[idx_in_qa] += 2.0 * w_pos
-                    c[idx_in_qa] += 2.0 * w_pos * diff
+        # Base translation has independent XYZ weights.  The legacy scalar
+        # keeps precedence for X/Y when an explicit source root is available.
+        position_terms: List[Tuple[int, float, float]] = []
+        if (
+            base_position_reference is not None
+            and self.root_qpos_adr is not None
+            and self.base_translation_opt_indices
+        ):
+            position_weights = self.base_translation_weights.copy()
+            if root_translation is not None:
+                if self.base_position_tracking_weight > 0.0:
+                    position_weights[:2] = self.base_position_tracking_weight
+                if self.base_position_tracking_weight_z > 0.0:
+                    position_weights[2] = self.base_position_tracking_weight_z
+            for axis, opt_idx in enumerate(self.base_translation_opt_indices):
+                diff = float(
+                    q[self.root_qpos_adr + axis]
+                    - base_position_reference[self.root_qpos_adr + axis]
+                )
+                weight = float(position_weights[axis])
+                P_diag_extra[opt_idx] += 2.0 * weight
+                c[opt_idx] += 2.0 * weight * diff
+                position_terms.append((opt_idx, diff, weight))
 
         P = P + sp.diags(P_diag_extra)
 
         # Non-penetration rows (self-collision + terrain), numeric form:
-        # hard_rows: (Ja, rhs) meaning Ja @ dqa >= rhs
+        # hard_rows: (Ja, rhs) meaning Ja @ delta_v >= rhs
         # slack_rows: (Ja, rhs_soft, span) adding span * s_unit_i to the row
         hard_rows: List[Tuple[np.ndarray, float]] = []
         slack_rows: List[Tuple[np.ndarray, float, float]] = []
         if self.hard_penetration_constraint:
-            hard_rows, slack_rows = self._compute_penetration_constraints(T=T_qvel)
+            hard_rows, slack_rows = self._compute_penetration_constraints()
 
-        # Extend variables with unit slacks s_unit in [0, 1] (slack s = span * s_unit)
+        # Extend variables with unit slacks s_unit in [0, 1] (slack s = span * s_unit).
         m = len(slack_rows)
         if m:
             slack_diag = np.array([
@@ -995,128 +1268,111 @@ class GenericInteractionRetargeter:
             P = sp.block_diag([P, sp.diags(slack_diag)], format="lil")
             c = np.concatenate([c, np.zeros(m)])
 
-        num_vars = n + m
+        # If the current nonlinear pose lies outside the hard bound by more
+        # than a physical step can repair, a literal hard row makes the first
+        # restoration QP infeasible.  Add a heavily penalized, bounded elastic
+        # variable only to rows that are already violated.  Nonlinear
+        # acceptance still requires the true hard bound before success; these
+        # variables merely let successive SQP iterations make monotone progress
+        # into the feasible set.
+        restoration_specs = [
+            (row_idx, float(rhs))
+            for row_idx, (_, rhs) in enumerate(hard_rows)
+            if rhs > self.sqp_feasibility_tolerance
+        ]
+        restoration_index = {
+            row_idx: restore_idx
+            for restore_idx, (row_idx, _) in enumerate(restoration_specs)
+        }
+        restoration_spans = np.array(
+            [span for _, span in restoration_specs], dtype=float
+        )
+        r_count = len(restoration_specs)
+        if r_count:
+            restoration_diag = self.restoration_penalty * restoration_spans**2
+            P = sp.block_diag([P, sp.diags(restoration_diag)], format="lil")
+            c = np.concatenate([c, np.zeros(r_count)])
+
+        num_vars = n + m + r_count
         ge_rows: List[Tuple[np.ndarray, float]] = []
-        for Ja, rhs in hard_rows:
+        for row_idx, (Ja, rhs) in enumerate(hard_rows):
             a = np.zeros(num_vars)
             a[:n] = Ja
+            restore_idx = restoration_index.get(row_idx)
+            if restore_idx is not None:
+                a[n + m + restore_idx] = restoration_spans[restore_idx]
             ge_rows.append((a, rhs))
         for i, (Ja, rhs_soft, span) in enumerate(slack_rows):
             a = np.zeros(num_vars)
             a[:n] = Ja
             a[n + i] = span
+            restore_idx = restoration_index.get(i)
+            if restore_idx is not None:
+                a[n + m + restore_idx] = restoration_spans[restore_idx]
             ge_rows.append((a, rhs_soft))
 
-        lb = np.concatenate([self.q_a_lb - q_a_current, np.zeros(m)])
-        ub = np.concatenate([self.q_a_ub - q_a_current, np.ones(m)])
+        delta_lb, delta_ub = self._step_bounds(q)
+        lb = np.concatenate([delta_lb, np.zeros(m + r_count)])
+        ub = np.concatenate([delta_ub, np.ones(m + r_count)])
 
-        # Solve (fallback: retry without the trust region, as before)
+        # Physical per-block limits are already included in lb/ub; there is no
+        # mixed-unit all-state trust-region SOC.
         P_csr = sp.csr_matrix(P)
-        x, ok = _solve_qp_clarabel(
-            P_csr, c, lb, ub, ge_rows, trust_region_dim=n, step_size=self.step_size
-        )
-        if not ok:
-            x, ok = _solve_qp_clarabel(P_csr, c, lb, ub, ge_rows)
+        x, ok = _solve_qp_clarabel(P_csr, c, lb, ub, ge_rows)
         if not ok:
             return q, np.inf
 
-        dqa_opt = x[:n]
+        delta_v = x[:n]
 
         # Objective value in the original residual form (same value CVXPY's
         # problem.value reported), used for the SQP convergence check.
-        r = r0 + J_L @ dqa_opt
+        r = r0 + J_L @ delta_v
         cost = float(w3 @ (r ** 2))
         if bone_res is not None:
-            rb = bone_res + bone_J @ dqa_opt
+            rb = bone_res + bone_J @ delta_v
             cost += self.lambda_bone * float(rb @ rb)
-        cost += float(self.Q_diag_modified @ ((dqa_opt + q_a_current) ** 2))
-        if dqa_smooth is not None:
-            cost += self.smooth_weight * float(((dqa_opt - dqa_smooth) ** 2).sum())
-        for qa_idx, diff in orient_terms:
-            cost += orientation_weight * (dqa_opt[qa_idx] + diff) ** 2
+        cost += float(
+            self.joint_regularization_diag
+            @ ((delta_v + neutral_residual) ** 2)
+        )
+        if smooth_residual is not None:
+            cost += self.smooth_weight * float(
+                ((delta_v + smooth_residual) ** 2).sum()
+            )
+        if orientation_residual is not None:
+            orient_delta = delta_v[self.base_rotation_opt_indices]
+            cost += self.base_rotation_weight * float(
+                ((orient_delta + orientation_residual) ** 2).sum()
+            )
+        for opt_idx, diff, weight in position_terms:
+            cost += weight * (delta_v[opt_idx] + diff) ** 2
         if m:
-            s_true = np.array([span for (_, _, span) in slack_rows]) * x[n:]
+            s_true = np.array([span for (_, _, span) in slack_rows]) * x[n : n + m]
             cost += (self.penetration_slack_penalty / 2.0) * float((s_true ** 2).sum())
+        else:
+            s_true = np.empty(0)
+        if r_count:
+            r_true = restoration_spans * x[n + m : n + m + r_count]
+            cost += (self.restoration_penalty / 2.0) * float((r_true**2).sum())
+        else:
+            r_true = np.empty(0)
 
-        q_opt = q.copy()
-        q_opt[self.q_a_indices] = dqa_opt + q_a_current
-
-        # CRITICAL FIX: Normalize quaternion with sign continuity to prevent frame-to-frame jumps
-        quat_new = q_opt[3:7]
-        quat_new = quat_new / (np.linalg.norm(quat_new) + 1e-12)
-
-        # Ensure quaternion sign continuity with previous frame (if available)
-        if q_last is not None:
-            quat_prev = q_last[3:7]
-            # If dot product is negative, quaternions are in opposite hemispheres
-            # Flip sign to ensure continuity
-            if np.dot(quat_new, quat_prev) < 0:
-                quat_new = -quat_new
-
-        q_opt[3:7] = quat_new
+        q_opt = self._integrate_optimized_step(q, delta_v)
+        self._last_qp_diagnostics = {
+            "active_hard_rows": len(hard_rows),
+            "active_slack_rows": len(slack_rows),
+            "slack_values": s_true.copy(),
+            "restoration_values": r_true.copy(),
+            "active_restoration_rows": r_count,
+            "proposed_delta_v": delta_v.copy(),
+            **getattr(self, "_last_constraint_counts", {}),
+        }
+        if self.solver_diagnostics:
+            self._last_qp_diagnostics["constraint_diagnostics"] = list(
+                getattr(self, "_active_constraint_diagnostics", [])
+            )
 
         return q_opt, cost
-
-    def _build_transform_qdot_to_qvel_fast(self, use_world_omega=True):
-        """
-        Return T(q) (nv x nq) such that v = T(q) @ qdot.
-        - Free root: qpos=[x,y,z, qw,qx,qy,qz], qvel=[vx,vy,vz, ωx,ωy,ωz]
-        where ω and v are WORLD-expressed in MuJoCo.
-        - 23 hinge joints: v = qdot.
-
-        If use_world_omega=False, uses BODY-omega mapping (for debugging).
-        """
-        nq, nv = self.robot_model.nq, self.robot_model.nv
-        T = np.zeros((nv, nq), dtype=float)
-
-        # ---- root free joint (assumed joint 0) ----
-        j0 = 0
-        if self.robot_model.jnt_type[j0] == mujoco.mjtJoint.mjJNT_FREE:
-            qadr = self.robot_model.jnt_qposadr[j0]  # 0
-            dadr = self.robot_model.jnt_dofadr[j0]  # 0
-
-            # Linear block: v_lin = xyz_dot
-            T[dadr : dadr + 3, qadr : qadr + 3] = np.eye(3)
-
-            # Angular block: ω_* = 2 * E_*(q) * quat_dot
-            w, x, y, z = self.robot_data.qpos[qadr + 3 : qadr + 7]
-
-            def get_e_world(qw, qx, qy, qz):
-                return np.array(
-                    [
-                        [-qx, qw, qz, -qy],
-                        [-qy, -qz, qw, qx],
-                        [-qz, qy, -qx, qw],
-                    ]
-                )
-
-            def get_e_body(qw, qx, qy, qz):
-                return np.array(
-                    [
-                        [-qx, qw, -qz, qy],
-                        [-qy, qz, qw, -qx],
-                        [-qz, -qy, qx, qw],
-                    ]
-                )
-
-            E_fn = get_e_world if use_world_omega else get_e_body
-            E1 = 2.0 * E_fn(w, x, y, z)
-            
-            # linear-first: v_W = rdot, ω_W = 2E(q) * quat_dot
-            # T[dadr + 0 : dadr + 3, qadr + 0 : qadr + 3] = np.eye(3) # Already set
-            T[dadr + 3 : dadr + 6, qadr + 3 : qadr + 7] = E1  # ω block
-
-        # ---- remaining hinge/slide joints: v = qdot ----
-        for j in range(1 if self.robot_model.jnt_type[0] == mujoco.mjtJoint.mjJNT_FREE else 0, self.robot_model.njnt):
-            jt = self.robot_model.jnt_type[j]
-            if jt in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE):
-                qa = self.robot_model.jnt_qposadr[j]
-                da = self.robot_model.jnt_dofadr[j]
-                T[da, qa] = 1.0
-            elif jt == mujoco.mjtJoint.mjJNT_BALL:
-                raise NotImplementedError("BALL joint block not implemented.")
-
-        return T
 
     def _skew(self, v: np.ndarray) -> np.ndarray:
         """Return 3x3 skew-symmetric matrix of vector v."""
@@ -1126,18 +1382,13 @@ class GenericInteractionRetargeter:
             [-v[1],  v[0],  0.0],
         ], dtype=float)
 
-    def _calc_contact_jacobian_from_point(self, body_idx: int, p_body: np.ndarray = None, input_world=False, T: Optional[np.ndarray] = None):
-        """
-        Translational Jacobian J(q) (3 x nq) such that
-        v_point_world = J(q) @ qdot.
-
-        Fast analytic version: J_qdot = J_v @ T(q)
-
-        Args:
-            T: Optional precomputed qdot->qvel transform. Built here if not
-                provided; callers computing many Jacobians at one configuration
-                should build it once and pass it in.
-        """
+    def _calc_contact_jacobian_from_point(
+        self,
+        body_idx: int,
+        p_body: Optional[np.ndarray] = None,
+        input_world: bool = False,
+    ) -> np.ndarray:
+        """Return the native ``3 x nv`` point Jacobian in world coordinates."""
         if p_body is None:
             p_body = np.zeros(3)
 
@@ -1160,29 +1411,23 @@ class GenericInteractionRetargeter:
         Jr = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
         mujoco.mj_jac(self.robot_model, self.robot_data, Jp, Jr, p_W, int(body_idx))  # Jp = J_v
 
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
+        return Jp
 
-        return Jp @ T
-
-    def _compute_robot_jacobians(self, q: np.ndarray, T: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Dict[str, np.ndarray], None]:
+    def _compute_robot_jacobians(
+        self, q: np.ndarray
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray], None]:
         """Compute Jacobians for mapped robot link points in world frame.
 
         Args:
             q: Robot configuration
-            T: Optional precomputed qdot->qvel transform (built here if None)
-
         Returns:
             Tuple of (J_V, p_dict, None):
-                - J_V: Stacked Jacobians (3*num_targets, nq_a)
+                - J_V: Stacked Jacobians (3*num_targets, nv_a)
                 - p_dict: Dictionary of robot link point positions keyed by source target name
                 - None: Placeholder for compatibility
         """
         J_dict = {}
         p_dict = {}
-
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
 
         for target_name, link_name in self.joint_mapping.items():
             try:
@@ -1191,8 +1436,8 @@ class GenericInteractionRetargeter:
                 # Get position in world frame
                 pos = self.robot_data.xpos[body_id].copy()
 
-                # Compute base Jacobian for body origin (3 x nq)
-                J_base = self._calc_contact_jacobian_from_point(body_id, T=T)
+                # Compute base Jacobian for body origin (3 x nv)
+                J_base = self._calc_contact_jacobian_from_point(body_id)
 
                 # Apply offset from merged target_mapping (if non-zero)
                 offset = self.target_offset_map.get(target_name)
@@ -1202,38 +1447,23 @@ class GenericInteractionRetargeter:
                     o_world = R_WB @ o_local
                     pos = pos + o_world  # p_target = p_body + R @ o_local
 
-                    # Rotational Jacobian Jr (3 x nq) for the cross-term correction
+                    # Rotational Jacobian Jr (3 x nv) for the cross-term correction
                     p_WB = self.robot_data.xpos[body_id]
                     p_W = p_WB.astype(np.float64).reshape(3, 1)
                     Jp = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
                     Jr = np.zeros((3, self.robot_model.nv), dtype=np.float64, order="C")
                     mujoco.mj_jac(self.robot_model, self.robot_data, Jp, Jr, p_W, int(body_id))
-                    Jr_world = Jr @ T  # rotational Jacobian in world frame (3 x nq)
                     # Cross-term: -skew(o_world) @ Jr_world
                     # Derivation: d/dt(p_body + R @ o_local)
                     #   = v_body + ω × o_world
                     #   = v_body - o_world × ω
                     #   = v_body - skew(o_world) @ ω
                     # J_full = J_base - skew(o_world) @ Jr_world
-                    J_full = J_base - self._skew(o_world) @ Jr_world
+                    J_full = J_base - self._skew(o_world) @ Jr
                 else:
                     J_full = J_base
 
-                # Extract optimized part (J_full is already in qpos coordinates)
-                valid_indices = self.q_a_indices[self.q_a_indices < J_full.shape[1]]
-                if len(valid_indices) < len(self.q_a_indices):
-                    print(
-                        f"Warning: Truncating indices for source target {target_name}. "
-                        f"J width: {J_full.shape[1]}, Max idx: {self.q_a_indices.max()}"
-                    )
-
-                J_reduced = J_full[:, valid_indices]
-                
-                # Pad if needed
-                if J_reduced.shape[1] < self.nq_a:
-                    J_pad = np.zeros((3, self.nq_a))
-                    J_pad[:, :J_reduced.shape[1]] = J_reduced
-                    J_reduced = J_pad
+                J_reduced = J_full[:, self.dof_indices]
                     
                 J_dict[target_name] = J_reduced
                 p_dict[target_name] = pos
@@ -1253,18 +1483,15 @@ class GenericInteractionRetargeter:
         num_targets = len(source_target_names_ordered)
         
         if num_targets > 0:
-            J_V = np.zeros((3 * num_targets, self.nq_a))
+            J_V = np.zeros((3 * num_targets, self.nv_a))
             for i, target_name in enumerate(source_target_names_ordered):
                 if target_name in J_dict:
                     J = J_dict[target_name]
-                    # Ensure J has the correct shape (3, nq_a)
-                    if J.shape != (3, self.nq_a):
-                        if J.shape[1] > self.nq_a:
-                            J = J[:, :self.nq_a]
-                        elif J.shape[1] < self.nq_a:
-                            J_pad = np.zeros((3, self.nq_a))
-                            J_pad[:, :J.shape[1]] = J
-                            J = J_pad
+                    if J.shape != (3, self.nv_a):
+                        raise RuntimeError(
+                            f"Jacobian for '{target_name}' has shape {J.shape}, "
+                            f"expected (3, {self.nv_a})."
+                        )
                     J_V[3 * i:3 * (i + 1), :] = J
                 else:
                     # CRITICAL: All targets should exist (validated in __init__), so this is unexpected.
@@ -1274,7 +1501,7 @@ class GenericInteractionRetargeter:
                         f"Available targets in J_dict: {list(J_dict.keys())}"
                     )
         else:
-            J_V = np.zeros((0, self.nq_a))
+            J_V = np.zeros((0, self.nv_a))
 
         return J_V, p_dict, None
 
@@ -1353,7 +1580,6 @@ class GenericInteractionRetargeter:
         geom2_name: str,
         fromto: np.ndarray,
         dist: float,
-        T: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """
         Compute relative contact Jacobian for a geometry pair.
@@ -1367,7 +1593,7 @@ class GenericInteractionRetargeter:
             dist: Signed distance between geometries
             
         Returns:
-            Contact Jacobian (1D array of length nq)
+            Contact Jacobian (1D array of length nv)
         """
         # Get closest points from fromto buffer
         pos1 = fromto[:3]  # closest point on geom1
@@ -1391,8 +1617,8 @@ class GenericInteractionRetargeter:
         body2_id = self.robot_model.geom_bodyid[geom2_id]
 
         # Compute Jacobians for both contact points (in world frame)
-        J_bodyA = self._calc_contact_jacobian_from_point(body1_id, pos1, input_world=True, T=T)
-        J_bodyB = self._calc_contact_jacobian_from_point(body2_id, pos2, input_world=True, T=T)
+        J_bodyA = self._calc_contact_jacobian_from_point(body1_id, pos1, input_world=True)
+        J_bodyB = self._calc_contact_jacobian_from_point(body2_id, pos2, input_world=True)
 
         # Compute relative Jacobian
         Jc = J_bodyA - J_bodyB
@@ -1408,10 +1634,10 @@ class GenericInteractionRetargeter:
         """Linearized non-penetration row(s) for one queried contact pair.
 
         Returns ``(hard_rows, slack_row)`` where every row is numeric:
-        - ``hard_rows``: list of ``(Ja, rhs)`` meaning ``Ja @ dqa >= rhs``.
+        - ``hard_rows``: list of ``(Ja, rhs)`` meaning ``Ja @ delta_v >= rhs``.
           Default (slack disabled): single hard row ``phi >= -penetration_tolerance``.
         - ``slack_row``: TopoRetarget slack mode (Eq. 8) soft row
-          ``(Ja, rhs_soft, span)`` meaning ``Ja @ dqa + span * s_unit >= rhs_soft``
+          ``(Ja, rhs_soft, span)`` means ``Ja @ delta_v + span * s_unit >= rhs_soft``
           with ``0 <= s_unit <= 1``; the caller adds the ``w_s/2 * s^2`` objective
           term. The hard backstop ``phi >= -b`` is included in ``hard_rows``.
 
@@ -1429,8 +1655,31 @@ class GenericInteractionRetargeter:
         slack_row = (Ja, -dist - self.penetration_soft_tolerance, span)
         return [hard_row], slack_row
 
+    def _record_penetration_diagnostic(
+        self,
+        source: str,
+        jacobian: np.ndarray,
+        signed_distance: float,
+        hard_rows: List[Tuple[np.ndarray, float]],
+        slack_row: Optional[Tuple[np.ndarray, float, float]],
+    ) -> None:
+        """Record one active contact row when detailed diagnostics are enabled."""
+        if not self.solver_diagnostics:
+            return
+        if not hasattr(self, "_active_constraint_diagnostics"):
+            self._active_constraint_diagnostics = []
+        self._active_constraint_diagnostics.append(
+            {
+                "source": source,
+                "signed_distance": float(signed_distance),
+                "hard_rhs": float(hard_rows[0][1]),
+                "soft_rhs": None if slack_row is None else float(slack_row[1]),
+                "jacobian_block_norms": self._dof_block_norms(jacobian),
+            }
+        )
+
     def _compute_penetration_constraints(
-        self, T: Optional[np.ndarray] = None
+        self,
     ) -> Tuple[List[Tuple[np.ndarray, float]], List[Tuple[np.ndarray, float, float]]]:
         """
         Compute penetration constraint rows for robot-robot and robot-terrain contacts.
@@ -1439,11 +1688,11 @@ class GenericInteractionRetargeter:
         1. **Self-collision** – MuJoCo's built-in collision detection finds pairs of
            robot geoms that are close to each other and builds linearised
            non-penetration constraints via contact Jacobians.
-        2. **Terrain penetration** – for every robot geom whose centre is within
-           ``collision_detection_threshold`` of the terrain mesh surface (measured
-           via ``trimesh.proximity.closest_point``), a unilateral constraint is
-           added that pushes the geom upward (in the terrain-surface-normal
-           direction) to avoid terrain penetration.
+        2. **Terrain penetration** – representative geom-surface points are
+           queried with ``trimesh.proximity.closest_point``. Nearby surfaces are
+           constrained directly; deep negative distances are also retained for
+           upward-facing support surfaces so an initially buried geom cannot be
+           hidden by an unsigned-distance prefilter.
 
         The terrain mesh is NOT embedded in the MuJoCo model, so MuJoCo's own
         collision pipeline cannot detect robot-terrain contacts.  We handle them
@@ -1458,9 +1707,7 @@ class GenericInteractionRetargeter:
         """
         hard_rows: List[Tuple[np.ndarray, float]] = []
         slack_rows: List[Tuple[np.ndarray, float, float]] = []
-
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
+        self._active_constraint_diagnostics = []
 
         m, d = self.robot_model, self.robot_data
         threshold = float(self.collision_detection_threshold)
@@ -1483,10 +1730,13 @@ class GenericInteractionRetargeter:
             dist = mujoco.mj_geomDistance(m, d, g1, g2, threshold, fromto)
             if dist <= threshold:
                 J_rel = self._compute_jacobian_for_contact_relative(
-                    g1, g2, self._geom_names[g1], self._geom_names[g2], fromto, dist, T=T
+                    g1, g2, self._geom_names[g1], self._geom_names[g2], fromto, dist
                 )
-                Ja = J_rel[self.q_a_indices]
+                Ja = J_rel[self.dof_indices]
                 hard, slack = self._penetration_constraint_terms(Ja, dist)
+                self._record_penetration_diagnostic(
+                    "self_collision", Ja, dist, hard, slack
+                )
                 hard_rows.extend(hard)
                 if slack is not None:
                     slack_rows.append(slack)
@@ -1494,16 +1744,33 @@ class GenericInteractionRetargeter:
         # ------------------------------------------------------------------
         # 2) Robot-terrain penetration constraints (via trimesh proximity)
         # ------------------------------------------------------------------
-        terrain_hard, terrain_slack = self._compute_terrain_penetration_constraints(
-            threshold, T=T
-        )
+        self_hard_count = len(hard_rows)
+        self_slack_count = len(slack_rows)
+        terrain_hard, terrain_slack = self._compute_terrain_penetration_constraints(threshold)
         hard_rows.extend(terrain_hard)
         slack_rows.extend(terrain_slack)
+        self._last_constraint_counts = {
+            "self_collision_hard_rows": self_hard_count,
+            "self_collision_slack_rows": self_slack_count,
+            "terrain_hard_rows": len(terrain_hard),
+            "terrain_slack_rows": len(terrain_slack),
+        }
 
         return hard_rows, slack_rows
 
+    def _nonlinear_penetration_violation(self, q: np.ndarray) -> float:
+        """Return the largest hard-bound violation after forward kinematics."""
+        if not self.hard_penetration_constraint:
+            return 0.0
+        self.robot_data.qpos[:] = q
+        mujoco.mj_forward(self.robot_model, self.robot_data)
+        hard_rows, _ = self._compute_penetration_constraints()
+        if not hard_rows:
+            return 0.0
+        return max(0.0, max(float(rhs) for _, rhs in hard_rows))
+
     def _compute_terrain_penetration_constraints(
-        self, threshold: float, T: Optional[np.ndarray] = None
+        self, threshold: float
     ) -> Tuple[List[Tuple[np.ndarray, float]], List[Tuple[np.ndarray, float, float]]]:
         """
         Compute non-penetration rows between robot geoms and the terrain trimesh.
@@ -1513,21 +1780,14 @@ class GenericInteractionRetargeter:
         This avoids the limitation of only checking the geom center which can
         miss penetration when the geom has large extent.
 
-        **Prefilter**: a geom is only sampled if its center is within
-        ``threshold + bounding_radius`` of the terrain surface. Every surface
-        point of a skipped geom is provably farther than ``threshold`` from the
-        terrain, so the per-point distance check below would discard it anyway
-        — the emitted rows are identical, but the expensive closest-point query
-        runs on far fewer points.
-
-        **Trade-off**: Only primitive geom types (sphere, box, capsule,
-        cylinder) are fully supported with surface sampling. Other geom types
-        (mesh, heightfield, etc.) fall back to only checking the center point.
+        **Trade-off**: Primitive geom types (sphere, box, capsule, cylinder,
+        ellipsoid) use surface samples. Meshes and heightfields fall back to
+        checking the geom center.
 
         For each sampled point that is close to or inside the terrain, we add
         the linear constraint:
 
-            n^T J_a  dqa  >=  -(d - tol)
+            n^T J_a  delta_v  >=  -(d - tol)
 
         where
         - d   is the signed distance (positive = above terrain),
@@ -1543,211 +1803,72 @@ class GenericInteractionRetargeter:
         Returns:
             (hard_rows, slack_rows): numeric rows; see _penetration_constraint_terms.
         """
-        import trimesh as _trimesh
-
-        def sample_geom_surface_points(geom, geom_pos, geom_rot):
-            """Sample points on the surface of a MuJoCo geom based on its type.
-            Returns an array of shape (N, 3) of world-frame points.
-
-            ## Implementation Notes / Trade-offs
-            Currently only supports **primitive-shaped collision geoms**:
-            - Sphere (mjGEOM_SPHERE)
-            - Box (mjGEOM_BOX)
-            - Capsule (mjGEOM_CAPSULE)
-            - Cylinder (mjGEOM_CYLINDER)
-            - Plane (skipped)
-
-            For other geom types (meshes, heightfields, ellipsoids), this falls back
-            to only checking the geom center point.
-
-            ## To add support for a new geom type:
-            1. Add a new `elif geom_type == mujoco.mjtGeom.mjGEOM_XXX:` case
-            2. Compute the appropriate surface points in the geom's local frame
-               based on the `geom.size` parameters
-            3. Transform the local points to world frame using:
-               `world_pt = geom_pos + geom_rot.apply(local_pt)`
-            4. Add all world points to the `points` list and return
-            """
-            geom_type = geom.type
-            size = geom.size
-            points = []
-
-            if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
-                # Sphere: radius = size[0], sample points on surface
-                radius = size[0]
-                # Sample 6 outward points along major axes
-                for dx, dy, dz in [(1, 0, 0), (-1, 0, 0),
-                                   (0, 1, 0), (0, -1, 0),
-                                   (0, 0, 1), (0, 0, -1)]:
-                    local_pt = np.array([dx, dy, dz]) * radius
-                    world_pt = geom_pos + geom_rot.apply(local_pt)
-                    points.append(world_pt)
-                return np.array(points)
-
-            elif geom_type == mujoco.mjtGeom.mjGEOM_BOX:
-                # Box: size = half extents, sample center of each face
-                half_extents = size[:3]
-                # Sample center of each of the 6 faces
-                for sx, sy, sz in [(1, 0, 0), (-1, 0, 0),
-                                   (0, 1, 0), (0, -1, 0),
-                                   (0, 0, 1), (0, 0, -1)]:
-                    local_pt = np.array([
-                        sx * half_extents[0],
-                        sy * half_extents[1],
-                        sz * half_extents[2]
-                    ])
-                    world_pt = geom_pos + geom_rot.apply(local_pt)
-                    points.append(world_pt)
-                return np.array(points)
-
-            elif geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
-                # Capsule: size[0] = radius, size[1] = half-length along x
-                radius = size[0]
-                half_len = size[1]
-                # Sample points on each end hemisphere + mid-body side points
-                for s in [-half_len, half_len]:
-                    for dx, dy, dz in [(1, 0, 0), (-1, 0, 0),
-                                       (0, 1, 0), (0, -1, 0),
-                                       (0, 0, 1), (0, 0, -1)]:
-                        local_pt = np.array([s, 0, 0])
-                        if dx != 0:
-                            local_pt[0] += dx * radius
-                        elif dy != 0:
-                            local_pt[1] += dy * radius
-                        else:
-                            local_pt[2] += dz * radius
-                        world_pt = geom_pos + geom_rot.apply(local_pt)
-                        points.append(world_pt)
-                # Add mid-body points along the cylinder surface
-                for theta in [0, np.pi/2, np.pi, 3*np.pi/2]:
-                    local_pt = np.array([
-                        0,
-                        radius * np.cos(theta),
-                        radius * np.sin(theta)
-                    ])
-                    world_pt = geom_pos + geom_rot.apply(local_pt)
-                    points.append(world_pt)
-                return np.array(points)
-
-            elif geom_type == mujoco.mjtGeom.mjGEOM_CYLINDER:
-                # Cylinder: size[0] = radius, size[1] = half-length along x
-                radius = size[0]
-                half_len = size[1]
-                # Sample center of each end cap + 4 side points at midpoint
-                for s in [-half_len, half_len]:
-                    local_pt = np.array([s, 0, 0])
-                    world_pt = geom_pos + geom_rot.apply(local_pt)
-                    points.append(world_pt)
-                for theta in [0, np.pi/2, np.pi, 3*np.pi/2]:
-                    local_pt = np.array([
-                        0,
-                        radius * np.cos(theta),
-                        radius * np.sin(theta)
-                    ])
-                    world_pt = geom_pos + geom_rot.apply(local_pt)
-                    points.append(world_pt)
-                return np.array(points)
-
-            elif geom_type == mujoco.mjtGeom.mjGEOM_PLANE:
-                # Plane is infinite, skip terrain collision checking
-                return np.empty((0, 3))
-
-            else:
-                # For other geom types (meshes, heightfields, ellipsoid),
-                # just return the center point as a fallback
-                return np.array([geom_pos])
-
         hard_rows: List[Tuple[np.ndarray, float]] = []
         slack_rows: List[Tuple[np.ndarray, float, float]] = []
         m, d = self.robot_model, self.robot_data
 
-        if T is None:
-            T = self._build_transform_qdot_to_qvel_fast()
-
-        # Collision-enabled geoms (skip purely visual geoms)
-        coll_geoms = [
-            gi for gi in range(m.ngeom)
-            if not (m.geom_contype[gi] == 0 and m.geom_conaffinity[gi] == 0)
-        ]
-        if not coll_geoms:
+        if not self._terrain_collision_geoms:
             return hard_rows, slack_rows
 
-        # Prefilter geoms by bounding sphere: a geom can only contribute a
-        # constraint if some surface point is within `threshold` of the terrain,
-        # i.e. if center_dist - bounding_radius <= threshold.
-        centers = np.array([d.geom_xpos[gi] for gi in coll_geoms])
-        _, center_dists, _ = _trimesh.proximity.closest_point(self.terrain_mesh, centers)
-        kept_geoms = [
-            gi
-            for gi, center_dist in zip(coll_geoms, center_dists)
-            if center_dist - self._geom_bounding_radii[gi] <= threshold
-        ]
-
-        # Collect world-frame sample points on the surface of every kept geom
+        # Transform the static local collision samples into world coordinates.
         all_points = []
         all_geom_info = []
-        for gi in kept_geoms:
+        for gi, points_local in self._terrain_collision_geoms:
             # Get current geom pose in world frame
             pos = d.geom_xpos[gi].copy()
             rot_mat = d.geom_xmat[gi].reshape(3, 3).copy()
-            rot = Rotation.from_matrix(rot_mat)
-
-            # Sample surface points based on geom type
-            geom = m.geom(gi)
-            points = sample_geom_surface_points(geom, pos, rot)
-
-            # Always add the center as a fallback even if other sampling failed
-            if len(points) == 0:
-                points = np.array([pos])
-
-            for pt in points:
-                all_points.append(pt)
-                all_geom_info.append(gi)
+            points = points_local @ rot_mat.T + pos
+            all_points.append(points)
+            all_geom_info.append(np.full(len(points), gi, dtype=int))
 
         if len(all_points) == 0:
             return hard_rows, slack_rows
 
-        all_points = np.array(all_points)  # (N, 3)
+        all_points = np.vstack(all_points)
+        all_geom_info = np.concatenate(all_geom_info)
 
-        # Query terrain mesh for closest points to each sampled point
-        closest_pts, dists, tri_ids = _trimesh.proximity.closest_point(
-            self.terrain_mesh, all_points
+        # Query terrain mesh for closest points to each sampled point through
+        # Open3D's persistent CPU acceleration structure.
+        closest_pts, unsigned_dists, tri_ids = self._closest_points_on_terrain(
+            all_points
         )
 
         for k, gi in enumerate(all_geom_info):
-            if dists[k] > threshold:
-                continue
-
-            # Signed distance: positive when above terrain.
-            # closest_pts[k] is on the terrain surface; query_pt is the
-            # point on the geom surface. We define "above" as the direction
-            # of the terrain face normal.
+            # Signed distance: positive when the point is on the outside of
+            # the terrain surface, negative when it has penetrated the surface.
+            # The terrain mesh is consistently wound, so its face normals already
+            # point outward; penetration is therefore measured along the surface
+            # normal, not forced to +Z.
             query_pt = all_points[k]
             surface_pt = closest_pts[k]
 
             # Face normal from terrain mesh
-            face_normal = self.terrain_mesh.face_normals[tri_ids[k]]
-            # Ensure normal points "outward" (upward for typical terrains)
-            if face_normal[2] < 0:
-                face_normal = -face_normal
+            raw_face_normal = self._terrain_face_normals[tri_ids[k]]
+            face_normal = raw_face_normal.copy()
 
-            # Signed distance along the normal
+            # Signed distance along the outward surface normal.
             signed_dist = np.dot(query_pt - surface_pt, face_normal)
 
-            # Only constrain points that are close to or below the surface
+            # Only constrain points that are close to or below the surface.
+            # Deep signed penetrations are retained for every face orientation
+            # so an initially buried geom cannot be hidden by an
+            # unsigned-distance prefilter.
             if signed_dist > threshold:
                 continue
 
             # Translational Jacobian for this geom's body at the query point
             body_id = m.geom_bodyid[gi]
             J_full = self._calc_contact_jacobian_from_point(
-                body_id, query_pt, input_world=True, T=T
+                body_id, query_pt, input_world=True
             )
             # Project onto terrain normal -> 1-D Jacobian
-            J_n = face_normal @ J_full  # (nq,)
-            Ja = J_n[self.q_a_indices]
+            J_n = face_normal @ J_full  # (nv,)
+            Ja = J_n[self.dof_indices]
 
             hard, slack = self._penetration_constraint_terms(Ja, signed_dist)
+            self._record_penetration_diagnostic(
+                "terrain", Ja, signed_dist, hard, slack
+            )
             hard_rows.extend(hard)
             if slack is not None:
                 slack_rows.append(slack)

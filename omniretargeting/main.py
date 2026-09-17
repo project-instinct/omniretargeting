@@ -1,5 +1,6 @@
 import argparse
-import warnings
+import cProfile
+from contextlib import contextmanager
 import numpy as np
 import trimesh
 from pathlib import Path
@@ -21,6 +22,24 @@ from omniretargeting.visualizer import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ROBOT_CONFIG_PATH = REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json"
+
+
+@contextmanager
+def cprofile_context(profile_path: str | None):
+    """Profile the enclosed CLI work when an output path is supplied."""
+    if profile_path is None:
+        yield
+        return
+
+    profiler = cProfile.Profile()
+    profiler.enable()
+    try:
+        yield
+    finally:
+        profiler.disable()
+        output_path = Path(profile_path).expanduser()
+        profiler.dump_stats(str(output_path))
+        print(f"Saved cProfile statistics to {output_path}")
 
 
 def load_source_config(yaml_path: Path) -> dict:
@@ -107,40 +126,9 @@ def export_scaled_objects(
     return mesh_path, pose_path
 
 
-def main():
-    parser = argparse.ArgumentParser(description="OmniRetargeting CLI")
-    parser.add_argument(
-        "--robot-config",
-        default=DEFAULT_ROBOT_CONFIG_PATH,
-        help=f"Path to robot configuration JSON file (default: {DEFAULT_ROBOT_CONFIG_PATH})",
-    )
-    parser.add_argument("--source-config", default=None, help="Path to YAML source configuration file (see config_templates/ for examples)")
-    parser.add_argument("--source", default=None, help="Legacy source entry name or source type from the robot profile (default: first source entry)")
-    parser.add_argument("--motion", default=None, help="Legacy path to source motion file")
-    parser.add_argument("--source-options", default=None, help="Legacy JSON object with adapter-specific source options")
-    parser.add_argument("--model-dir", default=None, help="Legacy adapter model directory, when required by the source type")
-    parser.add_argument("--smplx_model_dir", default=None, help=argparse.SUPPRESS) # Legacy flag for backward compatibility with old source configs that expect 'model_directory' under the root of the config dict.
-    parser.add_argument("--smplx_motion", default=None, help=argparse.SUPPRESS) # Legacy flag for backward compatibility with old source configs that expect 'motion' under the root of the config dict.
-    parser.add_argument("--scaled-objects", default=None, help="Directory to save scaled object meshes and pose trajectories (optional)")
-    parser.add_argument("--output", required=True, help="Path to save output motion (.npy)")
-    parser.add_argument("--terrain", help="Legacy path to terrain mesh file (optional, defaults to flat ground)")
-    parser.add_argument(
-        "--output-scaled-terrain",
-        dest="output_scaled_terrain",
-        default=None,
-        help="Path to save the scaled terrain mesh. When provided, terrain scaling is enabled.",
-    )
-    parser.add_argument("--vis", action="store_true", help="Visualize the retargeted motion")
-    parser.add_argument("--save-video", dest="save_video", default=None, help="Save retargeted motion video to file (e.g. /tmp/out.mp4). Uses offscreen rendering (set MUJOCO_GL=egl for headless).")
-    parser.add_argument("--framerate", type=float, default=None, help="Framerate of the motion (optional, defaults to 30.0 or auto-detected)")
-    parser.add_argument("--output-framerate", dest="output_framerate", type=float, default=None,
-                        help="Resample motion to this framerate before retargeting (e.g. 30 to downsample 120fps data)")
-    parser.add_argument("--replace-cylinders-with-capsules", dest="replace_cylinders_with_capsules", action="store_true", default=False,
-                        help="Legacy flag to replace cylinder collision geoms with capsules to match IsaacLab/PhysX convention.")
-    parser.add_argument("--penetration-resolver", choices=["hard_constraint", "hard_constraint_slack", "xyz_nudge"], default=None,
-                        help="Legacy override the contact handling mode for retargeting.")
-
-    args = parser.parse_args()
+def _run(args, parser: argparse.ArgumentParser):
+    if args.scale_factor is not None and (not np.isfinite(args.scale_factor) or args.scale_factor <= 0):
+        parser.error("--scale-factor must be a finite positive number")
 
     args.output = normalize_retargeted_output_path(args.output)
 
@@ -164,86 +152,19 @@ def main():
             "Robot URDF is required. Set 'urdf_path' in the robot profile JSON (--robot-config)."
         )
 
-    selected_source = robot_config.get("selected_source", {})
-    legacy_motion_path = args.motion or args.smplx_motion
-    legacy_model_dir = args.model_dir or args.smplx_model_dir
-    runtime_source_options = {}
-    data_source_source_config = {}
-
-    if args.smplx_motion is not None:
-        warnings.warn(
-            "--smplx_motion is deprecated; use --motion or --source-config instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-    if args.smplx_model_dir is not None:
-        warnings.warn(
-            "--smplx_model_dir is deprecated; use --model-dir or define model_directory in --source-config.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
-    if args.source_config:
-        print(f"Loading source config from {args.source_config}...")
-        source_config_dict = load_source_config(args.source_config)
-        source_type = source_config_dict["type"]
-        source_motion_path = source_config_dict["motion"]
-        runtime_source_options = {
-            key: value
-            for key, value in source_config_dict.items()
-            if key not in ["type", "motion"]
-        }
-        if legacy_model_dir is not None and "model_directory" not in runtime_source_options and "smplx_model_dir" not in runtime_source_options:
-            warnings.warn(
-                "--model-dir is deprecated with --source-config; prefer model_directory in the YAML file.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            runtime_source_options["model_directory"] = legacy_model_dir
-        if args.source or legacy_motion_path is not None or args.source_options is not None:
-            warnings.warn(
-                "Ignoring legacy source arguments because --source-config was provided.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        selected_source = select_robot_source(robot_config, source_type)
-        data_source_source_config = dict(selected_source)
-        print(f"Source type: {source_type}")
-        print(f"Motion file: {source_motion_path}")
-    else:
-        warnings.warn(
-            "Legacy CLI source arguments are deprecated; prefer --source-config.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if args.source:
-            source_entries = robot_config.get("source", [])
-            matches = [s for s in source_entries if s.get("name") == args.source or s.get("type") == args.source]
-            if len(matches) != 1:
-                raise ValueError(f"--source {args.source!r} must match exactly one source entry by name or type.")
-            selected_source = matches[0]
-
-        source_type = selected_source.get("type", args.source)
-        if not source_type:
-            raise ValueError(
-                "Source type is required. Provide --source-config, set a source entry in the robot profile, or pass --source."
-            )
-
-        source_motion_path = legacy_motion_path
-        if source_motion_path is None:
-            raise ValueError("Motion input is required. Provide --source-config or use legacy --motion.")
-
-        if args.source_options:
-            runtime_source_options = json.loads(args.source_options)
-            if not isinstance(runtime_source_options, dict):
-                raise ValueError("--source-options must be a JSON object.")
-
-        if legacy_model_dir is not None:
-            runtime_source_options["model_directory"] = legacy_model_dir
-
-        data_source_source_config = dict(selected_source)
-        print(f"Using legacy CLI source resolution for type: {source_type}")
-        print(f"Motion file: {source_motion_path}")
+    print(f"Loading source config from {args.source_config}...")
+    source_config_dict = load_source_config(args.source_config)
+    source_type = source_config_dict["type"]
+    source_motion_path = source_config_dict["motion"]
+    runtime_source_options = {
+        key: value
+        for key, value in source_config_dict.items()
+        if key not in ["type", "motion"]
+    }
+    selected_source = select_robot_source(robot_config, source_type)
+    data_source_source_config = dict(selected_source)
+    print(f"Source type: {source_type}")
+    print(f"Motion file: {source_motion_path}")
 
     joint_mapping = selected_source.get("target_mapping")
 
@@ -253,28 +174,18 @@ def main():
     robot_height = robot_config.get("robot_height")
     retargeting = robot_config.get("retargeting")
 
-    # Merge CLI flag into retargeting config
-    if retargeting is None:
-        retargeting = {}
-    if args.replace_cylinders_with_capsules:
-        retargeting["replace_cylinders_with_capsules"] = True
-    if args.penetration_resolver is not None:
-        retargeting["penetration_resolver"] = args.penetration_resolver
-
     # Handle terrain
-    temp_terrain_path = None
-    # Check if terrain is in source config first
+    temp_terrain_paths = []
     if "terrain" in runtime_source_options:
         terrain_path = runtime_source_options.pop("terrain")
         print(f"Using terrain from source config: {terrain_path}")
-    elif args.terrain:
-        terrain_path = args.terrain
     else:
         print("No terrain provided, creating default flat terrain.")
         flat_terrain = create_flat_terrain()
         fd, temp_terrain_path = tempfile.mkstemp(suffix=".obj")
         os.close(fd)
         flat_terrain.export(temp_terrain_path)
+        temp_terrain_paths.append(temp_terrain_path)
         terrain_path = temp_terrain_path
 
     try:
@@ -310,6 +221,26 @@ def main():
         else:
             print("Warning: Orientations not available for this file format.")
 
+        if args.scale_factor is not None:
+            motion_data.positions = motion_data.positions * args.scale_factor
+            if motion_data.root_translations is not None:
+                motion_data.root_translations = motion_data.root_translations * args.scale_factor
+            if motion_data.object_points is not None:
+                motion_data.object_points = motion_data.object_points * args.scale_factor
+            if motion_data.source_height is not None:
+                motion_data.source_height *= args.scale_factor
+            if motion_data.human_height is not None:
+                motion_data.human_height *= args.scale_factor
+            source_positions = motion_data.positions
+
+            scaled_terrain = trimesh.load(terrain_path, force="mesh")
+            scaled_terrain.apply_scale(args.scale_factor)
+            fd, scaled_terrain_path = tempfile.mkstemp(suffix=".obj")
+            os.close(fd)
+            scaled_terrain.export(scaled_terrain_path)
+            temp_terrain_paths.append(scaled_terrain_path)
+            terrain_path = scaled_terrain_path
+
         # Initialize Retargeter
         print("Initializing OmniRetargeter...")
         retargeter = OmniRetargeter(
@@ -324,30 +255,33 @@ def main():
 
         # Perform retargeting
         print("Retargeting motion...")
-        enable_terrain_scaling = bool(args.output_scaled_terrain)
         source_to_robot_scale, retargeted_motion = retargeter.retarget_motion(
             motion_data,
             framerate=framerate,
             visualize_trajectory=args.vis,
-            enable_terrain_scaling=enable_terrain_scaling,
+            enable_scene_scaling=args.enable_scene_scaling,
+            show_progress=args.progress,
         )
+        if args.scale_factor is not None:
+            source_to_robot_scale = args.scale_factor
 
-        if args.output_scaled_terrain:
+        if args.enable_scene_scaling:
+            scene_output_dir = Path(args.output).with_suffix("")
+            scene_output_dir.mkdir(parents=True, exist_ok=True)
+
             scaled_terrain = trimesh.load(terrain_path, force="mesh")
             scaled_terrain.apply_scale(source_to_robot_scale)
-            output_scaled_terrain_path = Path(args.output_scaled_terrain)
-            output_scaled_terrain_path.parent.mkdir(parents=True, exist_ok=True)
+            output_scaled_terrain_path = scene_output_dir / "scaled_terrain.obj"
             scaled_terrain.export(output_scaled_terrain_path)
             print(f"Saved scaled terrain mesh to {output_scaled_terrain_path}")
-        
-        # Export scaled objects if requested
-        if args.scaled_objects and hasattr(motion_data, 'object_mesh') and motion_data.object_mesh is not None:
-            export_scaled_objects(
-                motion_data,
-                Path(args.scaled_objects),
-                source_to_robot_scale,
-                apply_scene_scaling=bool(args.output_scaled_terrain),
-            )
+
+            if motion_data.object_mesh is not None:
+                export_scaled_objects(
+                    motion_data,
+                    scene_output_dir,
+                    source_to_robot_scale,
+                    apply_scene_scaling=True,
+                )
 
         # Save output
         print(f"Saving output to {args.output}...")
@@ -380,7 +314,7 @@ def main():
         if (args.vis or args.save_video) and terrain_path and os.path.exists(terrain_path):
             try:
                 vis_terrain = trimesh.load(terrain_path, force='mesh')
-                if args.output_scaled_terrain:
+                if args.enable_scene_scaling:
                     vis_terrain.apply_scale(source_to_robot_scale)
             except Exception as e:
                 print(f"Could not load terrain for visualization: {e}")
@@ -391,12 +325,12 @@ def main():
             vis_object_meshes = build_object_tracks(
                 motion_data,
                 source_to_robot_scale=source_to_robot_scale,
-                apply_scene_scaling=bool(args.output_scaled_terrain),
+                apply_scene_scaling=args.enable_scene_scaling or args.scale_factor is not None,
             )
             if vis_object_meshes:
                 print(f"Loaded object track for visualization: {vis_object_meshes[0].name}")
 
-        scaled_source_positions = source_positions * source_to_robot_scale if args.output_scaled_terrain else source_positions
+        scaled_source_positions = source_positions * source_to_robot_scale if args.enable_scene_scaling else source_positions
 
         if args.save_video:
             save_trajectory_video(
@@ -424,9 +358,53 @@ def main():
             )
 
     finally:
-        # Cleanup temp file
-        if temp_terrain_path and os.path.exists(temp_terrain_path):
-            os.remove(temp_terrain_path)
+        for temp_terrain_path in temp_terrain_paths:
+            if os.path.exists(temp_terrain_path):
+                os.remove(temp_terrain_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="OmniRetargeting CLI")
+    parser.add_argument(
+        "--robot-config",
+        default=DEFAULT_ROBOT_CONFIG_PATH,
+        help=f"Path to robot configuration JSON file (default: {DEFAULT_ROBOT_CONFIG_PATH})",
+    )
+    parser.add_argument(
+        "--source-config",
+        required=True,
+        help="Path to YAML source configuration file (see config_templates/ for examples)",
+    )
+    parser.add_argument("--output", required=True, help="Path to save output motion (.npy)")
+    scaling_group = parser.add_mutually_exclusive_group()
+    scaling_group.add_argument(
+        "--enable-scene-scaling",
+        action="store_true",
+        help="Scale the source motion, terrain, and objects, and export the scaled scene beside the output motion.",
+    )
+    scaling_group.add_argument(
+        "--scale-factor",
+        type=float,
+        default=None,
+        help="Scale the source motion, terrain, and objects by this factor without exporting a scaled scene.",
+    )
+    parser.add_argument("--vis", action="store_true", help="Visualize the retargeted motion")
+    parser.add_argument("--save-video", dest="save_video", default=None, help="Save retargeted motion video to file (e.g. /tmp/out.mp4). Uses offscreen rendering (set MUJOCO_GL=egl for headless).")
+    parser.add_argument("--framerate", type=float, default=None, help="Framerate of the motion (optional, defaults to 30.0 or auto-detected)")
+    parser.add_argument("--output-framerate", dest="output_framerate", type=float, default=None,
+                        help="Resample motion to this framerate before retargeting (e.g. 30 to downsample 120fps data)")
+    parser.add_argument("--progress", action="store_true",
+                        help="Show a progress bar while retargeting frames")
+    parser.add_argument(
+        "--cprofile",
+        metavar="PROFILE_FILE_PATH",
+        help="Write cProfile statistics for the complete retargeting run to this file.",
+    )
+
+    args = parser.parse_args()
+    with cprofile_context(args.cprofile):
+        _run(args, parser)
+
 
 if __name__ == "__main__":
     main()

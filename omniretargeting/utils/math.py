@@ -10,6 +10,88 @@ from scipy.spatial.transform import Rotation
 import mujoco
 
 
+def sample_mujoco_geom_local_points(
+    geom_type: int,
+    size: np.ndarray,
+    ring_samples: int = 12,
+) -> np.ndarray:
+    """Return representative surface points in a MuJoCo geom's local frame.
+
+    MuJoCo cylinders and capsules are aligned with local Z.  Keeping the
+    primitive construction in one place prevents terrain penetration and foot
+    stabilization from using different axis conventions.
+    """
+    geom_type = int(geom_type)
+    size = np.asarray(size, dtype=float)
+
+    if geom_type == mujoco.mjtGeom.mjGEOM_SPHERE:
+        radius = size[0]
+        return radius * np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [-1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, -1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [0.0, 0.0, -1.0],
+            ]
+        )
+
+    if geom_type == mujoco.mjtGeom.mjGEOM_BOX:
+        hx, hy, hz = size[:3]
+        corners = [
+            [sx, sy, sz]
+            for sx in (-hx, hx)
+            for sy in (-hy, hy)
+            for sz in (-hz, hz)
+        ]
+        corners.extend([[0.0, 0.0, -hz], [0.0, 0.0, hz]])
+        return np.asarray(corners, dtype=float)
+
+    if geom_type in (mujoco.mjtGeom.mjGEOM_CYLINDER, mujoco.mjtGeom.mjGEOM_CAPSULE):
+        radius, half_length = size[:2]
+        theta = np.linspace(0.0, 2.0 * np.pi, ring_samples, endpoint=False)
+        rings = [
+            np.column_stack(
+                [
+                    radius * np.cos(theta),
+                    radius * np.sin(theta),
+                    np.full_like(theta, z),
+                ]
+            )
+            for z in (-half_length, 0.0, half_length)
+        ]
+        if geom_type == mujoco.mjtGeom.mjGEOM_CAPSULE:
+            endpoints = [
+                [0.0, 0.0, -half_length - radius],
+                [0.0, 0.0, half_length + radius],
+            ]
+        else:
+            endpoints = [
+                [0.0, 0.0, -half_length],
+                [0.0, 0.0, half_length],
+            ]
+        return np.vstack([*rings, np.asarray(endpoints, dtype=float)])
+
+    if geom_type == mujoco.mjtGeom.mjGEOM_ELLIPSOID:
+        rx, ry, rz = size[:3]
+        return np.array(
+            [
+                [rx, 0.0, 0.0],
+                [-rx, 0.0, 0.0],
+                [0.0, ry, 0.0],
+                [0.0, -ry, 0.0],
+                [0.0, 0.0, rz],
+                [0.0, 0.0, -rz],
+            ]
+        )
+
+    if geom_type == mujoco.mjtGeom.mjGEOM_PLANE:
+        return np.empty((0, 3), dtype=float)
+
+    return np.zeros((1, 3), dtype=float)
+
+
 def linear_interpolate(
     array: np.ndarray,
     indices: np.ndarray,

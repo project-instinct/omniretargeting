@@ -1,9 +1,10 @@
 {
     "name": "largebox_lifting",
     "description": "Large box lifting and manipulation",
-    "omomo_sequence_file": "/localhdd/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p",
+    "omomo_sequence_file": "/home/ziwen/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p",
     "omomo_sequence_index": 31,
-    "omomo_data_root": "/localhdd/Datasets/OMOMO",
+    "omomo_data_root": "/home/ziwen/Datasets/OMOMO",
+    "smplx_model_directory": "/home/ziwen/Datasets/smplx",
     "n_object_samples": 32,
     "terrain": {
         "type": "flat",
