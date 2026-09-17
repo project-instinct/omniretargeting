@@ -125,7 +125,15 @@ def main() -> None:
 
     # Resume: skip motions whose retargeted output already exists
     if args.resume:
-        completed = [f for f in motion_files if _output_exists(f, output_dir)]
+        completed = [
+            f
+            for f in motion_files
+            if _output_exists(
+                f,
+                output_dir,
+                source_folder if args.recursive else None,
+            )
+        ]
         if completed:
             print(f"Resume: skipping {len(completed)} already-processed motion(s)")
         completed_set = set(completed)
