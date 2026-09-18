@@ -1518,6 +1518,7 @@ def test_retarget_frame_keeps_first_solution_when_joint_limit_retry_fails():
     np.testing.assert_array_equal(state.q_init, q_at_limit)
     np.testing.assert_array_equal(state.q_last, q_at_limit)
     np.testing.assert_array_equal(result, q_at_limit)
+    assert inner_retargeter.last_solve_diagnostics == {"success": True}
 
 
 def test_create_stream_state_passes_hard_penetration_constraint():

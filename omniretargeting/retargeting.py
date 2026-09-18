@@ -961,19 +961,12 @@ class GenericInteractionRetargeter:
                         break
                 if not backtrack_accepted:
                     # No positive backtracking scale preserves the nonlinear
-                    # hard bound. With no accepted step, an already feasible
-                    # current pose is treated as zero-step convergence;
-                    # otherwise the frame is reported as failed. After an
-                    # accepted step, retain the previously accepted feasible
-                    # pose and treat the zero step as convergence.
+                    # hard bound. If no step has been accepted, the SQP did
+                    # not make progress and the frame must be reported as a
+                    # failure even when the current pose is feasible. After
+                    # an accepted step, retain the previously accepted
+                    # feasible pose and treat the zero step as convergence.
                     if not accepted_any:
-                        if current_violation <= self.sqp_feasibility_tolerance:
-                            q_new = q
-                            accepted_step = np.zeros_like(accepted_step)
-                            candidate_violation = current_violation
-                            converged = True
-                            last_cost = cost
-                            break
                         backtrack_failed = True
                         q_new = q
                         accepted_step = np.zeros_like(accepted_step)
