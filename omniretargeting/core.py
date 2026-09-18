@@ -519,6 +519,7 @@ class OmniRetargeter:
 
         q_opt = solve(q_init)
         if state.frame_idx > 0 and state.retargeter.reaches_joint_limit(q_opt):
+            first_solve_diagnostics = dict(state.retargeter.last_solve_diagnostics)
             q_default = state.q_default.copy()
             self._align_initial_root_pose(
                 q_default,
@@ -527,7 +528,11 @@ class OmniRetargeter:
                 root_orientation,
                 estimated_quat_wxyz,
             )
-            q_opt = solve(q_default)
+            retry_q_opt = solve(q_default)
+            if state.retargeter.last_solve_diagnostics["success"]:
+                q_opt = retry_q_opt
+            else:
+                state.retargeter.last_solve_diagnostics = first_solve_diagnostics
         state.q_init = q_opt
         state.q_last = q_opt
         state.frame_idx += 1

@@ -488,6 +488,9 @@ class GenericInteractionRetargeter:
         self.foot_sticking_tolerance = foot_sticking_tolerance
         self.collision_detection_threshold = collision_detection_threshold
         self.terrain_sample_points = int(terrain_sample_points)
+        self._terrain_deep_penetration_depth = float(
+            max(terrain_deep_penetration_depth, self.collision_detection_threshold)
+        )
 
         # Apply cylinder → capsule replacement if requested
         if replace_cylinders_with_capsules:
@@ -958,11 +961,11 @@ class GenericInteractionRetargeter:
                         break
                 if not backtrack_accepted:
                     # No positive backtracking scale preserves the nonlinear
-                    # hard bound. If no usable step has been accepted yet, the
-                    # frame has not moved and must be reported as failed instead
-                    # of silently accepted. Otherwise, keep the previously
-                    # accepted feasible pose and treat the zero step as
-                    # convergence.
+                    # hard bound. If no step has been accepted, the SQP did
+                    # not make progress and the frame must be reported as a
+                    # failure even when the current pose is feasible. After
+                    # an accepted step, retain the previously accepted
+                    # feasible pose and treat the zero step as convergence.
                     if not accepted_any:
                         backtrack_failed = True
                         q_new = q
@@ -1834,6 +1837,14 @@ class GenericInteractionRetargeter:
         )
 
         for k, gi in enumerate(all_geom_info):
+            # A far-away closest triangle is not a meaningful contact. The
+            # Open3D scene always returns the global nearest primitive, so an
+            # unsigned-distance cap is required to avoid false constraints from
+            # unrelated surfaces (e.g. a wrist above a downward-facing
+            # underside face).
+            if unsigned_dists[k] > self._terrain_deep_penetration_depth:
+                continue
+
             # Signed distance: positive when the point is on the outside of
             # the terrain surface, negative when it has penetrated the surface.
             # The terrain mesh is consistently wound, so its face normals already
