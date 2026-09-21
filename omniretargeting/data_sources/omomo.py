@@ -33,8 +33,10 @@ class OmomoDataSource(DataSource):
     use_smplx_base_pose: bool = True
 
     def __post_init__(self):
-        self.sequence_file = Path(self.sequence_file)
-        self.data_root = Path(self.data_root)
+        self.sequence_file = Path(self.sequence_file).expanduser()
+        self.data_root = Path(self.data_root).expanduser()
+        if self.model_directory is not None:
+            self.model_directory = str(Path(self.model_directory).expanduser())
         self._motion_data: MotionData | None = None
 
         if not self.sequence_file.exists():
@@ -78,8 +80,10 @@ class OmomoDataSource(DataSource):
             "data/body_models/smplx",
         ]
         for candidate in search_paths:
-            if candidate and Path(candidate).exists():
-                return str(candidate)
+            if candidate:
+                candidate_path = Path(candidate).expanduser()
+                if candidate_path.exists():
+                    return str(candidate_path)
         raise FileNotFoundError(
             "Could not locate SMPL-X model directory for OMOMO. "
             "Provide model_directory or install the models under a configured dataset root."

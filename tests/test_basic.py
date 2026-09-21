@@ -1431,6 +1431,7 @@ def test_retarget_frame_retries_with_default_initial_guess_at_joint_limit():
     inner_retargeter = Mock()
     inner_retargeter.retarget_frame.side_effect = [q_at_limit, q_recovered]
     inner_retargeter.reaches_joint_limit.return_value = True
+    inner_retargeter.last_solve_diagnostics = {"success": True}
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
     retargeter.retargeting_config = {}
@@ -1468,6 +1469,56 @@ def test_retarget_frame_retries_with_default_initial_guess_at_joint_limit():
     np.testing.assert_array_equal(state.q_default, default_q)
     np.testing.assert_array_equal(state.q_init, q_recovered)
     np.testing.assert_array_equal(result, q_recovered)
+
+
+def test_retarget_frame_keeps_first_solution_when_joint_limit_retry_fails():
+    from omniretargeting.core import RetargetingStreamState
+    from omniretargeting import OmniRetargeter
+
+    mapped_targets = np.arange(12, dtype=float).reshape(4, 3)
+    previous_q = np.full(8, 9.0, dtype=float)
+    default_q = np.arange(8, dtype=float)
+    q_at_limit = np.arange(8, dtype=float) + 20.0
+    q_failed_retry = default_q.copy()
+
+    inner_retargeter = Mock()
+    solve_results = [
+        (q_at_limit, {"success": True}),
+        (q_failed_retry, {"success": False}),
+    ]
+
+    def solve_with_diagnostics(*args, **kwargs):
+        q_result, diagnostics = solve_results.pop(0)
+        inner_retargeter.last_solve_diagnostics = diagnostics
+        return q_result
+
+    inner_retargeter.retarget_frame.side_effect = solve_with_diagnostics
+    inner_retargeter.reaches_joint_limit.return_value = True
+
+    retargeter = OmniRetargeter.__new__(OmniRetargeter)
+    retargeter.retargeting_config = {}
+    retargeter._estimate_base_orientation_from_joints = Mock(return_value=None)
+    retargeter._extract_mapped_source_targets = Mock(return_value=mapped_targets)
+
+    state = RetargetingStreamState(
+        retargeter=inner_retargeter,
+        q_init=previous_q.copy(),
+        q_default=default_q,
+        q_last=previous_q.copy(),
+        last_estimated_quat=None,
+        frame_idx=1,
+        scaled_terrain=Mock(),
+    )
+
+    result = retargeter.retarget_frame(
+        MotionFrame(positions=np.zeros((4, 3), dtype=float)), state
+    )
+
+    assert inner_retargeter.retarget_frame.call_count == 2
+    np.testing.assert_array_equal(state.q_init, q_at_limit)
+    np.testing.assert_array_equal(state.q_last, q_at_limit)
+    np.testing.assert_array_equal(result, q_at_limit)
+    assert inner_retargeter.last_solve_diagnostics == {"success": True}
 
 
 def test_create_stream_state_passes_hard_penetration_constraint():

@@ -98,9 +98,16 @@ def _resolve_rel_subdir(motion_file: Path, source_folder: Path | None) -> str | 
 def _output_exists(
     motion_file: Path,
     output_dir: Path,
+    source_folder: Path | None = None,
 ) -> bool:
     """Return True if the retargeted .npz for *motion_file* already exists."""
-    return (output_dir / "motions" / f"{motion_file.stem}_retargeted.npz").is_file()
+    rel_subdir = _resolve_rel_subdir(motion_file, source_folder)
+    return (
+        output_dir
+        / "motions"
+        / (rel_subdir or "")
+        / f"{motion_file.stem}_retargeted.npz"
+    ).is_file()
 
 
 def write_source_config(
@@ -325,9 +332,10 @@ def _build_command(
     save_video: bool = False,
     scale_factor: float | None = None,
     progress: bool = False,
+    rel_subdir: str | None = None,
 ) -> list[str]:
     """Build the main.py argument list for one motion file."""
-    motion_dir = output_dir / "motions"
+    motion_dir = output_dir / "motions" / (rel_subdir or "")
     motion_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
@@ -504,6 +512,7 @@ def _run_test_job(
         save_video=save_video,
         scale_factor=scale_factor,
         progress=progress,
+        rel_subdir=rel_subdir,
     )
     log_file = output_dir / "logs" / (f"{rel_subdir}/{first.stem}.log" if rel_subdir else f"{first.stem}.log")
 
@@ -600,6 +609,7 @@ def _run_one_motion(
         save_video=save_video,
         scale_factor=scale_factor,
         progress=progress,
+        rel_subdir=rel_subdir,
     )
     log_file = output_dir / "logs" / (f"{rel_subdir}/{motion_stem}.log" if rel_subdir else f"{motion_stem}.log")
     result = run_single_job(cmd, activation_prefix, log_file, timeout)

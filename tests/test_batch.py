@@ -59,6 +59,22 @@ def test_build_command_places_video_beside_retargeted_motion(tmp_path):
     assert video_path == tmp_path / "motions" / "stem_retargeted.mp4"
 
 
+def test_recursive_build_command_preserves_relative_motion_path(tmp_path):
+    cmd = _build_command(
+        tmp_path / "configs" / "subdir" / "stem_config.yaml",
+        "robot.json",
+        tmp_path,
+        "stem",
+        save_video=True,
+        rel_subdir="subdir",
+    )
+
+    output_path = Path(cmd[cmd.index("--output") + 1])
+    video_path = Path(cmd[cmd.index("--save-video") + 1])
+    assert output_path == tmp_path / "motions" / "subdir" / "stem_retargeted.npz"
+    assert video_path == tmp_path / "motions" / "subdir" / "stem_retargeted.mp4"
+
+
 def test_output_exists_uses_flat_motions_directory(tmp_path):
     motion_file = tmp_path / "source" / "stem.npz"
     output_path = tmp_path / "output" / "motions" / "stem_retargeted.npz"
@@ -66,6 +82,23 @@ def test_output_exists_uses_flat_motions_directory(tmp_path):
     output_path.touch()
 
     assert _output_exists(motion_file, tmp_path / "output")
+
+
+def test_output_exists_preserves_recursive_relative_motion_path(tmp_path):
+    source_folder = tmp_path / "source"
+    left_motion = source_folder / "left" / "stem.npz"
+    right_motion = source_folder / "right" / "stem.npz"
+    left_motion.parent.mkdir(parents=True)
+    right_motion.parent.mkdir(parents=True)
+    left_motion.touch()
+    right_motion.touch()
+
+    output_path = tmp_path / "output" / "motions" / "left" / "stem_retargeted.npz"
+    output_path.parent.mkdir(parents=True)
+    output_path.touch()
+
+    assert _output_exists(left_motion, tmp_path / "output", source_folder)
+    assert not _output_exists(right_motion, tmp_path / "output", source_folder)
 
 
 def test_export_shared_scaled_terrain_uses_terrain_subdirectory(
