@@ -417,6 +417,10 @@ def mock_collision_pipeline(monkeypatch):
     test_local_collision_repair.py.
     """
     from omniretargeting import core
+    from omniretargeting import self_collision
+    monkeypatch.setattr(self_collision, "SelfCollisionQuery", lambda *args, **kwargs: Mock())
+    monkeypatch.setattr(self_collision, "summarize_self_collisions",
+                        lambda *args, **kwargs: {"status": "mocked", "max_depth": None})
     monkeypatch.setattr(core.SceneQuery, "from_tasks", lambda *args, **kwargs: Mock())
     monkeypatch.setattr(core.OmniRetargeter, "_clamp_final_joint_safety_limits", lambda self, q: q)
     monkeypatch.setattr(core, "select_safe_postprocessing",
@@ -500,7 +504,7 @@ def test_retarget_motion_applies_terrain_scale_when_enabled(mock_collision_pipel
     )
 
 
-def test_retarget_motion_applies_foot_stabilization_for_xyz_nudge(mock_collision_pipeline):
+def test_retarget_motion_skips_root_nudges_before_fixed_base_acceptance(mock_collision_pipeline):
     from omniretargeting import OmniRetargeter
 
     original_terrain_copy = Mock(name="original_terrain_copy")
@@ -530,12 +534,8 @@ def test_retarget_motion_applies_foot_stabilization_for_xyz_nudge(mock_collision
     )
 
     assert terrain_scale == 1.0
-    assert retargeted_motion is stabilized_motion
-    retargeter._apply_foot_stabilization.assert_called_once_with(
-        raw_motion,
-        original_terrain_copy,
-        framerate=60.0,
-    )
+    np.testing.assert_array_equal(retargeted_motion, raw_motion)
+    retargeter._apply_foot_stabilization.assert_not_called()
 
 
 def test_retarget_motion_skips_foot_stabilization_for_hard_constraint(mock_collision_pipeline):
@@ -567,7 +567,7 @@ def test_retarget_motion_skips_foot_stabilization_for_hard_constraint(mock_colli
     )
 
     assert terrain_scale == 1.0
-    assert retargeted_motion is raw_motion
+    np.testing.assert_array_equal(retargeted_motion, raw_motion)
     retargeter._apply_foot_stabilization.assert_not_called()
 
 

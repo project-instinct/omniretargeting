@@ -17,6 +17,69 @@ from omniretargeting.scene_geometry import (
 from tests.test_local_collision_repair import setup_motion
 
 
+@pytest.mark.parametrize("height_shift", [0.0, -0.08])
+def test_thin_ground_box_cylinder_clearance_matches_analytic_support(height_shift):
+    # A separated cylinder above this exact OMOMO ankle pose used to receive
+    # a -17 cm mesh distance to the ground's bottom face.
+    model = mujoco.MjModel.from_xml_string("""<mujoco><worldbody><body><freejoint/>
+    <geom type="cylinder" size=".01 .093"/></body></worldbody></mujoco>""")
+    data = mujoco.MjData(model)
+    data.qpos[:] = [0.41606292506305426, 0.7590681276805564,
+                   0.060214388873985454 + height_shift,
+                   0.5268410130909874, -0.5132573649026344,
+                   -0.49014686003229224, -0.4677194457139336]
+    mujoco.mj_forward(model, data)
+    scene = trimesh.creation.box(extents=[10, 10, .1])
+    scene.apply_translation([0, 0, -.05])
+    before = scene.vertices.copy()
+    backend = RigidGeometryQuery(model, [0], SceneQuery(scene))
+    row = backend.query(data, .25)[0]
+    axis_z = data.geom_xmat[0].reshape(3, 3)[2, 2]
+    lowest_z = data.geom_xpos[0, 2] - .093 * abs(axis_z) - .01 * np.sqrt(1-axis_z**2)
+    assert row["clearance"] == pytest.approx(lowest_z, abs=2e-6)
+    np.testing.assert_allclose(row["directions"], [0, 0, 1], atol=2e-5)
+    np.testing.assert_array_equal(scene.vertices, before)
+    assert backend.max_vertex_deviation < 1e-10
+
+
+def test_rotated_box_keeps_original_mesh_instead_of_axis_aligned_bounds():
+    model, _, _ = setup_motion(1)
+    scene = trimesh.creation.box(extents=[.1, .4, .8])
+    scene.apply_transform(trimesh.transformations.rotation_matrix(.3, [0, 0, 1]))
+    backend = RigidGeometryQuery(model, collision_geom_ids(model), SceneQuery(scene))
+    assert all(backend.model.geom_type[g] == mujoco.mjtGeom.mjGEOM_MESH
+               for g in backend.scene_ids.values())
+
+
+@pytest.mark.parametrize("legacy_fails", [False, True])
+def test_inconsistent_native_witness_retries_without_changing_collision_flags(monkeypatch, legacy_fails):
+    model, q, scene = setup_motion(1)
+    backend = RigidGeometryQuery(model, collision_geom_ids(model), SceneQuery(scene))
+    data = mujoco.MjData(model)
+    data.qpos[:] = q[0]
+    mujoco.mj_forward(model, data)
+    flags = int(backend.model.opt.disableflags)
+    original = mujoco.mj_geomDistance
+    def query(m, d, first, second, cutoff, witness):
+        if legacy_fails or not int(m.opt.disableflags) & int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD):
+            witness[:] = [0, 0, 0, 3, 0, 0]
+            return 0.0
+        return original(m, d, first, second, cutoff, witness)
+    monkeypatch.setattr(mujoco, 'mj_geomDistance', query)
+    rows = backend.query(data, .2)
+    assert backend.distance_retries > 0
+    assert int(backend.model.opt.disableflags) == flags
+    if legacy_fails:
+        assert backend.failures
+        assert rows and all(row['uncertain'] and np.isnan(row['clearance']) for row in rows)
+    else:
+        assert not backend.failures
+        assert rows and all(not row['uncertain'] for row in rows)
+        for row in rows:
+            assert np.linalg.norm(row['points']-row['surface_points']) == pytest.approx(
+                abs(row['clearance']), abs=1e-7)
+
+
 def test_full_geometry_detects_small_obstacle_enclosed_between_robot_samples():
     model = mujoco.MjModel.from_xml_string("""<mujoco><worldbody><body><freejoint/>
     <geom type="box" size=".5 .5 .5"/></body></worldbody></mujoco>""")

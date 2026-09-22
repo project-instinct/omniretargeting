@@ -88,7 +88,8 @@ def test_bundle_serves_exact_bytes_cache_etag_and_only_assets(tmp_path):
     latest = write_recording(tmp_path, b"new recording", camera_position=[1, 2, 3],
                              camera_look_at=[0, 0, 0], metadata={"source_frames": 99})
     (tmp_path / "private.txt").write_text("not a playback asset")
-    server = serve_recording(tmp_path, 0)
+    server = serve_recording(tmp_path, 0, host="127.0.0.1")
+    assert server.server_address[0] == "127.0.0.1"
     root = f"http://127.0.0.1:{server.server_port}"
     try:
         with urlopen(root + "/" + manifest["recording"]) as response:
@@ -183,7 +184,7 @@ def test_rigid_instance_browser_transform_matches_fk_and_keeps_real_batches():
         <body name="b" pos="-.2 0 0"><joint axis="0 1 0"/>
           <geom type="sphere" size=".1"/></body>
       </body></worldbody></mujoco>''')
-    server = viser.ViserServer(port=0)
+    server = viser.ViserServer(host="127.0.0.1", port=0)
     try:
         data = mujoco.MjData(model)
         scene = ViserMujocoScene(server, model, num_envs=1)

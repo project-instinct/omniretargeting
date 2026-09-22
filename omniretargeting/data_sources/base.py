@@ -8,7 +8,7 @@ from typing import Any, Iterator
 
 import numpy as np
 
-from omniretargeting.utils import linear_interpolate, slerp_interpolate
+from omniretargeting.motion_interpolation import linear_interpolate, slerp_interpolate
 
 
 @dataclass
@@ -100,6 +100,22 @@ class MotionData:
         new_object_points = linear_interpolate(self.object_points, dst_indices, axis=0) if self.object_points is not None else None
 
         new_metadata = dict(self.metadata)
+        surfaces = self.metadata.get("body_surface_samples")
+        if surfaces is not None:
+            parts = {}
+            for name, part in surfaces["parts"].items():
+                triangles = np.asarray(part["triangles"])
+                if len(triangles) != T:
+                    raise ValueError("Body surface samples must follow the motion timeline")
+                parts[name] = {**part, "triangles": linear_interpolate(triangles, dst_indices, axis=0)}
+            new_metadata["body_surface_samples"] = {**surfaces, "parts": parts}
+            if "full_body" in surfaces:
+                full = surfaces["full_body"]
+                if len(full["triangles"]) != T:
+                    raise ValueError("Whole-body surface samples must follow the motion timeline")
+                new_metadata["body_surface_samples"]["full_body"] = {
+                    **full, "triangles": linear_interpolate(np.asarray(full["triangles"]), dst_indices, axis=0)
+                }
         for key in ("joint_orientations", "body_aligned_joint_orientations"):
             jo = new_metadata.get(key)
             if jo is not None and isinstance(jo, np.ndarray) and jo.shape[0] == T:

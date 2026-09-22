@@ -18,6 +18,62 @@ class GeometryQueryError(RuntimeError):
     """A requested collision query cannot provide reliable geometry."""
 
 
+def _box_corners(half_size):
+    return np.asarray(np.meshgrid(*[[-h, h] for h in half_size])).reshape(3, -1).T
+
+
+def _exact_box_half_size(vertices):
+    """Recognize an existing axis-aligned box without convexifying a scene."""
+    vertices = np.unique(np.asarray(vertices), axis=0)
+    if len(vertices) != 8:
+        return None
+    half_size = np.ptp(vertices, axis=0) / 2
+    if np.any(half_size <= 0):
+        return None
+    corners = _box_corners(half_size)
+    if np.max(cKDTree(vertices).query(corners)[0]) > 1e-10:
+        return None
+    return half_size
+
+
+def _cylinder_box_face_distance(model, data, cylinder, box):
+    """Exact face witness when other box faces cannot affect the distance.
+
+    The cylinder's complete projection must stay inside both tangential box
+    extents, even under a translation as long as this exit. Otherwise an edge
+    or corner may determine the distance and the general query remains needed.
+    """
+    if (model.geom_type[cylinder] != mujoco.mjtGeom.mjGEOM_CYLINDER
+            or model.geom_type[box] != mujoco.mjtGeom.mjGEOM_BOX):
+        return None
+    rotation = data.geom_xmat[box].reshape(3, 3)
+    center = rotation.T @ (data.geom_xpos[cylinder] - data.geom_xpos[box])
+    axis = rotation.T @ data.geom_xmat[cylinder].reshape(3, 3)[:, 2]
+    radius, half_length = model.geom_size[cylinder, :2]
+    half_size = model.geom_size[box]
+    extents = half_length * np.abs(axis) + radius * np.sqrt(np.maximum(0., 1. - axis**2))
+    distances = np.stack((center - extents - half_size, -center - extents - half_size))
+    side, coordinate = np.unravel_index(np.argmax(distances), distances.shape)
+    distance = float(distances[side, coordinate])
+    tangential = np.arange(3) != coordinate
+    side_margin = half_size - np.abs(center) - extents
+    if np.any(side_margin[tangential] <= abs(distance) + 1e-9):
+        return None
+    normal = np.zeros(3)
+    normal[coordinate] = 1. if side == 0 else -1.
+    # Cylinder support point in the direction opposite the box's outward normal.
+    direction = -normal
+    axial = float(direction @ axis)
+    radial = direction - axial * axis
+    radial_norm = float(np.linalg.norm(radial))
+    point = center + half_length * np.sign(axial) * axis
+    if radial_norm > 1e-12:
+        point += radius * radial / radial_norm
+    surface = point - distance * normal
+    return (distance, np.r_[rotation @ point + data.geom_xpos[box],
+                            rotation @ surface + data.geom_xpos[box]], rotation @ normal)
+
+
 def distance_direction(distance, fromto, contact_normal=None):
     """Gradient with respect to the first geom's world translation.
 
@@ -65,6 +121,9 @@ class RigidGeometryQuery:
     def __init__(self, robot, geom_ids, scene_query):
         self.robot, self.scene_query = robot, scene_query
         self.failures, self.pair_queries = [], 0
+        self.distance_retries = 0
+        self.analytic_face_queries = 0
+        self._last_distance_normal = None
         self.parts = []
         self.open_parts = [
             (cid, part, faces)
@@ -85,19 +144,19 @@ class RigidGeometryQuery:
             name = f"scene_{cid}"
             center = part.vertices.mean(axis=0)
             vertices = np.asarray(part.vertices) - center
-            spec.add_mesh(
-                name=name,
-                uservert=vertices.ravel(),
-                userface=np.asarray(part.faces).ravel(),
-            )
+            half_size = _exact_box_half_size(vertices)
             body = spec.worldbody.add_body(name=name, pos=center)
-            body.add_geom(
-                name=name,
-                type=mujoco.mjtGeom.mjGEOM_MESH,
-                meshname=name,
-                contype=2,
-                conaffinity=1,
-            )
+            if half_size is not None:
+                # Thin, wide mesh boxes can produce a spurious exit through
+                # the opposite face for a separated cylinder. The native box is
+                # the same solid and avoids that degenerate mesh query.
+                body.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_BOX,
+                              size=half_size, contype=2, conaffinity=1)
+            else:
+                spec.add_mesh(name=name, uservert=vertices.ravel(),
+                              userface=np.asarray(part.faces).ravel())
+                body.add_geom(name=name, type=mujoco.mjtGeom.mjGEOM_MESH,
+                              meshname=name, contype=2, conaffinity=1)
             self.parts.append((cid, name, vertices))
         self.mapping = {}
         for gid in map(int, geom_ids):
@@ -174,6 +233,14 @@ class RigidGeometryQuery:
             if self.model.body_mocapid[bid] != -1 or self.model.body_jntnum[bid]:
                 raise GeometryQueryError("scene collision body is movable")
             self.scene_ids[cid] = gid
+            if self.model.geom_type[gid] == mujoco.mjtGeom.mjGEOM_BOX:
+                restored = _box_corners(self.model.geom_size[gid]) + self.model.geom_pos[gid]
+                deviation = max(cKDTree(restored).query(vertices)[0].max(),
+                                cKDTree(vertices).query(restored)[0].max())
+                if deviation > 1e-10:
+                    raise GeometryQueryError(f"compiled scene box deviation {deviation} m")
+                deviations.append(float(deviation))
+                continue
             mid = int(self.model.geom_dataid[gid])
             va, vn = (
                 int(self.model.mesh_vertadr[mid]),
@@ -215,6 +282,8 @@ class RigidGeometryQuery:
             "robot_proxy_max_vertex_deviation": self.robot_max_vertex_deviation,
             "robot_geom_mapping": {str(k): list(v) for k, v in self.mapping.items()},
             "pair_queries": self.pair_queries,
+            "distance_retries": self.distance_retries,
+            "analytic_cylinder_box_face_queries": self.analytic_face_queries,
             "failures": self.failures,
             "open_surface_test": "exact capsule-axis / finite triangle distance",
             "open_surface_supported_geoms": [
@@ -227,6 +296,42 @@ class RigidGeometryQuery:
             "ambiguous_surface_intersections": self.ambiguous_surface_intersections,
             "open_surface_solid_side_inferred": False,
         }
+
+    def _distance(self, first, second, cutoff, witness):
+        """Reject inconsistent engine witnesses before forming a constraint."""
+        self._last_distance_normal = None
+        analytic = _cylinder_box_face_distance(self.model, self.data, first, second)
+        if analytic is not None:
+            self.analytic_face_queries += 1
+            distance, witness[:], self._last_distance_normal = analytic
+            return distance
+        flags = int(self.model.opt.disableflags)
+        native_bit = int(mujoco.mjtDisableBit.mjDSBL_NATIVECCD)
+        try:
+            for attempt in range(2):
+                if attempt:
+                    if flags & native_bit:
+                        break
+                    self.distance_retries += 1
+                    self.model.opt.disableflags = flags | native_bit
+                witness[:] = 0
+                distance = mujoco.mj_geomDistance(
+                    self.model, self.data, first, second, cutoff, witness
+                )
+                if not np.isfinite(distance):
+                    continue
+                if distance >= cutoff:
+                    return distance
+                length = np.linalg.norm(witness[:3] - witness[3:])
+                # Some native CCD cylinder queries return zero with witness
+                # points metres apart. That is not a contact or a usable normal.
+                if np.isfinite(witness).all() and np.isclose(
+                    length, abs(distance), rtol=1e-5, atol=1e-7
+                ):
+                    return distance
+            raise GeometryQueryError("inconsistent geom distance/witness after retry")
+        finally:
+            self.model.opt.disableflags = flags
 
     def query(self, robot_data, activation_distance):
         for gid, (_qg, _qb, mocap) in self.mapping.items():
@@ -249,16 +354,16 @@ class RigidGeometryQuery:
                 self.pair_queries += 1
                 witness = np.zeros(6)
                 try:
-                    distance = mujoco.mj_geomDistance(
-                        self.model, self.data, qg, sg, activation_distance, witness
-                    )
+                    distance = self._distance(qg, sg, activation_distance, witness)
                     if not np.isfinite(distance):
                         raise GeometryQueryError("nonfinite geom distance")
                     if distance >= activation_distance:
                         continue
-                    normal = None
+                    normal = (-self._last_distance_normal if self._last_distance_normal is not None else None)
                     contact_point = None
                     for contact in self.data.contact:
+                        if self._last_distance_normal is not None:
+                            break
                         if tuple(contact.geom) == (qg, sg):
                             normal = contact.frame[:3]
                             contact_point = contact.pos

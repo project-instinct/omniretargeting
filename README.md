@@ -265,6 +265,14 @@ robot-specific objects are merged recursively, while a scalar or list in the
 robot profile replaces the algorithm default. The bundled
 `unitree_g1_instinctmj.json` uses this compact form.
 
+Robot self-collision avoidance is enabled by default, independently of the
+scene penetration resolver. It checks only collision-enabled geoms, respects
+model collision filters, and checks the paths between saved poses. Visual-only
+geoms are ignored. Set `retargeting.self_collision_enabled` to `false` to opt
+out; an old saved profile that explicitly sets it to `false` keeps that choice.
+The output diagnostics report self-collision separately from scene penetration.
+See [self-collision implementation and validation](docs/self_collision.md).
+
 Palm and sole tracking/contact offsets are inferred from the robot's mesh and
 collision geometry when omitted. Profiles only need explicit offsets when the
 model has no usable end-effector geometry or intentionally uses a custom tool
@@ -328,6 +336,8 @@ The viewer reads `base_pos_w`, `base_quat_w`, `joint_pos`, and `joint_names`
 from `.npz` outputs. If `object_pos_w/object_quat_w` are present, it can also
 show an object mesh via `--object-mesh`, or infer common OMOMO meshes from
 `~/Datasets/OMOMO/data/captured_objects`.
+
+To restrict both live and cached servers to this machine, add `--host 127.0.0.1`.
 
 The Playback tab supports exact-frame inspection with First/Prev/Next/Last,
 direct frame entry, configurable multi-frame jumps, contact-event navigation,
@@ -412,6 +422,9 @@ OmniRetargeter(robot_urdf_path, terrain_mesh_path, joint_mapping, robot_height=N
 
 ## Architecture
 
+For implementation entry points and module responsibilities, see the
+[code layout guide](docs/code_layout.md).
+
 OmniRetargeting adapts the interaction mesh retargeting approach from the holosoma_retargeting project to work with generic robots and terrains:
 
 1. **Terrain Scaling**: Automatically scales terrain mesh to match SMPLX motion scale
@@ -422,6 +435,23 @@ OmniRetargeting adapts the interaction mesh retargeting approach from the holoso
 6. **Joint Limits**: Respects robot joint limits during optimization
 
 ### Contact-priority hand/foot retargeting
+
+For whole-body scene interaction, raw SMPL-X sources also provide persistent
+skin samples. `retargeting.surface_contact.enabled` defaults to true and learns
+indexed human/robot reference-surface correspondence, following UMR's contact-map
+formulation. Active forearm, torso, pelvis and other surface contacts share the
+framewise solver, refinement and final validation; existing hand/foot contacts
+retain priority. Source motion, robot size and scene scale remain unchanged.
+See [whole-body surface contact](docs/whole_body_surface_contact.md) for configuration,
+exported `surface_contact_*` arrays, correspondence diagnostics and limitations.
+
+`retargeting.whole_body_correction.enabled` also defaults to true. The final
+coupled correction lets pelvis/waist/leg joints participate alongside hand/foot
+compensation, with a fixed floating base and fixed endpoint error budgets.
+Prescribed moving-object geometry contributes collision constraints at frames
+and between frames; open mesh components remain explicitly unknown. See
+[constrained whole-body correction](docs/constrained_whole_body_correction.md)
+for the UMR method mapping, configuration and validation coverage.
 
 Robot profiles can enable `retargeting.end_effector_priority`. For raw SMPL-X
 motions, the loader samples stable hand and foot surface vertices, detects
@@ -451,6 +481,18 @@ re-enable them.
 Mechanical joint ranges, scene/contact constraints, and the per-iteration
 optimization trust region remain active. Source-relative base-motion bounds
 and soft smoothing are configured separately.
+
+Whole-trajectory refinement in the main pipeline uses the same immutable
+framewise reference and budgets as final acceptance. Its CLARABEL subproblem
+bounds cumulative joint corrections, added correction velocity/acceleration,
+end-effector displacement, contact residuals, and reliable scene penetration.
+Each retained update also passes real FK and dense/interframe geometry checks.
+These bounds constrain **added corrections**, not the speed of the source motion.
+`track_swing: false` disables only free-effector position rows; contact, arm
+posture, and orientation rows remain active. Optional smoothing that violates
+these budgets leaves the validated refinement intact. Legacy ground-lock/XYZ
+foot stabilization is skipped in this fixed-base pipeline; remaining penetration
+is handled by local joint repair and reported independently.
 
 The default joint range is the full mechanical range. Core joints no longer
 receive automatic extra range reductions or name-based neutral-pose penalties;

@@ -15,6 +15,13 @@ from typing import Any, Dict, Mapping
 import numpy as np
 import trimesh
 
+from .contact_schedule import (
+    _apply_contact_hysteresis as _apply_contact_hysteresis,
+    _close_short_gaps as _close_short_gaps,
+    _iter_true_runs as _iter_true_runs,
+    _remove_short_runs as _remove_short_runs,
+    _sigmoid as _sigmoid,
+)
 
 _SURFACE_ONLY_CONTACT_MODES = frozenset({"sliding", "transition"})
 _DEFAULT_NORMAL_ORIENTATION_DEADZONE = 0.005
@@ -42,6 +49,8 @@ class SceneContactTask:
     up_directions: np.ndarray | None = None
     transition_weights: np.ndarray | None = None
     contact_modes: np.ndarray | None = None
+    environment_ids: np.ndarray | None = None  # 0: static scene; 1..N: moving objects
+    preserve_contact_anchors: bool = False
 
     def frame(self, frame_idx: int) -> Dict[str, Any]:
         """Return the optimizer payload for one frame."""
@@ -56,7 +65,7 @@ class SceneContactTask:
             else ("sticking" if bool(self.contact_mask[frame_idx]) else "none")
         )
         contact_position = self.contact_positions[frame_idx]
-        if contact_mode == "sticking" and transition_weight < 1.0:
+        if contact_mode == "sticking" and transition_weight < 1.0 and not self.preserve_contact_anchors:
             contact_position = (
                 (1.0 - transition_weight) * self.tracking_positions[frame_idx]
                 + transition_weight * contact_position
@@ -72,6 +81,7 @@ class SceneContactTask:
             "contact": bool(self.contact_mask[frame_idx]),
             "contact_mode": contact_mode,
             "transition_weight": transition_weight,
+            "environment_id": int(self.environment_ids[frame_idx]) if self.environment_ids is not None else 0,
         }
         if self.forward_directions is not None:
             payload["forward_direction"] = self.forward_directions[frame_idx]
@@ -132,67 +142,6 @@ def build_world_tracking_tasks(
             contact_modes=np.full(num_frames, "none", dtype="<U8"),
         )
     return tasks
-
-
-def _sigmoid(value: np.ndarray) -> np.ndarray:
-    value = np.clip(value, -60.0, 60.0)
-    return 1.0 / (1.0 + np.exp(-value))
-
-
-def _iter_true_runs(mask: np.ndarray):
-    start = None
-    for idx, value in enumerate(np.r_[mask, False]):
-        if value and start is None:
-            start = idx
-        elif not value and start is not None:
-            yield start, idx
-            start = None
-
-
-def _close_short_gaps(mask: np.ndarray, max_gap_frames: int) -> np.ndarray:
-    result = np.asarray(mask, dtype=bool).copy()
-    if max_gap_frames <= 0:
-        return result
-    false_runs = list(_iter_true_runs(~result))
-    for start, end in false_runs:
-        if start == 0 or end == len(result):
-            continue
-        if end - start <= max_gap_frames:
-            result[start:end] = True
-    return result
-
-
-def _remove_short_runs(mask: np.ndarray, min_contact_frames: int) -> np.ndarray:
-    result = np.asarray(mask, dtype=bool).copy()
-    if min_contact_frames <= 1:
-        return result
-    for start, end in list(_iter_true_runs(result)):
-        if end - start < min_contact_frames:
-            result[start:end] = False
-    return result
-
-
-def _apply_contact_hysteresis(
-    enter_mask: np.ndarray,
-    stay_mask: np.ndarray,
-) -> np.ndarray:
-    """Keep an active contact until the looser exit condition is violated."""
-    enter = np.asarray(enter_mask, dtype=bool)
-    stay = np.asarray(stay_mask, dtype=bool)
-    if enter.shape != stay.shape:
-        raise ValueError(
-            "enter_mask and stay_mask must have the same shape, got "
-            f"{enter.shape} and {stay.shape}."
-        )
-    result = np.zeros_like(enter)
-    active = False
-    for frame_idx in range(len(result)):
-        if active:
-            active = bool(stay[frame_idx])
-        elif enter[frame_idx]:
-            active = True
-        result[frame_idx] = active
-    return result
 
 
 def _query_scene_samples(
@@ -965,6 +914,10 @@ def stack_contact_tasks(
         return {}
     return {
         "contact_names": np.asarray(names),
+        "contact_environment_ids": np.stack([
+            tasks[name].environment_ids if tasks[name].environment_ids is not None
+            else np.zeros(len(tasks[name].contact_mask), dtype=int) for name in names
+        ], axis=1),
         "contact_mask": np.stack([tasks[name].contact_mask for name in names], axis=1),
         "contact_modes": np.stack(
             [

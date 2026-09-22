@@ -202,7 +202,7 @@ def write_recording(directory: Path, payload: bytes, *, camera_position, camera_
     return manifest
 
 
-def serve_recording(directory: Path, port: int):
+def serve_recording(directory: Path, port: int, *, host: str = "0.0.0.0"):
     """Serve only bundle assets, with immutable recording cache validation."""
     directory = directory.resolve()
     recordings = {"/" + path.name: hashlib.sha256(path.read_bytes()).hexdigest()
@@ -239,7 +239,7 @@ def serve_recording(directory: Path, port: int):
         def log_message(self, *args):
             pass
 
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server = ThreadingHTTPServer((host, port), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return server

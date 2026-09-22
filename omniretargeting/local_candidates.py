@@ -12,6 +12,7 @@ import cvxpy as cp
 import mujoco
 import numpy as np
 
+from .self_collision import bounded_collision_constraints
 from .contact import _is_surface_only_contact_mode
 from .geometry_query import relative_point_jacobian
 from .trajectory_validation import QueryBudgetExceeded
@@ -193,22 +194,13 @@ def _solve_pose(v, frame, warm, previous_delta, joints, planes):
                 collision["directions"][k],
             )
             rows.append((float(collision["clearance"][k]), row[dofs]))
-        if cfg["self_collision_enabled"]:
-            for contact in data.contact:
-                if contact.dist >= 0.01:
-                    continue
-                g1, g2 = contact.geom
-                row = relative_point_jacobian(
-                    v.model,
-                    data,
-                    contact.pos,
-                    v.model.geom_bodyid[g2],
-                    contact.frame[:3],
-                    contact.pos,
-                    v.model.geom_bodyid[g1],
-                )
-                rows.append((float(contact.dist), row[dofs]))
         slacks = []
+        if v.self_query is not None:
+            self_constraints, self_penalty = bounded_collision_constraints(
+                v.self_query, v.self_query.query(data=data), data, step, dofs, slack_variables=slacks
+            )
+            constraints.extend(self_constraints)
+            objective += self_penalty
         for phi, gradient in rows:
             slack = cp.Variable(nonneg=True)
             constraints += [

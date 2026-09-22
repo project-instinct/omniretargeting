@@ -7,12 +7,12 @@
 - `omniretargeting/scene_geometry.py`：统一 `collision_geom_ids`、`geom_surface_offsets`、`ScenePenetrationProbe`、`measure_scene_penetration`；新增共享 `SceneQuery`，缓存 libigl 三角形 AABB。清除逐帧实现的强制朝上法向和无符号距离深穿剔除。box 覆盖角点、棱边和面；capsule/cylinder 覆盖完整轴向及截面；mesh 使用编译后 MuJoCo 顶点的凸包，保留极值点并采样三角面。
 - `omniretargeting/trajectory_validation.py`：同一套 FK、接触、限位、新增关节修正及其时间差分检查；几何按帧／geom、自碰撞按 geom pair 比较。保存帧和帧间子姿态都检查几何；帧间也复核接触位置、必要方向和摆动偏移。未知场景侧、细分上限、查询上限单独报告。
 - `omniretargeting/local_collision_repair.py`：按运动链、障碍、时间聚合事件；协调重叠窗口，优先线性关节插值；不裁剪角度来伪造通过。边界不可信、接触切换、超限和帧间碰撞都会阻止直接采用插值。必要时只优化窗口内部的链关节，正则化 Δq、Δq 的速度和加速度；用现有 MuJoCo Jacobian、CVXPY/Clarabel、标量关节限位工具和 `_lock_contact_offsets`。有界碰撞 slack 显式保留，接触和机械预算作为约束，真实 FK／非线性检查决定是否接受步长。一次失败后可在相同接触阶段有限扩窗；总窗口数、迭代和查询均有限额。同侧半空间取自可靠边界的几何方向，不更改场景符号。
-- `omniretargeting/retargeting.py`、`trajectory_refinement.py`：两阶段共享查询；旧采样入口保留导入兼容。全轨迹 `lsq_linear` 碰撞项仍明确是软惩罚，新增最终验收承担检查。规范化法向时使用副本，避免写回任务数组。
+- `omniretargeting/retargeting.py`、`trajectory_refinement.py`：两阶段共享查询；旧采样入口保留导入兼容。独立调用的 `lsq_linear` 碰撞项仍是软惩罚；主流程通过 `_refinement/guard.py` 使用 CLARABEL 加入最终验收的累计关节／末端／接触预算和可信场景非退化约束，每次更新再经过真实 FK 与密集帧间几何验收。规范化法向时使用副本，避免写回任务数组。
 - `omniretargeting/core.py`：接触任务构造完成后固定查询自由侧证据；打印有效配置和实际开启阶段。`_select_penetration_safe_refinement` 改为联合验收入口；正常调用还传入接触任务、实际 fps 和全局安全配置。取消 75%／50%／25% 整段混合与 `max(10cm, before+regression)` 验收。候选不合格时分局部块回退，每次拼接重新检查邻接运动。
 - `omniretargeting/main.py`：保存 `<output>.diagnostics.json`；写 NPZ 前核对最终 qpos 的 SHA-256。`retargeting_defaults.py` 增加可关闭开关，删除旧混合／全局最大深度回归默认字段；机器人 profile 文件未改。
 - 新增 `tests/test_scene_geometry.py`、`tests/test_local_collision_repair.py`、`tests/local_collision_benchmark.py`；更新 `test_basic.py` 中旧整段混合契约及轻量编排测试桩，更新 `test_robot_config.py` 的默认配置断言。
 
-最终顺序为：逐帧 SQP → 既有 `_project_actuated_temporal_step` → 全轨迹 refinement → 可选 smoothing → foot stabilization → 最终 joint clamp → 联合验收／局部回退 → 局部插值或受限优化 → 最终复验 → 质量报告 → 校验摘要并保存。局部修复之后没有 clamp、混合、限速或滤波。新增阶段不改根平移／旋转、帧数、fps、接触时间或窗口外关节。原始机器人输出作为固定误差参考，源人体和目标数组不写回。
+最终顺序为：逐帧 SQP → 既有 `_project_actuated_temporal_step` → 基线 joint clamp 和固定足端参考 → 受约束全轨迹 refinement → 可选 smoothing（失败时保留已验证 refinement）→ 最终 joint clamp → 联合验收／局部回退 → 局部插值或受限优化 → 最终复验 → 质量报告 → 校验摘要并保存。固定根主流程跳过修改根位置的 foot stabilization／ground lock／XYZ nudge。局部修复之后没有 clamp、混合、限速或滤波。新增阶段不改根平移／旋转、帧数、fps、接触时间或窗口外关节。原始机器人输出作为固定误差参考，源人体和目标数组不写回。
 
 **查询与接触语义**
 

@@ -21,6 +21,8 @@ from .retargeting import (
     _apply_joint_limit_safety_fraction,
 )
 from .scene_geometry import ScenePenetrationProbe, collision_geom_ids
+from .collision_motion import CollisionMotionBounds
+from .self_collision import SelfCollisionQuery, self_collision_config
 from .trajectory_refinement import _lock_contact_offsets, _scalar_joint_coordinates
 
 LOCAL_REPAIR_DEFAULTS = {
@@ -67,6 +69,7 @@ def local_repair_config(
     cfg["self_collision_enabled"] = bool(
         self_collision_enabled or cfg.get("self_collision_enabled", False)
     )
+    cfg["self_collision"] = self_collision_config(cfg.get("self_collision"))
     # Bound only added collision-repair corrections, not source motion rates.
     cfg.setdefault("correction_velocity", 5.4)
     cfg.setdefault("correction_acceleration", 72.0)
@@ -149,7 +152,7 @@ def _summary(depths, model):
 
 class TrajectoryValidator:
     def __init__(self, model, reference, query, tasks, priority, config, framerate,
-                 surface_tasks=None, *, geometry_cache=None, body_relation_tasks=None):
+                 surface_tasks=None, *, geometry_cache=None, body_relation_tasks=None, self_contact_tasks=None, surface_contact_tasks=None, contact_offset_choice=None):
         self.model, self.reference, self.query = (
             model,
             np.asarray(reference).copy(),
@@ -158,6 +161,15 @@ class TrajectoryValidator:
         self.cfg, self.fps, self.tasks = config, float(framerate), tasks
         self.surface_tasks, self.frame_start = surface_tasks, 0
         self.body_relation_tasks = body_relation_tasks
+        self.surface_contact_tasks = surface_contact_tasks
+        if surface_contact_tasks is not None and (
+            surface_contact_tasks.model is not model or len(surface_contact_tasks.targets) != len(self.reference)
+        ):
+            raise ValueError("Surface contact must use the same model and original timeline")
+        self.self_contact_tasks = self_contact_tasks
+        if self_contact_tasks is not None:
+            if self_contact_tasks.model is not model or len(self_contact_tasks.targets) != len(self.reference):
+                raise ValueError("Self contact must use the same model and original timeline")
         if body_relation_tasks is not None:
             if body_relation_tasks.model is not model or len(body_relation_tasks.targets) != len(self.reference):
                 raise ValueError("Body relations must use the same model and original timeline")
@@ -184,12 +196,17 @@ class TrajectoryValidator:
         )
         self.query_start = query.query_points
         self.geometry_calls = 0
+        self.self_query = (
+            SelfCollisionQuery(model, config.get("self_collision"))
+            if config["self_collision_enabled"] else None
+        )
         # Reuse exact-pose geometry only while model and scene remain unchanged.
         # Keep their objects alive and isolate sampling/self-collision policies.
         # Contact residuals and frame-specific modes are re-evaluated below.
         self._pose_cache = {} if geometry_cache is None else geometry_cache.setdefault(
             (model, query, tuple(self.probe.geom_ids), self.probe.margin,
-             config["sample_spacing"], config["self_collision_enabled"]), {}
+             config["sample_spacing"], config["self_collision_enabled"],
+             tuple(sorted(self_collision_config(config.get("self_collision")).items()))), {}
         )
         self.specs = {}
         for name, task in tasks.items():
@@ -211,36 +228,17 @@ class TrajectoryValidator:
                     raw.get("contact_offsets", [tracking]), dtype=float
                 ).reshape(-1, 3),
             )
-        self.offset_choice = _lock_contact_offsets(model, self.reference, self.specs)
+        self.offset_choice = (_lock_contact_offsets(model, self.reference, self.specs)
+                              if contact_offset_choice is None else
+                              {name: np.asarray(choice, dtype=int).copy() for name, choice in contact_offset_choice.items()})
+        for name, spec in self.specs.items():
+            choice = self.offset_choice.get(name)
+            if choice is None or choice.shape != (len(self.reference),) or np.any(choice < 0) or np.any(choice >= len(spec["contact_offsets"])):
+                raise ValueError(f"Invalid fixed contact marker choices for {name}")
         self.original_effectors = self.effectors(self.reference)
-        self.joint_ids = np.array(
-            [np.flatnonzero(model.jnt_qposadr == qi)[0] for qi in self.qi], dtype=int
-        )
         self.fixed_qi = np.setdiff1d(np.arange(model.nq), self.qi)
-        # Per-geom ancestor path bounds avoid letting an unrelated moving arm
-        # force subdivisions for a foot. Each angular contribution uses the sum
-        # of descendant link lengths, a conservative bound on its lever arm.
-        self.levers = np.zeros((len(self.probe.geom_ids), len(self.qi)))
-        self.root_levers = np.zeros(len(self.probe.geom_ids))
-        self.slide_ancestors = np.zeros_like(self.levers, dtype=bool)
-        for row, gid in enumerate(self.probe.geom_ids):
-            bid = int(model.geom_bodyid[gid])
-            radius = float(model.geom_rbound[gid]) + float(
-                np.linalg.norm(model.geom_pos[gid])
-            )
-            while bid > 0:
-                for col, jid in enumerate(self.joint_ids):
-                    if model.jnt_bodyid[jid] == bid:
-                        if model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_SLIDE:
-                            self.levers[row, col] = 1.0
-                            self.slide_ancestors[row, col] = True
-                        else:
-                            self.levers[row, col] = radius + float(
-                                np.linalg.norm(model.jnt_pos[jid])
-                            )
-                radius += float(np.linalg.norm(model.body_pos[bid]))
-                bid = int(model.body_parentid[bid])
-            self.root_levers[row] = radius
+        self.motion_bounds = CollisionMotionBounds(model, self.probe.geom_ids)
+        self.joint_ids = self.motion_bounds.joint_ids
 
     @contextmanager
     def segment(self, start, stop):
@@ -248,6 +246,9 @@ class TrajectoryValidator:
         or selecting new robot marker offsets. Share FK/query caches and budgets.
         """
         view = copy(self)
+        # A witness guard owns its validator's reference and timeline. A
+        # shallow-copied parent guard would check the wrong source frames.
+        view._scene_witness_guard = None
         view.frame_start = self.frame_start + start
         view.reference = self.reference[start:stop]
         view.specs = {}
@@ -277,9 +278,12 @@ class TrajectoryValidator:
                    for weight, residual, _ in self.surface_rows(pose, frame, self.di))
 
     def relation_rows(self, pose, frame, dofs):
-        if self.body_relation_tasks is None:
-            return ()
-        return self.body_relation_tasks.rows(pose, self.frame_start + frame, dofs)
+        if self.body_relation_tasks is not None:
+            yield from self.body_relation_tasks.rows(pose, self.frame_start + frame, dofs)
+        if self.self_contact_tasks is not None:
+            yield from self.self_contact_tasks.rows(pose, self.frame_start + frame, dofs)
+        if self.surface_contact_tasks is not None:
+            yield from self.surface_contact_tasks.rows(pose, self.frame_start + frame, dofs)
 
     def relation_score(self, poses):
         return sum(weight * float(residual @ residual)
@@ -299,6 +303,7 @@ class TrajectoryValidator:
                     name,
                     task.frame(frame)["contact_mode"],
                     bool(task.contact_mask[frame]),
+                    task.frame(frame)["environment_id"],
                 )
             )
         return tuple(phases)
@@ -442,6 +447,20 @@ class TrajectoryValidator:
         metrics["correction_jerk"] = float(
             np.max(np.abs(np.diff(delta, n=3, axis=0)), initial=0) * self.fps**3
         )
+        if self.self_contact_tasks is not None:
+            task = self.self_contact_tasks
+            old = task.errors(self.reference, self.frame_start)
+            new = task.errors(candidate, self.frame_start)
+            if np.any(new > np.maximum(old, task.cfg["tolerance"]) + task.cfg["regression"] + 1e-8):
+                reasons.append("self_contact_regression")
+            metrics["self_contact"] = task.metrics(candidate, self.frame_start)
+        if self.surface_contact_tasks is not None:
+            task = self.surface_contact_tasks
+            old = task.errors(self.reference, self.frame_start)
+            new = task.errors(candidate, self.frame_start)
+            if np.any(new > np.maximum(old, task.cfg["tolerance"]) + task.cfg["regression"] + 1e-8):
+                reasons.append("surface_contact_regression")
+            metrics["surface_contact"] = task.metrics(candidate, self.frame_start)
         if self.surface_tasks is not None:
             metrics["surface_normal_cost"] = self.surface_score(candidate)
         if self.body_relation_tasks is not None:
@@ -492,9 +511,14 @@ class TrajectoryValidator:
                         f
                         and mode == "sticking"
                         and task.frame(f - 1)["contact_mode"] == "sticking"
+                        and payload["environment_id"] == task.frame(f - 1)["environment_id"]
                     ):
-                        v = (p[f] - p[f - 1]) * self.fps
-                        v0 = (p0[f] - p0[f - 1]) * self.fps
+                        # Remove the authored target motion. A hand traveling
+                        # with a carried object has zero tracking slip even
+                        # though its world velocity is large.
+                        target_step = target - task.frame(f - 1)["contact_position"]
+                        v = (p[f] - p[f - 1] - target_step) * self.fps
+                        v0 = (p0[f] - p0[f - 1] - target_step) * self.fps
                         slip.append(float(np.linalg.norm(v)))
                         if (
                             np.linalg.norm(v - v0)
@@ -548,6 +572,7 @@ class TrajectoryValidator:
             metrics[name] = {
                 "contact_position_error": max(contact_errors, default=0.0),
                 "support_slip": max(slip, default=0.0),
+                "support_slip_definition": "world contact-target residual velocity, m/s; same environment only",
                 "swing_world_error": max(swing_errors, default=0.0),
                 "swing_world_deviation": max(changes, default=0.0),
                 "horizontal_correction": float(
@@ -658,9 +683,13 @@ class TrajectoryValidator:
         n = len(trajectory)
         depths = np.zeros((n, self.model.ngeom))
         between = np.zeros((max(n - 1, 0), self.model.ngeom))
+        reliable = np.zeros_like(depths)
+        between_reliable = np.zeros_like(between)
+        unknown_geoms = np.zeros_like(depths, dtype=bool)
+        between_unknown_geoms = np.zeros_like(between, dtype=bool)
         unknown = np.zeros(n, dtype=bool)
         between_unknown = np.zeros(max(n - 1, 0), dtype=bool)
-        pair_count = self.model.ngeom**2 if self.cfg["self_collision_enabled"] else 1
+        pair_count = len(self.self_query.pairs) if self.self_query is not None else 1
         self_depth = np.zeros((n, pair_count))
         between_self = np.zeros((max(n - 1, 0), pair_count))
         samples, unresolved = 0, []
@@ -672,7 +701,7 @@ class TrajectoryValidator:
             key = np.ascontiguousarray(q).tobytes()
             cached = self._pose_cache.get(key)
             if cached is not None:
-                values, uncertain, sd, saved_records = cached
+                values, uncertain, sd, saved_records, trusted, unknown_ids = cached
                 records.extend(
                     dict(
                         record,
@@ -682,7 +711,7 @@ class TrajectoryValidator:
                     )
                     for record in saved_records
                 )
-                return values, uncertain, sd
+                return values, uncertain, sd, trusted, unknown_ids
             record_start = len(records)
             # Bound expensive queries before invoking the shared backend.
             estimated = self.probe.query_work_bound
@@ -697,7 +726,13 @@ class TrajectoryValidator:
             if point_limit is not None and self.query.query_points - self.query_start > point_limit:
                 raise QueryBudgetExceeded("scene query point/pair budget")
             values = np.zeros(self.model.ngeom)
+            trusted = np.zeros(self.model.ngeom)
+            unknown_ids = np.zeros(self.model.ngeom, dtype=bool)
             for gid in np.unique(frame["geom_ids"]):
+                mask = frame["geom_ids"] == gid
+                unknown_ids[gid] = np.any(frame["uncertain"][mask])
+                valid = mask & ~frame["uncertain"] & np.isfinite(frame["clearance"])
+                trusted[gid] = np.max(-frame["clearance"][valid], initial=0)
                 indices = np.flatnonzero(
                     (frame["geom_ids"] == gid) & np.isfinite(frame["clearance"])
                 )
@@ -719,78 +754,65 @@ class TrajectoryValidator:
                             "clearance": float(frame["clearance"][k]),
                             "direction": frame["directions"][k].tolist(),
                             "confidence": float(frame["confidence"][k]),
+                            "uncertain": bool(frame["uncertain"][k]),
                             "surface_id": int(frame["surface_ids"][k]),
                             "obstacle_id": int(frame["obstacle_ids"][k]),
                             "contact_modes": list(self.phase(f)),
                         }
                     )
             sd = np.zeros(pair_count)
-            if self.cfg["self_collision_enabled"]:
+            if self.self_query is not None:
                 data.qpos[:] = q
                 mujoco.mj_forward(self.model, data)
-                for contact in data.contact:
-                    if contact.dist < 0:
-                        g1, g2 = sorted(map(int, contact.geom))
-                        pair = g1 * self.model.ngeom + g2
-                        sd[pair] = max(sd[pair], -float(contact.dist))
-                        if -contact.dist > self.cfg["penetration_tolerance"]:
-                            for gid in contact.geom:
-                                bid = int(self.model.geom_bodyid[gid])
-                                records.append(
-                                    {
-                                        "frame": int(f),
-                                        "alpha": float(alpha),
-                                        "body_id": bid,
-                                        "body": self.model.body(bid).name,
-                                        "geom": int(gid),
-                                        "point": contact.pos.tolist(),
-                                        "depth": -float(contact.dist),
-                                        "clearance": float(contact.dist),
-                                        "direction": contact.frame[:3].tolist(),
-                                        "confidence": 1.0,
-                                        "surface_id": -1,
-                                        "obstacle_id": -2,
-                                        "pair": list(map(int, contact.geom)),
-                                        "contact_modes": list(self.phase(f)),
-                                    }
-                                )
+                for collision in self.self_query.query(data=data):
+                    depth = max(-collision["clearance"], 0.0)
+                    sd[collision["pair_index"]] = depth
+                    if depth > self.self_query.cfg["penetration_tolerance"]:
+                        for side, gid in enumerate(collision["pair"]):
+                            bid = int(self.model.geom_bodyid[gid])
+                            records.append({
+                                "frame": int(f), "alpha": float(alpha),
+                                "body_id": bid, "body": self.model.body(bid).name,
+                                "geom": int(gid), "point": collision["points"][side].tolist(),
+                                "depth": depth, "clearance": collision["clearance"],
+                                "direction": ((1 if side == 0 else -1) * collision["direction"]).tolist(),
+                                "confidence": 1.0, "surface_id": -1, "obstacle_id": -2,
+                                "pair": collision["pair"],
+                                "pair_points": collision["points"].tolist(),
+                                "pair_direction": collision["direction"].tolist(),
+                                "contact_modes": list(self.phase(f)),
+                            })
             uncertain = bool(np.any(frame["uncertain"]))
             self._pose_cache[key] = (
                 values,
                 uncertain,
                 sd,
                 records[record_start:].copy(),
+                trusted,
+                unknown_ids,
             )
-            return values, uncertain, sd
+            return values, uncertain, sd, trusted, unknown_ids
 
         for f, q in enumerate(trajectory):
-            depths[f], unknown[f], self_depth[f] = sample(q, f)
+            depths[f], unknown[f], self_depth[f], reliable[f], unknown_geoms[f] = sample(q, f)
         # Interval envelopes include endpoints: a stationary penetrating pose
         # cannot masquerade as a previously healthy interval just because no
         # interior subdivision was needed.
         between[:] = np.maximum(depths[:-1], depths[1:])
         between_self[:] = np.maximum(self_depth[:-1], self_depth[1:])
+        between_reliable[:] = np.maximum(reliable[:-1], reliable[1:])
+        between_unknown_geoms[:] = unknown_geoms[:-1] | unknown_geoms[1:]
+        between_unknown[:] = unknown[:-1] | unknown[1:]
         for f in range(n - 1):
             dq = _pose_velocity(self.model, trajectory[f], trajectory[f + 1])
-            slides = self.model.jnt_type[self.joint_ids] == mujoco.mjtJoint.mjJNT_SLIDE
-            excursions = self.slide_ancestors @ np.max(
-                np.abs(trajectory[f : f + 2, self.qi]), axis=0
-            )
-            levers = (
-                self.levers
-                + excursions[:, None] * (self.levers > 0) * (~slides)[None, :]
-            )
-            motion = levers @ np.abs(dq[self.di])
-            for jid in range(self.model.njnt):
-                if self.model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_FREE:
-                    dof = int(self.model.jnt_dofadr[jid])
-                    motion += np.linalg.norm(dq[dof:dof+3]) + (
-                        self.root_levers + excursions
-                    ) * np.linalg.norm(dq[dof+3:dof+6])
-                elif self.model.jnt_type[jid] == mujoco.mjtJoint.mjJNT_BALL:
-                    dof = int(self.model.jnt_dofadr[jid])
-                    motion += (self.root_levers + excursions) * np.linalg.norm(dq[dof:dof+3])
+            motion = self.motion_bounds.displacements(trajectory[f], trajectory[f + 1])
             bound = float(np.max(motion, initial=0))
+            spacing = self.cfg["motion_spacing"]
+            if self.self_query is not None:
+                relative = self.self_query.motion_bounds.pair_bound(
+                    self.self_query.pairs, trajectory[f], trajectory[f + 1])
+                # A self distance changes with the motion of both bodies.
+                bound = max(bound, relative * spacing / self.self_query.cfg["motion_spacing"])
             required = max(1, int(np.ceil(bound / self.cfg["motion_spacing"])))
             steps = min(required, int(self.cfg["max_substeps"]))
             if required > steps:
@@ -799,7 +821,7 @@ class TrajectoryValidator:
                 alpha = j / steps
                 q = trajectory[f].copy()
                 mujoco.mj_integratePos(self.model, q, dq, alpha)
-                values, uncertain, sd = sample(q, f, alpha)
+                values, uncertain, sd, trusted, unknown_ids = sample(q, f, alpha)
                 failure, change = self.interframe_contact(trajectory, f, alpha, q)
                 interframe_contact_change = max(interframe_contact_change, change)
                 if failure:
@@ -809,15 +831,24 @@ class TrajectoryValidator:
                 between[f] = np.maximum(between[f], values)
                 between_unknown[f] |= uncertain
                 between_self[f] = np.maximum(between_self[f], sd)
+                between_reliable[f] = np.maximum(between_reliable[f], trusted)
+                between_unknown_geoms[f] |= unknown_ids
                 samples += 1
         stats = _summary(depths, self.model)
         stats.update(
             interframe_max_depth=float(np.max(between, initial=0)),
             interframe_depth=between,
+            reliable_scene_depth=reliable,
+            interframe_reliable_scene_depth=between_reliable,
+            uncertain_geoms=unknown_geoms,
+            interframe_uncertain_geoms=between_unknown_geoms,
             uncertain_frames=np.flatnonzero(unknown).tolist(),
             uncertain_intervals=np.flatnonzero(between_unknown).tolist(),
             subdivision_limit_intervals=unresolved,
             self_depth=self_depth,
+            self_collision_status="enabled" if self.self_query is not None else "disabled",
+            self_collision_pairs=self.self_query.pairs.tolist() if self.self_query is not None else [],
+            self_collision_max_depth=float(np.max(self_depth, initial=0)) if self.self_query is not None else None,
             interframe_self_depth=between_self,
             records=records,
             interframe_contact_failures=interframe_contact_failures,
@@ -829,30 +860,47 @@ class TrajectoryValidator:
         )
         return stats
 
-    def compare_geometry(self, before, after, *, require_improvement=False):
+    def compare_geometry(self, before, after, *, require_improvement=False,
+                         focus_self=False, allow_existing_uncertainty=False):
         reasons = []
         cfg = self.cfg
-        for key in (
-            "per_geom_depth",
-            "interframe_depth",
-            "self_depth",
-            "interframe_self_depth",
-        ):
+        allow_existing_uncertainty |= focus_self
+        scene_keys = (("reliable_scene_depth", "interframe_reliable_scene_depth")
+                      if allow_existing_uncertainty else ("per_geom_depth", "interframe_depth"))
+        for key in (*scene_keys, "self_depth", "interframe_self_depth"):
+            tolerance = (cfg["self_collision"]["penetration_tolerance"]
+                         if "self" in key else cfg["penetration_tolerance"])
+            regression = (cfg["self_collision"]["regression_tolerance"]
+                          if "self" in key else cfg["collision_regression"])
             old, new = before[key], after[key]
             limit = np.where(
-                old <= cfg["penetration_tolerance"],
-                cfg["penetration_tolerance"],
-                old + cfg["collision_regression"],
+                old <= tolerance,
+                tolerance,
+                old + regression,
             )
             if np.any(new > limit + 1e-8):
                 reasons.append("collision_regression")
-        if after["uncertain_frames"] or after["uncertain_intervals"]:
+        if allow_existing_uncertainty:
+            # Retained unknown scene sides remain unresolved in the report.
+            # They cannot veto independent self repair, but a newly unknown
+            # geom/interval cannot be used to hide a scene regression either.
+            for key in ("uncertain_geoms", "interframe_uncertain_geoms"):
+                if np.any(after[key] & ~before[key]):
+                    reasons.append("new_uncertain_scene_side")
+        elif after["uncertain_frames"] or after["uncertain_intervals"]:
             reasons.append("uncertain_scene_side")
         if after["subdivision_limit_intervals"]:
             reasons.append("subdivision_budget")
         if after["interframe_contact_failures"]:
             reasons.append("contact_interframe")
         if require_improvement:
+            if focus_self:
+                keys = ("self_depth", "interframe_self_depth")
+                old = max(np.max(before[k], initial=0) for k in keys)
+                new = max(np.max(after[k], initial=0) for k in keys)
+                if new > cfg["self_collision"]["penetration_tolerance"] and new >= old - 1e-5:
+                    reasons.append("collision_not_improved")
+                return sorted(set(reasons))
             old = max(
                 before["max_depth"],
                 before["interframe_max_depth"],

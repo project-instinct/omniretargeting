@@ -54,12 +54,15 @@ def _foot_defaults() -> Dict[str, Any]:
 
 CONTACT_RETARGETING_DEFAULTS: Dict[str, Any] = {
     "body_relations": {"enabled": False, "weight": 1.0, "sigma": 0.12},
+    "self_contact": {"enabled": True},
+    "surface_contact": {"enabled": True},
+    "whole_body_correction": {"enabled": True, "moving_collision_enabled": True},
     "preserve_root_z": False,
     "collision_detection_threshold": 0.1,
     "terrain_sample_points": 100,
     "terrain_sample_seed": 0,
     "penetration_resolver": "hard_constraint",
-    "self_collision_enabled": False,
+    "self_collision_enabled": True,
     "joint_limit_safety_fraction": 1.0,
     "end_effector_priority": {
         "enabled": True,
@@ -75,6 +78,8 @@ CONTACT_RETARGETING_DEFAULTS: Dict[str, Any] = {
         "contact_sigma": 0.025,
         "swing_sigma": 0.06,
         "interaction_mesh": {
+            "weighting": "uniform",
+            "kappa": 3.0,  # Experimental exponential decay, 1/metre.
             "laplacian_weight": 10.0,
             "joint_weight_overrides": {
                 "L_Elbow": 5.0,
@@ -134,6 +139,7 @@ CONTACT_RETARGETING_DEFAULTS: Dict[str, Any] = {
                 ["R_Knee", "R_Ankle"],
             ],
         },
+        "pose_initialization": {"enabled": False, "max_iterations": 20},
         "temporal": {
             "enabled": True,
             "acceleration_sigma": 0.015,

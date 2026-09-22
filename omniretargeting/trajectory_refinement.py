@@ -12,11 +12,13 @@ accepts box bounds, so penetration enters as a one-sided residual whose active
 set is rebuilt at every Gauss--Newton iteration.  That is a penalty and not a
 hard constraint: it drives sample points out of the scene but cannot certify a
 penetration-free result, so the achieved depth is always measured separately.
+The main pipeline supplies a RefinementGuard: it uses CLARABEL to enforce the
+final validator's endpoint/correction budgets and checks real FK and geometry
+before retaining each step. The box-only standalone API remains available.
 """
 
 from __future__ import annotations
 
-from math import comb
 from typing import Any, Mapping
 
 import mujoco
@@ -24,406 +26,43 @@ import numpy as np
 import trimesh
 from scipy import sparse
 from scipy.optimize import lsq_linear
-from scipy.spatial.transform import Rotation
 
-from .scene_geometry import (SceneQuery, ScenePenetrationProbe, collision_geom_ids,
-                             geom_surface_offsets, measure_scene_penetration)
-
-from .contact import (
-    SceneContactTask,
-    _is_surface_only_contact_mode,
-    _iter_true_runs,
+from ._refinement.effectors import build_refinement_effectors
+from ._refinement.math import (
+    _difference_operator as _difference_operator,
+    _inset_finite_joint_bounds as _inset_finite_joint_bounds,
+    _joint_coordinate_mask as _joint_coordinate_mask,
+    _joint_posture_target_vectors as _joint_posture_target_vectors,
+    _joint_temporal_weight_vector as _joint_temporal_weight_vector,
+    _local_semantic_rotation as _local_semantic_rotation,
+    _lock_contact_offsets as _lock_contact_offsets,
+    _minimal_vector_alignment as _minimal_vector_alignment,
+    _orthonormal_target_rotation as _orthonormal_target_rotation,
+    _penetration_depth_weight as _penetration_depth_weight,
+    _scalar_joint_coordinates as _scalar_joint_coordinates,
+    _skew_symmetric as _skew_symmetric,
+    _transported_arm_segment_targets as _transported_arm_segment_targets,
 )
-from .retargeting import (
+from ._refinement.tasks import linearize_trajectory_tasks
+from ._refinement.self_collision import (
+    guard_self_collision_update,
+    linearize_self_collisions,
+)
+from .self_collision import SelfCollisionQuery
+from ._solver.targets import (
     _apply_configured_joint_limits,
     _apply_joint_limit_safety_fraction,
-    _clamp_target_to_reach,
-    _transform_swing_target,
 )
-
-
-def _scalar_joint_coordinates(
-    model: mujoco.MjModel,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return qpos/dof coordinates and their limits for scalar robot joints."""
-    qpos_indices: list[int] = []
-    dof_indices: list[int] = []
-    lower: list[float] = []
-    upper: list[float] = []
-    for joint_id in range(model.njnt):
-        joint_type = model.jnt_type[joint_id]
-        if joint_type not in (
-            mujoco.mjtJoint.mjJNT_HINGE,
-            mujoco.mjtJoint.mjJNT_SLIDE,
-        ):
-            continue
-        qpos_index = int(model.jnt_qposadr[joint_id])
-        qpos_indices.append(qpos_index)
-        dof_indices.append(int(model.jnt_dofadr[joint_id]))
-        if model.jnt_limited[joint_id]:
-            joint_lower, joint_upper = model.jnt_range[joint_id]
-        else:
-            joint_lower, joint_upper = -np.inf, np.inf
-        lower.append(float(joint_lower))
-        upper.append(float(joint_upper))
-    return (
-        np.asarray(qpos_indices, dtype=int),
-        np.asarray(dof_indices, dtype=int),
-        np.asarray(lower, dtype=float),
-        np.asarray(upper, dtype=float),
-    )
-
-
-def _joint_temporal_weight_vector(
-    model: mujoco.MjModel,
-    qpos_indices: np.ndarray,
-    rules: Mapping[str, float] | None,
-) -> np.ndarray:
-    """Resolve substring-based per-joint smoothing weights.
-
-    The whole-trajectory solver must keep hand position residuals in the same
-    system as smoothing.  Weighting redundant shoulder/elbow/wrist coordinates
-    here selects a smoother arm pose without applying a post-hoc filter that
-    would move the end effector away from its scene interaction point.
-    """
-    weights = np.ones(len(qpos_indices), dtype=float)
-    normalized_rules = {
-        str(token).lower(): max(float(weight), 0.0)
-        for token, weight in dict(rules or {}).items()
-    }
-    if not normalized_rules:
-        return weights
-
-    names_by_qpos: dict[int, str] = {}
-    for joint_id in range(model.njnt):
-        joint_name = model.joint(joint_id).name
-        if joint_name:
-            names_by_qpos[int(model.jnt_qposadr[joint_id])] = joint_name.lower()
-    for coordinate_idx, qpos_idx in enumerate(qpos_indices):
-        joint_name = names_by_qpos.get(int(qpos_idx), "")
-        for token, weight in normalized_rules.items():
-            if token in joint_name:
-                weights[coordinate_idx] = weight
-    return weights
-
-
-def _joint_posture_target_vectors(
-    model: mujoco.MjModel,
-    qpos_indices: np.ndarray,
-    rules: Mapping[str, Mapping[str, float]] | None,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Resolve safe joint targets and sigmas from joint-name substrings.
-
-    The source skeleton supplies wrist positions but no reliable articulated
-    hand orientation.  Without a posture term those redundant wrist joints can
-    take large angles solely to shave millimetres from endpoint error.  A soft
-    neutral target selects the least-folded IK solution while still allowing a
-    wrist to move when the endpoint and arm-shape objectives require it.
-    """
-    targets = np.zeros(len(qpos_indices), dtype=float)
-    sigmas = np.full(len(qpos_indices), np.inf, dtype=float)
-    normalized_rules = {
-        str(token).lower(): dict(spec or {})
-        for token, spec in dict(rules or {}).items()
-    }
-    if not normalized_rules:
-        return targets, sigmas
-
-    names_by_qpos: dict[int, str] = {}
-    for joint_id in range(model.njnt):
-        joint_name = model.joint(joint_id).name
-        if joint_name:
-            names_by_qpos[int(model.jnt_qposadr[joint_id])] = joint_name.lower()
-    for coordinate_idx, qpos_idx in enumerate(qpos_indices):
-        joint_name = names_by_qpos.get(int(qpos_idx), "")
-        for token, spec in normalized_rules.items():
-            if token not in joint_name:
-                continue
-            targets[coordinate_idx] = float(spec.get("target", 0.0))
-            sigmas[coordinate_idx] = max(float(spec.get("sigma", 0.35)), 1e-6)
-    return targets, sigmas
-
-
-def _joint_coordinate_mask(
-    model: mujoco.MjModel,
-    qpos_indices: np.ndarray,
-    joint_name_tokens: list[str] | tuple[str, ...] | None,
-) -> np.ndarray:
-    """Select scalar coordinates whose joint names contain a configured token.
-
-    Hand orientation is deliberately assigned to the wrist coordinates only.
-    Position and arm-shape tasks may still use the complete kinematic chain,
-    but an orientation residual must not rotate the shoulder or fold the elbow
-    merely to make the palm frame agree with SMPL-X.
-    """
-    tokens = [
-        str(token).strip().lower()
-        for token in (joint_name_tokens or [])
-        if str(token).strip()
-    ]
-    mask = np.zeros(len(qpos_indices), dtype=bool)
-    if not tokens:
-        return mask
-
-    names_by_qpos: dict[int, str] = {}
-    for joint_id in range(model.njnt):
-        joint_name = model.joint(joint_id).name
-        if joint_name:
-            names_by_qpos[int(model.jnt_qposadr[joint_id])] = joint_name.lower()
-    for coordinate_idx, qpos_idx in enumerate(qpos_indices):
-        joint_name = names_by_qpos.get(int(qpos_idx), "")
-        mask[coordinate_idx] = any(token in joint_name for token in tokens)
-    return mask
-
-
-def _inset_finite_joint_bounds(
-    lower: np.ndarray,
-    upper: np.ndarray,
-    margin: float,
-    margin_ratio: float = 0.0,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Move finite solver bounds inside the configured/mechanical limits.
-
-    A bounded least-squares solution is allowed to sit exactly on its box
-    boundary.  Using a small interior hard margin means even a saturated
-    optimization variable cannot equal the robot's actual limit.  The inset
-    can be absolute or proportional to each finite joint range and is capped
-    at one quarter of that range so narrow joints always retain a non-empty
-    feasible interval.
-    """
-    result_lower = np.asarray(lower, dtype=float).copy()
-    result_upper = np.asarray(upper, dtype=float).copy()
-    requested = max(float(margin), 0.0)
-    requested_ratio = max(float(margin_ratio), 0.0)
-    finite_both = np.isfinite(result_lower) & np.isfinite(result_upper)
-    widths = result_upper - result_lower
-    inset = np.full_like(result_lower, requested)
-    if requested_ratio > 0.0:
-        inset[finite_both] = widths[finite_both] * requested_ratio
-    inset[finite_both] = np.minimum(
-        inset[finite_both],
-        np.maximum(widths[finite_both], 0.0) * 0.25,
-    )
-    result_lower[np.isfinite(result_lower)] += inset[
-        np.isfinite(result_lower)
-    ]
-    result_upper[np.isfinite(result_upper)] -= inset[
-        np.isfinite(result_upper)
-    ]
-    return result_lower, result_upper
-
-
-def _minimal_vector_alignment(
-    source_direction: np.ndarray,
-    target_direction: np.ndarray,
-) -> np.ndarray:
-    """Return the minimum-angle rotation aligning two unit directions."""
-    source = np.asarray(source_direction, dtype=float).reshape(3)
-    target = np.asarray(target_direction, dtype=float).reshape(3)
-    source /= max(float(np.linalg.norm(source)), 1e-10)
-    target /= max(float(np.linalg.norm(target)), 1e-10)
-    cross = np.cross(source, target)
-    sine = float(np.linalg.norm(cross))
-    cosine = float(np.clip(np.dot(source, target), -1.0, 1.0))
-    if sine > 1e-8:
-        skew = np.array(
-            [
-                [0.0, -cross[2], cross[1]],
-                [cross[2], 0.0, -cross[0]],
-                [-cross[1], cross[0], 0.0],
-            ]
-        )
-        return np.eye(3) + skew + skew @ skew * ((1.0 - cosine) / sine**2)
-    if cosine > 0.0:
-        return np.eye(3)
-    basis = np.array([1.0, 0.0, 0.0])
-    if abs(float(np.dot(source, basis))) > 0.8:
-        basis = np.array([0.0, 1.0, 0.0])
-    axis = np.cross(source, basis)
-    axis /= max(float(np.linalg.norm(axis)), 1e-10)
-    return 2.0 * np.outer(axis, axis) - np.eye(3)
-
-
-def _transported_arm_segment_targets(
-    source_shoulder: np.ndarray,
-    source_elbow: np.ndarray,
-    source_hand: np.ndarray,
-    robot_shoulder: np.ndarray,
-    robot_hand_target: np.ndarray,
-    upper_arm_length: float,
-    forearm_length: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Transport the captured two-link arm shape toward a robot hand target.
-
-    Endpoint-only IK is underdetermined: it can attain the same hand position
-    with a visually unrelated shoulder/elbow branch.  This construction first
-    rebuilds both captured segment directions at the robot's link lengths,
-    then applies one minimum-angle rotation to point their chord toward the
-    requested hand position.  A single rotation preserves the captured elbow
-    angle and bend plane exactly.  The endpoint objective remains separate, so
-    an unreachable target produces a deliberate position compromise instead
-    of changing the arm into a folded configuration.
-    """
-    source_shoulder = np.asarray(source_shoulder, dtype=float).reshape(3)
-    source_elbow = np.asarray(source_elbow, dtype=float).reshape(3)
-    source_hand = np.asarray(source_hand, dtype=float).reshape(3)
-    robot_shoulder = np.asarray(robot_shoulder, dtype=float).reshape(3)
-    robot_hand_target = np.asarray(robot_hand_target, dtype=float).reshape(3)
-    upper = max(float(upper_arm_length), 1e-6)
-    forearm = max(float(forearm_length), 1e-6)
-
-    source_upper = source_elbow - source_shoulder
-    source_forearm = source_hand - source_elbow
-    upper_norm = float(np.linalg.norm(source_upper))
-    forearm_norm = float(np.linalg.norm(source_forearm))
-    if upper_norm < 1e-8 or forearm_norm < 1e-8:
-        raise ValueError("source arm segments must have non-zero length")
-
-    scaled_upper = upper * source_upper / upper_norm
-    scaled_forearm = forearm * source_forearm / forearm_norm
-    source_chord = scaled_upper + scaled_forearm
-    chord_norm = float(np.linalg.norm(source_chord))
-    robot_axis = robot_hand_target - robot_shoulder
-    axis_norm = float(np.linalg.norm(robot_axis))
-    if chord_norm < 1e-8 or axis_norm < 1e-8:
-        return scaled_upper, scaled_forearm
-
-    transport = _minimal_vector_alignment(source_chord, robot_axis)
-    return transport @ scaled_upper, transport @ scaled_forearm
-
-
-def _orthonormal_target_rotation(
-    forward_direction: np.ndarray | None,
-    up_direction: np.ndarray | None,
-) -> np.ndarray | None:
-    if forward_direction is None or up_direction is None:
-        return None
-    forward = np.asarray(forward_direction, dtype=float).reshape(3).copy()
-    up = np.asarray(up_direction, dtype=float).reshape(3).copy()
-    if not np.all(np.isfinite(forward)) or not np.all(np.isfinite(up)):
-        return None
-    up_norm = float(np.linalg.norm(up))
-    if up_norm < 1e-10:
-        return None
-    up /= up_norm
-    forward -= up * float(np.dot(up, forward))
-    forward_norm = float(np.linalg.norm(forward))
-    if forward_norm < 1e-10:
-        return None
-    forward /= forward_norm
-    lateral = np.cross(up, forward)
-    lateral_norm = float(np.linalg.norm(lateral))
-    if lateral_norm < 1e-10:
-        return None
-    lateral /= lateral_norm
-    forward = np.cross(lateral, up)
-    return np.column_stack([forward, lateral, up])
-
-
-def _local_semantic_rotation(
-    forward_direction: np.ndarray | None,
-    up_direction: np.ndarray | None,
-) -> np.ndarray:
-    """Return the body's local forward/lateral/up semantic hand frame.
-
-    MuJoCo body axes are model-construction details and do not necessarily
-    mean palm-forward, palm-lateral and palm-normal.  For the G1 rubber hand,
-    local +X runs from wrist to fingers while local -Y is the palm normal.
-    Mapping through this fixed frame lets the optimizer compare anatomical
-    hand directions instead of accidentally aligning unrelated mesh axes.
-    """
-    rotation = _orthonormal_target_rotation(forward_direction, up_direction)
-    if rotation is None:
-        raise ValueError(
-            "orientation_local_forward and orientation_local_up must be "
-            "finite, non-zero, and non-collinear."
-        )
-    return rotation
-
-
-def _skew_symmetric(vector: np.ndarray) -> np.ndarray:
-    """Return the cross-product matrix for a three-vector."""
-    x, y, z = np.asarray(vector, dtype=float).reshape(3)
-    return np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]])
-
-
-def _difference_operator(num_frames: int, order: int) -> sparse.csr_matrix:
-    """Return the exact ``order``-th finite-difference matrix over time."""
-    num_rows = num_frames - order
-    if num_rows <= 0:
-        return sparse.csr_matrix((0, num_frames))
-    diagonals = [
-        np.full(num_rows, ((-1.0) ** (order - j)) * comb(order, j))
-        for j in range(order + 1)
-    ]
-    return sparse.diags(
-        diagonals,
-        list(range(order + 1)),
-        shape=(num_rows, num_frames),
-        format="csr",
-    )
-
-
-def _penetration_depth_weight(
-    clearance: float,
-    config: Mapping[str, Any],
-) -> float:
-    """Increase the influence of deep collision samples without a hard cutoff.
-
-    The ordinary quadratic penalty can reduce many shallow intersections while
-    allowing one collision point to become much deeper.  This bounded IRLS
-    weight makes samples beyond ``depth_priority_start`` dominate that tradeoff
-    while keeping the problem a soft least-squares optimization.
-    """
-    depth = max(-float(clearance), 0.0)
-    priority_start = max(float(config.get("depth_priority_start", 0.05)), 1e-8)
-    max_weight = max(float(config.get("max_depth_weight", 9.0)), 1.0)
-    return min(max_weight, max(1.0, (depth / priority_start) ** 2))
-
-
-def _lock_contact_offsets(
-    model: mujoco.MjModel,
-    trajectory: np.ndarray,
-    effectors: Mapping[str, dict[str, Any]],
-) -> dict[str, np.ndarray]:
-    """Choose one contact offset per contiguous contact run.
-
-    Re-selecting the nearest hand or sole keypoint at every frame makes the
-    contact residual discontinuous in time, which fights the jerk term living
-    in the same objective.  Committing to the offset that is best on average
-    over a no-slip run keeps that residual smooth for the whole run, and keeps
-    it fixed across Gauss--Newton iterations so the active set cannot chatter.
-    """
-    data = mujoco.MjData(model)
-    num_frames = len(trajectory)
-    distances = {
-        name: np.zeros((num_frames, len(spec["contact_offsets"])), dtype=float)
-        for name, spec in effectors.items()
-    }
-    for frame_idx in range(num_frames):
-        data.qpos[:] = trajectory[frame_idx]
-        mujoco.mj_forward(model, data)
-        for name, spec in effectors.items():
-            body_id = int(spec["body_id"])
-            rotation = data.xmat[body_id].reshape(3, 3)
-            candidates = (
-                data.xpos[body_id][None, :] + spec["contact_offsets"] @ rotation.T
-            )
-            target = spec["task"].contact_positions[frame_idx]
-            distances[name][frame_idx] = np.linalg.norm(
-                candidates - target[None, :], axis=1
-            )
-
-    selection: dict[str, np.ndarray] = {}
-    for name, spec in effectors.items():
-        chosen = np.zeros(num_frames, dtype=int)
-        mask = np.asarray(spec["task"].contact_mask, dtype=bool)
-        for start, end in _iter_true_runs(mask):
-            chosen[start:end] = int(
-                np.argmin(np.mean(distances[name][start:end], axis=0))
-            )
-        selection[name] = chosen
-    return selection
+from .contact import (
+    SceneContactTask,
+)
+from .scene_geometry import (
+    ScenePenetrationProbe,
+    SceneQuery,
+    collision_geom_ids,
+    geom_surface_offsets as geom_surface_offsets,
+    measure_scene_penetration as measure_scene_penetration,
+)
 
 
 def refine_joint_trajectory(
@@ -439,6 +78,9 @@ def refine_joint_trajectory(
     source_joint_names: list[str] | tuple[str, ...] | None = None,
     scene_query: SceneQuery | None = None,
     body_relation_tasks=None,
+    self_contact_tasks=None,
+    surface_contact_tasks=None,
+    refinement_guard=None,
 ) -> np.ndarray:
     """Jointly refine scalar joints over time with sparse Gauss--Newton.
 
@@ -448,8 +90,20 @@ def refine_joint_trajectory(
     that whole-body smoothing is meant to avoid.
     """
     result = np.asarray(trajectory, dtype=float).copy()
-    if len(result) < 4 or not tasks:
+    if surface_contact_tasks is not None and (
+        surface_contact_tasks.model is not model or len(surface_contact_tasks.targets) != len(result)
+    ):
+        raise ValueError("Surface contact must use the same model and original timeline")
+    if refinement_guard is not None:
+        from .trajectory_validation import QueryBudgetExceeded
+
+        validator = refinement_guard.validator
+        if validator.model is not model or not np.array_equal(validator.reference, result):
+            raise ValueError("Refinement guard must use the same model and input trajectory")
+    self_enabled = bool(config.get("self_collision_enabled", True))
+    if len(result) == 0 or (not self_enabled and self_contact_tasks is None and surface_contact_tasks is None and (len(result) < 4 or not tasks)):
         return result
+    self_query = SelfCollisionQuery(model, config.get("self_collision")) if self_enabled else None
 
     qpos_indices, dof_indices, joint_lower, joint_upper = (
         _scalar_joint_coordinates(model)
@@ -538,245 +192,17 @@ def refine_joint_trajectory(
             for joint_idx, joint_name in enumerate(source_joint_names)
         }
 
-    raw_specs = dict(end_effector_config.get("effectors", {}) or {})
-    effectors: dict[str, dict[str, Any]] = {}
-    for name, task in tasks.items():
-        if name not in raw_specs:
-            continue
-        spec = dict(raw_specs[name] or {})
-        body_name = spec.get("robot_body")
-        body_id = mujoco.mj_name2id(
-            model, mujoco.mjtObj.mjOBJ_BODY, str(body_name)
-        )
-        if body_id < 0:
-            continue
-        reach_reference_body = spec.get("reach_reference_body")
-        reach_reference_body_id = -1
-        if reach_reference_body:
-            reach_reference_body_id = mujoco.mj_name2id(
-                model,
-                mujoco.mjtObj.mjOBJ_BODY,
-                str(reach_reference_body),
-            )
-            if reach_reference_body_id < 0:
-                raise ValueError(
-                    f"End-effector '{name}' refers to missing reach reference "
-                    f"body '{reach_reference_body}'."
-                )
-        tracking_offset = np.asarray(
-            spec.get("tracking_offset", [0.0, 0.0, 0.0]), dtype=float
-        ).reshape(3)
-        contact_offsets = np.asarray(
-            spec.get("contact_offsets", [tracking_offset]), dtype=float
-        )
-        if contact_offsets.ndim == 1:
-            contact_offsets = contact_offsets[None, :]
-        raw_arm_posture = dict(spec.get("arm_posture", {}) or {})
-        arm_posture = None
-        if bool(raw_arm_posture.get("enabled", False)):
-            shoulder_name = str(raw_arm_posture["shoulder_body"])
-            elbow_name = str(raw_arm_posture["elbow_body"])
-            wrist_name = raw_arm_posture.get("wrist_body")
-            shoulder_body_id = mujoco.mj_name2id(
-                model, mujoco.mjtObj.mjOBJ_BODY, shoulder_name
-            )
-            elbow_body_id = mujoco.mj_name2id(
-                model, mujoco.mjtObj.mjOBJ_BODY, elbow_name
-            )
-            wrist_body_id = (
-                -1
-                if wrist_name is None
-                else mujoco.mj_name2id(
-                    model, mujoco.mjtObj.mjOBJ_BODY, str(wrist_name)
-                )
-            )
-            if shoulder_body_id < 0 or elbow_body_id < 0:
-                raise ValueError(
-                    f"End-effector '{name}' arm_posture refers to a missing "
-                    "shoulder or elbow body."
-                )
-            if wrist_name is not None and wrist_body_id < 0:
-                raise ValueError(
-                    f"End-effector '{name}' arm_posture refers to missing "
-                    f"wrist body '{wrist_name}'."
-                )
-            source_shoulder_name = str(raw_arm_posture["source_shoulder"])
-            source_elbow_name = str(raw_arm_posture["source_elbow"])
-            source_wrist_name = raw_arm_posture.get("source_wrist")
-            if source_joint_positions is not None and (
-                source_shoulder_name not in source_name_to_index
-                or source_elbow_name not in source_name_to_index
-            ):
-                raise ValueError(
-                    f"End-effector '{name}' arm_posture source joints are missing."
-                )
-            if (
-                source_joint_positions is not None
-                and source_wrist_name is not None
-                and str(source_wrist_name) not in source_name_to_index
-            ):
-                raise ValueError(
-                    f"End-effector '{name}' arm_posture source wrist is missing."
-                )
-            if (wrist_name is None) != (source_wrist_name is None):
-                raise ValueError(
-                    f"End-effector '{name}' arm_posture must configure both "
-                    "wrist_body and source_wrist together."
-                )
-            arm_posture = {
-                "shoulder_body_id": int(shoulder_body_id),
-                "elbow_body_id": int(elbow_body_id),
-                "wrist_body_id": int(wrist_body_id),
-                "source_shoulder_idx": source_name_to_index.get(
-                    source_shoulder_name
-                ),
-                "source_elbow_idx": source_name_to_index.get(source_elbow_name),
-                "source_wrist_idx": (
-                    None
-                    if source_wrist_name is None
-                    else source_name_to_index.get(str(source_wrist_name))
-                ),
-                "upper_arm_length": float(raw_arm_posture["upper_arm_length"]),
-                "forearm_length": float(raw_arm_posture["forearm_length"]),
-                "upper_direction_sigma": max(
-                    float(
-                        raw_arm_posture.get(
-                            "upper_direction_sigma",
-                            raw_arm_posture.get("sigma", 0.08),
-                        )
-                    ),
-                    1e-6,
-                ),
-                "forearm_direction_sigma": max(
-                    float(
-                        raw_arm_posture.get(
-                            "forearm_direction_sigma",
-                            raw_arm_posture.get("sigma", 0.08),
-                        )
-                    ),
-                    1e-6,
-                ),
-            }
-        refine_orientation = bool(
-            spec.get("refine_orientation", spec.get("track_orientation", False))
-        )
-        orientation_local_rotation = _local_semantic_rotation(
-            spec.get("orientation_local_forward", [1.0, 0.0, 0.0]),
-            spec.get("orientation_local_up", [0.0, 0.0, 1.0]),
-        )
-        orientation_joint_tokens = tuple(
-            str(token)
-            for token in spec.get("orientation_joint_tokens", [])
-        )
-        orientation_coordinate_mask = _joint_coordinate_mask(
-            model,
-            qpos_indices,
-            orientation_joint_tokens,
-        )
-        if (
-            refine_orientation
-            and orientation_joint_tokens
-            and not np.any(orientation_coordinate_mask)
-        ):
-            raise ValueError(
-                f"End-effector '{name}' orientation_joint_tokens do not "
-                "match any scalar robot joint."
-            )
-        effectors[name] = {
-            "task": task,
-            "body_id": body_id,
-            "tracking_offset": tracking_offset,
-            "contact_offsets": contact_offsets,
-            "contact_position_sigma": (
-                None
-                if spec.get("contact_position_sigma") is None
-                else max(float(spec["contact_position_sigma"]), 1e-6)
-            ),
-            "swing_position_sigma": (
-                None
-                if spec.get("swing_position_sigma") is None
-                else max(float(spec["swing_position_sigma"]), 1e-6)
-            ),
-            "track_sliding_tangent": bool(
-                spec.get("track_sliding_tangent", True)
-            ),
-            "sliding_tangent_sigma": max(
-                float(
-                    spec.get(
-                        "sliding_tangent_sigma",
-                        end_effector_config.get("sliding_tangent_sigma", 0.10),
-                    )
-                ),
-                1e-6,
-            ),
-            "track_orientation": refine_orientation,
-            "orientation_sigma": float(
-                spec.get(
-                    "orientation_sigma",
-                    config.get("orientation_sigma", np.deg2rad(7.5)),
-                )
-            ),
-            "orientation_mode": str(
-                spec.get("orientation_mode", "rotation")
-            ).lower(),
-            "forward_orientation_sigma": max(
-                float(
-                    spec.get(
-                        "forward_orientation_sigma",
-                        spec.get(
-                            "orientation_sigma",
-                            config.get("orientation_sigma", np.deg2rad(7.5)),
-                        ),
-                    )
-                ),
-                1e-6,
-            ),
-            "up_orientation_sigma": max(
-                float(
-                    spec.get(
-                        "up_orientation_sigma",
-                        spec.get(
-                            "orientation_sigma",
-                            config.get("orientation_sigma", np.deg2rad(7.5)),
-                        ),
-                    )
-                ),
-                1e-6,
-            ),
-            "contact_orientation_weight": max(
-                float(spec.get("contact_orientation_weight", 1.0)), 0.0
-            ),
-            "swing_orientation_weight": max(
-                float(spec.get("swing_orientation_weight", 1.0)), 0.0
-            ),
-            "orientation_local_rotation": orientation_local_rotation,
-            "orientation_coordinate_mask": (
-                orientation_coordinate_mask
-                if orientation_joint_tokens
-                else None
-            ),
-            "swing_morphology_scale": float(
-                spec.get(
-                    "swing_morphology_scale",
-                    end_effector_config.get("swing_morphology_scale", 1.0),
-                )
-            ),
-            "preserve_world_target": bool(
-                spec.get("preserve_world_target", False)
-            ),
-            "reach_reference_body_id": int(reach_reference_body_id),
-            "reach_reference_offset": np.asarray(
-                spec.get("reach_reference_offset", [0.0, 0.0, 0.0]),
-                dtype=float,
-            ).reshape(3),
-            "max_swing_reach": (
-                None
-                if spec.get("max_swing_reach") is None
-                else float(spec["max_swing_reach"])
-            ),
-            "arm_posture": arm_posture,
-        }
-    if not effectors:
+    effectors = build_refinement_effectors(
+        config=config,
+        end_effector_config=end_effector_config,
+        model=model,
+        qpos_indices=qpos_indices,
+        source_joint_positions=source_joint_positions,
+        source_name_to_index=source_name_to_index,
+        tasks=tasks,
+    )
+
+    if not effectors and not self_enabled and self_contact_tasks is None and surface_contact_tasks is None:
         return result
 
     iterations = max(int(config.get("iterations", 3)), 1)
@@ -847,7 +273,6 @@ def refine_joint_trajectory(
     step_tolerance = float(config.get("step_tolerance", 1e-4))
     use_acceleration = bool(config.get("acceleration_enabled", True))
     use_jerk = bool(config.get("jerk_enabled", True))
-    from omniretargeting.retargeting import _swing_target_z_offset
 
     # The derivative residuals are per-frame differences, so their sigmas carry
     # implicit units of rad/frame^n.  Rescaling against the framerate they were
@@ -953,429 +378,38 @@ def refine_joint_trajectory(
 
     for iteration in range(iterations):
         current_joints = result[:, qpos_indices].copy()
-        block_rows: list[np.ndarray] = []
-        block_columns: list[np.ndarray] = []
-        block_values: list[np.ndarray] = []
-        block_rhs: list[float] = []
-        row_index = 0
-
-        def append_block(
-            frame_idx: int,
-            jacobian: np.ndarray,
-            target_delta: np.ndarray,
-            sigma: float,
-            weight: float = 1.0,
-        ) -> None:
-            nonlocal row_index
-            scale = np.sqrt(max(float(weight), 1e-8)) / sigma
-            block = np.atleast_2d(np.asarray(jacobian, dtype=float)) * scale
-            target = np.asarray(target_delta, dtype=float).reshape(-1) * scale
-            local_rows, local_columns = np.nonzero(np.abs(block) > 1e-14)
-            block_rows.append(local_rows + row_index)
-            block_columns.append(frame_idx * num_joints + local_columns)
-            block_values.append(block[local_rows, local_columns])
-            block_rhs.extend(target.tolist())
-            row_index += block.shape[0]
-
-        penetration_frames = (
-            probe.probe_trajectory(result)
-            if probe is not None
-            else [None] * num_frames
+        task_block, block_rhs, active_penetration_rows = linearize_trajectory_tasks(
+            body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks,
+            contact_offset_choice=contact_offset_choice,
+            contact_position_sigma=contact_position_sigma,
+            data=data,
+            dof_indices=dof_indices,
+            effectors=effectors,
+            end_effector_config=end_effector_config,
+            jacobian_position=jacobian_position,
+            jacobian_rotation=jacobian_rotation,
+            model=model,
+            num_frames=num_frames,
+            num_joints=num_joints,
+            penetration_anchor_radius=penetration_anchor_radius,
+            penetration_cfg=penetration_cfg,
+            penetration_clearance=penetration_clearance,
+            penetration_sigma=penetration_sigma,
+            probe=probe,
+            result=result,
+            source_joint_positions=source_joint_positions,
+            source_root_positions=source_root_positions,
+            swing_position_sigma=swing_position_sigma,
         )
-        active_penetration_rows = 0
-
-        for frame_idx in range(num_frames):
-            data.qpos[:] = result[frame_idx]
-            mujoco.mj_forward(model, data)
-            source_root_position = (
-                None
-                if source_root_positions is None
-                else source_root_positions[frame_idx]
-            )
-            if body_relation_tasks is not None:
-                for weight, residual, jacobian in body_relation_tasks.rows(result[frame_idx], frame_idx, dof_indices):
-                    append_block(frame_idx, jacobian, -residual, 1.0, weight)
-            root_z_offset = _swing_target_z_offset(
-                end_effector_config,
-                robot_root_z=float(result[frame_idx, 2]),
-                source_root_position=source_root_position,
-            )
-            for name, spec in effectors.items():
-                task: SceneContactTask = spec["task"]
-                body_id = int(spec["body_id"])
-                rotation = data.xmat[body_id].reshape(3, 3).copy()
-                in_contact = bool(task.contact_mask[frame_idx])
-                if in_contact:
-                    contact_mode = (
-                        str(task.contact_modes[frame_idx])
-                        if task.contact_modes is not None
-                        else "sticking"
-                    )
-                    target_position = task.contact_positions[frame_idx]
-                    offset = spec["contact_offsets"][
-                        contact_offset_choice[name][frame_idx]
-                    ]
-                    position_sigma = (
-                        contact_position_sigma
-                        if spec["contact_position_sigma"] is None
-                        else float(spec["contact_position_sigma"])
-                    )
-                    confidence = max(
-                        float(task.contact_confidence[frame_idx]), 0.25
-                    )
-                    if task.transition_weights is not None:
-                        confidence *= max(
-                            float(task.transition_weights[frame_idx]), 1e-3
-                        )
-                else:
-                    contact_mode = "none"
-                    target_position = _transform_swing_target(
-                        task.tracking_positions[frame_idx],
-                        source_root_position,
-                        root_z_offset,
-                        float(spec["swing_morphology_scale"]),
-                        bool(spec["preserve_world_target"]),
-                    )
-                    reach_body_id = int(spec["reach_reference_body_id"])
-                    if reach_body_id >= 0:
-                        reach_rotation = data.xmat[reach_body_id].reshape(3, 3)
-                        reach_origin = (
-                            data.xpos[reach_body_id]
-                            + reach_rotation @ spec["reach_reference_offset"]
-                        )
-                        target_position = _clamp_target_to_reach(
-                            target_position,
-                            reach_origin,
-                            spec["max_swing_reach"],
-                        )
-                    offset = spec["tracking_offset"]
-                    position_sigma = (
-                        swing_position_sigma
-                        if spec["swing_position_sigma"] is None
-                        else float(spec["swing_position_sigma"])
-                    )
-                    confidence = 1.0
-
-                point = data.xpos[body_id] + rotation @ offset
-                jacobian_position.fill(0.0)
-                jacobian_rotation.fill(0.0)
-                mujoco.mj_jac(
-                    model,
-                    data,
-                    jacobian_position,
-                    jacobian_rotation,
-                    point,
-                    body_id,
-                )
-                position_delta = target_position - point
-                if in_contact and _is_surface_only_contact_mode(contact_mode):
-                    # A surface contact has only one positional coordinate, so
-                    # it can be held more tightly than a full XYZ endpoint
-                    # without overconstraining the limb.  Keep this as an
-                    # internal semantic default: callers still tune the usual
-                    # contact sigma, while noisy-video hands get reliable
-                    # normal placement without another profile knob.
-                    surface_position_sigma = min(position_sigma, 0.006)
-                    surface_normal = np.asarray(
-                        task.surface_normals[frame_idx].copy(), dtype=float
-                    )
-                    surface_normal /= max(
-                        float(np.linalg.norm(surface_normal)), 1e-10
-                    )
-                    append_block(
-                        frame_idx,
-                        surface_normal[None, :]
-                        @ jacobian_position[:, dof_indices],
-                        np.asarray([surface_normal @ position_delta]),
-                        surface_position_sigma,
-                        confidence,
-                    )
-                    # Contact confidence and transition fades may soften how
-                    # tightly an uncertain video marker is pulled to the
-                    # surface, but they must never soften the outside
-                    # half-space itself.  Add a one-sided high-priority row
-                    # only while the selected hand/foot marker is deeper than
-                    # the accepted surface tolerance.  This avoids treating a
-                    # noisy penetrated source marker as permission for the
-                    # robot to enter the reconstructed scene.
-                    normal_tolerance = max(
-                        float(
-                            end_effector_config.get(
-                                "contact_normal_tolerance", 0.005
-                            )
-                        ),
-                        0.0,
-                    )
-                    inward_violation = (
-                        float(surface_normal @ position_delta)
-                        - normal_tolerance
-                    )
-                    if inward_violation > 0.0:
-                        append_block(
-                            frame_idx,
-                            surface_normal[None, :]
-                            @ jacobian_position[:, dof_indices],
-                            np.asarray([inward_violation]),
-                            min(surface_position_sigma, 0.002),
-                        )
-                    if (
-                        contact_mode == "sliding"
-                        and spec["track_sliding_tangent"]
-                    ):
-                        tangent_projection = np.eye(3) - np.outer(
-                            surface_normal, surface_normal
-                        )
-                        append_block(
-                            frame_idx,
-                            tangent_projection
-                            @ jacobian_position[:, dof_indices],
-                            tangent_projection @ position_delta,
-                            max(
-                                float(spec["sliding_tangent_sigma"]),
-                                position_sigma,
-                            ),
-                            confidence,
-                        )
-                else:
-                    append_block(
-                        frame_idx,
-                        jacobian_position[:, dof_indices],
-                        position_delta,
-                        position_sigma,
-                        confidence,
-                    )
-
-                arm_posture = spec["arm_posture"]
-                if arm_posture is not None and source_joint_positions is not None:
-                    shoulder_body_id = int(arm_posture["shoulder_body_id"])
-                    elbow_body_id = int(arm_posture["elbow_body_id"])
-                    shoulder_position = data.xpos[shoulder_body_id].copy()
-                    elbow_position = data.xpos[elbow_body_id].copy()
-                    current_upper = elbow_position - shoulder_position
-                    source_frame = source_joint_positions[frame_idx]
-                    wrist_body_id = int(arm_posture["wrist_body_id"])
-                    use_wrist_center = wrist_body_id >= 0
-                    source_endpoint = (
-                        source_frame[int(arm_posture["source_wrist_idx"])]
-                        if use_wrist_center
-                        else task.tracking_positions[frame_idx]
-                    )
-                    shape_endpoint_target = _transform_swing_target(
-                        source_endpoint,
-                        source_root_position,
-                        root_z_offset,
-                        float(spec["swing_morphology_scale"]),
-                        bool(spec["preserve_world_target"]),
-                    )
-                    target_upper, target_forearm = (
-                        _transported_arm_segment_targets(
-                            source_frame[int(arm_posture["source_shoulder_idx"])],
-                            source_frame[int(arm_posture["source_elbow_idx"])],
-                            source_endpoint,
-                            shoulder_position,
-                            shape_endpoint_target,
-                            float(arm_posture["upper_arm_length"]),
-                            float(arm_posture["forearm_length"]),
-                        )
-                    )
-                    shoulder_jacobian = np.zeros_like(jacobian_position)
-                    elbow_jacobian = np.zeros_like(jacobian_position)
-                    mujoco.mj_jac(
-                        model,
-                        data,
-                        shoulder_jacobian,
-                        None,
-                        shoulder_position,
-                        shoulder_body_id,
-                    )
-                    mujoco.mj_jac(
-                        model,
-                        data,
-                        elbow_jacobian,
-                        None,
-                        elbow_position,
-                        elbow_body_id,
-                    )
-                    shape_endpoint_position = (
-                        data.xpos[wrist_body_id].copy()
-                        if use_wrist_center
-                        else data.xpos[body_id]
-                        + rotation @ spec["tracking_offset"]
-                    )
-                    shape_endpoint_body_id = (
-                        wrist_body_id if use_wrist_center else body_id
-                    )
-                    shape_endpoint_jacobian = np.zeros_like(jacobian_position)
-                    mujoco.mj_jac(
-                        model,
-                        data,
-                        shape_endpoint_jacobian,
-                        None,
-                        shape_endpoint_position,
-                        shape_endpoint_body_id,
-                    )
-                    current_forearm = shape_endpoint_position - elbow_position
-                    append_block(
-                        frame_idx,
-                        (elbow_jacobian - shoulder_jacobian)[:, dof_indices],
-                        target_upper - current_upper,
-                        float(arm_posture["upper_direction_sigma"]),
-                    )
-                    append_block(
-                        frame_idx,
-                        (shape_endpoint_jacobian - elbow_jacobian)[:, dof_indices],
-                        target_forearm - current_forearm,
-                        float(arm_posture["forearm_direction_sigma"]),
-                    )
-
-                if spec["track_orientation"]:
-                    target_rotation = _orthonormal_target_rotation(
-                        None
-                        if task.forward_directions is None
-                        else task.forward_directions[frame_idx],
-                        None
-                        if task.up_directions is None
-                        else task.up_directions[frame_idx],
-                    )
-                    if target_rotation is not None:
-                        semantic_rotation = (
-                            rotation @ spec["orientation_local_rotation"]
-                        )
-                        orientation_jacobian = jacobian_rotation[
-                            :, dof_indices
-                        ].copy()
-                        orientation_coordinate_mask = spec[
-                            "orientation_coordinate_mask"
-                        ]
-                        if orientation_coordinate_mask is not None:
-                            orientation_jacobian[
-                                :, ~orientation_coordinate_mask
-                            ] = 0.0
-                        orientation_weight = (
-                            float(spec["contact_orientation_weight"])
-                            if in_contact
-                            else float(spec["swing_orientation_weight"])
-                        )
-                        orientation_weight *= confidence
-                        if (
-                            orientation_weight > 0.0
-                            and spec["orientation_mode"] == "axes"
-                        ):
-                            current_forward = semantic_rotation[:, 0]
-                            current_up = semantic_rotation[:, 2]
-                            # For a world-frame angular increment dtheta,
-                            # dv = dtheta x v = -skew(v) dtheta.  Splitting
-                            # the two anatomical axes lets finger direction
-                            # remain more important than palm roll, instead
-                            # of forcing an unreachable full SO(3) target.
-                            append_block(
-                                frame_idx,
-                                -_skew_symmetric(current_forward)
-                                @ orientation_jacobian,
-                                target_rotation[:, 0] - current_forward,
-                                float(spec["forward_orientation_sigma"]),
-                                orientation_weight,
-                            )
-                            append_block(
-                                frame_idx,
-                                -_skew_symmetric(current_up)
-                                @ orientation_jacobian,
-                                target_rotation[:, 2] - current_up,
-                                float(spec["up_orientation_sigma"]),
-                                orientation_weight,
-                            )
-                        elif orientation_weight > 0.0:
-                            rotation_error = Rotation.from_matrix(
-                                target_rotation @ semantic_rotation.T
-                            ).as_rotvec()
-                            append_block(
-                                frame_idx,
-                                orientation_jacobian,
-                                rotation_error,
-                                max(float(spec["orientation_sigma"]), 1e-6),
-                                orientation_weight,
-                            )
-
-            frame_penetration = penetration_frames[frame_idx]
-            if frame_penetration is None:
-                continue
-            # Only a genuinely sticking effector is fixed to a full XYZ scene
-            # anchor.  Transition and sliding contacts constrain the surface
-            # normal only, so their local chain must remain available to move
-            # colliding geometry tangentially out of the scene.  The sticking
-            # exemption is by distance, not by body id: colliding geoms often
-            # live on the wrist/ankle parent body rather than the configured
-            # effector body.  The honest depth still comes from
-            # measure_scene_penetration.
-            active_anchor_points = [
-                np.asarray(spec["task"].contact_positions[frame_idx], dtype=float)
-                for spec in effectors.values()
-                if penetration_anchor_radius > 0.0
-                and bool(spec["task"].contact_mask[frame_idx])
-                and (
-                    spec["task"].contact_modes is None
-                    or str(spec["task"].contact_modes[frame_idx]) == "sticking"
-                )
-            ]
-            # One-sided: only points that violate the requested clearance get a
-            # row, and the active set is rebuilt from the current pose at every
-            # Gauss--Newton iteration.
-            for index in np.flatnonzero(
-                (frame_penetration["clearance"] < penetration_clearance)
-                & ~frame_penetration["uncertain"]
-            ):
-                if any(
-                    float(
-                        np.linalg.norm(
-                            frame_penetration["points"][index] - anchor
-                        )
-                    )
-                    < penetration_anchor_radius
-                    for anchor in active_anchor_points
-                ):
-                    continue
-                jacobian_position.fill(0.0)
-                mujoco.mj_jac(
-                    model,
-                    data,
-                    jacobian_position,
-                    None,
-                    frame_penetration["points"][index],
-                    int(frame_penetration["body_ids"][index]),
-                )
-                append_block(
-                    frame_idx,
-                    frame_penetration["directions"][index]
-                    @ jacobian_position[:, dof_indices],
-                    penetration_clearance
-                    - frame_penetration["clearance"][index],
-                    penetration_sigma,
-                    _penetration_depth_weight(
-                        frame_penetration["clearance"][index],
-                        penetration_cfg,
-                    ),
-                )
-                active_penetration_rows += 1
-
-        task_block = sparse.coo_matrix(
-            (
-                np.concatenate(block_values)
-                if block_values
-                else np.zeros(0, dtype=float),
-                (
-                    np.concatenate(block_rows)
-                    if block_rows
-                    else np.zeros(0, dtype=int),
-                    np.concatenate(block_columns)
-                    if block_columns
-                    else np.zeros(0, dtype=int),
-                ),
-            ),
-            shape=(row_index, num_frames * num_joints),
-        ).tocsr()
 
         systems = [task_block]
         residuals = [np.asarray(block_rhs, dtype=float)]
+        active_self_rows = 0
+        if self_query is not None:
+            self_block, self_rhs = linearize_self_collisions(self_query, result, dof_indices)
+            systems.append(self_block)
+            residuals.append(self_rhs)
+            active_self_rows = len(self_rhs)
 
         active_limit_rows = 0
         if joint_limit_avoidance_enabled and (
@@ -1596,17 +630,26 @@ def refine_joint_trajectory(
             ),
             0.0,
         )
-        solution = lsq_linear(
-            system,
-            rhs_array,
-            bounds=(lower, upper),
-            method="trf",
-            lsq_solver="lsmr",
-            tol=solver_tolerance,
-            lsmr_tol=solver_tolerance,
-            max_iter=solver_iterations,
-            verbose=0,
-        )
+        if refinement_guard is not None:
+            try:
+                solution = refinement_guard.solve(system, rhs_array, result, lower, upper)
+            except QueryBudgetExceeded as exc:
+                refinement_guard.report.update(status="query_budget", reason=str(exc))
+                break
+            if solution is None:
+                break
+        else:
+            solution = lsq_linear(
+                system,
+                rhs_array,
+                bounds=(lower, upper),
+                method="trf",
+                lsq_solver="lsmr",
+                tol=solver_tolerance,
+                lsmr_tol=solver_tolerance,
+                max_iter=solver_iterations,
+                verbose=0,
+            )
         if not np.all(np.isfinite(solution.x)):
             raise RuntimeError("trajectory refinement produced a non-finite step")
         if int(getattr(solution, "status", 1)) == 0:
@@ -1616,12 +659,24 @@ def refine_joint_trajectory(
                 "converging, so this step is truncated."
             )
         step = solution.x.reshape(num_frames, num_joints)
-        result[:, qpos_indices] = current_joints + step
+        candidate = result.copy()
+        candidate[:, qpos_indices] = current_joints + step
+        if self_query is not None:
+            candidate = guard_self_collision_update(self_query, result, candidate, qpos_indices)
+        if refinement_guard is not None:
+            try:
+                candidate = refinement_guard.accept(result, candidate, system, rhs_array)
+            except QueryBudgetExceeded as exc:
+                refinement_guard.report.update(status="query_budget", reason=str(exc))
+                break
+        step = candidate[:, qpos_indices] - current_joints
+        result = candidate
         print(
             "Trajectory refinement "
             f"{iteration + 1}/{iterations}: cost={solution.cost:.4f}, "
             f"max_joint_step={np.max(np.abs(step)):.5f}, "
             f"penetration_rows={active_penetration_rows}, "
+            f"self_collision_rows={active_self_rows}, "
             f"joint_limit_rows={active_limit_rows}, "
             f"swing_step_rows={active_swing_step_rows}, "
             f"joint_step_rows={active_joint_step_rows}"
@@ -1629,4 +684,11 @@ def refine_joint_trajectory(
         if float(np.max(np.abs(step))) < step_tolerance:
             break
 
+    if refinement_guard is not None:
+        refinement_guard.report["accepted_update_count"] = sum(
+            row["accepted_alpha"] > 0.0 for row in refinement_guard.report["iterations"]
+        )
+        refinement_guard.report["changed_frames"] = int(np.count_nonzero(
+            np.any(result != refinement_guard.validator.reference, axis=1)
+        ))
     return result

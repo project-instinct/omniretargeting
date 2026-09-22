@@ -8,18 +8,24 @@ from __future__ import annotations
 
 from time import perf_counter
 
-import cvxpy as cp
 import mujoco
 import numpy as np
 
+from .collision_window import (
+    _check_corridor as _check_corridor,
+    _collision_score as _collision_score,
+    _corridor_planes as _corridor_planes,
+    _optimize_window as _optimize_window,
+    _window_stats as _window_stats,
+)
 from .contact import _is_surface_only_contact_mode
 from .scene_geometry import SceneQuery
+from .scene_witness_guard import preserve_known_scene_samples
 from .trajectory_validation import (
     QueryBudgetExceeded,
     TrajectoryValidator,
     _pose_velocity,
     _runs,
-    _summary,
     local_repair_config,
 )
 
@@ -49,7 +55,18 @@ def _interpolate(reference, start, end, joints, model):
 def _event_windows(v, stats):
     groups = {}
     for record in stats["records"]:
-        key = (v.chain(record["body_id"]), record["obstacle_id"])
+        joints = v.chain(record["body_id"])
+        if record["obstacle_id"] == -2:
+            bodies = [int(v.model.geom_bodyid[g]) for g in record["pair"]]
+            paths = [set(v.ancestor_coordinates(b)) for b in bodies]
+            relative = paths[0] ^ paths[1]
+            common = paths[0] & paths[1]
+            joints = set(relative)
+            for body, path in zip(bodies, paths):
+                if path & relative:
+                    joints.update(v.chain(body))
+            joints = tuple(sorted(joints - common))
+        key = (joints, record["obstacle_id"])
         groups.setdefault(key, set()).add(record["frame"])
         if record["alpha"]:
             groups[key].add(record["frame"] + 1)
@@ -57,6 +74,7 @@ def _event_windows(v, stats):
     max_frames = max(0, int(np.floor(v.cfg["max_window_seconds"] * v.fps)))
     extension = max(1, int(np.floor(v.cfg["max_extension_seconds"] * v.fps)))
     for (joints, obstacle), frames in sorted(groups.items()):
+        focus_self = obstacle == -2
         mask = np.zeros(len(v.reference), dtype=bool)
         mask[list(frames)] = True
         for first, last in _runs(mask):
@@ -75,14 +93,20 @@ def _event_windows(v, stats):
             for lo in range(first, last + 1, max_frames - 1):
                 hi = min(last, lo + max_frames - 2)
                 start, end = max(0, lo - 1), min(len(mask) - 1, hi + 1)
+                if focus_self:
+                    # Correction derivatives need a collar on both sides.
+                    # Contact modes are enforced per frame by the optimizer;
+                    # a phase change is not a reason to skip self repair.
+                    padding = min(extension, max(0, (max_frames - (end - start)) // 2))
+                    start, end = max(0, start - padding), min(len(mask) - 1, end + padding)
                 reason = ""
                 # Boundaries must be collision/limit/contact-valid and same phase.
                 phase = v.phase(lo, joints)
 
                 def normal(f, joints=joints, phase=phase):
+                    if focus_self:
+                        return np.max(stats["self_depth"][f], initial=0) <= v.self_query.cfg["penetration_tolerance"]
                     if v.phase(f, joints) != phase:
-                        return False
-                    if f in stats["uncertain_frames"]:
                         return False
                     if (
                         np.max(stats["per_geom_depth"][f], initial=0)
@@ -111,7 +135,7 @@ def _event_windows(v, stats):
                         normal(start)
                         or start == 0
                         or end - start >= max_frames
-                        or v.phase(start, joints) != phase
+                        or (not focus_self and v.phase(start, joints) != phase)
                     ):
                         break
                     start -= 1
@@ -120,13 +144,13 @@ def _event_windows(v, stats):
                         normal(end)
                         or end == len(mask) - 1
                         or end - start >= max_frames
-                        or v.phase(end, joints) != phase
+                        or (not focus_self and v.phase(end, joints) != phase)
                     ):
                         break
                     end += 1
                 if not normal(start) or not normal(end):
                     reason = "missing_valid_boundaries"
-                if any(v.phase(f, joints) != phase for f in range(start, end + 1)):
+                if not focus_self and any(v.phase(f, joints) != phase for f in range(start, end + 1)):
                     reason = "contact_phase_switch"
                 events.append(
                     {
@@ -135,12 +159,14 @@ def _event_windows(v, stats):
                         "joints": list(joints),
                         "obstacles": [int(obstacle)],
                         "boundary_reason": reason,
+                        "focus": "self" if focus_self else "scene",
                     }
                 )
     # Coordinate overlapping windows once, including different obstacles/limbs.
     merged = []
-    for event in sorted(events, key=lambda e: e["window"]):
-        if merged and event["window"][0] < merged[-1]["window"][1]:
+    for event in sorted(events, key=lambda e: (e.get("focus") != "self", e["window"])):
+        if (merged and event.get("focus") == merged[-1].get("focus")
+                and event["window"][0] < merged[-1]["window"][1]):
             previous = merged[-1]
             if event["window"][1] - previous["window"][0] <= max_frames:
                 previous["window"][1] = max(previous["window"][1], event["window"][1])
@@ -157,419 +183,6 @@ def _event_windows(v, stats):
                 continue
         merged.append(event)
     return merged
-
-
-def _window_stats(stats, start, end, model):
-    result = dict(stats)
-    result.update(_summary(stats["per_geom_depth"][start : end + 1], model))
-    for key in ("interframe_depth", "interframe_self_depth"):
-        result[key] = stats[key][max(0, start - 1) : end + 1]
-    result["self_depth"] = stats["self_depth"][start : end + 1]
-    result["interframe_contact_failures"] = [
-        failure
-        for failure in stats["interframe_contact_failures"]
-        if max(0, start - 1) <= failure["frame"] <= end
-    ]
-    result["interframe_max_depth"] = float(
-        np.max(result["interframe_depth"], initial=0)
-    )
-    for key in (
-        "uncertain_frames",
-        "uncertain_intervals",
-        "subdivision_limit_intervals",
-    ):
-        result[key] = [f for f in stats[key] if max(0, start - 1) <= f <= end]
-    return result
-
-
-def _collision_score(stats):
-    values = np.concatenate(
-        [
-            stats[k].ravel()
-            for k in (
-                "per_geom_depth",
-                "interframe_depth",
-                "self_depth",
-                "interframe_self_depth",
-            )
-        ]
-    )
-    return float(np.max(values, initial=0)), float(np.sum(values**2))
-
-
-def _corridor_planes(v, event, original):
-    """Fixed same-side hints from reliable boundary geom centres.
-
-    These are halfspaces on *added* motion, not an alternate scene SDF. At a
-    corner the full sum of the boundary exit vectors retains both components.
-    Opposite boundary sides provide no local channel and are reported.
-    """
-    a, b = event["window"]
-    data = mujoco.MjData(v.model)
-    gids = sorted(
-        {
-            r["geom"]
-            for r in original["records"]
-            if a <= r["frame"] <= b and r["obstacle_id"] in event["obstacles"]
-        }
-    )
-    centers = []
-    for f in (a, b):
-        data.qpos[:] = v.reference[f]
-        mujoco.mj_forward(v.model, data)
-        centers.append(data.geom_xpos[gids].copy())
-    queries = [v.query.query(points) for points in centers]
-    planes = []
-    for k, gid in enumerate(gids):
-        if any(
-            q["uncertain"][k]
-            or not np.isfinite(q["clearance"][k])
-            or q["clearance"][k] <= 0
-            for q in queries
-        ):
-            continue
-        if np.dot(queries[0]["directions"][k], queries[1]["directions"][k]) < -0.1:
-            continue
-        normal = queries[0]["directions"][k] + queries[1]["directions"][k]
-        normal /= max(np.linalg.norm(normal), 1e-9)
-        planes.append((gid, normal))
-    return planes
-
-
-def _check_corridor(v, candidate, event, planes):
-    data, original_data = mujoco.MjData(v.model), mujoco.MjData(v.model)
-    start, end = event["window"]
-    for f in range(start + 1, end):
-        data.qpos[:] = candidate[f]
-        original_data.qpos[:] = v.reference[f]
-        mujoco.mj_forward(v.model, data)
-        mujoco.mj_forward(v.model, original_data)
-        for gid, normal in planes:
-            if (
-                np.dot(data.geom_xpos[gid] - original_data.geom_xpos[gid], normal)
-                < -1e-6
-            ):
-                return False
-    return True
-
-
-def _optimize_window(
-    v, current, initial, event, original_stats, planes, iteration_budget=None,
-    *, polish=False,
-):
-    start, end = event["window"]
-    joints = np.asarray(event["joints"], dtype=int)
-    frames = np.arange(start + 1, end)
-    if not len(frames) or not len(joints):
-        return (
-            current,
-            None,
-            {"iterations": 0, "reason": "no_interior_chain_variables", "slack": 0.0},
-        )
-    # Acceptance includes both endpoints, which this solve cannot modify.
-    # An uncertain fixed endpoint cannot become verified through interior SQP.
-    # The caller may still try a permitted expansion with different endpoints.
-    uncertain_endpoints = sorted(
-        {start, end}.intersection(original_stats["uncertain_frames"])
-    )
-    if uncertain_endpoints:
-        return current, None, {
-            "iterations": 0, "reason": "uncertain_fixed_boundary", "slack": 0.0,
-            "uncertain_fixed_frames": uncertain_endpoints,
-        }
-    columns = np.array([np.flatnonzero(v.qi == qi)[0] for qi in joints])
-    dofs = v.di[columns]
-    reference = v.reference[np.ix_(frames, joints)]
-    best, best_stats = current.copy(), original_stats
-    iterate = initial.copy()
-    log = {
-        "iterations": 0,
-        "reason": "iteration_budget",
-        "slack": 0.0,
-        "slack_sum_peak": 0.0,
-        "immovable_collision_rows": 0,
-        "nonlinear_rejections": [],
-    }
-    cfg = v.cfg
-    local_before = _window_stats(original_stats, start, end, v.model)
-    data, original_data = mujoco.MjData(v.model), mujoco.MjData(v.model)
-    # First exhaust a tight endpoint budget; then allow the explicit free-foot
-    # robot-side budget. Contacts keep the same bounds in both passes.
-    iteration_count = int(
-        cfg["iterations"] if iteration_budget is None else iteration_budget
-    )
-    for iteration in range(iteration_count):
-        log["iterations"] += 1
-        step = cp.Variable((len(frames), len(joints)))
-        correction = iterate[np.ix_(frames, joints)] - reference + step
-        full_delta = cp.vstack(
-            [np.zeros((1, len(joints))), correction, np.zeros((1, len(joints)))]
-        )
-        trust = min(0.08, cfg["max_joint_correction"])
-        constraints = [
-            step <= trust,
-            step >= -trust,
-            correction <= cfg["max_joint_correction"],
-            correction >= -cfg["max_joint_correction"],
-        ]
-        lower, upper = v.lower[columns], v.upper[columns]
-        finite = np.isfinite(lower)
-        if np.any(finite):
-            constraints.append(
-                reference[:, finite] + correction[:, finite] >= lower[finite]
-            )
-        finite = np.isfinite(upper)
-        if np.any(finite):
-            constraints.append(
-                reference[:, finite] + correction[:, finite] <= upper[finite]
-            )
-        diff = (full_delta[1:] - full_delta[:-1]) * v.fps
-        constraints += [
-            diff <= cfg["correction_velocity"],
-            diff >= -cfg["correction_velocity"],
-        ]
-        acceleration = (diff[1:] - diff[:-1]) * v.fps
-        constraints += [
-            acceleration <= cfg["correction_acceleration"],
-            acceleration >= -cfg["correction_acceleration"],
-        ]
-        objective = cp.sum_squares(
-            correction / cfg["max_joint_correction"]
-        ) + cp.sum_squares(diff / cfg["correction_velocity"])
-        objective += cp.sum_squares(acceleration / cfg["correction_acceleration"])
-        estimated = len(frames) * v.probe.query_work_bound
-        point_limit = cfg["max_query_points"]
-        if point_limit is not None and v.query.query_points - v.query_start + estimated > point_limit:
-            raise QueryBudgetExceeded("scene query point budget before SQP")
-        collision_frames = v.probe.probe_trajectory(iterate[frames])
-        if point_limit is not None and v.query.query_points - v.query_start > point_limit:
-            raise QueryBudgetExceeded("scene query point budget in SQP")
-        slacks, linear_contacts = [], {}
-        for row, f in enumerate(frames):
-            data.qpos[:] = iterate[f]
-            original_data.qpos[:] = v.reference[f]
-            mujoco.mj_forward(v.model, data)
-            mujoco.mj_forward(v.model, original_data)
-            for weight, residual, jac in v.surface_rows(iterate[f], f, dofs):
-                objective += weight * cp.sum_squares(residual + jac @ step[row])
-            for weight, residual, jac in v.relation_rows(iterate[f], f, dofs):
-                objective += weight * cp.sum_squares(residual + jac @ step[row])
-            for name, spec in v.specs.items():
-                payload = spec["task"].frame(f)
-                point = v.point(data, name, f)
-                p0 = v.original_effectors[name]["position"][f]
-                jac = np.zeros((3, v.model.nv))
-                mujoco.mj_jac(v.model, data, jac, None, point, spec["body_id"])
-                p = point + jac[:, dofs] @ step[row]
-                normal = np.array(payload["surface_normal"], dtype=float, copy=True)
-                normal /= max(np.linalg.norm(normal), 1e-12)
-                projector = (
-                    np.outer(normal, normal)
-                    if payload["contact"]
-                    and _is_surface_only_contact_mode(payload["contact_mode"])
-                    else np.eye(3)
-                )
-                if payload["contact"]:
-                    target = payload["contact_position"]
-                    budget = (
-                        max(
-                            float(np.linalg.norm(projector @ (p0 - target))),
-                            cfg["contact_tolerance"],
-                        )
-                        + cfg["contact_regression"]
-                    )
-                    constraints += [
-                        cp.norm(projector @ (p - target)) <= budget,
-                        cp.norm(projector @ (p - p0))
-                        <= v.contact_change_budget(
-                            float(np.linalg.norm(projector @ (p0 - target)))
-                        ),
-                    ]
-                    if payload["contact_mode"] == "sticking":
-                        linear_contacts[name, int(f)] = p - p0
-                else:
-                    budget = (
-                        min(v.swing_budget(name, f), 0.001)
-                        if iteration < max(1, iteration_count // 2)
-                        else v.swing_budget(name, f)
-                    )
-                    constraints.append(cp.norm(p - p0) <= budget)
-            for gid, normal in planes:
-                point = data.geom_xpos[gid]
-                jac = np.zeros((3, v.model.nv))
-                mujoco.mj_jac(
-                    v.model, data, jac, None, point, int(v.model.geom_bodyid[gid])
-                )
-                constraints.append(
-                    normal
-                    @ (point - original_data.geom_xpos[gid] + jac[:, dofs] @ step[row])
-                    >= 0
-                )
-            frame = collision_frames[row]
-            indices = np.flatnonzero((frame["clearance"] < 0.01) & ~frame["uncertain"])
-            for k in indices:
-                jac = np.zeros((3, v.model.nv))
-                mujoco.mj_jac(
-                    v.model,
-                    data,
-                    jac,
-                    None,
-                    frame["points"][k],
-                    int(frame["body_ids"][k]),
-                )
-                gradient = frame["directions"][k] @ jac[:, dofs]
-                if not np.any(np.abs(gradient) > 1e-12):
-                    log["immovable_collision_rows"] += 1
-                slack = cp.Variable(nonneg=True)
-                # Explicit bounded slack: infeasible scene constraints are never
-                # described as hard nonpenetration, even with a large penalty.
-                constraints += [
-                    frame["clearance"][k] + gradient @ step[row]
-                    >= -cfg["penetration_tolerance"] - slack,
-                    slack
-                    <= min(cfg["max_collision_slack"], max(-frame["clearance"][k], 0) + cfg["collision_regression"]),
-                ]
-                slacks.append(slack)
-                objective += cp.square(slack / 0.005)
-            if cfg["self_collision_enabled"]:
-                for contact in data.contact:
-                    if contact.dist >= 0.01:
-                        continue
-                    jacobians = []
-                    for gid in contact.geom:
-                        jac = np.zeros((3, v.model.nv))
-                        mujoco.mj_jac(
-                            v.model,
-                            data,
-                            jac,
-                            None,
-                            contact.pos,
-                            int(v.model.geom_bodyid[gid]),
-                        )
-                        jacobians.append(jac[:, dofs])
-                    gradient = contact.frame[:3] @ (jacobians[1] - jacobians[0])
-                    slack = cp.Variable(nonneg=True)
-                    constraints += [
-                        contact.dist + gradient @ step[row]
-                        >= -cfg["penetration_tolerance"] - slack,
-                        slack <= min(cfg["max_collision_slack"], max(-contact.dist, 0) + cfg["collision_regression"]),
-                    ]
-                    slacks.append(slack)
-                    objective += cp.square(slack / 0.005)
-        inter_stats = v.geometry(iterate)
-        for record in inter_stats["records"]:
-            f, alpha = record["frame"], record["alpha"]
-            if not alpha or not start <= f < end or record["confidence"] <= 0:
-                continue
-            dq = _pose_velocity(v.model, iterate[f], iterate[f + 1])
-            q = iterate[f].copy()
-            mujoco.mj_integratePos(v.model, q, dq, alpha)
-            data.qpos[:] = q
-            mujoco.mj_forward(v.model, data)
-            jac = np.zeros((3, v.model.nv))
-            mujoco.mj_jac(
-                v.model, data, jac, None, np.asarray(record["point"]), record["body_id"]
-            )
-            increment = 0
-            if start < f < end:
-                increment = increment + (1 - alpha) * step[f - start - 1]
-            if start < f + 1 < end:
-                increment = increment + alpha * step[f - start]
-            if isinstance(increment, int):
-                continue
-            slack = cp.Variable(nonneg=True)
-            if record["obstacle_id"] == -2:
-                pair_jacobians = []
-                for gid in record["pair"]:
-                    pair_jac = np.zeros((3, v.model.nv))
-                    mujoco.mj_jac(
-                        v.model,
-                        data,
-                        pair_jac,
-                        None,
-                        np.asarray(record["point"]),
-                        int(v.model.geom_bodyid[gid]),
-                    )
-                    pair_jacobians.append(pair_jac[:, dofs])
-                gradient = np.asarray(record["direction"]) @ (
-                    pair_jacobians[1] - pair_jacobians[0]
-                )
-            else:
-                gradient = np.asarray(record["direction"]) @ jac[:, dofs]
-            constraints += [
-                record["clearance"] + gradient @ increment
-                >= -cfg["penetration_tolerance"] - slack,
-                slack <= min(cfg["max_collision_slack"], record["depth"] + cfg["collision_regression"]),
-            ]
-            slacks.append(slack)
-            objective += cp.square(slack / 0.005)
-        for (name, f), pdelta in linear_contacts.items():
-            previous = linear_contacts.get((name, f - 1))
-            if previous is not None:
-                constraints.append(
-                    cp.norm((pdelta - previous) * v.fps)
-                    <= cfg["support_slip_regression"]
-                )
-        problem = cp.Problem(cp.Minimize(objective), constraints)
-        try:
-            problem.solve(
-                solver="CLARABEL", max_iter=80, canon_backend=cp.SCIPY_CANON_BACKEND
-            )
-        except cp.error.SolverError as exc:
-            log["reason"] = f"solver_error:{exc}"
-            continue
-        if step.value is None:
-            log["reason"] = f"linear_subproblem:{problem.status}"
-            # Restore a feasible original start for the next bounded attempt.
-            iterate = best.copy()
-            continue
-        values = [float(s.value) for s in slacks if s.value is not None]
-        log["slack"] = max(log["slack"], max(values, default=0.0))
-        log["slack_sum_peak"] = max(log["slack_sum_peak"], sum(values))
-        accepted = False
-        for alpha in (1.0, 0.5, 0.25, 0.125):
-            trial = iterate.copy()
-            trial[np.ix_(frames, joints)] += alpha * step.value
-            fidelity = v.fidelity(trial)
-            if not fidelity["ok"] or not _check_corridor(v, trial, event, planes):
-                log["nonlinear_rejections"].append(
-                    fidelity["reasons"] or ["same_side_corridor"]
-                )
-                continue
-            stats = v.geometry(trial)
-            local_after = _window_stats(stats, start, end, v.model)
-            reasons = v.compare_geometry(
-                local_before, local_after, require_improvement=not polish
-            )
-            # Keep only bounded, jointly admissible progress. A later iteration
-            # may relinearize an improved residual; this is not a proof of infeasibility.
-            def correction_cost(q):
-                delta = q[:, joints] - v.reference[:, joints]
-                return (v.surface_score(q) + v.relation_score(q) + np.sum((delta / cfg["max_joint_correction"])**2)
-                        + np.sum((np.diff(delta, axis=0)*v.fps / cfg["correction_velocity"])**2)
-                        + np.sum((np.diff(delta, n=2, axis=0)*v.fps**2 / cfg["correction_acceleration"])**2))
-
-            improves = (
-                _collision_score(local_after)[0] <= cfg["penetration_tolerance"]
-                and correction_cost(trial) < correction_cost(best) - 1e-8
-            ) if polish else _collision_score(local_after) < _collision_score(
-                _window_stats(best_stats, start, end, v.model))
-            if reasons or not improves:
-                log["nonlinear_rejections"].append(reasons or ["no_progress"])
-                continue
-            best, best_stats, iterate = trial, stats, trial
-            accepted = True
-            break
-        if (
-            accepted
-            and _collision_score(_window_stats(best_stats, start, end, v.model))[0]
-            <= cfg["penetration_tolerance"]
-        ):
-            log["reason"] = "target_reached"
-            break
-        if not accepted:
-            iterate = best.copy()
-    return best, best_stats, log
 
 
 def _point_corrections(v, before, after, event, records):
@@ -613,6 +226,9 @@ def repair_local_collisions(
     surface_tasks=None,
     geometry_cache=None,
     body_relation_tasks=None,
+    self_contact_tasks=None,
+    surface_contact_tasks=None,
+    contact_offset_choice=None,
 ):
     start_time = perf_counter()
     cfg = local_repair_config(config, priority=end_effector_config)
@@ -643,7 +259,8 @@ def repair_local_collisions(
     v = TrajectoryValidator(
         model, reference, query, tasks, end_effector_config, cfg, framerate, surface_tasks,
         geometry_cache=geometry_cache,
-        body_relation_tasks=body_relation_tasks,
+        contact_offset_choice=contact_offset_choice,
+        body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks,
     )
     try:
         original = v.geometry(reference)
@@ -671,6 +288,7 @@ def repair_local_collisions(
                 event["reason"] = "window_count_budget"
                 continue
             a, b = event["window"]
+            focus_self = event.get("focus") == "self"
             if any(a < y and b > x for x, y in used):
                 event["reason"] = "overlap_exceeds_window_budget"
                 continue
@@ -680,10 +298,14 @@ def repair_local_collisions(
             # An earlier event can modify adjacent fixed boundaries. Build the
             # candidate from the current output, while reference budgets stay fixed.
             initial = _interpolate(result, a, b, event["joints"], model)
+            if focus_self:
+                initial = result.copy()
             planes = _corridor_planes(v, event, original)
             event["same_side_planes"] = len(planes)
             before = _window_stats(final_stats, a, b, model)
             reasons = [event["boundary_reason"]] if event["boundary_reason"] else []
+            if focus_self:
+                reasons = ["self_collision_projection"]
             if not reasons:
                 fidelity = v.fidelity(initial)
                 reasons.extend(fidelity["reasons"])
@@ -696,8 +318,11 @@ def repair_local_collisions(
                             before,
                             _window_stats(check, a, b, model),
                             require_improvement=True,
+                            allow_existing_uncertainty=True,
                         )
                     )
+                    if not reasons:
+                        reasons.extend(preserve_known_scene_samples(v, initial, original, a, b))
                     # Interpolation is accepted only if the event meets the
                     # detector's tolerance; partial progress uses bounded SQP.
                     if (
@@ -710,7 +335,7 @@ def repair_local_collisions(
                         event.update(
                             method="interpolation", reason="joint_checks_passed"
                         )
-            if reasons and cfg["bidirectional_enabled"] and cfg["iterations"]:
+            if reasons and not focus_self and cfg["bidirectional_enabled"] and cfg["iterations"]:
                 from .local_candidates import bidirectional_window
                 event["interpolation_rejected"] = sorted(set(reasons))
                 candidate, directional = bidirectional_window(v, result, initial, event, planes)
@@ -719,7 +344,10 @@ def repair_local_collisions(
                     fidelity = v.fidelity(candidate)
                     check = v.geometry(candidate)
                     rejected = fidelity["reasons"] + v.compare_geometry(
-                        final_stats, check, require_improvement=True)
+                        final_stats, check, require_improvement=True,
+                        allow_existing_uncertainty=True)
+                    if not rejected:
+                        rejected.extend(preserve_known_scene_samples(v, candidate, original, a, b))
                     if not _check_corridor(v, candidate, event, planes):
                         rejected.append("same_side_corridor")
                     if not rejected:
@@ -739,7 +367,7 @@ def repair_local_collisions(
                 extension = max(0, int(cfg["max_extension_seconds"] * framerate))
                 max_span = int(cfg["max_window_seconds"] * framerate)
                 ea, eb = a, b
-                for _ in range(extension):
+                for _ in range(0 if focus_self else extension):
                     na, nb = max(0, ea - 1), min(len(reference) - 1, eb + 1)
                     if nb - na > max_span or (na == ea and nb == eb):
                         break
@@ -753,7 +381,6 @@ def repair_local_collisions(
                     if any(
                         np.max(original["per_geom_depth"][f], initial=0)
                         > cfg["penetration_tolerance"]
-                        or f in original["uncertain_frames"]
                         for f in (na, nb)
                     ):
                         break
@@ -813,7 +440,9 @@ def repair_local_collisions(
         if used:
             checked = v.geometry(result)
             reasons = (
-                v.compare_geometry(original, checked) + v.fidelity(result)["reasons"]
+                v.compare_geometry(original, checked, allow_existing_uncertainty=True)
+                + v.fidelity(result)["reasons"]
+                + preserve_known_scene_samples(v, result, original)
             )
             if reasons:
                 # Revalidate/revert individual windows, including adjacent seams.
@@ -833,8 +462,9 @@ def repair_local_collisions(
                         reason="final_composition:" + ",".join(reasons),
                     )
                     reasons = (
-                        v.compare_geometry(original, checked)
+                        v.compare_geometry(original, checked, allow_existing_uncertainty=True)
                         + v.fidelity(result)["reasons"]
+                        + preserve_known_scene_samples(v, result, original)
                     )
                     if not reasons:
                         break
@@ -849,7 +479,7 @@ def repair_local_collisions(
         event["after"] = _window_stats(final_stats, a, b, model)
         if (
             event["method"] == "local_optimization"
-            and _collision_score(event["after"])[0] > cfg["penetration_tolerance"]
+            and _collision_score(event["after"], focus_self=event.get("focus") == "self")[0] > cfg["penetration_tolerance"]
         ):
             event["reason"] = "bounded_improvement_with_residual"
         event.update(
@@ -890,7 +520,7 @@ def repair_local_collisions(
             a, b = event["window"]
             editable[np.ix_(np.arange(a+1, b), event["joints"])] = True
         event["status"] = ("unresolved" if event["method"] == "fallback" else
-                           "partial" if _collision_score(event["after"])[0] > cfg["penetration_tolerance"] else "resolved")
+                           "partial" if _collision_score(event["after"], focus_self=event.get("focus") == "self")[0] > cfg["penetration_tolerance"] else "resolved")
     report["invariants"] = {
         "fixed_coordinates_unchanged": np.array_equal(result[:, v.fixed_qi], reference[:, v.fixed_qi]),
         "outside_windows_and_unrelated_joints_unchanged": np.array_equal(result[~editable], reference[~editable]),
@@ -916,6 +546,9 @@ def select_safe_postprocessing(
     scene_query=None,
     geometry_cache=None,
     body_relation_tasks=None,
+    self_contact_tasks=None,
+    surface_contact_tasks=None,
+    contact_offset_choice=None,
 ):
     """Jointly accept existing refinement/postprocessing; never mix joint angles.
 
@@ -929,7 +562,8 @@ def select_safe_postprocessing(
         scene_query if scene_query is not None else SceneQuery.from_tasks(scene, tasks, full_geometry=cfg["full_geometry"])
     )
     v = TrajectoryValidator(model, baseline, query, tasks, priority, cfg, framerate,
-                            geometry_cache=geometry_cache, body_relation_tasks=body_relation_tasks)
+                            geometry_cache=geometry_cache, body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks,
+                            contact_offset_choice=contact_offset_choice)
     result = np.asarray(baseline).copy()
     decisions = []
     try:
@@ -938,7 +572,9 @@ def select_safe_postprocessing(
         reasons = fidelity["reasons"]
         if not reasons:
             after = v.geometry(candidate)
-            reasons = v.compare_geometry(before, after)
+            reasons = v.compare_geometry(before, after, allow_existing_uncertainty=True)
+            if not reasons:
+                reasons.extend(preserve_known_scene_samples(v, candidate, before))
         if not reasons:
             return (
                 candidate.copy(),
@@ -975,7 +611,9 @@ def select_safe_postprocessing(
                 geometry_evaluated = not failure
                 if geometry_evaluated:
                     check = v.geometry(trial)
-                    failure = v.compare_geometry(before, check)
+                    failure = v.compare_geometry(before, check, allow_existing_uncertainty=True)
+                    if not failure:
+                        failure.extend(preserve_known_scene_samples(v, trial, before))
                 decisions.append(
                     {
                         "window": [int(start), int(end - 1)],

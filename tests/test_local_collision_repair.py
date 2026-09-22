@@ -324,7 +324,7 @@ def test_postprocessing_rejects_bad_fidelity_before_extra_geometry_and_reuses_in
     assert report["after"]["max_depth"] == 0
 
 
-def test_uncertain_fixed_window_boundary_reports_why_interior_sqp_cannot_be_accepted():
+def test_uncertain_scene_keeps_unknown_report_while_known_window_is_repaired():
     model, q, box = setup_motion()
     q[3:6, 8] = 0.04
     open_triangle = trimesh.Trimesh(
@@ -335,16 +335,19 @@ def test_uncertain_fixed_window_boundary_reports_why_interior_sqp_cannot_be_acce
     result, report = repair_local_collisions(
         model, q, scene, {}, {}, {"max_query_points": None}
     )
-    np.testing.assert_array_equal(result, q)
     assert report["before"]["max_depth"] > 0.01
+    assert report["after"]["max_depth"] < report["before"]["max_depth"]
     assert report["unresolved"]
     assert report["events"]
-    for event in report["events"]:
-        assert event["method"] == "fallback"
-        assert event["optimization"]["reason"] == "uncertain_fixed_boundary"
-        assert event["optimization"]["uncertain_fixed_frames"]
-        assert event["iterations"] == 0
-    assert report["geometry_calls"] == 1
+    assert report["after"]["uncertain_frames"]
+    assert "uncertain_scene_side" in report["unresolved_reasons"]
+    event = report["events"][0]
+    assert event["method"] in {"local_optimization", "bidirectional_dp", "interpolation"}
+    # The scene repair may reduce a known collision, but it cannot alter root
+    # alignment or endpoints while the unrelated open patch remains unknown.
+    np.testing.assert_array_equal(result[:, :7], q[:, :7])
+    np.testing.assert_array_equal(result[[0, -1]], q[[0, -1]])
+    assert report["geometry_calls"] > 1  # The changed candidate must be checked.
 
 
 def test_actual_support_foot_stays_put_during_other_chain_repair():
@@ -414,7 +417,7 @@ def test_self_collision_policy_is_unchanged_and_enabled_validator_checks_pairs()
     assert np.max(on["interframe_self_depth"]) > 0.01
 
 
-def test_core_clamp_and_stabilization_precede_repair_and_exact_qpos_is_hashed(
+def test_core_preserves_root_before_repair_and_hashes_exact_qpos(
     monkeypatch,
 ):
     from omniretargeting.core import OmniRetargeter
@@ -449,8 +452,10 @@ def test_core_clamp_and_stabilization_precede_repair_and_exact_qpos_is_hashed(
         source, framerate=30, visualize_trajectory=False
     )
     assert scale == 1
-    assert calls == ["stabilize", "clamp", "clamp"]
+    assert calls == ["clamp", "clamp"]
+    np.testing.assert_array_equal(output[:, :7], q[:, :7])
     report = retargeter.last_collision_diagnostics
+    assert report["effective_config"]["active_stages"]["foot_stabilization"] is False
     assert report["local_repair"]["events"][0]["method"] == "interpolation"
     assert report["accepted_qpos_sha256"] == trajectory_digest(output)
     assert report["local_repair"]["after"]["max_depth"] <= 0.001

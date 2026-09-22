@@ -160,6 +160,7 @@ class SceneQuery:
         self.component_query_calls = 0
         self.components = []
         self._component_query_data = []
+        self._component_features = []
         self.evidence_radius = float(evidence_radius)
         points = np.asarray(
             evidence_points if evidence_points is not None else [], dtype=float
@@ -190,6 +191,8 @@ class SceneQuery:
             tree = igl.AABB()
             tree.init(np.asarray(part.vertices), np.asarray(part.faces))
             self.components.append((part, np.asarray(faces, dtype=int), closed, tree))
+            from .open_surface_features import OpenSurfaceFeatures
+            self._component_features.append(None if closed else OpenSurfaceFeatures(part))
             vertices, triangles = np.asarray(part.vertices), np.asarray(part.faces)
             # Evidence can orient a nearest surface point only if an evidence
             # ball intersects this component. Check the actual triangles once;
@@ -206,6 +209,13 @@ class SceneQuery:
             self._component_query_data.append(
                 (vertices, triangles, np.asarray(part.bounds), has_evidence)
             )
+        # Such a component marks EVERY query point uncertain, even far away.
+        # Geometry and evidence are immutable, so centre culling can never
+        # discard a geom in this case; its prepass would only repeat queries.
+        self.has_unsigned_only_components = any(
+            not component[2] and not data[3]
+            for component, data in zip(self.components, self._component_query_data)
+        )
 
     @classmethod
     def from_tasks(cls, mesh, tasks, **kwargs):
@@ -214,6 +224,9 @@ class SceneQuery:
             mask = np.asarray(task.contact_mask) & (
                 np.asarray(task.contact_confidence) >= 0.5
             )
+            environment_ids = getattr(task, "environment_ids", None)
+            if environment_ids is not None:
+                mask &= np.asarray(environment_ids) == 0
             points.extend(np.asarray(task.surface_points)[mask])
             normals.extend(np.asarray(task.surface_normals)[mask])
         return cls(mesh, points, normals, **kwargs)
@@ -239,7 +252,7 @@ class SceneQuery:
             "geometry_queries": [backend.describe() for backend in self.geometry_backends.values()],
         }
 
-    def query(self, points):
+    def query(self, points, *, component_ids=None):
         points = np.asarray(points, dtype=float).reshape(-1, 3)
         self.query_points += len(points)
         self.query_calls += 1
@@ -252,7 +265,10 @@ class SceneQuery:
         confidence = np.ones(n)
         uncertain = np.zeros(n, dtype=bool)
         unsigned = np.full(n, np.inf)
+        selected_components = None if component_ids is None else set(map(int, component_ids))
         for cid, (mesh, faces, closed, tree) in enumerate(self.components):
+            if selected_components is not None and cid not in selected_components:
+                continue
             if n == 0:
                 break
             vertices, triangles, bounds, has_evidence = self._component_query_data[cid]
@@ -330,6 +346,10 @@ class SceneQuery:
                     )
                     normals = normals * np.where(vote < 0, -1, 1)[:, None]
                 sign = np.where(np.sum(offset * normals, axis=1) >= 0, 1.0, -1.0)
+                reliable = self._component_features[cid].reliable_witnesses(
+                    points, near, tid, reliable, self.evidence_tree,
+                    self.evidence_points, self.evidence_normals, self.evidence_radius,
+                )
             signed = sign * dist
             # Unknown components cannot be discarded just because their nearest
             # surface is far away. Keep this flag even if another component is known.
@@ -424,13 +444,18 @@ class ScenePenetrationProbe:
         for q in trajectory:
             data.qpos[:] = q
             mujoco.mj_forward(self.model, data)
-            centers = self.query.query(data.geom_xpos[self.geom_ids])
-            # Only *confirmed free* and sufficiently distant centres may be culled.
-            near = (
-                centers["uncertain"]
-                | ~np.isfinite(centers["clearance"])
-                | (centers["clearance"] <= self.bounding_radii + self.margin)
-            )
+            if self.query.has_unsigned_only_components:
+                # The unchanged sample sets include every geom centre. Keep
+                # their ordering and all uncertainty/full-geometry checks.
+                near = np.ones(len(self.geom_ids), dtype=bool)
+            else:
+                centers = self.query.query(data.geom_xpos[self.geom_ids])
+                # Only confirmed-free, distant centres permit culling.
+                near = (
+                    centers["uncertain"]
+                    | ~np.isfinite(centers["clearance"])
+                    | (centers["clearance"] <= self.bounding_radii + self.margin)
+                )
             points, owners = [], []
             for local in np.flatnonzero(near):
                 gid = self.geom_ids[local]

@@ -10,9 +10,10 @@ import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation
 
-from .base import DataSource, MotionData
-from .smplx import DEFAULT_SMPLX_TARGET_NAMES, _SMPLX_ROOT_OFFSET
 from omniretargeting.utils import estimate_body_height
+
+from .base import DataSource, MotionData
+from .smplx import _SMPLX_ROOT_OFFSET, DEFAULT_SMPLX_TARGET_NAMES
 
 
 @dataclass
@@ -41,7 +42,7 @@ class OmomoDataSource(DataSource):
             raise FileNotFoundError(f"Sequence file not found: {self.sequence_file}")
 
         data = joblib.load(self.sequence_file)
-        if self.sequence_index >= len(data):
+        if self.sequence_index < 0 or self.sequence_index >= len(data):
             raise ValueError(f"Sequence index {self.sequence_index} out of range (max: {len(data)-1})")
 
         self.sequence = data[self.sequence_index]
@@ -130,41 +131,30 @@ class OmomoDataSource(DataSource):
             object_points.append(world_points)
         return np.array(object_points, dtype=np.float32)
 
-    def _load_body_positions(self) -> np.ndarray:
-        import smplx
+    def _load_body_motion(self):
         import torch
 
-        model_directory = self._resolve_model_directory()
-        raw_trans = np.asarray(self.sequence["trans"], dtype=np.float32)
-        root_orient = np.asarray(self.sequence["root_orient"], dtype=np.float32)
-        body_pose = np.asarray(self.sequence["pose_body"], dtype=np.float32)
-        trans2joint = np.asarray(self.sequence["trans2joint"], dtype=np.float32).reshape(1, 3)
-        transl = raw_trans + trans2joint
-        betas = np.asarray(self.sequence["betas"], dtype=np.float32).reshape(1, -1)
-        if betas.shape[1] > 10:
-            betas = betas[:, :10]
+        from .smplx import SmplxDataSource
 
-        num_frames = body_pose.shape[0]
-        body_model = smplx.create(
-            model_directory,
-            "smplx",
-            gender=self._sequence_gender(),
-            use_pca=False,
+        # OMOMO stores the SMPL-X model translation, not the pelvis position.
+        # Its upstream skeleton FK uses pelvis = trans - trans2joint. Adding
+        # trans2joint to the model translation applies the rest offset twice.
+        # Reuse the SMPL-X adapter so skin, soles and joint frames are generated
+        # from exactly the same unmodified pose parameters.
+        adapter = SmplxDataSource(
+            self.sequence_file, model_directory=self._resolve_model_directory(),
+            gender=self._sequence_gender(), use_smplx_base_pose=self.use_smplx_base_pose,
+            frame_id_semantics="provenance",
         )
-        output = body_model(
-            betas=torch.tensor(betas).float(),
-            global_orient=torch.tensor(root_orient).float(),
-            body_pose=torch.tensor(body_pose).float(),
-            transl=torch.tensor(transl).float(),
-            left_hand_pose=torch.zeros(num_frames, 45).float(),
-            right_hand_pose=torch.zeros(num_frames, 45).float(),
-            jaw_pose=torch.zeros(num_frames, 3).float(),
-            leye_pose=torch.zeros(num_frames, 3).float(),
-            reye_pose=torch.zeros(num_frames, 3).float(),
-            expression=torch.zeros(num_frames, 10).float(),
-            return_full_pose=True,
-        )
-        return output.joints.detach().cpu().numpy()[:, :22, :].astype(np.float32)
+        raw = dict(self.sequence)
+        raw["pose_body"] = np.asarray(raw["pose_body"]).reshape(-1, 63)
+        with torch.no_grad():
+            positions, orientations, root, _, _, metadata = adapter._load_raw_npz(raw, self.framerate)
+        metadata.update(adapter._foot_sole_metadata(orientations))
+        return positions, orientations, root, metadata
+
+    def _load_body_positions(self) -> np.ndarray:
+        return self._load_body_motion()[0]
 
     def _estimate_height_from_positions(self, positions: np.ndarray, target_names: list[str]) -> float | None:
         """Estimate human height using shared utility.
@@ -180,9 +170,7 @@ class OmomoDataSource(DataSource):
 
     def load(self) -> MotionData:
         if self._motion_data is None:
-            raw_trans = np.asarray(self.sequence["trans"], dtype=np.float32)
-            root_orient = np.asarray(self.sequence["root_orient"], dtype=np.float32)
-            positions = self._load_body_positions()
+            positions, orientations, root_orient, body_metadata = self._load_body_motion()
             object_points = self._transform_object_points()
             target_names = self.target_names or DEFAULT_SMPLX_TARGET_NAMES[: positions.shape[1]]
             object_pose = self._object_pose_data()
@@ -205,7 +193,13 @@ class OmomoDataSource(DataSource):
                 object_mesh=self.object_mesh,
                 metadata={
                     **self.metadata,
-                    "joint_orientations": None,
+                    **body_metadata,
+                    "joint_orientations": orientations,
+                    "body_aligned_joint_orientations": Rotation.from_matrix(
+                        Rotation.from_quat(orientations.reshape(-1, 4), scalar_first=True).as_matrix() @ _SMPLX_ROOT_OFFSET
+                    ).as_quat(scalar_first=True).reshape(orientations.shape),
+                    "object_mesh_path": str(self.data_root / "data" / "captured_objects" / f"{self.object_name}_cleaned_simplified.obj"),
+                    "human_translation_convention": "SMPL-X model translation; no trans2joint addition",
                     "object_translations": object_pose["translation"],
                     "object_rotations": object_pose["rotation"],
                     "object_scales": object_pose["scale"],
@@ -223,19 +217,20 @@ class OmomoDataSource(DataSource):
 def create_omomo_data_source(motion_file, source_config, runtime_options):
     source_config = dict(source_config or {})
     runtime_options = dict(runtime_options or {})
+    adapter_options = dict(source_config.get("adapter_options") or {})
 
     def option(*keys, default=None):
-        for container in (runtime_options, source_config):
+        for container in (runtime_options, adapter_options, source_config):
             for key in keys:
                 if key in container and container[key] is not None:
                     return container[key]
         return default
 
-    sequence_index = runtime_options.get("sequence_index", 0)
-    data_root = runtime_options.get("data_root", "/localhdd/Datasets/OMOMO")
-    n_object_samples = runtime_options.get("n_object_samples", 100)
-    target_names_override = runtime_options.get("target_names_override", None)
-    model_directory = runtime_options.get("model_directory", None)
+    sequence_index = int(option("sequence_index", default=0))
+    data_root = option("data_root", default="/localhdd/Datasets/OMOMO")
+    n_object_samples = int(option("n_object_samples", default=100))
+    target_names_override = option("target_names_override")
+    model_directory = option("model_directory")
 
     return OmomoDataSource(
         sequence_file=motion_file,
@@ -244,10 +239,11 @@ def create_omomo_data_source(motion_file, source_config, runtime_options):
         n_object_samples=n_object_samples,
         target_names=target_names_override,
         model_directory=model_directory,
-        use_smplx_base_pose=option("use_smplx_base_pose", default=False),
+        use_smplx_base_pose=option("use_smplx_base_pose", default=True),
+        framerate=float(option("framerate", default=30.0)),
     )
 
 
 from .registry import register_data_source
 
-register_data_source("omomo", create_omomo_data_source, extensions=[".npz"])
+register_data_source("omomo", create_omomo_data_source, extensions=[".p", ".joblib"])

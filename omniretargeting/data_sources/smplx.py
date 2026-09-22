@@ -517,8 +517,13 @@ class SmplxDataSource(DataSource):
                 body_pose=torch.zeros(1, 63),
                 transl=torch.zeros(1, 3),
             )
+        from .smplx_surface import sample_smplx_surfaces
+        body_surfaces = sample_smplx_surfaces(
+            body_model, reference, self._posed_vertices_cache, _SMPLX_ROOT_OFFSET.T,
+        )
         return joints, orientations, root_orient, trans, framerate, {
             **timeline_metadata,
+            "body_surface_samples": body_surfaces,
             "betas": betas_tensor.detach().cpu().numpy()[0].tolist(),
             "end_effector_markers": end_effector_markers,
             "joint_rest_positions": reference.joints.detach().cpu().numpy()[0, :22] @ _SMPLX_ROOT_OFFSET,

@@ -45,3 +45,6 @@ omniretargeting-mjviser = "omniretargeting.mjviser_viewer:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["omniretargeting*"]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
