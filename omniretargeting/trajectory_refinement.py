@@ -80,6 +80,7 @@ def refine_joint_trajectory(
     body_relation_tasks=None,
     self_contact_tasks=None,
     surface_contact_tasks=None,
+    surface_pose_tasks=None,
     refinement_guard=None,
 ) -> np.ndarray:
     """Jointly refine scalar joints over time with sparse Gauss--Newton.
@@ -90,6 +91,10 @@ def refine_joint_trajectory(
     that whole-body smoothing is meant to avoid.
     """
     result = np.asarray(trajectory, dtype=float).copy()
+    if surface_pose_tasks is not None and (
+        surface_pose_tasks.model is not model or len(surface_pose_tasks.targets) != len(result)
+    ):
+        raise ValueError("Surface pose must use the same model and original timeline")
     if surface_contact_tasks is not None and (
         surface_contact_tasks.model is not model or len(surface_contact_tasks.targets) != len(result)
     ):
@@ -101,7 +106,7 @@ def refine_joint_trajectory(
         if validator.model is not model or not np.array_equal(validator.reference, result):
             raise ValueError("Refinement guard must use the same model and input trajectory")
     self_enabled = bool(config.get("self_collision_enabled", True))
-    if len(result) == 0 or (not self_enabled and self_contact_tasks is None and surface_contact_tasks is None and (len(result) < 4 or not tasks)):
+    if len(result) == 0 or (not self_enabled and self_contact_tasks is None and surface_contact_tasks is None and surface_pose_tasks is None and (len(result) < 4 or not tasks)):
         return result
     self_query = SelfCollisionQuery(model, config.get("self_collision")) if self_enabled else None
 
@@ -202,7 +207,7 @@ def refine_joint_trajectory(
         tasks=tasks,
     )
 
-    if not effectors and not self_enabled and self_contact_tasks is None and surface_contact_tasks is None:
+    if not effectors and not self_enabled and self_contact_tasks is None and surface_contact_tasks is None and surface_pose_tasks is None:
         return result
 
     iterations = max(int(config.get("iterations", 3)), 1)
@@ -379,7 +384,7 @@ def refine_joint_trajectory(
     for iteration in range(iterations):
         current_joints = result[:, qpos_indices].copy()
         task_block, block_rhs, active_penetration_rows = linearize_trajectory_tasks(
-            body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks,
+            body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks, surface_pose_tasks=surface_pose_tasks,
             contact_offset_choice=contact_offset_choice,
             contact_position_sigma=contact_position_sigma,
             data=data,

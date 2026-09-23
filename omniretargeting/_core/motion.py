@@ -174,45 +174,23 @@ class FramewiseMotionMixin:
                 print("Body relations: " + diagnostics_json(report))
             retargeter.body_relation_tasks = self.last_body_relation_tasks
 
-        from ..self_contact import build_self_contact_tasks
-        if getattr(self, "last_self_contact_tasks", None) is None:
-            tasks, report = build_self_contact_tasks(
-                self.robot_model, getattr(self, "_body_surface_samples", None),
-                self.valid_joint_mapping, getattr(retargeter, "robot_reference_qpos", None),
-                getattr(self, "last_end_effector_tasks", {}),
-                self.retargeting_config.get("self_contact", {}),
-            )
-            self.last_self_contact_tasks, self.last_self_contact_diagnostics = tasks, report
-            print("Self contact: " + diagnostics_json(report))
-        retargeter.self_contact_tasks = self.last_self_contact_tasks
-
-        from ..surface_contact import build_surface_contact_tasks
-        if apply_surface_contacts and not getattr(self, "_surface_contacts_built", False):
-            tasks, report = build_surface_contact_tasks(
-                self.robot_model, getattr(self, "_body_surface_samples", None),
-                getattr(retargeter, "robot_reference_qpos", None), scaled_terrain,
-                self.retargeting_config.get("surface_contact", {}),
-                joint_mapping=self.valid_joint_mapping,
-                framerate=getattr(self, "_source_framerate", 30.0),
-                scene_objects=getattr(self, "_scene_objects", ()),
-            )
-            self.last_surface_contact_tasks, self.last_surface_contact_diagnostics = tasks, report
-            self._surface_contacts_built = True
-            print("Whole-body surface contact: " + diagnostics_json({
-                k: report.get(k) for k in ("status", "reason", "contact_regions", "contact_samples", "active_frame_points")
-            }))
-        retargeter.surface_contact_tasks = (
-            self.last_surface_contact_tasks if apply_surface_contacts else None
+        from .surfaces import prepare_surface_tasks
+        prepare_surface_tasks(
+            self, retargeter, processed_trajectory, scaled_terrain,
+            source_reference_joint_positions, apply_scene_contacts=apply_surface_contacts,
+            robot_seed_trajectory=reference_trajectory,
         )
-        if (retargeter.surface_contact_tasks is not None
-                and len(retargeter.surface_contact_tasks.targets) != len(processed_trajectory)):
-            raise ValueError("Whole-body surface contacts must follow the original motion timeline")
+        if apply_surface_contacts and getattr(retargeter, "contact_phase", None) is not None:
+            end_effector_tasks = {
+                name: self.last_end_effector_tasks[name] for name in (end_effector_tasks or {})
+            }
 
         if self.retargeting_config.get("sequence_solver", {}).get("enabled", False):
             from .sequence import solve_core_sequence
             return solve_core_sequence(
                 self, retargeter, processed_trajectory, end_effector_tasks,
                 base_orientations, object_points, reference_trajectory,
+                source_joint_orientations=source_joint_orientations,
             )
 
         # Retarget each frame
@@ -375,6 +353,20 @@ class FramewiseMotionMixin:
                     quat_xyzw = self._estimate_base_orientation_from_joints(human_joints)
                     if quat_xyzw is not None:
                         q_init[3:7] = np.array([quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]])
+                if (
+                    base_translations is None
+                    and not preserve_root_z
+                    and bool(self.retargeting_config.get("end_effector_priority", {}).get(
+                        "initial_foot_alignment", False
+                    ))
+                    and end_effector_tasks
+                ):
+                    from .initialization import align_initial_base_height_to_feet
+
+                    q_init = align_initial_base_height_to_feet(
+                        self.robot_model, q_init, retargeter.end_effectors,
+                        end_effector_tasks,
+                    )
             if (
                 frame_idx > 0
                 and reference_trajectory is None
@@ -691,6 +683,7 @@ class FramewiseMotionMixin:
                 body_relation_tasks=getattr(self, "last_body_relation_tasks", None),
                 self_contact_tasks=getattr(self, "last_self_contact_tasks", None),
                 surface_contact_tasks=retargeter.surface_contact_tasks,
+                surface_pose_tasks=retargeter.surface_pose_tasks,
             )
             report["pass"] = "contact_overlay" if reference_trajectory is not None else "baseline"
             self.last_framewise_self_collision_reports.append(report)

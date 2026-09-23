@@ -56,6 +56,8 @@ CONTACT_RETARGETING_DEFAULTS: Dict[str, Any] = {
     "body_relations": {"enabled": False, "weight": 1.0, "sigma": 0.12},
     "self_contact": {"enabled": True},
     "surface_contact": {"enabled": True},
+    "surface_pose": {"enabled": True},
+    "contact_phase_priority": {"enabled": True},
     "whole_body_correction": {"enabled": True, "moving_collision_enabled": True},
     "preserve_root_z": False,
     "collision_detection_threshold": 0.1,
@@ -68,8 +70,8 @@ CONTACT_RETARGETING_DEFAULTS: Dict[str, Any] = {
         "enabled": True,
         "world_tracking_only": False,
         "world_tracking_enabled": True,
-        "preserve_noncontact_baseline": True,
-        "local_contact_chain_only": True,
+        "preserve_noncontact_baseline": False,
+        "local_contact_chain_only": False,
         "semantic_contact_effectors": ["left_hand", "right_hand"],
         "world_tracking_effectors": ["left_foot", "right_foot"],
         "hierarchy": True,
@@ -148,16 +150,16 @@ CONTACT_RETARGETING_DEFAULTS: Dict[str, Any] = {
             "max_base_acceleration_step": 0.03,
         },
         "base_position_constraint": {
-            # Register the robot to the source once on frame zero, then keep
-            # the source root's horizontal displacement exactly.  Height is
-            # deliberately left to the leg/contact/terrain solve.
+            # Contact reachability can move the body horizontally. The source
+            # path is a soft reference, independent of torso orientation.
             "enabled": True,
-            "use_initial_offset": True,
-            "lock_initial_xy": True,
+            "use_initial_offset": False,
+            "lock_initial_xy": False,
             "track_xy": True,
-            "lock_xy": True,
+            "lock_xy": False,
             "track_z": False,
-            "hard_constraints": True,
+            "hard_constraints": False,
+            "xy_sigma": 0.25,
             "max_xy_error": 0.03,
             "z_offset": 0.0,
             "max_z_error": 0.08,
@@ -214,7 +216,7 @@ CONTACT_RETARGETING_DEFAULTS: Dict[str, Any] = {
             "left_foot": _foot_defaults(),
             "right_foot": _foot_defaults(),
         },
-        "base_orientation_weight": 150.0,
+        "base_orientation_weight": 400.0,
         "body_orientation": {
             "position_anchor_weight": 4.0,
         },

@@ -390,6 +390,7 @@ class OmniRetargeter(
         semantic_tasks: Dict[str, SceneContactTask] = {}
         world_tasks: Dict[str, SceneContactTask] = {}
         end_effector_tasks: Dict[str, SceneContactTask] = {}
+        processed_markers = {}
         if (semantic_contact_enabled or world_tracking_enabled) and end_effector_markers:
             processed_markers = {
                 name: {
@@ -497,6 +498,9 @@ class OmniRetargeter(
                 for name, task in end_effector_tasks.items()
             }
         self.last_end_effector_tasks = end_effector_tasks
+        self._contact_phase_markers = processed_markers
+        self.last_contact_phase = None
+        self._contact_phase_clearances = None
         self.last_body_relation_tasks = None
         if (body_surface_samples is not None or scene_objects) and terrain_scale != 1.0:
             raise ValueError("Body surface contact requires unscaled metric source and scene")
@@ -506,6 +510,9 @@ class OmniRetargeter(
         self.last_surface_contact_tasks = None
         self.last_surface_contact_diagnostics = {"status": "disabled", "reason": "not_built"}
         self._surface_contacts_built = False
+        self._surface_tasks_prepared = False
+        self.last_surface_pose_tasks = None
+        self.last_surface_pose_diagnostics = {"status": "disabled", "reason": "not_built"}
         self.last_self_contact_tasks = None
         self.last_self_contact_diagnostics = {"status": "disabled", "reason": "not_built"}
         self.last_body_relation_diagnostics = {"status": "disabled", "reason": "experiment_disabled"}
@@ -575,7 +582,7 @@ class OmniRetargeter(
                 processed_reference_joint_positions
             )
         preserve_noncontact_baseline = bool(
-            end_effector_cfg.get("preserve_noncontact_baseline", True)
+            end_effector_cfg.get("preserve_noncontact_baseline", False)
         )
         sequence_enabled = bool(retargeting_config.get("sequence_solver", {}).get("enabled", False))
         if sequence_enabled:
@@ -622,6 +629,7 @@ class OmniRetargeter(
         relation_tasks = self.last_body_relation_tasks
         effective_config["active_stages"]["self_contact"] = self.last_self_contact_tasks is not None
         effective_config["active_stages"]["surface_contact"] = self.last_surface_contact_tasks is not None
+        effective_config["active_stages"]["surface_pose"] = self.last_surface_pose_tasks is not None
         relation_stages = {}
 
         def record_relations(stage, motion):
@@ -661,7 +669,7 @@ class OmniRetargeter(
         )
         refinement_cfg["self_collision_enabled"] = local_cfg["self_collision_enabled"]
         refinement_cfg["self_collision"] = local_cfg["self_collision"]
-        if not sequence_enabled and bool(refinement_cfg.get("enabled", False)) and (end_effector_tasks or local_cfg["self_collision_enabled"] or self.last_self_contact_tasks is not None or self.last_surface_contact_tasks is not None):
+        if not sequence_enabled and bool(refinement_cfg.get("enabled", False)) and (end_effector_tasks or local_cfg["self_collision_enabled"] or self.last_self_contact_tasks is not None or self.last_surface_contact_tasks is not None or self.last_surface_pose_tasks is not None):
             refinement_guard = RefinementGuard(TrajectoryValidator(
                 self.robot_model, framewise_motion, self.scene_query,
                 validation_tasks, validation_priority, local_cfg,
@@ -669,6 +677,7 @@ class OmniRetargeter(
                 body_relation_tasks=relation_tasks,
                 self_contact_tasks=self.last_self_contact_tasks,
                 surface_contact_tasks=self.last_surface_contact_tasks,
+                surface_pose_tasks=self.last_surface_pose_tasks,
             ))
             source_root_idx = self._resolve_source_root_index()
             retargeted_motion = refine_joint_trajectory(
@@ -687,6 +696,7 @@ class OmniRetargeter(
                 **({"body_relation_tasks": relation_tasks} if relation_tasks is not None else {}),
                 **({"self_contact_tasks": self.last_self_contact_tasks} if self.last_self_contact_tasks is not None else {}),
                 **({"surface_contact_tasks": self.last_surface_contact_tasks} if self.last_surface_contact_tasks is not None else {}),
+                **({"surface_pose_tasks": self.last_surface_pose_tasks} if self.last_surface_pose_tasks is not None else {}),
             )
         record_relations("refinement", retargeted_motion)
         effective_config["active_stages"]["trajectory_refinement"] = refinement_guard is not None
@@ -729,6 +739,7 @@ class OmniRetargeter(
             **({"body_relation_tasks": relation_tasks} if relation_tasks is not None else {}),
             **({"self_contact_tasks": self.last_self_contact_tasks} if self.last_self_contact_tasks is not None else {}),
             **({"surface_contact_tasks": self.last_surface_contact_tasks} if self.last_surface_contact_tasks is not None else {}),
+            **({"surface_pose_tasks": self.last_surface_pose_tasks} if self.last_surface_pose_tasks is not None else {}),
         )
         record_relations("before_local_repair", retargeted_motion)
         retargeted_motion, local_report = repair_local_collisions(
@@ -741,6 +752,7 @@ class OmniRetargeter(
             **({"body_relation_tasks": relation_tasks} if relation_tasks is not None else {}),
             **({"self_contact_tasks": self.last_self_contact_tasks} if self.last_self_contact_tasks is not None else {}),
             **({"surface_contact_tasks": self.last_surface_contact_tasks} if self.last_surface_contact_tasks is not None else {}),
+            **({"surface_pose_tasks": self.last_surface_pose_tasks} if self.last_surface_pose_tasks is not None else {}),
         )
         record_relations("after_local_repair", retargeted_motion)
         # Final coupled stage uses the accepted robot motion as its fixed
@@ -754,6 +766,7 @@ class OmniRetargeter(
             validation_config=local_cfg, body_relation_tasks=relation_tasks,
             self_contact_tasks=self.last_self_contact_tasks,
             surface_contact_tasks=self.last_surface_contact_tasks,
+            surface_pose_tasks=self.last_surface_pose_tasks,
             contact_offset_choice=local_report.get("contact_offset_choice"),
         )
         record_relations("whole_body_correction", retargeted_motion)
@@ -767,6 +780,7 @@ class OmniRetargeter(
         effective_config["body_relations_runtime"] = self.last_body_relation_diagnostics
         effective_config["self_contact_runtime"] = self.last_self_contact_diagnostics
         effective_config["surface_contact_runtime"] = self.last_surface_contact_diagnostics
+        effective_config["surface_pose_runtime"] = self.last_surface_pose_diagnostics
         from .self_collision import SelfCollisionQuery, summarize_self_collisions
         if local_cfg["self_collision_enabled"]:
             self_report = summarize_self_collisions(
@@ -786,6 +800,8 @@ class OmniRetargeter(
                                    else {"status": "disabled"}),
             local_repair=local_report, self_collision=self_report,
             whole_body_correction=whole_body_report,
+            contact_phase_priority=(self.last_contact_phase.diagnostics
+                                    if self.last_contact_phase is not None else None),
             accepted_qpos_sha256=trajectory_digest(retargeted_motion),
             self_contact={"configuration": self.last_self_contact_diagnostics,
                           "final": self.last_self_contact_tasks.metrics(retargeted_motion)
@@ -796,6 +812,9 @@ class OmniRetargeter(
                              "final": self.last_surface_contact_tasks.metrics(retargeted_motion)
                              if self.last_surface_contact_tasks is not None else None},
             body_relations=dict(configuration=self.last_body_relation_diagnostics, stages=relation_stages),
+            surface_pose={"configuration": self.last_surface_pose_diagnostics,
+                          "final": self.last_surface_pose_tasks.metrics(retargeted_motion)
+                          if self.last_surface_pose_tasks is not None else None},
             execution_order=["framewise", "baseline_joint_clamp", "validation_references",
                              "trajectory_refinement", "optional_smoothing", "joint_clamp", "joint_acceptance",
                              "local_collision_repair", "whole_body_correction", "final_verification", "save"],

@@ -6,13 +6,16 @@ Python 文件保持在 1000 行以内。按职责拆分，保留原有入口和�
 | 入口 | 职责 | 实现模块 |
 | --- | --- | --- |
 | `sequence_retargeting.py` / `retarget_sequence` | 可通过 CLI `--solver sequence` 使用的通用整段求解 | `_sequence/coordinates.py`：模型切空间、机械限位与按秒计算的差分；`tasks.py`：源固定交互图、接触与姿态任务；`_core/sequence.py`：主流程数据衔接。见 [使用说明](sequence_retargeting.md) |
+| `_sequence/orientation.py` / `OrientationTargets` | 与根部平移独立的世界/父级相对姿态目标 | `_core/orientation_targets.py` 复用源绑定标定；[根部自适应说明](adaptive_root_motion.md) 记录论文依据和默认行为 |
 | `core.py` / `OmniRetargeter` | 初始化、接触任务准备、重定向和后处理编排 | `_core/motion.py`：逐帧执行和源根部参考；`geometry.py`：机器人几何推断；`feet.py`：足部稳定和局部表面修正；`postprocessing.py`：平滑、关节安全限制和质量报告；`visualization.py`：Matplotlib 预览 |
 | `retargeting.py` / `GenericInteractionRetargeter` | 机器人配置、交互网格和逐帧优化循环 | `_solver/step.py`：组装 SQP 问题；`constraints.py`：接触链和根部约束；`hierarchy.py`：分层求解和步长保护；`orientation.py`、`pose.py`、`end_effectors.py`：各类目标；`kinematics.py`：Jacobian 和碰撞约束；`targets.py`：目标变换和关节限制 |
 | `trajectory_refinement.py` / `refine_joint_trajectory` | 全轨迹迭代、时间正则化、稀疏最小二乘求解 | `_refinement/effectors.py`：解析末端配置；`tasks.py`：任务线性化；`guard.py`：复用最终验收预算的约束求解与非线性检查；`math.py`：坐标、朝向和差分工具 |
 | `contact.py` | 场景接触推断和任务数据结构 | `contact_schedule.py`：滞回、短接触段和间隙处理；`object_contact.py`：原始运动物体的主要端点接触与环境标识 |
 | `whole_body_correction.py` | 固定机器人基准的全身接触/碰撞联合修正与时间正则 | `whole_body_guard.py`：固定末端预算、物体材料坐标帧间目标、实际几何回退；`moving_scene.py`：原始运动物体闭合组件与反向交叉查询 |
-| `self_contact.py` | 保留手与大腿的表面接触向量、共享 Jacobian 和误差验收 | `data_sources/smplx_surface.py`：固定重心采样；`surface_correspondence.py`：参考姿态下绑定实际机器人表面 |
+| `self_contact.py` | 全身自接触向量、双端 Jacobian 和误差验收；保留旧手—大腿输入兼容 | `full_body_self_contact.py`：源拓扑/测地近邻排除和固定点对；`surface_correspondence.py`：旧 `parts` 输入的区域绑定 |
+| `surface_motion.py` / `surface_pose.py` | 三类任务共用的学习表面对应，以及无接触时的位置/法向姿态目标 | `full_body_self_contact.py`：非相邻源段的稳定材料点对；`_core/surfaces.py`：源与求解任务衔接；`_sequence/surface_guard.py`：整段求解中的固定主要末端和接触预算 |
 | `surface_contact.py` | 全身表面到场景的接触向量、共享求解/验收与 NPZ 导出 | `surface_learning.py`：固定索引学习、绑定和缓存；`surface_anatomy.py`：关节链对应范围；`surface_observation.py`：材料坐标中的接触观测；`data_sources/smplx_surface.py`：真实全身表面采样 |
+| `contact_phase.py` | 从 UMR 表面观测和主接触读出每帧接触角色（支撑/跟随/自由），求解按支撑 > 跟随 > 自由 > 姿态排序 | `contact_phase_observation.py`：从原始末端样本独立观测净空；`contact_schedule.approach_blend`：按源进度在接触区间外交接目标；不求力或力矩；见 `docs/contact_phase_priority.md` |
 | `local_collision_repair.py` | 局部修复事件、候选验收和诊断 | `collision_window.py`：窗口内关节优化和碰撞评分；`scene_witness_guard.py`：固定表面点的已知几何状态保护；`open_surface_features.py`：开放网格折边可靠性 |
 | `self_collision.py` | 碰撞体自碰撞查询、间距约束和独立诊断 | `collision_motion.py`：场景/自碰撞共用运动范围估计；`_refinement/self_collision.py`：轨迹残差与非线性检查 |
 | `main.py` | CLI、源配置和主流程 | `motion_visualization.py`：可视化场景、视频导出和播放 |

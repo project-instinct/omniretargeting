@@ -8,11 +8,12 @@ from scipy import sparse
 from scipy.spatial import Delaunay, QhullError, cKDTree
 
 from .._refinement.math import _lock_contact_offsets, _skew_symmetric
-from .._solver.targets import _transform_swing_target
+from .._solver.targets import _approach_contact_target, _transform_swing_target
 from ..contact import _is_surface_only_contact_mode
 from ..scene_geometry import collision_geom_ids, geom_surface_offsets
 from ..self_collision import SelfCollisionQuery
 from ..utils import calculate_laplacian_matrix, get_adjacency_list
+from .orientation import OrientationTargets
 
 
 def frozen_array(value, shape, label):
@@ -59,6 +60,7 @@ class SequenceTasks:
         scene_query=None,
         contact_offset_choice=None,
         extra_tasks=(),
+        orientation_targets=(),
     ):
         self.model, self.coords = model, coordinates
         self.data = mujoco.MjData(model)
@@ -198,6 +200,9 @@ class SequenceTasks:
             else None
         )
         self.extra_tasks = tuple(task for task in extra_tasks if task is not None)
+        from ..contact_phase import phase_policy
+        self.contact_phase = phase_policy(*self.extra_tasks, *tasks.values())
+        self.orientations = OrientationTargets(model, self.frames, orientation_targets)
 
     def point(self, body, offset=None):
         p = self.data.xpos[body].copy()
@@ -206,6 +211,50 @@ class SequenceTasks:
         jac = np.zeros((3, self.model.nv))
         mujoco.mj_jac(self.model, self.data, jac, None, p, body)
         return p, jac[:, self.coords.cols]
+
+    def clearance_rows(self, stats=None):
+        """Scene and self clearance deficits (metres) at the forwarded pose."""
+        stats = {} if stats is None else stats
+        for gid, offsets in self.shells:
+            points = (
+                offsets @ self.data.geom_xmat[gid].reshape(3, 3).T
+                + self.data.geom_xpos[gid]
+            )
+            measured = self.scene.query(points)
+            clearance = measured["clearance"]
+            reliable = np.flatnonzero(np.isfinite(clearance))
+            if not len(reliable):
+                continue
+            k = reliable[np.argmin(clearance[reliable])]
+            stats["scene_depth_m"] = max(
+                stats.get("scene_depth_m", 0.0), -float(clearance[k])
+            )
+            deficit = self.config["scene_clearance_m"] - clearance[k]
+            if deficit > 0:
+                jac = np.zeros((3, self.model.nv))
+                mujoco.mj_jac(
+                    self.model,
+                    self.data,
+                    jac,
+                    None,
+                    points[k],
+                    int(self.model.geom_bodyid[gid]),
+                )
+                yield (
+                    np.atleast_1d(-deficit),
+                    measured["directions"][k] @ jac[:, self.coords.cols],
+                )
+        if self.self_query is not None:
+            for row in self.self_query.query(data=self.data):
+                stats["self_depth_m"] = max(
+                    stats.get("self_depth_m", 0.0), -row["clearance"]
+                )
+                deficit = self.config["self_clearance_m"] - row["clearance"]
+                if deficit > 0:
+                    yield (
+                        np.atleast_1d(-deficit),
+                        self.self_query.jacobian(row, self.data)[self.coords.cols],
+                    )
 
     def frame_rows(self, pose, frame):
         self.data.qpos[:] = pose
@@ -216,6 +265,8 @@ class SequenceTasks:
             contact_normal_max_m=0.0,
             self_depth_m=0.0,
             scene_depth_m=0.0,
+            world_tracking_max_m=0.0,
+            free_tracking_max_m=0.0,
         )
 
         def add(residual, jac, sigma):
@@ -242,6 +293,12 @@ class SequenceTasks:
                 (np.eye(3) - np.outer(direction, direction)) @ derivative / norm,
                 sigma,
             )
+        orientation_rows, orientation_jacs, orientation_error = self.orientations.rows(
+            self.data, self.coords.cols, frame
+        )
+        residuals.extend(orientation_rows)
+        matrices.extend(orientation_jacs)
+        stats["body_orientation_max_rad"] = orientation_error
         for name, spec in self.effectors.items():
             target_data = spec["task"].frame(frame)
             active = target_data["contact"]
@@ -310,13 +367,20 @@ class SequenceTasks:
                     root_z - self.roots[frame, 2],
                     spec.get("swing_morphology_scale", 1.0),
                     world,
+                    robot_root_position=(
+                        None if self.coords.root_q is None
+                        else pose[self.coords.root_q : self.coords.root_q + 3]
+                    ),
                 )
+                target, free_share = _approach_contact_target(target, target_data)
                 if (
                     not world
                     and self.coords.root_d is not None
-                    and self.coords.root_d + 2 in self.coords.inverse
                 ):
-                    derivative[2, self.coords.inverse[self.coords.root_d + 2]] -= 1
+                    for axis in range(3):
+                        column = self.coords.inverse.get(self.coords.root_d + axis)
+                        if column is not None:
+                            derivative[axis, column] -= free_share
                 add(
                     point - target,
                     derivative,
@@ -324,6 +388,8 @@ class SequenceTasks:
                     if world
                     else self.config["free_tracking_sigma_m"],
                 )
+                key = "world_tracking_max_m" if world else "free_tracking_max_m"
+                stats[key] = max(stats[key], float(np.linalg.norm(point - target)))
             if spec.get("track_orientation", False):
                 rotation = self.data.xmat[spec["body_id"]].reshape(3, 3)
                 angular_jac = np.zeros((3, self.model.nv))
@@ -348,44 +414,8 @@ class SequenceTasks:
                         -_skew_symmetric(direction) @ angular_jac[:, self.coords.cols],
                         self.config["orientation_sigma"],
                     )
-        for gid, offsets in self.shells:
-            points = (
-                offsets @ self.data.geom_xmat[gid].reshape(3, 3).T
-                + self.data.geom_xpos[gid]
-            )
-            measured = self.scene.query(points)
-            clearance = measured["clearance"]
-            reliable = np.flatnonzero(np.isfinite(clearance))
-            if not len(reliable):
-                continue
-            k = reliable[np.argmin(clearance[reliable])]
-            stats["scene_depth_m"] = max(stats["scene_depth_m"], -float(clearance[k]))
-            deficit = self.config["scene_clearance_m"] - clearance[k]
-            if deficit > 0:
-                jac = np.zeros((3, self.model.nv))
-                mujoco.mj_jac(
-                    self.model,
-                    self.data,
-                    jac,
-                    None,
-                    points[k],
-                    int(self.model.geom_bodyid[gid]),
-                )
-                add(
-                    -deficit,
-                    measured["directions"][k] @ jac[:, self.coords.cols],
-                    self.config["collision_sigma_m"],
-                )
-        if self.self_query is not None:
-            for row in self.self_query.query(data=self.data):
-                stats["self_depth_m"] = max(stats["self_depth_m"], -row["clearance"])
-                deficit = self.config["self_clearance_m"] - row["clearance"]
-                if deficit > 0:
-                    add(
-                        -deficit,
-                        self.self_query.jacobian(row, self.data)[self.coords.cols],
-                        self.config["collision_sigma_m"],
-                    )
+        for residual, jac in self.clearance_rows(stats):
+            add(residual, jac, self.config["collision_sigma_m"])
         for task in self.extra_tasks:
             for weight, residual, jac in task.rows(pose, frame, self.coords.cols):
                 add(residual * np.sqrt(weight), jac * np.sqrt(weight), 1.0)

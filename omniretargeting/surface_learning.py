@@ -82,8 +82,8 @@ def crossed_midline_mask(human, robot, config):
     )
 
 
-def geodesic_edges(vertices, faces, face_ids, barycentric, neighbors=6):
-    """Connect sampled indices along the source mesh, never across limb gaps."""
+def mesh_edge_graph(vertices, faces):
+    """Metric undirected mesh graph shared by learning and self-contact gating."""
     edges = trimesh.geometry.faces_to_edges(faces)
     edges = np.unique(np.sort(edges, axis=1), axis=0)
     lengths = np.linalg.norm(vertices[edges[:, 0]] - vertices[edges[:, 1]], axis=1)
@@ -91,7 +91,12 @@ def geodesic_edges(vertices, faces, face_ids, barycentric, neighbors=6):
         (np.maximum(lengths, 1e-12), (edges[:, 0], edges[:, 1])),
         shape=(len(vertices), len(vertices)),
     )
-    graph = graph + graph.T
+    return graph + graph.T
+
+
+def geodesic_edges(vertices, faces, face_ids, barycentric, neighbors=6):
+    """Connect sampled indices along the source mesh, never across limb gaps."""
+    graph = mesh_edge_graph(vertices, faces)
     anchors = faces[face_ids, np.argmax(barycentric, axis=1)]
     result = []
     for start in range(0, len(anchors), 32):

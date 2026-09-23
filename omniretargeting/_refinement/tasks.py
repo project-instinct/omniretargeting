@@ -8,6 +8,7 @@ from scipy import sparse
 from scipy.spatial.transform import Rotation
 
 from .._solver.targets import (
+    _approach_contact_target,
     _clamp_target_to_reach,
     _swing_target_z_offset,
     _transform_swing_target,
@@ -26,6 +27,7 @@ def linearize_trajectory_tasks(
     body_relation_tasks,
     self_contact_tasks=None,
     surface_contact_tasks=None,
+    surface_pose_tasks=None,
     contact_offset_choice,
     contact_position_sigma,
     data,
@@ -96,6 +98,9 @@ def linearize_trajectory_tasks(
         if surface_contact_tasks is not None:
             for weight, residual, jacobian in surface_contact_tasks.rows(result[frame_idx], frame_idx, dof_indices):
                 append_block(frame_idx, jacobian, -residual, 1.0, weight)
+        if surface_pose_tasks is not None:
+            for weight, residual, jacobian in surface_pose_tasks.rows(result[frame_idx], frame_idx, dof_indices):
+                append_block(frame_idx, jacobian, -residual, 1.0, weight)
         root_z_offset = _swing_target_z_offset(
             end_effector_config,
             robot_root_z=float(result[frame_idx, 2]),
@@ -136,6 +141,10 @@ def linearize_trajectory_tasks(
                     root_z_offset,
                     float(spec["swing_morphology_scale"]),
                     bool(spec["preserve_world_target"]),
+                    robot_root_position=result[frame_idx, :3],
+                )
+                target_position, _ = _approach_contact_target(
+                    target_position, task.frame(frame_idx)
                 )
                 reach_body_id = int(spec["reach_reference_body_id"])
                 if reach_body_id >= 0:
@@ -267,6 +276,7 @@ def linearize_trajectory_tasks(
                     root_z_offset,
                     float(spec["swing_morphology_scale"]),
                     bool(spec["preserve_world_target"]),
+                    robot_root_position=result[frame_idx, :3],
                 )
                 target_upper, target_forearm = (
                     _transported_arm_segment_targets(

@@ -28,6 +28,7 @@ def main():
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--source-cache", type=Path)
     parser.add_argument("--seed", type=Path)
+    parser.add_argument("--lock-root-xy", action="store_true", help="Run a locked-path ablation")
     args = parser.parse_args()
     root, clip = args.trial_dir.resolve(), args.clip
     out = args.output_dir or root / "general_sequence" / clip
@@ -131,7 +132,8 @@ def main():
         tasks,
         priority,
         framerate=source.framerate,
-        config=dict(iterations=args.iterations, pose_axes=axes),
+        config=dict(iterations=args.iterations, pose_axes=axes, lock_root_xy=args.lock_root_xy),
+        root_orientation_targets=source.root_orientations,
         environment_points=environment,
         scene_query=SceneQuery(ground),
         contact_offset_choice=diagnostic["local_repair"]["contact_offset_choice"],

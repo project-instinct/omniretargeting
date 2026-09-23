@@ -272,7 +272,7 @@ def build_step_constraints(
                         base_target[2] - base_new[2] <= max_z_error,
                     ]
                 )
-        xy_scale = max(max_xy_error, 1e-6)
+        xy_scale = max(float(base_cfg.get("xy_sigma", max_xy_error)), 1e-6)
         z_scale = max(max_z_error, 1e-6)
         base_position_terms = []
         if track_xy and not lock_xy:

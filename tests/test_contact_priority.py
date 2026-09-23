@@ -381,24 +381,33 @@ def test_self_collision_objective_skips_queries_when_explicitly_disabled():
     assert penalty.value == 0.0
 
 
-def test_contact_frame_blends_tracking_position_into_anchor_during_transition():
-    task = _task(
-        np.asarray([[0.0, 0.0, 0.0]]),
-        contact_mask=np.asarray([True]),
-    )
+def test_contact_anchor_holds_from_onset_after_source_progress_hand_over():
+    # Source hand: rests, travels to the anchor at x=1, holds, then leaves.
+    tracking = np.array([[0.0, 0, 0], [0.0, 0, 0], [0.4, 0, 0], [0.8, 0, 0],
+                         [0.9, 0, 0], [0.9, 0, 0], [0.5, 0, 0], [0.1, 0, 0]])
+    anchors = tracking.copy()
+    anchors[4:6] = [1.0, 0, 0]
     task = SceneContactTask(
         **{
-            **task.__dict__,
-            "tracking_positions": np.asarray([[0.0, 0.0, 0.0]]),
-            "contact_positions": np.asarray([[1.0, 0.0, 0.0]]),
-            "transition_weights": np.asarray([0.25]),
+            **_task(tracking, contact_mask=np.isin(np.arange(8), (4, 5))).__dict__,
+            "contact_positions": anchors,
+            "transition_weights": np.full(8, 0.25),
         }
     )
-
-    frame = task.frame(0)
-
-    np.testing.assert_allclose(frame["contact_position"], [0.25, 0.0, 0.0])
-    assert frame["transition_weight"] == pytest.approx(0.25)
+    frames = [task.frame(f) for f in range(8)]
+    # Inside the source interval the anchor is exact; a fade weight does not
+    # pull the target back toward the swing path.
+    for f in (4, 5):
+        np.testing.assert_allclose(frames[f]["contact_position"], [1.0, 0, 0])
+        assert frames[f]["transition_weight"] == pytest.approx(0.25)
+    weights = [p["approach_weight"] for p in frames]
+    # Progress along the source's own approach: 0 at the start, 0.4/0.9 and
+    # 0.8/0.9 on the way, exactly on the anchor at onset; mirrored on leaving.
+    np.testing.assert_allclose(weights, [0, 0, 4 / 9, 8 / 9, 0, 0, 0.5, 0])
+    np.testing.assert_allclose(frames[3]["approach_position"], [0.9, 0, 0])
+    np.testing.assert_allclose(frames[6]["approach_position"], [0.6, 0, 0])
+    np.testing.assert_array_equal(task.tracking_positions, tracking)
+    np.testing.assert_array_equal(task.contact_positions, anchors)
 
 
 def test_foot_side_matching_uses_name_tokens_not_roll_link_substrings():

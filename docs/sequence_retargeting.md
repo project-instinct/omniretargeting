@@ -23,7 +23,9 @@ floating base. All contact/pose/reference terms are evaluated on the same
 candidate trajectory as temporal terms; there is no post-hoc low-pass filter.
 Velocity, acceleration and jerk regularization use seconds, so changing the
 input sample rate does not silently change the intended derivative penalties.
-Quaternion signs are aligned before component differences.
+Root XY is free by default with a soft source-path reference. Root translation
+and rotation corrections are regularized relative to the original source, so
+deliberate fast travel and back rotations are not smoothed as solver error.
 
 Inputs are mapped source positions, immutable root positions, `SceneContactTask`
 objects, effector geometry/configuration and optional static/moving environment
@@ -31,11 +33,22 @@ points. No SMPL-X extraction occurs in the solver. Pose edges come from supplied
 correspondences or mapped robot ancestry. Optional `pose_axes` are linear
 combinations of mapped markers, allowing torso axes without hard-coded names.
 Core prepares those axes from its existing arm/root correspondences.
+It also transfers calibrated source body orientations (including parent-relative
+back/waist frames) into the sequence solver. The source root orientation target
+is frozen before bootstrap, not replaced with the bootstrap's fitted posture.
+
+The generic API accepts `root_orientation_targets` as `(T, 4)` wxyz quaternions
+and `body_orientation_targets` as robot-frame rotation specifications. When no
+root orientations are provided, the API uses the initial root rotations as its
+reference. Orientation axis residuals track pitch, roll and heading independently
+of root translation. See [adaptive root motion](adaptive_root_motion.md) for the
+paper references, configuration, and distinction from footstep planning.
 
 Fixed contacts use the exact world anchors in the supplied task. Sliding and
 transition modes constrain the scene normal. Free end effectors follow the
 configured body-relative morphology target; `preserve_world_target` retains
-world targets for feet. One material marker is selected for a contiguous contact
+world targets for feet. Free-hand targets follow all three translation components
+of the current robot root; their Jacobians include this target motion. One material marker is selected for a contiguous contact
 run and carried through final validation/repair. Source positions, contact
 schedules, object poses, geometry and timing are not rewritten.
 
@@ -58,6 +71,25 @@ are used. Sticking anchors remain fixed even when transition weights fade; those
 do not interpolate the anchor away from its original world location. Contact
 terms have dominant finite weights, rather than a mathematical
 strict-priority guarantee, so final contact/world-position errors must be checked.
+When dense surface pose or learned whole-body self-contact tasks are supplied,
+the solver additionally uses fixed input-trajectory endpoint/contact budgets,
+constrained sparse subproblems, and nonlinear acceptance. These budgets prevent
+the added tasks from accumulating endpoint regression; they do not certify that
+the input contact errors are already small. See [surface objectives](dense_surface_pose_and_self_contact.md).
+With [contact roles](contact_phase_priority.md) the constrained subproblem first
+keeps scene/self clearance, then endpoint support, surface support and following
+contacts, before the weighted objective.
+
+The constrained subproblem is exact but kept small. Per-frame bounds form one
+sparse affine map and one vectorized second-order cone. Because frames couple
+only through the temporal differences, the least-squares objective is replaced
+by its banded Cholesky factor (one row per coordinate instead of one per dense
+surface sample). It is then scaled to O(1): the minimizer is unchanged, but at
+the raw O(1e7) magnitude Clarabel stopped at its iteration cap with millimetre
+bound violations. Dense surface-pose rows are built per frame as one stacked,
+pre-weighted block. On OMOMO with learned whole-body surfaces one iteration pair
+fell from 1011 s to 62 s, and every subproblem now reports `optimal`
+(`out/contact_roles_20260923/BASELINE_PATCH.md`).
 Diagnostic reports include all nonlinear iterations, model dimensions, frame
 rate, fixed material choices and separate contact/scene/self residuals. Failed
 line searches retain the complete previous trajectory, avoiding per-joint splices.

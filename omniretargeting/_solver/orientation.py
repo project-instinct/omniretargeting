@@ -56,6 +56,7 @@ class BodyOrientationMixin:
         self.body_relation_tasks = None
         self.self_contact_tasks = None
         self.surface_contact_tasks = None
+        self.surface_pose_tasks = None
         if not self.body_orientation_enabled:
             return
 

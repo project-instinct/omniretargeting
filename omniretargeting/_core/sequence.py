@@ -1,9 +1,13 @@
 """Prepare the generic sequence solver from existing core correspondences."""
 
+from dataclasses import replace
+
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from .._sequence.coordinates import Coordinates
 from ..sequence_retargeting import retarget_sequence
+from .orientation_targets import sequence_body_orientation_targets
 
 
 def solve_core_sequence(
@@ -14,9 +18,11 @@ def solve_core_sequence(
     base_orientations,
     object_points,
     reference_trajectory=None,
+    source_joint_orientations=None,
 ):
     model = owner.robot_model
     frames = len(positions)
+    coordinates = Coordinates(model)
     root_index = owner._resolve_source_root_index()
     config = dict(owner.retargeting_config.get("sequence_solver", {}))
     config.setdefault(
@@ -66,9 +72,6 @@ def solve_core_sequence(
     if reference_trajectory is None:
         seed = getattr(retargeter, "robot_reference_qpos", None)
         initial = np.tile(model.qpos0 if seed is None else seed, (frames, 1))
-        from .._sequence.coordinates import Coordinates
-
-        coordinates = Coordinates(model)
         if coordinates.root_q is not None:
             root = coordinates.root_q
             initial[:, root : root + 3] = positions[:, root_index]
@@ -89,6 +92,18 @@ def solve_core_sequence(
                     initial[f, root + 3 : root + 7] = orientation
     else:
         initial = np.asarray(reference_trajectory, dtype=float).copy()
+    # Freeze source orientation targets before bootstrap. Its output must not
+    # become the next pass's new definition of the desired back angle.
+    orientation_reference = base_orientations
+    if orientation_reference is None and coordinates.root_q is not None:
+        start = coordinates.root_q + 3
+        orientation_reference = initial[:, start : start + 4].copy()
+    elif orientation_reference is not None:
+        orientation_reference = np.asarray(orientation_reference, dtype=float)
+        if orientation_reference.shape == (frames, 3):
+            orientation_reference = Rotation.from_rotvec(orientation_reference).as_quat(
+                scalar_first=True
+            )
     terrain = np.broadcast_to(
         retargeter.terrain_points, (frames, *retargeter.terrain_points.shape)
     )
@@ -106,12 +121,44 @@ def solve_core_sequence(
                 flush=True,
             )
 
-    common = dict(
-        framerate=owner._source_framerate,
-        environment_points=environment,
-        scene_query=retargeter.scene_query,
-    )
+    common = {
+        "framerate": owner._source_framerate,
+        "environment_points": environment,
+        "scene_query": retargeter.scene_query,
+        "root_orientation_targets": orientation_reference,
+        "body_orientation_targets": sequence_body_orientation_targets(
+            retargeter, source_joint_orientations, orientation_reference
+        ),
+    }
     initialization_report = None
+    extra_tasks = (
+        getattr(owner, "last_body_relation_tasks", None),
+        getattr(owner, "last_self_contact_tasks", None),
+        getattr(owner, "last_surface_contact_tasks", None),
+        getattr(owner, "last_surface_pose_tasks", None),
+    )
+    if config.pop("backend", "sequence") == "mink":
+        # UMR-style per-frame QPs warm-start from the previous frame, so the
+        # relaxed whole-sequence bootstrap is not needed.
+        from ..mink_retargeting import retarget_mink
+
+        def frame_progress(_pose, record):
+            if record["frame"] % 30 == 0 or record["frame"] == frames - 1:
+                print(
+                    f"Mink frame {record['frame']}/{frames}: cost={record['after']:.3f}, "
+                    f"iterations={record['iterations']}, {record['seconds']:.1f} s",
+                    flush=True,
+                )
+
+        motion, report = retarget_mink(
+            model, initial, positions, owner.smplx_joint_names, mapping,
+            positions[:, root_index], tasks or {}, priority, config=config,
+            callback=frame_progress, extra_tasks=extra_tasks, **common,
+        )
+        report["initialization"] = None
+        owner.last_sequence_report = report
+        owner.last_unprocessed_framewise_motion = motion.copy()
+        return motion
     if reference_trajectory is None:
         # A neutral/calibrated pose is not an IK solution. First acquire the
         # source body/feet configuration before tightening interaction anchors;
@@ -128,7 +175,7 @@ def solve_core_sequence(
             owner.smplx_joint_names,
             mapping,
             positions[:, root_index],
-            tasks or {},
+            {name: replace(task, contact_phase=None) for name, task in (tasks or {}).items()},
             priority,
             config=bootstrap_config,
             callback=progress,
@@ -147,11 +194,7 @@ def solve_core_sequence(
         config=config,
         **common,
         callback=progress,
-        extra_tasks=(
-            getattr(owner, "last_body_relation_tasks", None),
-            getattr(owner, "last_self_contact_tasks", None),
-            getattr(owner, "last_surface_contact_tasks", None),
-        ),
+        extra_tasks=extra_tasks,
     )
     report["initialization"] = initialization_report
     owner.last_sequence_report = report

@@ -71,6 +71,23 @@ def test_backside_surface_sample_is_rejected():
     assert observed["diagnostics"]["rejected_facing"] == 4
 
 
+def test_skin_contact_on_inside_of_closed_room_uses_observed_side():
+    # A closed room shell has the same topology as a solid box but the human
+    # occupies its interior. Its mesh winding cannot define the contact side.
+    room = trimesh.creation.box(extents=[2.0, 2.0, 2.0])
+    points = np.tile([0.98, 0.0, 0.0], (4, 1, 1))
+    observed = observe_contacts(
+        points, np.tile([1.0, 0.0, 0.0], (4, 1, 1)),
+        np.ones((4, 1), dtype=bool), room, _config(), framerate=30.0,
+    )
+
+    assert observed["active"].all()
+    np.testing.assert_allclose(
+        observed["normals"][:, 0], np.tile([-1.0, 0.0, 0.0], (4, 1))
+    )
+    np.testing.assert_allclose(observed["distance"], 0.02)
+
+
 def test_tangential_motion_is_sliding_and_material_point_is_not_pinned():
     points = np.zeros((4, 1, 3))
     points[:, 0, 0] = [0.0, 0.02, 0.04, 0.06]

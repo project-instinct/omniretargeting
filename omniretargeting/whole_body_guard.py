@@ -30,17 +30,19 @@ class WholeBodyValidator(TrajectoryValidator):
         super().__init__(*args, **kwargs)
 
     def swing_budget(self, name, frame):
+        # Contact roles reorder the main solve only. Repair keeps every free
+        # endpoint within its own budget around that solved trajectory.
         return self.whole_cfg[
             "foot_position_budget" if "foot" in name else "free_position_budget"
         ]
 
-    def _point_reasons(self, name, payload, position, original):
+    def _point_reasons(self, name, payload, position, original, frame=0):
         reasons = []
         budget = self.whole_cfg["contact_regression"]
         if (
             "foot" in name
             and np.linalg.norm(position - original)
-            > self.whole_cfg["foot_position_budget"] + 1e-8
+            > self.swing_budget(name, frame) + 1e-8
         ):
             reasons.append(f"whole_body_foot_position:{name}")
         if payload["contact"]:
@@ -70,6 +72,7 @@ class WholeBodyValidator(TrajectoryValidator):
                         spec["task"].frame(f),
                         values[name]["position"][f],
                         self.original_effectors[name]["position"][f],
+                        f,
                     )
                 )
         correction = candidate[:, self.qi] - self.reference[:, self.qi]
@@ -132,7 +135,7 @@ class WholeBodyValidator(TrajectoryValidator):
                 self.point(b, name, frame),
                 self.point(a, name, frame),
             )
-            reasons.extend(self._point_reasons(name, payload, point, original_point))
+            reasons.extend(self._point_reasons(name, payload, point, original_point, frame))
             change = np.linalg.norm(point - original_point)
             maximum = max(maximum, float(change))
             if (
@@ -185,10 +188,10 @@ class WholeBodyGuard(RefinementGuard):
                 jac = np.zeros((3, v.model.nv))
                 mujoco.mj_jac(v.model, data, jac, None, point, spec["body_id"])
                 linear = point + jac[:, v.di] @ step[f]
-                if "foot" in name:
+                if "foot" in name and np.isfinite(v.swing_budget(name, f)):
                     constraints.append(
                         cp.norm(linear - original)
-                        <= v.whole_cfg["foot_position_budget"]
+                        <= v.swing_budget(name, f)
                     )
                 if not payload["contact"]:
                     continue

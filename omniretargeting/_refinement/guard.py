@@ -71,6 +71,8 @@ class RefinementGuard:
                 payload = task.frame(f)
                 if not payload["contact"]:
                     budget = v.swing_budget(name, f)
+                    if not np.isfinite(budget):
+                        continue
                     constraints.append(cp.norm(linear[f] - p0[f]) <= budget)
                     if spec.get("preserve_world_target", "foot" in name):
                         target = payload["tracking_position"]

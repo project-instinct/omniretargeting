@@ -228,6 +228,7 @@ def repair_local_collisions(
     body_relation_tasks=None,
     self_contact_tasks=None,
     surface_contact_tasks=None,
+    surface_pose_tasks=None,
     contact_offset_choice=None,
 ):
     start_time = perf_counter()
@@ -260,7 +261,7 @@ def repair_local_collisions(
         model, reference, query, tasks, end_effector_config, cfg, framerate, surface_tasks,
         geometry_cache=geometry_cache,
         contact_offset_choice=contact_offset_choice,
-        body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks,
+        body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks, surface_pose_tasks=surface_pose_tasks,
     )
     try:
         original = v.geometry(reference)
@@ -548,6 +549,7 @@ def select_safe_postprocessing(
     body_relation_tasks=None,
     self_contact_tasks=None,
     surface_contact_tasks=None,
+    surface_pose_tasks=None,
     contact_offset_choice=None,
 ):
     """Jointly accept existing refinement/postprocessing; never mix joint angles.
@@ -562,7 +564,7 @@ def select_safe_postprocessing(
         scene_query if scene_query is not None else SceneQuery.from_tasks(scene, tasks, full_geometry=cfg["full_geometry"])
     )
     v = TrajectoryValidator(model, baseline, query, tasks, priority, cfg, framerate,
-                            geometry_cache=geometry_cache, body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks,
+                            geometry_cache=geometry_cache, body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks, surface_pose_tasks=surface_pose_tasks,
                             contact_offset_choice=contact_offset_choice)
     result = np.asarray(baseline).copy()
     decisions = []

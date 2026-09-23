@@ -42,28 +42,69 @@ class SurfaceKinematics:
     def __init__(self, model, bindings):
         self.model, self.bindings = model, tuple(bindings)
         self.data = mujoco.MjData(model)
-        self.qpos, self.cache = None, {}
+        self.qpos, self.cache, self._key = None, {}, None
+        # Per-binding constants; name lookups and tiny numpy calls dominate
+        # when thousands of dense samples are queried every frame.
+        self._geoms = [int(model.geom(b.robot_geom).id) for b in self.bindings]
+        self._bodies = [int(model.geom_bodyid[g]) for g in self._geoms]
+        self._points = [np.asarray(b.local_point, dtype=float) for b in self.bindings]
+        self._normals = [np.asarray(b.local_normal, dtype=float) for b in self.bindings]
 
     def at(self, qpos, index):
-        if self.qpos is None or not np.array_equal(self.qpos, qpos):
-            self.qpos = np.array(qpos, copy=True)
+        key = np.asarray(qpos, dtype=float).tobytes()
+        if key != self._key:
+            self._key = key
+            self.qpos = np.array(qpos, dtype=float, copy=True)
             self.data.qpos[:] = qpos
             mujoco.mj_forward(self.model, self.data)
             self.cache.clear()
         if index not in self.cache:
-            binding = self.bindings[index]
-            gid = self.model.geom(binding.robot_geom).id
+            gid = self._geoms[index]
             rotation = self.data.geom_xmat[gid].reshape(3, 3)
-            point = self.data.geom_xpos[gid] + rotation @ binding.local_point
-            normal = rotation @ binding.local_normal
-            normal = normal / np.linalg.norm(normal)
+            point = self.data.geom_xpos[gid] + rotation @ self._points[index]
+            normal = rotation @ self._normals[index]
+            normal = normal / np.sqrt(normal @ normal)
             jp, jr = np.zeros((3, self.model.nv)), np.zeros((3, self.model.nv))
-            mujoco.mj_jac(
-                self.model, self.data, jp, jr, point, int(self.model.geom_bodyid[gid])
-            )
-            jn = np.cross(jr.T, normal).T
+            mujoco.mj_jac(self.model, self.data, jp, jr, point, self._bodies[index])
+            # d(normal) = omega x normal = -[normal]x omega.
+            x, y, z = normal
+            jn = -np.array([[0.0, -z, y], [z, 0.0, -x], [-y, x, 0.0]]) @ jr
             self.cache[index] = (point, normal, jp, jn)
         return self.cache[index]
+
+    def batch(self, qpos, indices):
+        """Points, normals and their Jacobians for many bindings at once.
+
+        One body Jacobian per rigid body; each point then moves with it:
+        J_p = J_origin - [p - origin]x J_rot, and J_n = -[n]x J_rot.
+        """
+        if len(indices):
+            self.at(qpos, int(indices[0]))  # forward kinematics at qpos
+        data, nv = self.data, self.model.nv
+        geoms = np.asarray(self._geoms)[indices]
+        bodies = np.asarray(self._bodies)[indices]
+        rotation = data.geom_xmat[geoms].reshape(-1, 3, 3)
+        local = np.asarray(self._points)[indices]
+        points = data.geom_xpos[geoms] + np.einsum("kij,kj->ki", rotation, local)
+        normals = np.einsum("kij,kj->ki", rotation, np.asarray(self._normals)[indices])
+        normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+        jp, jn = np.zeros((len(indices), 3, nv)), np.zeros((len(indices), 3, nv))
+        for body in np.unique(bodies):
+            linear, angular = np.zeros((3, nv)), np.zeros((3, nv))
+            mujoco.mj_jacBody(self.model, data, linear, angular, int(body))
+            group = bodies == body
+            jp[group] = linear - _skew(points[group] - data.xpos[body]) @ angular
+            jn[group] = -_skew(normals[group]) @ angular
+        return points, normals, jp, jn
+
+
+def _skew(vectors):
+    x, y, z = np.moveaxis(vectors, -1, 0)
+    zero = np.zeros_like(x)
+    return np.stack(
+        [np.stack([zero, -z, y], -1), np.stack([z, zero, -x], -1), np.stack([-y, x, zero], -1)],
+        -2,
+    )
 
 
 class SurfaceTasks:

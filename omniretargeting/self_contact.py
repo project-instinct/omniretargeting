@@ -1,9 +1,9 @@
 """Persistent body-surface contact maps, complementary to geometric avoidance.
 
 UMR supplies the idea of contact vectors between corresponding surface points.
-Here correspondence is explicit anatomical-region projection, not its learned
-network. Source proximity and opposing normals select runs; identities remain
-fixed during each run, and both moving robot surfaces contribute Jacobians.
+Whole-body inputs reuse learned correspondence. Legacy part-only adapters keep
+their anatomical projection. Identities remain fixed during each run, and both
+moving robot surfaces contribute Jacobians.
 """
 
 from dataclasses import asdict
@@ -26,6 +26,7 @@ DEFAULTS = {
     "minimum_gap": 0.002,
     "regression": 0.002,
     "tolerance": 0.01,
+    "minimum_geodesic_distance": 0.12,
 }
 
 
@@ -38,6 +39,7 @@ def self_contact_config(config=None):
         "weight",
         "regression",
         "tolerance",
+        "minimum_geodesic_distance",
     ):
         if not np.isfinite(result[key]) or result[key] <= 0:
             raise ValueError(f"self_contact.{key} must be finite and positive")
@@ -92,6 +94,7 @@ class SelfContactTasks:
         self.confidence.setflags(write=False)
         self.normal_targets.setflags(write=False)
         self.diagnostics = diagnostics
+        self.protect_primary_endpoints = diagnostics.get("discovery") == "non_adjacent_source_segments_and_robot_welds"
 
     def at(self, pose, index):
         pa, na, ja, jna = self.kinematics.at(pose, 2 * index)
@@ -145,7 +148,9 @@ class SelfContactTasks:
         for k, event in enumerate(self.events):
             values = errors[:, k]
             values = values[np.isfinite(values)]
-            groups[f"{event['hand']}->{event['body']}:{event['start']}"] = {
+            a = event.get("part_a", event.get("hand"))
+            b = event.get("part_b", event.get("body"))
+            groups[f"{a}->{b}:{event['start']}"] = {
                 "count": len(values),
                 "mean_m": float(values.mean()) if len(values) else None,
                 "max_m": float(values.max()) if len(values) else None,
@@ -157,6 +162,19 @@ class SelfContactTasks:
             "pair_vector_error_max_m": float(values.max()) if len(values) else None,
             "groups": groups,
             "penetration_is_measured_separately": True,
+        }
+
+    def export(self):
+        return {
+            "self_contact_targets_local": self.targets,
+            "self_contact_normal_targets_local": self.normal_targets,
+            "self_contact_confidence": self.confidence,
+            "self_contact_face_ids": np.array([b.face_id for b in self.bindings]),
+            "self_contact_barycentric": np.array([b.barycentric for b in self.bindings]),
+            "self_contact_robot_geoms": np.array([b.robot_geom for b in self.bindings]),
+            "self_contact_robot_local_points": np.array([b.local_point for b in self.bindings]),
+            "self_contact_robot_local_normals": np.array([b.local_normal for b in self.bindings]),
+            "self_contact_parts": np.array([b.part for b in self.bindings]),
         }
 
 
@@ -185,7 +203,8 @@ def _nearest_pairs(hand, body):
 
 
 def build_self_contact_tasks(
-    model, source, mapping, robot_reference_qpos, scene_tasks=None, config=None
+    model, source, mapping, robot_reference_qpos, scene_tasks=None, config=None,
+    *, surface_motion=None,
 ):
     cfg = self_contact_config(config)
     report = {"status": "disabled", "reason": "missing_skin_samples", "events": []}
@@ -194,6 +213,15 @@ def build_self_contact_tasks(
         return None, report
     if source is None or robot_reference_qpos is None:
         return None, report
+    if "full_body" in source:
+        from .full_body_self_contact import build_full_body_self_contact
+        # Dense observations keep brief touches; the historical part-only
+        # fallback retains its three-frame noise rejection default.
+        cfg["min_contact_frames"] = (config or {}).get("min_contact_frames", 1)
+        return build_full_body_self_contact(
+            model, source, mapping, robot_reference_qpos, scene_tasks, cfg,
+            surface_motion=surface_motion,
+        )
     parts, reports = bind_sampled_parts(model, source, mapping, robot_reference_qpos)
     report.update(
         parts=reports,

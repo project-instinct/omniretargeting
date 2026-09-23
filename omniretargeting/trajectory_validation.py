@@ -152,7 +152,7 @@ def _summary(depths, model):
 
 class TrajectoryValidator:
     def __init__(self, model, reference, query, tasks, priority, config, framerate,
-                 surface_tasks=None, *, geometry_cache=None, body_relation_tasks=None, self_contact_tasks=None, surface_contact_tasks=None, contact_offset_choice=None):
+                 surface_tasks=None, *, geometry_cache=None, body_relation_tasks=None, self_contact_tasks=None, surface_contact_tasks=None, surface_pose_tasks=None, contact_offset_choice=None):
         self.model, self.reference, self.query = (
             model,
             np.asarray(reference).copy(),
@@ -161,7 +161,14 @@ class TrajectoryValidator:
         self.cfg, self.fps, self.tasks = config, float(framerate), tasks
         self.surface_tasks, self.frame_start = surface_tasks, 0
         self.body_relation_tasks = body_relation_tasks
+        self.surface_pose_tasks = surface_pose_tasks
+        if surface_pose_tasks is not None and (
+            surface_pose_tasks.model is not model or len(surface_pose_tasks.targets) != len(self.reference)
+        ):
+            raise ValueError("Surface pose must use the same model and original timeline")
         self.surface_contact_tasks = surface_contact_tasks
+        from .contact_phase import phase_policy
+        self.contact_phase = phase_policy(surface_contact_tasks, surface_pose_tasks, *tasks.values())
         if surface_contact_tasks is not None and (
             surface_contact_tasks.model is not model or len(surface_contact_tasks.targets) != len(self.reference)
         ):
@@ -278,6 +285,8 @@ class TrajectoryValidator:
                    for weight, residual, _ in self.surface_rows(pose, frame, self.di))
 
     def relation_rows(self, pose, frame, dofs):
+        if self.surface_pose_tasks is not None:
+            yield from self.surface_pose_tasks.rows(pose, self.frame_start + frame, dofs)
         if self.body_relation_tasks is not None:
             yield from self.body_relation_tasks.rows(pose, self.frame_start + frame, dofs)
         if self.self_contact_tasks is not None:
@@ -292,6 +301,10 @@ class TrajectoryValidator:
 
     def phase(self, frame, joints=None):
         phases = []
+        if self.contact_phase is not None:
+            policy, f = self.contact_phase, self.frame_start + frame
+            phases.append(("contact_roles", tuple(np.flatnonzero(policy.support[f])),
+                           tuple(policy.role(n, f) for n in policy.roles)))
         for name, spec in self.specs.items():
             if joints is not None and not set(joints) & set(
                 self.ancestor_coordinates(spec["body_id"])
@@ -465,6 +478,10 @@ class TrajectoryValidator:
             metrics["surface_normal_cost"] = self.surface_score(candidate)
         if self.body_relation_tasks is not None:
             metrics["body_relations"] = self.body_relation_tasks.metrics(candidate, self.frame_start)
+        if self.surface_pose_tasks is not None:
+            metrics["surface_pose"] = self.surface_pose_tasks.metrics(candidate, self.frame_start)
+        if self.contact_phase is not None:
+            metrics["contact_phase_priority"] = self.contact_phase.diagnostics
         metrics["joints"] = {
             self.model.joint(int(jid)).name: {
                 "unit": "m"

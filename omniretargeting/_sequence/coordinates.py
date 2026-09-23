@@ -9,7 +9,7 @@ from .._refinement.math import _difference_operator, _scalar_joint_coordinates
 
 class Coordinates:
     def __init__(
-        self, model, lock_root_xy=True, lock_root_z=False, lock_root_orientation=False
+        self, model, lock_root_xy=False, lock_root_z=False, lock_root_orientation=False
     ):
         self.model = model
         self.qi, self.di, self.lower, self.upper = _scalar_joint_coordinates(model)

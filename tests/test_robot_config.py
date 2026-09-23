@@ -118,12 +118,18 @@ def test_compact_instinctmj_profile_expands_algorithm_defaults():
     assert priority["effectors"]["left_hand"]["robot_body"] == "left_rubber_hand"
     assert priority["effectors"]["left_hand"]["preserve_world_target"] is False
     assert priority["effectors"]["left_foot"]["preserve_world_target"] is True
+    assert priority["initial_foot_alignment"] is True
+    assert priority["effectors"]["left_foot"]["tracking_offset"] == [0.04, 0.0, -0.035]
+    assert priority["effectors"]["right_foot"]["tracking_offset"] == [0.04, 0.0, -0.035]
     base_position = priority["base_position_constraint"]
     assert base_position["enabled"] is True
-    assert base_position["use_initial_offset"] is True
-    assert base_position["lock_initial_xy"] is True
+    assert base_position["use_initial_offset"] is False
+    assert base_position["lock_initial_xy"] is False
     assert base_position["track_xy"] is True
-    assert base_position["lock_xy"] is True
+    assert base_position["lock_xy"] is False
+    assert base_position["hard_constraints"] is False
+    assert priority["local_contact_chain_only"] is False
+    assert priority["preserve_noncontact_baseline"] is False
     assert base_position["track_z"] is False
     assert loaded["retargeting"]["trajectory_refinement"][
         "contact_position_sigma"

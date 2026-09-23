@@ -86,7 +86,7 @@ def test_quaternion_signs_and_non_g1_coordinate_layout():
     model = mujoco.MjModel.from_xml_string(
         '<mujoco><worldbody><body><freejoint/><geom size=".1"/><body><joint type="hinge"/><geom size=".1"/></body></body></worldbody></mujoco>'
     )
-    coordinates = Coordinates(model)
+    coordinates = Coordinates(model, lock_root_xy=True)
     poses = np.tile(model.qpos0, (4, 1))
     poses[1::2, 3:7] *= -1
     normalized = coordinates.normalize(poses)
@@ -96,7 +96,7 @@ def test_quaternion_signs_and_non_g1_coordinate_layout():
     moved = coordinates.integrate(normalized, step, 1.0)
     assert np.array_equal(moved[:, :2], normalized[:, :2])
     assert np.allclose(np.linalg.norm(moved[:, 3:7], axis=1), 1.0)
-    locked = Coordinates(model, lock_root_z=True, lock_root_orientation=True)
+    locked = Coordinates(model, lock_root_xy=True, lock_root_z=True, lock_root_orientation=True)
     fully_locked = locked.integrate(normalized, np.full((4, 1), 0.01), 1.0)
     assert np.array_equal(fully_locked[:, :7], normalized[:, :7])
 

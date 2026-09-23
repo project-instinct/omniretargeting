@@ -23,6 +23,10 @@ def solve_hierarchy(
     contact_residual,
     self_contact_residual=None,
     surface_contact_residual=None,
+    surface_pose_residual=None,
+    support_residual=None,
+    follow_surface_residual=None,
+    support_endpoint_residual=None,
     prioritize_surface_contact=False,
     dqa,
     end_effector_targets,
@@ -55,12 +59,15 @@ def solve_hierarchy(
         )
     )
     strict_surface = prioritize_surface_contact and surface_contact_residual is not None
-    hierarchy_enabled = hierarchy_enabled or strict_surface
+    supported = (support_residual is not None
+                 or support_endpoint_residual is not None
+                 or follow_surface_residual is not None)
+    hierarchy_enabled = hierarchy_enabled or strict_surface or supported
     free_priority = str(retargeter.end_effector_config.get("free_motion_priority", "lexicographic"))
     if free_priority not in {"lexicographic", "balanced"}:
         raise ValueError("free_motion_priority must be 'lexicographic' or 'balanced'.")
     balanced_free = free_priority == "balanced"
-    if balanced_free and contact_residual is None and not strict_surface:
+    if balanced_free and contact_residual is None and not strict_surface and not supported:
         # With no active contact there is no optimum to protect. Retain
         # the existing weighted solver's recovery behavior instead of
         # introducing a stricter failure path merely because contact
@@ -72,6 +79,8 @@ def solve_hierarchy(
         # weighted level, so morphology mismatch does not force an exact
         # free-foot position at the expense of the whole-body pose.
         endpoint_weight = float(retargeter.end_effector_config.get("weighted_scale", 1.0))
+        if not hierarchy_enabled and support_endpoint_residual is not None:
+            body_obj += endpoint_weight * cp.sum_squares(support_endpoint_residual)
         if contact_residual is not None:
             body_obj += endpoint_weight * cp.sum_squares(contact_residual)
         if swing_residual is not None:
@@ -85,6 +94,7 @@ def solve_hierarchy(
                 retargeter.end_effector_config.get("pose_direction_weight", 10.0)
             ) * cp.sum_squares(pose_direction_residual)
 
+    baseline_body_obj = body_obj
     if self_contact_residual is not None:
         # Anatomical surface correspondence is approximate. Share the existing
         # free-motion objective rather than changing support-foot priorities.
@@ -92,9 +102,10 @@ def solve_hierarchy(
         # multiplying an isolated lexicographic optimum by a ramp would not.
         body_obj += cp.sum_squares(self_contact_residual)
 
-    baseline_body_obj = body_obj
     if surface_contact_residual is not None and not strict_surface:
         body_obj = body_obj + cp.sum_squares(surface_contact_residual)
+    if surface_pose_residual is not None:
+        body_obj = body_obj + cp.sum_squares(surface_pose_residual)
 
     import sys
     show_solver_debug = hasattr(sys, '_omni_frame_count') and sys._omni_frame_count <= 5
@@ -173,12 +184,14 @@ def solve_hierarchy(
             unreachable source targets attainable at their existing error.
             """
             residuals = getattr(retargeter, "_protected_endpoint_residuals", {})
-            if surface_contact_residual is None or not residuals:
+            if (all(r is None for r in (surface_contact_residual, self_contact_residual,
+                                       surface_pose_residual)) or not residuals):
                 return True
             baseline_problem = solve_stage(baseline_body_obj, "surface-endpoint-reference")
             if not tangent.usable(baseline_problem, retargeter):
                 return False
-            tasks = getattr(retargeter, "surface_contact_tasks", None)
+            tasks = (getattr(retargeter, "surface_pose_tasks", None)
+                     or getattr(retargeter, "surface_contact_tasks", None))
             allowance = float(tasks.cfg.get("endpoint_regression", 0.001)) if tasks is not None else 0.001
             for residual in residuals.values():
                 bound = float(np.linalg.norm(residual.value)) + allowance
@@ -196,6 +209,38 @@ def solve_hierarchy(
             )
             tie_break = float(retargeter.end_effector_config.get("tie_break_regularization", 1e-8))
 
+            # Observed roles: endpoint support, surface support, then the
+            # following contacts. Free limbs and posture come later, so they
+            # yield only as much as these contacts actually require.
+            from ..contact_phase import PRIORITY_TOLERANCE
+
+            if support_endpoint_residual is not None:
+                endpoint_support_level = cp.norm(support_endpoint_residual, 2)
+                endpoint_support_problem = solve_stage(
+                    endpoint_support_level + tie_break * cp.sum_squares(dqa),
+                    "endpoint-support",
+                )
+                if not tangent.usable(endpoint_support_problem, retargeter):
+                    return q, np.inf
+                active_constraints.append(
+                    endpoint_support_level
+                    <= (1.0 + relative_tolerance)
+                    * max(float(endpoint_support_level.value), 0.0)
+                    + absolute_tolerance
+                )
+
+            if support_residual is not None:
+                support_level = cp.norm(support_residual, 2)
+                support_problem = solve_stage(
+                    support_level + tie_break * cp.sum_squares(dqa), "surface-support"
+                )
+                if not tangent.usable(support_problem, retargeter):
+                    return q, np.inf
+                active_constraints.append(
+                    support_level <= max(float(support_level.value), 0.0)
+                    + PRIORITY_TOLERANCE
+                )
+
             if contact_residual is not None:
                 contact_level = cp.norm(contact_residual, 2)
                 contact_problem = solve_stage(
@@ -209,6 +254,20 @@ def solve_hierarchy(
                     + absolute_tolerance
                 )
                 active_constraints.append(contact_level <= contact_bound)
+
+            if follow_surface_residual is not None:
+                follow_surface_level = cp.norm(follow_surface_residual, 2)
+                follow_surface_problem = solve_stage(
+                    follow_surface_level + tie_break * cp.sum_squares(dqa),
+                    "surface-follow",
+                )
+                if not tangent.usable(follow_surface_problem, retargeter):
+                    return q, np.inf
+                active_constraints.append(
+                    follow_surface_level
+                    <= max(float(follow_surface_level.value), 0.0)
+                    + PRIORITY_TOLERANCE
+                )
 
             if strict_surface:
                 if not protect_endpoint_baseline():
@@ -485,7 +544,10 @@ def solve_hierarchy(
                             )
                             proposed_base[qpos_idx] += dqa_opt[qa_idx]
 
-                    if bool(base_cfg.get("track_xy", True)):
+                    if bool(base_cfg.get("track_xy", True)) and (
+                        bool(base_cfg.get("lock_xy", False))
+                        or bool(base_cfg.get("hard_constraints", True))
+                    ):
                         xy_delta = proposed_base[:2] - base_target[:2]
                         xy_norm = float(np.linalg.norm(xy_delta))
                         if bool(base_cfg.get("lock_xy", False)):
@@ -504,7 +566,9 @@ def solve_hierarchy(
                             for qpos_idx in (0, 1)
                             if qpos_idx in retargeter.q_a_indices
                         )
-                    if bool(base_cfg.get("track_z", True)):
+                    if bool(base_cfg.get("track_z", True)) and bool(
+                        base_cfg.get("hard_constraints", True)
+                    ):
                         max_z_error = max(
                             float(base_cfg.get("max_z_error", 0.12)), 0.0
                         )
@@ -574,7 +638,7 @@ def solve_hierarchy(
                 max_orientation_step_error = temporal_cfg.get(
                     "max_base_orientation_step_error"
                 )
-                sticking_contact_active = any(
+                sticking_contact_active = support_endpoint_residual is not None or any(
                     bool(target_data.get("contact", False))
                     and str(target_data.get("contact_mode", ""))
                     == "sticking"

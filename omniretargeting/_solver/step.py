@@ -56,6 +56,7 @@ class OptimizationStepMixin:
             Tuple of (optimized_config, cost)
         """
         # Update robot state
+        self._contact_phase_frame = relation_frame
         self.robot_data.qpos[:] = q
         mujoco.mj_forward(self.robot_model, self.robot_data)
 
@@ -480,21 +481,28 @@ class OptimizationStepMixin:
                 for weight, residual, jacobian in rows:
                     body_obj += weight * cp.sum_squares(residual + jacobian @ transform @ dqa)
 
-        self_contact_residual = None
-        if self.self_contact_tasks is not None and relation_frame is not None:
+        def surface_residual(task, **row_kwargs):
+            if task is None or relation_frame is None:
+                return None
+            rows = list(task.rows(
+                q, relation_frame, np.arange(self.robot_model.nv), **row_kwargs
+            ))
+            if not rows:
+                return None
+            # One matrix expression avoids thousands of tiny CVXPY objects
+            # when all dense surface samples participate in the same step.
+            residual = np.concatenate([np.sqrt(w) * r for w, r, _ in rows])
+            jacobian = np.vstack([np.sqrt(w) * j for w, _, j in rows])
             transform = self._build_transform_qdot_to_qvel_fast()[:, self.q_a_indices]
-            terms = [np.sqrt(w) * (r + j @ transform @ dqa)
-                     for w, r, j in self.self_contact_tasks.rows(q, relation_frame, np.arange(self.robot_model.nv))]
-            if terms:
-                self_contact_residual = cp.hstack(terms)
+            return residual + (jacobian @ transform) @ dqa
 
-        surface_contact_residual = None
-        if self.surface_contact_tasks is not None and relation_frame is not None:
-            transform = self._build_transform_qdot_to_qvel_fast()[:, self.q_a_indices]
-            terms = [np.sqrt(w) * (r + j @ transform @ dqa)
-                     for w, r, j in self.surface_contact_tasks.rows(q, relation_frame, np.arange(self.robot_model.nv))]
-            if terms:
-                surface_contact_residual = cp.hstack(terms)
+        self_contact_residual = surface_residual(self.self_contact_tasks)
+        surface_contact_residual = surface_residual(self.surface_contact_tasks)
+        surface_pose_residual = surface_residual(self.surface_pose_tasks)
+        from ..contact_phase import phase_policy
+        policy = phase_policy(self, self.surface_contact_tasks)
+        support_residual = surface_residual(policy)
+        follow_surface_residual = surface_residual(policy, role="follow")
 
         return solve_hierarchy(
             retargeter=self,
@@ -506,6 +514,10 @@ class OptimizationStepMixin:
             contact_residual=contact_residual,
             self_contact_residual=self_contact_residual,
             surface_contact_residual=surface_contact_residual,
+            surface_pose_residual=surface_pose_residual,
+            support_residual=support_residual,
+            follow_surface_residual=follow_surface_residual,
+            support_endpoint_residual=getattr(self, "_support_endpoint_residual", None),
             prioritize_surface_contact=(self.surface_contact_tasks is not None
                                         and self.surface_contact_tasks.cfg["priority"] == "after_end_effectors"),
             dqa=dqa,

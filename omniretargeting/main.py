@@ -389,8 +389,9 @@ def main():
         help="Legacy direct path to an SMPLX motion file (.npz)",
     )
     parser.add_argument("--output", required=True, help="Path to save output motion (.npz)")
-    parser.add_argument("--solver", choices=["framewise", "sequence"], default=None,
-                        help="Retargeting solver; sequence jointly optimizes all input frames")
+    parser.add_argument("--solver", choices=["framewise", "sequence", "mink"], default=None,
+                        help="Retargeting solver; sequence jointly optimizes all input frames, "
+                             "mink solves the same objective as one small QP per frame (UMR-style)")
     parser.add_argument("--terrain", help="Path to terrain mesh file (optional, defaults to flat ground)")
     parser.add_argument(
         "--output-scaled-terrain",
@@ -732,7 +733,10 @@ def main():
             retargeting=retargeting,
         )
         if args.solver is not None:
-            retargeter.retargeting_config.setdefault("sequence_solver", {})["enabled"] = args.solver == "sequence"
+            sequence = retargeter.retargeting_config.setdefault("sequence_solver", {})
+            sequence["enabled"] = args.solver in ("sequence", "mink")
+            if args.solver == "mink":
+                sequence["backend"] = "mink"
         position_anchor = base_orientation.get("root_position")
         if position_anchor:
             retargeter.retargeting_config.setdefault("end_effector_priority", {})[
@@ -874,9 +878,16 @@ def main():
         output_payload.update(
             stack_contact_tasks(getattr(retargeter, "last_end_effector_tasks", {}))
         )
+        contact_phase = getattr(retargeter, "last_contact_phase", None)
+        if contact_phase is not None:
+            output_payload.update(contact_phase.export())
         surface_contacts = getattr(retargeter, "last_surface_contact_tasks", None)
         if surface_contacts is not None:
             output_payload.update(surface_contacts.export())
+        for name in ("self_contact", "surface_pose"):
+            task = getattr(retargeter, f"last_{name}_tasks", None)
+            if task is not None:
+                output_payload.update(task.export())
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         diagnostics = getattr(retargeter, "last_collision_diagnostics", None)
         relation_tasks = getattr(retargeter, "last_body_relation_tasks", None)

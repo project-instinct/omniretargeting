@@ -58,22 +58,37 @@ def _transform_swing_target(
     robot_root_z_offset: float,
     morphology_scale: float,
     preserve_world_target: bool = False,
+    *,
+    robot_root_position: np.ndarray | None = None,
 ) -> np.ndarray:
     """Express a source end-effector target around the robot root target.
 
-    The root-height offset is a world-space registration correction and must
-    therefore be applied even when ``morphology_scale`` is exactly one.  The
-    previous implementation skipped the entire transform at unit scale, which
-    left swing hands and feet at the human actor's height after the shorter
-    robot root had been moved down.
+    Free hands follow robot root translation, including horizontal reach
+    adaptation. Feet retain their world targets. The explicit height offset
+    remains supported; omitting robot_root_position retains legacy XY behavior.
     """
     target = np.asarray(tracking_position, dtype=float).reshape(3)
     if preserve_world_target or source_root_position is None:
         return target.copy()
     source_root = np.asarray(source_root_position, dtype=float).reshape(3)
     robot_root_target = source_root.copy()
+    if robot_root_position is not None:
+        robot_root_target[:2] = np.asarray(robot_root_position, dtype=float)[:2]
     robot_root_target[2] += float(robot_root_z_offset)
     return robot_root_target + float(morphology_scale) * (target - source_root)
+
+
+def _approach_contact_target(target, target_data):
+    """Hand a free target over to its contact anchor by source progress.
+
+    Returns the blended target and the share that still moves with the free
+    target, which scales that target's own Jacobian.
+    """
+    weight = float(target_data.get("approach_weight", 0.0))
+    if weight <= 0.0:
+        return target, 1.0
+    reference = np.asarray(target_data["approach_position"], dtype=float).reshape(3)
+    return target + weight * (reference - target), 1.0 - weight
 
 
 def _calibrated_orientation_target(

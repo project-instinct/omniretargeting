@@ -62,7 +62,7 @@ def _active_coordinates(validator, moving):
     """Union surface/collision ancestors with endpoint compensation ancestors."""
     v = validator
     bodies = {int(spec["body_id"]) for spec in v.specs.values()}
-    for task in (v.surface_contact_tasks, v.self_contact_tasks):
+    for task in (v.surface_contact_tasks, v.self_contact_tasks, v.surface_pose_tasks):
         if task is not None:
             for binding in task.bindings:
                 bodies.add(
@@ -103,13 +103,11 @@ class WholeBodyObjective:
         v, cfg = self.v, self.v.whole_cfg
         if v.surface_contact_tasks is not None:
             task = v.surface_contact_tasks
-            for weight, residual, jac in task.rows(pose, frame + v.frame_start, v.di):
+            for weight, residual, jac in task.rows(pose, frame + v.frame_start, v.di, include_normals=False):
                 yield cfg["surface_weight"] * weight, residual, jac
-            for weight, residual, jac in task.normal_rows(
-                pose, frame + v.frame_start, v.di
-            ):
+            for weight, residual, jac in task.normal_rows(pose, frame + v.frame_start, v.di):
                 yield cfg["normal_weight"] * weight, residual, jac
-        for task in (v.self_contact_tasks, v.body_relation_tasks):
+        for task in (v.self_contact_tasks, v.body_relation_tasks, v.surface_pose_tasks):
             if task is not None:
                 yield from task.rows(pose, frame + v.frame_start, v.di)
 
@@ -199,6 +197,7 @@ def correct_whole_body_trajectory(
     scene_query,
     scene_objects=(),
     surface_contact_tasks=None,
+    surface_pose_tasks=None,
     self_contact_tasks=None,
     framerate=30.0,
     validation_config=None,
@@ -229,6 +228,7 @@ def correct_whole_body_trajectory(
         surface_contact_tasks is None
         and self_contact_tasks is None
         and body_relation_tasks is None
+        and surface_pose_tasks is None
         and not (scene_objects and cfg["moving_collision_enabled"])
     ):
         report["status"] = "no_active_tasks"
@@ -271,6 +271,7 @@ def correct_whole_body_trajectory(
         framerate,
         whole_body_config=cfg,
         surface_contact_tasks=surface_contact_tasks,
+        surface_pose_tasks=surface_pose_tasks,
         self_contact_tasks=self_contact_tasks,
         body_relation_tasks=body_relation_tasks,
     )

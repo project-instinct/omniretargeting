@@ -46,7 +46,7 @@ def _path_stats(query, trajectory):
 
 def project_self_collision_trajectory(model, trajectory, scene, tasks, priority,
                                       config, *, framerate=30.0, scene_query=None,
-                                      body_relation_tasks=None, self_contact_tasks=None, surface_contact_tasks=None):
+                                      body_relation_tasks=None, self_contact_tasks=None, surface_contact_tasks=None, surface_pose_tasks=None):
     """Resolve saved-frame and playback-path collisions before later stages.
 
     No scene work is needed for a clear trajectory. For residuals, query only
@@ -72,7 +72,7 @@ def project_self_collision_trajectory(model, trajectory, scene, tasks, priority,
         scene, tasks, full_geometry=cfg["full_geometry"],
     )
     validator = TrajectoryValidator(model, reference, scene_query, tasks, priority, cfg,
-                                    framerate, body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks)
+                                    framerate, body_relation_tasks=body_relation_tasks, self_contact_tasks=self_contact_tasks, surface_contact_tasks=surface_contact_tasks, surface_pose_tasks=surface_pose_tasks)
     result = reference.copy()
     events = _event_windows(validator, before)
     used = []

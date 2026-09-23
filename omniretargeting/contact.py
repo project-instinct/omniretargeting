@@ -9,12 +9,14 @@ motion-tracking policies.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cached_property
 from typing import Any, Dict, Mapping
 
 import numpy as np
 import trimesh
 
+from .contact_schedule import approach_blend
 from .contact_schedule import (
     _apply_contact_hysteresis as _apply_contact_hysteresis,
     _close_short_gaps as _close_short_gaps,
@@ -50,7 +52,15 @@ class SceneContactTask:
     transition_weights: np.ndarray | None = None
     contact_modes: np.ndarray | None = None
     environment_ids: np.ndarray | None = None  # 0: static scene; 1..N: moving objects
-    preserve_contact_anchors: bool = False
+    preserve_contact_anchors: bool = False  # anchors are always held; kept for callers
+    contact_phase: Any = field(default=None, repr=False, compare=False)
+
+    @cached_property
+    def approach(self):
+        """Source-progress hand-over between free targets and contact anchors."""
+        return approach_blend(
+            self.tracking_positions, self.contact_positions, self.contact_mask
+        )
 
     def frame(self, frame_idx: int) -> Dict[str, Any]:
         """Return the optimizer payload for one frame."""
@@ -64,12 +74,11 @@ class SceneContactTask:
             if self.contact_modes is not None
             else ("sticking" if bool(self.contact_mask[frame_idx]) else "none")
         )
+        # The anchor holds from the first contact frame: the free target was
+        # already handed over outside the interval (``approach``), so the
+        # contact target is not pulled back toward the swing path inside it.
         contact_position = self.contact_positions[frame_idx]
-        if contact_mode == "sticking" and transition_weight < 1.0 and not self.preserve_contact_anchors:
-            contact_position = (
-                (1.0 - transition_weight) * self.tracking_positions[frame_idx]
-                + transition_weight * contact_position
-            )
+        approach_weights, approach_positions = self.approach
         payload = {
             "name": self.name,
             "tracking_position": self.tracking_positions[frame_idx],
@@ -81,6 +90,8 @@ class SceneContactTask:
             "contact": bool(self.contact_mask[frame_idx]),
             "contact_mode": contact_mode,
             "transition_weight": transition_weight,
+            "approach_weight": float(approach_weights[frame_idx]),
+            "approach_position": approach_positions[frame_idx],
             "environment_id": int(self.environment_ids[frame_idx]) if self.environment_ids is not None else 0,
         }
         if self.forward_directions is not None:
@@ -702,6 +713,14 @@ def infer_scene_contact_tasks(
                 smoothing_frames=eff_contact_normal_smoothing_frames,
                 normal_orientation_deadzone=normal_orientation_deadzone,
             )
+        if up_directions is not None and name.endswith("_foot"):
+            # A reconstructed sole can lie just below a thin floor surface.
+            # Its approach offset then points at the floor underside even
+            # though the sole frame still identifies the contact side.
+            opposite = contact_mask & (
+                np.sum(surface_normals * up_directions, axis=1) < 0.0
+            )
+            surface_normals[opposite] *= -1.0
         if eff_contact_patch_distance > 0.0:
             surface_points = _contact_patch_surface_points(
                 scene_mesh,

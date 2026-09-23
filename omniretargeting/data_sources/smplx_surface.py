@@ -1,4 +1,4 @@
-"""Sparse, persistent SMPL-X skin samples for body-to-body contact.
+"""Persistent SMPL-X skin samples for whole-body pose and contact.
 
 Sampling is area weighted (trimesh), once on the shaped rest mesh. Face IDs
 and barycentric coordinates survive posing and resampling. These are observed
@@ -71,6 +71,8 @@ def sample_smplx_surfaces(
              "neck", "left_clavicle", "right_clavicle", "head", "left_upper_arm", "right_upper_arm",
              "left_forearm", "right_forearm", "left_hand", "right_hand"]
     from .smplx import DEFAULT_SMPLX_TARGET_NAMES
+    effectors = {7: "left_foot", 10: "left_foot", 8: "right_foot", 11: "right_foot",
+                 20: "left_hand", 21: "right_hand"}
     return {
         "kind": "barycentric_skin",
         "parts": parts,
@@ -86,5 +88,13 @@ def sample_smplx_surfaces(
             "joint_names": np.asarray(DEFAULT_SMPLX_TARGET_NAMES),
             "joint_parents": parents[:22].copy(),
             "sample_joint_indices": joint.copy(),
+            "sample_effectors": np.array([effectors.get(int(i), "") for i in joint]),
+            "sample_world_tracking": np.isin(joint, [7, 8, 10, 11]),
+            "reference_root_position": (
+                reference.joints.detach().cpu().numpy()[0, 0] @ canonical_to_world.T
+            ),
+            "reference_joint_positions": (
+                reference.joints.detach().cpu().numpy()[0, :22] @ canonical_to_world.T
+            ),
         },
     }

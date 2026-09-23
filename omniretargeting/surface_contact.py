@@ -6,8 +6,9 @@ the environment points and source vectors remain in unscaled metric world
 coordinates. Only source-active samples generate objectives.
 """
 
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
+import mujoco
 import numpy as np
 
 from .contact_schedule import _iter_true_runs
@@ -29,6 +30,9 @@ DEFAULTS = {
     "normal_speed": 0.2,
     "sticking_speed": 0.04,
     "endpoint_regression": 0.001,
+    "normal_weight": 0.05,
+    "normal_sigma": 0.35,
+    "contact_binding_calibration": True,
 }
 
 
@@ -48,6 +52,8 @@ def surface_contact_config(config=None):
         "normal_speed",
         "sticking_speed",
         "endpoint_regression",
+        "normal_weight",
+        "normal_sigma",
     ):
         if not np.isfinite(cfg[key]) or cfg[key] <= 0:
             raise ValueError(f"surface_contact.{key} must be finite and positive")
@@ -62,7 +68,65 @@ def surface_contact_config(config=None):
         raise ValueError(
             "surface_contact.min_contact_frames must be a positive integer"
         )
+    if not isinstance(cfg["contact_binding_calibration"], (bool, np.bool_)):
+        raise TypeError("surface_contact.contact_binding_calibration must be boolean")
     return cfg
+
+
+def calibrate_contact_bindings(model, bindings, sample_indices, active, targets, seed):
+    """Resolve a sphere's contact-facing side once from a warm robot motion.
+
+    Learned whole-body correspondence supplies the robot geom identity. On a
+    symmetric collision sphere its point can land on the far side, even when
+    the source skin touches the near side. The original source contact targets
+    and the unchanged warm trajectory choose one persistent shell point per
+    active skin sample; they do not move a target or introduce framewise slip.
+    """
+    poses = np.asarray(seed, dtype=float)
+    if poses.shape != (len(active), model.nq) or not np.isfinite(poses).all():
+        raise ValueError("Contact binding seed must match the source timeline")
+    selected = list(bindings)
+    candidates = [
+        (i, int(model.geom(binding.robot_geom).id))
+        for i, binding in enumerate(selected)
+        if (active[:, sample_indices[i]].any()
+            and model.geom_type[int(model.geom(binding.robot_geom).id)]
+            == mujoco.mjtGeom.mjGEOM_SPHERE)
+    ]
+    if not candidates:
+        return tuple(selected), {"calibrated_samples": 0, "mean_shell_shift_m": 0.0}
+    used_frames = np.flatnonzero(active[:, sample_indices].any(axis=1))
+    data = mujoco.MjData(model)
+    centers, rotations = {}, {}
+    geoms = sorted({geom for _, geom in candidates})
+    for frame in used_frames:
+        data.qpos[:] = poses[frame]
+        mujoco.mj_forward(model, data)
+        centers[frame] = {g: data.geom_xpos[g].copy() for g in geoms}
+        rotations[frame] = {g: data.geom_xmat[g].reshape(3, 3).copy() for g in geoms}
+    displacements = []
+    for index, geom in candidates:
+        sample = int(sample_indices[index])
+        frames = np.flatnonzero(active[:, sample])
+        local_targets = np.array([
+            rotations[f][geom].T @ (targets[f, sample] - centers[f][geom])
+            for f in frames
+        ])
+        direction = np.mean(local_targets, axis=0)
+        norm = float(np.linalg.norm(direction))
+        if norm < 1e-8:
+            continue
+        unit = direction / norm
+        point = float(model.geom_size[geom, 0]) * unit
+        old = np.asarray(selected[index].local_point, dtype=float)
+        selected[index] = replace(
+            selected[index], local_point=tuple(point), local_normal=tuple(unit)
+        )
+        displacements.append(float(np.linalg.norm(point - old)))
+    return tuple(selected), {
+        "calibrated_samples": len(displacements),
+        "mean_shell_shift_m": float(np.mean(displacements)) if displacements else 0.0,
+    }
 
 
 class SurfaceContactTasks:
@@ -200,12 +264,19 @@ class SurfaceContactTasks:
             point, _, jacobian, _ = self.kinematics.at(pose, int(index))
             yield int(index), point - self.targets[frame, index], jacobian[:, dofs]
 
-    def rows(self, pose, frame, dofs):
+    def rows(self, pose, frame, dofs, *, include_normals=True):
         for index, residual, jacobian in self.position_rows(pose, frame, dofs):
             yield (
                 self.weights[frame, index],
                 residual / self.cfg["sigma"],
                 jacobian / self.cfg["sigma"],
+            )
+        normal_rows = self.normal_rows(pose, frame, dofs) if include_normals else ()
+        for weight, residual, jacobian in normal_rows:
+            yield (
+                self.cfg["normal_weight"] * weight,
+                residual / self.cfg["normal_sigma"],
+                jacobian / self.cfg["normal_sigma"],
             )
 
     def normal_rows(self, pose, frame, dofs):
@@ -289,6 +360,8 @@ class SurfaceContactTasks:
         if self.pose_normal_targets is not None:
             payload["surface_contact_pose_normal_targets_w"] = self.pose_normal_targets
             payload["surface_contact_pose_normal_valid"] = self.pose_normal_valid
+        if getattr(self, "contact_phase", None) is not None:
+            payload.update(self.contact_phase.export())
         return payload
 
 
@@ -302,6 +375,8 @@ def build_surface_contact_tasks(
     joint_mapping=None,
     framerate=30.0,
     scene_objects=(),
+    surface_motion=None,
+    robot_seed_trajectory=None,
 ):
     cfg = surface_contact_config(config)
     report = {
@@ -350,13 +425,13 @@ def build_surface_contact_tasks(
             "reason": "no_source_surface_contact",
             "samples": len(bary),
         }
-    bindings, binding_valid, correspondence = bind_whole_body(
-        model,
-        source,
-        robot_reference_qpos,
-        cfg.get("correspondence"),
-        joint_mapping=joint_mapping,
-    )
+    if surface_motion is not None:
+        bindings, binding_valid, correspondence = surface_motion.binding_result
+    else:
+        bindings, binding_valid, correspondence = bind_whole_body(
+            model, source, robot_reference_qpos, cfg.get("correspondence"),
+            joint_mapping=joint_mapping,
+        )
     active &= binding_valid[None, :]
     retained = np.flatnonzero(active.any(0))
     report.update(
@@ -367,6 +442,11 @@ def build_surface_contact_tasks(
     if not len(retained):
         return None, {**report, "reason": "no_valid_contact_correspondences"}
     selected = tuple(bindings[i] for i in retained)
+    if cfg["contact_binding_calibration"] and robot_seed_trajectory is not None:
+        selected, calibration = calibrate_contact_bindings(
+            model, selected, retained, active, points, robot_seed_trajectory
+        )
+        report["contact_binding_calibration"] = calibration
     pose_normals, pose_valid = transported_contact_normals(
         model, source, selected, retained, robot_reference_qpos
     )
@@ -385,7 +465,7 @@ def build_surface_contact_tasks(
             for k, i in enumerate(retained)
         ],
     )
-    return SurfaceContactTasks(
+    task = SurfaceContactTasks(
         model,
         selected,
         environment[:, retained],
@@ -399,7 +479,24 @@ def build_surface_contact_tasks(
         surface_ids=observation["surface_ids"][:, retained],
         pose_normal_targets=pose_normals,
         pose_normal_valid=pose_valid,
-    ), report
+    )
+    task.static_surface_id = 0 if scene_mesh is not None and len(scene_mesh.faces) else None
+    labels = np.asarray(full.get("sample_effectors", [""] * len(bary)))
+    if labels.shape != (len(bary),):
+        raise ValueError("Sample effector labels must follow surface identities")
+    outside = observation["clear_side"]
+    task.source_clearances = {}
+    for name in np.unique(labels):
+        if not name:
+            continue
+        group = labels == name
+        # All observed material samples on an effector must be clear. Missing
+        # samples are unknown, not evidence that a foot has lifted.
+        task.source_clearances[str(name)] = np.where(
+            (valid[:, group] & outside[:, group]).all(axis=1),
+            observation["distance"][:, group].min(axis=1), np.nan
+        )
+    return task, report
 
 
 def transported_contact_normals(

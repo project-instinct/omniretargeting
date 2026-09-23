@@ -64,3 +64,68 @@ def _apply_contact_hysteresis(
             active = True
         result[frame_idx] = active
     return result
+
+
+def _progress(distance, far, near):
+    """Share of the source's own travel from ``far`` to the anchor at ``near``."""
+    span = distance[far] - distance[near]
+    if not np.isfinite(span) or span <= 1e-9:
+        return None
+    return np.clip((distance[far] - distance) / span, 0.0, 1.0)
+
+
+def approach_blend(tracking, anchors, contact_mask):
+    """Hand a free target to its contact anchor by the source's own progress.
+
+    For a run starting at ``s`` with anchor ``A``, the source endpoint's
+    distance to ``A`` (its contact vector length) measures progress: from the
+    farthest frame since the previous run it rises to exactly 1 at the onset.
+    The world reference is the source path shifted to land on ``A`` there, so
+    fast source motion hands over quickly and slow motion slowly, with no
+    duration or distance threshold. Departures mirror this after each run;
+    a gap between two runs splits where the source is farthest from both.
+    Contact intervals, anchors and source samples are not changed.
+    """
+    tracking = np.asarray(tracking, dtype=float)
+    anchors = np.asarray(anchors, dtype=float)
+    frames = len(tracking)
+    weights = np.zeros(frames)
+    references = tracking.copy()
+    runs = list(_iter_true_runs(np.asarray(contact_mask, dtype=bool)))
+    if not runs or not np.isfinite(tracking).all():
+        return weights, references
+    bounds = [(None, runs[0])] + list(zip(runs, runs[1:])) + [(runs[-1], None)]
+    for before, after in bounds:
+        start = 0 if before is None else before[1]
+        stop = frames if after is None else after[0]
+        if stop <= start:
+            continue
+        span = np.arange(start, stop)
+        if before is not None:
+            last = before[1] - 1
+            leave = np.linalg.norm(tracking - anchors[last], axis=1)
+        if after is not None:
+            first = after[0]
+            reach = np.linalg.norm(tracking - anchors[first], axis=1)
+        if before is not None and after is not None:
+            split = span[np.argmax(np.minimum(leave[span], reach[span]))]
+        elif before is not None:
+            split = span[np.argmax(leave[span])]
+        else:
+            split = span[np.argmax(reach[span])]
+        if before is not None:
+            share = _progress(leave, split, last)
+            if share is not None:
+                window = np.arange(start, split + 1)
+                weights[window] = share[window]
+                references[window] = tracking[window] + anchors[last] - tracking[last]
+        if after is not None:
+            share = _progress(reach, split, first)
+            if share is not None:
+                window = np.arange(split, stop)
+                use = share[window] > weights[window]
+                weights[window[use]] = share[window][use]
+                references[window[use]] = (
+                    tracking[window[use]] + anchors[first] - tracking[first]
+                )
+    return weights, references
