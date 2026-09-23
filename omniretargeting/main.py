@@ -173,6 +173,12 @@ def _run(args, parser: argparse.ArgumentParser):
 
     robot_height = robot_config.get("robot_height")
     retargeting = robot_config.get("retargeting")
+    if args.penetration_resolver is not None:
+        if retargeting is None:
+            retargeting = {}
+        else:
+            retargeting = dict(retargeting)
+        retargeting["penetration_resolver"] = args.penetration_resolver
 
     # Handle terrain
     temp_terrain_paths = []
@@ -387,6 +393,13 @@ def main():
         type=float,
         default=None,
         help="Scale the source motion, terrain, and objects by this factor without exporting a scaled scene.",
+    )
+    parser.add_argument(
+        "--penetration-resolver",
+        dest="penetration_resolver",
+        choices=["hard_constraint", "hard_constraint_slack", "xyz_nudge"],
+        default=None,
+        help="Contact handling mode; overrides the value in the robot profile.",
     )
     parser.add_argument("--vis", action="store_true", help="Visualize the retargeted motion")
     parser.add_argument("--save-video", dest="save_video", default=None, help="Save retargeted motion video to file (e.g. /tmp/out.mp4). Uses offscreen rendering (set MUJOCO_GL=egl for headless).")

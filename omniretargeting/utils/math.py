@@ -302,8 +302,13 @@ def sample_points_on_mesh(mesh: trimesh.Trimesh, num_points: int) -> np.ndarray:
     return points
 
 
-def compute_mesh_height_at_point(mesh: trimesh.Trimesh, x: float, y: float) -> float:
-    """Compute the height (z) of the mesh at a given (x, y) position."""
+def compute_mesh_height_at_point(mesh: trimesh.Trimesh, x: float, y: float, prefer_lowest: bool = False) -> float:
+    """Compute the height (z) of the mesh at a given (x, y) position.
+
+    With ``prefer_lowest=True``, return the lowest vertical intersection. This
+    is the correct support height for indoor meshes that also contain ceilings
+    or overhead geometry.
+    """
     # Create a ray from above the point downward
     ray_origin = np.array([x, y, 100.0])  # High z value
     ray_direction = np.array([0, 0, -1])  # Downward
@@ -316,7 +321,8 @@ def compute_mesh_height_at_point(mesh: trimesh.Trimesh, x: float, y: float) -> f
         )
         if len(locations) > 0:
             # Return the highest intersection point (closest to the ray origin)
-            return float(np.max(locations[:, 2]))
+            # by default, or the lowest support surface when requested.
+            return float(np.min(locations[:, 2]) if prefer_lowest else np.max(locations[:, 2]))
     except Exception:
         # Fall back to a dependency-free triangle walk when rtree/pyembree is unavailable.
         pass
@@ -347,7 +353,7 @@ def compute_mesh_height_at_point(mesh: trimesh.Trimesh, x: float, y: float) -> f
             heights.append(u * tri[1, 2] + v * tri[2, 2] + w * tri[0, 2])
 
     if heights:
-        return float(max(heights))
+        return float(min(heights) if prefer_lowest else max(heights))
 
     # No intersection found, return a default height.
     return 0.0

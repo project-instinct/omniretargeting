@@ -24,6 +24,15 @@ from .utils import (
     sample_mujoco_geom_local_points,
 )
 
+# Order in which penetration resolvers are tried when the active resolver
+# rejects the motion.  ``retarget_motion`` starts at the resolver configured by
+# the robot profile and moves right only if enough frames are rejected.
+PENETRATION_RESOLVER_FALLBACK_ORDER = (
+    "hard_constraint",
+    "hard_constraint_slack",
+    "xyz_nudge",
+)
+
 
 @dataclass
 class RetargetingStreamState:
@@ -126,6 +135,7 @@ class OmniRetargeter:
 
         # Initialize retargeting components
         self._setup_retargeting_components()
+        self._frame_fallback_count = 0
 
 
     def _setup_retargeting_components(self):
@@ -169,6 +179,32 @@ class OmniRetargeter:
         print(f"Valid source targets: {self.valid_source_target_names}")
         print(f"Robot height: {self.robot_height:.3f}m")
         print(f"Robot DOF: {self.get_robot_dof()}")
+
+    def _retarget_motion_once(
+        self,
+        scaled_motion_data: MotionData,
+        scaled_terrain: trimesh.Trimesh,
+        show_progress: bool,
+        apply_foot_stabilization: bool,
+    ) -> np.ndarray:
+        """Run one full retargeting pass with the current resolver settings."""
+        self._frame_fallback_count = 0
+        retargeted_motion = np.array(
+            list(
+                self.retarget_stream(
+                    scaled_motion_data,
+                    scaled_terrain=scaled_terrain,
+                    show_progress=show_progress,
+                )
+            )
+        )
+        if apply_foot_stabilization:
+            retargeted_motion = self._apply_foot_stabilization(
+                retargeted_motion,
+                scaled_terrain,
+                framerate=scaled_motion_data.framerate,
+            )
+        return retargeted_motion
 
     def retarget_motion(
         self,
@@ -250,20 +286,57 @@ class OmniRetargeter:
         if visualize_trajectory:
             self._visualize_trajectory(scaled_motion_data.positions, scaled_terrain)
 
-        retargeted_motion = np.array(
-            list(self.retarget_stream(scaled_motion_data, scaled_terrain=scaled_terrain, show_progress=show_progress))
-        )
-
         retargeting_config = getattr(self, "retargeting_config", {})
-        if retargeting_config.get("penetration_resolver", "hard_constraint") == "xyz_nudge":
-            # This stabilization is intentionally batch-only: it detects contact runs,
-            # smooths across windows, and corrects stance drift using temporal context
-            # that retarget_stream() does not have while yielding frames one by one.
-            retargeted_motion = self._apply_foot_stabilization(
-                retargeted_motion,
-                scaled_terrain,
-                framerate=motion_data.framerate,
+        resolver = retargeting_config.get(
+            "penetration_resolver", PENETRATION_RESOLVER_FALLBACK_ORDER[0]
+        )
+        if resolver not in PENETRATION_RESOLVER_FALLBACK_ORDER:
+            raise ValueError(
+                f"Unknown penetration_resolver '{resolver}'. "
+                f"Expected one of {list(PENETRATION_RESOLVER_FALLBACK_ORDER)}."
             )
+
+        saved_retargeting_config = self.retargeting_config
+        self.retargeting_config = dict(self.retargeting_config)
+        try:
+            start_index = PENETRATION_RESOLVER_FALLBACK_ORDER.index(resolver)
+            retargeted_motion = None
+            for resolver_index in range(start_index, len(PENETRATION_RESOLVER_FALLBACK_ORDER)):
+                active_resolver = PENETRATION_RESOLVER_FALLBACK_ORDER[resolver_index]
+                self.retargeting_config["penetration_resolver"] = active_resolver
+
+                candidate_motion = self._retarget_motion_once(
+                    scaled_motion_data,
+                    scaled_terrain,
+                    show_progress=show_progress,
+                    apply_foot_stabilization=active_resolver == "xyz_nudge",
+                )
+                retargeted_motion = candidate_motion
+
+                fallback_count = self._frame_fallback_count
+                if fallback_count:
+                    print(
+                        f"Fell back to unconstrained SQP steps on "
+                        f"{fallback_count} frame(s) with resolver "
+                        f"'{active_resolver}'."
+                    )
+
+                # Only hard-constraint resolvers can reject frames.  If enough
+                # of them reject, move to the next resolver in the fallback order.
+                fallback_threshold = max(1, int(len(candidate_motion) * 0.1))
+                rejected = (
+                    active_resolver in ("hard_constraint", "hard_constraint_slack")
+                    and fallback_count >= fallback_threshold
+                )
+                if not rejected:
+                    break
+
+                print(
+                    f"Resolver '{active_resolver}' rejected {fallback_count} frame(s); "
+                    f"trying next fallback resolver."
+                )
+        finally:
+            self.retargeting_config = saved_retargeting_config
 
         return source_to_robot_scale, retargeted_motion
 
@@ -506,7 +579,8 @@ class OmniRetargeter:
         else:
             max_iter = 10
 
-        def solve(q_seed: np.ndarray) -> np.ndarray:
+        def solve(q_seed: np.ndarray, hard_penetration: bool) -> np.ndarray:
+            state.retargeter.hard_penetration_constraint = hard_penetration
             return state.retargeter.retarget_frame(
                 mapped_source_targets,
                 q_seed,
@@ -517,7 +591,24 @@ class OmniRetargeter:
                 root_translation=root_translation,
             )
 
-        q_opt = solve(q_init)
+        original_hard_penetration = getattr(
+            state.retargeter, "hard_penetration_constraint", False
+        ) is True
+        q_opt = solve(q_init, original_hard_penetration)
+
+        # Hard penetration rows are linearized at the current pose.  When they
+        # reject the only positive step, retrying without those rows prevents a
+        # frame from silently freezing; subsequent frames rebuild the rows at
+        # the new pose and can still enforce them.
+        if (
+            original_hard_penetration
+            and not state.retargeter.last_solve_diagnostics.get("success", True)
+        ):
+            fallback_q_opt = solve(q_init, False)
+            if state.retargeter.last_solve_diagnostics.get("success", True):
+                q_opt = fallback_q_opt
+                self._frame_fallback_count += 1
+
         if state.frame_idx > 0 and state.retargeter.reaches_joint_limit(q_opt):
             first_solve_diagnostics = dict(state.retargeter.last_solve_diagnostics)
             q_default = state.q_default.copy()
@@ -528,11 +619,21 @@ class OmniRetargeter:
                 root_orientation,
                 estimated_quat_wxyz,
             )
-            retry_q_opt = solve(q_default)
-            if state.retargeter.last_solve_diagnostics["success"]:
-                q_opt = retry_q_opt
-            else:
-                state.retargeter.last_solve_diagnostics = first_solve_diagnostics
+            retry_q_opt = solve(q_default, original_hard_penetration)
+            if not state.retargeter.last_solve_diagnostics.get("success", True):
+                if original_hard_penetration:
+                    retry_q_opt = solve(q_default, False)
+                    if state.retargeter.last_solve_diagnostics.get("success", True):
+                        self._frame_fallback_count += 1
+                    else:
+                        state.retargeter.last_solve_diagnostics = first_solve_diagnostics
+                        retry_q_opt = q_opt
+                else:
+                    state.retargeter.last_solve_diagnostics = first_solve_diagnostics
+                    retry_q_opt = q_opt
+            q_opt = retry_q_opt
+
+        state.retargeter.hard_penetration_constraint = original_hard_penetration
         state.q_init = q_opt
         state.q_last = q_opt
         state.frame_idx += 1
@@ -946,7 +1047,9 @@ class OmniRetargeter:
         for frame_idx in range(xy_points.shape[0]):
             for foot_idx in range(xy_points.shape[1]):
                 x, y = xy_points[frame_idx, foot_idx]
-                heights[frame_idx, foot_idx] = compute_mesh_height_at_point(terrain_mesh, float(x), float(y))
+                heights[frame_idx, foot_idx] = compute_mesh_height_at_point(
+                    terrain_mesh, float(x), float(y), prefer_lowest=True
+                )
         return heights
 
     def _apply_surface_collision_corrections(
@@ -960,12 +1063,22 @@ class OmniRetargeter:
         if len(motion) == 0 or not foot_specs:
             return motion, np.zeros((len(motion), len(foot_specs)), dtype=bool)
 
-        triangles = np.asarray(terrain_mesh.triangles, dtype=float)
-        if len(triangles) == 0:
+        if len(terrain_mesh.faces) == 0:
             return motion, np.zeros((len(motion), len(foot_specs)), dtype=bool)
-        face_normals = np.asarray(terrain_mesh.face_normals, dtype=float)
 
         surface_clearance = float(cfg["surface_clearance"])
+        import open3d as o3d
+
+        terrain_scene = o3d.t.geometry.RaycastingScene()
+        terrain_scene.add_triangles(
+            o3d.core.Tensor(
+                np.ascontiguousarray(terrain_mesh.vertices, dtype=np.float32)
+            ),
+            o3d.core.Tensor(
+                np.ascontiguousarray(terrain_mesh.faces, dtype=np.uint32)
+            ),
+        )
+        terrain_face_normals = np.asarray(terrain_mesh.face_normals, dtype=float)
         max_surface_correction = float(cfg["max_surface_correction"])
         surface_iterations = max(int(cfg["surface_iterations"]), 1)
 
@@ -980,6 +1093,8 @@ class OmniRetargeter:
                 self.robot_data.qpos[:] = qpos
                 mujoco.mj_forward(self.robot_model, self.robot_data)
 
+                world_points_list = []
+                foot_ids = []
                 for foot_idx, spec in enumerate(foot_specs):
                     collision_points = spec.get("collision_points")
                     if collision_points is None or collision_points.size == 0:
@@ -989,21 +1104,28 @@ class OmniRetargeter:
                     body_pos = np.asarray(self.robot_data.xpos[body_id], dtype=float)
                     body_rot = np.asarray(self.robot_data.xmat[body_id], dtype=float).reshape(3, 3)
                     world_points = collision_points @ body_rot.T + body_pos
+                    world_points_list.append(world_points)
+                    foot_ids.extend([foot_idx] * len(world_points))
 
-                    for point in world_points:
-                        correction, wall_contact = self._compute_surface_point_correction(
-                            point,
-                            triangles,
-                            face_normals,
-                            clearance=surface_clearance,
-                            cfg=cfg,
-                        )
-                        wall_contact_mask[frame_idx, foot_idx] |= wall_contact
-                        if correction is not None:
-                            if wall_contact:
-                                wall_x_corrections.append(float(correction[0]))
-                            else:
-                                correction_vectors.append(correction)
+                if not world_points_list:
+                    break
+
+                corrections, wall_contacts = self._compute_surface_point_corrections(
+                    np.vstack(world_points_list),
+                    terrain_mesh,
+                    clearance=surface_clearance,
+                    cfg=cfg,
+                    terrain_scene=terrain_scene,
+                    terrain_face_normals=terrain_face_normals,
+                )
+                for point_idx, (correction, wall_contact) in enumerate(zip(corrections, wall_contacts)):
+                    foot_idx = foot_ids[point_idx]
+                    wall_contact_mask[frame_idx, foot_idx] |= wall_contact
+                    if correction is not None:
+                        if wall_contact:
+                            wall_x_corrections.append(float(correction[0]))
+                        else:
+                            correction_vectors.append(correction)
 
                 if not correction_vectors and not wall_x_corrections:
                     break
@@ -1034,6 +1156,83 @@ class OmniRetargeter:
             )
 
         return stabilized, wall_contact_mask
+
+    def _compute_surface_point_corrections(
+        self,
+        points: np.ndarray,
+        terrain_mesh: trimesh.Trimesh,
+        clearance: float,
+        cfg: Dict[str, Any],
+        terrain_scene: Any | None = None,
+        terrain_face_normals: np.ndarray | None = None,
+    ) -> Tuple[List[np.ndarray | None], np.ndarray]:
+        """Return per-point surface corrections using a BVH closest-point query."""
+        points = np.asarray(points, dtype=float)
+        if points.size == 0:
+            return [], np.zeros(0, dtype=bool)
+
+        if terrain_scene is not None and terrain_face_normals is not None:
+            import open3d as o3d
+
+            result = terrain_scene.compute_closest_points(
+                o3d.core.Tensor(np.ascontiguousarray(points, dtype=np.float32)),
+                nthreads=1,
+            )
+            closest_points = np.asarray(result["points"].numpy(), dtype=float)
+            face_indices = np.asarray(result["primitive_ids"].numpy(), dtype=int)
+        else:
+            closest_points, _, face_indices = trimesh.proximity.closest_point(
+                terrain_mesh, points
+            )
+            face_indices = np.asarray(face_indices, dtype=int)
+
+        normals = (
+            np.asarray(terrain_face_normals, dtype=float)[face_indices]
+            if terrain_face_normals is not None
+            else np.asarray(terrain_mesh.face_normals, dtype=float)[face_indices]
+        )
+        normal_norms = np.linalg.norm(normals, axis=1)
+        valid = normal_norms >= 1e-12
+        normals = normals / np.maximum(normal_norms[:, None], 1e-12)
+
+        signed_offsets = np.einsum("ij,ij->i", points - closest_points, normals)
+        penetrations = clearance - signed_offsets
+
+        wall_normal_z_threshold = float(cfg.get("wall_normal_z_threshold", 0.35))
+        wall_x_dominance_threshold = float(cfg.get("wall_x_dominance_threshold", 0.5))
+        wall_red_axis_only = bool(cfg.get("wall_red_axis_only", True))
+
+        corrections: List[np.ndarray | None] = []
+        wall_contacts = np.zeros(len(points), dtype=bool)
+        for idx in range(len(points)):
+            if not valid[idx] or penetrations[idx] <= 0.0:
+                corrections.append(None)
+                continue
+
+            penetration = float(penetrations[idx])
+            normal = normals[idx]
+            wall_contact = False
+            if (
+                wall_red_axis_only
+                and abs(normal[2]) <= wall_normal_z_threshold
+                and abs(normal[0]) >= wall_x_dominance_threshold
+            ):
+                correction = np.array(
+                    [penetration * np.sign(normal[0]), 0.0, 0.0], dtype=float
+                )
+                wall_contact = True
+            else:
+                correction = penetration * normal
+
+            if not wall_contact:
+                correction[2] = max(correction[2], 0.0)
+            if np.linalg.norm(correction) < 1e-9:
+                corrections.append(None)
+            else:
+                corrections.append(correction)
+            wall_contacts[idx] = wall_contact
+
+        return corrections, wall_contacts
 
     def _compute_surface_point_correction(
         self,
