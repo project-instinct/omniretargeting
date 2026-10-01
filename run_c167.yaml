@@ -1,5 +1,0 @@
-type: smplx
-motion: /home/duanxin/Xyk/omniretargeting/test_data/c167_1530_final_v3/smplx_amass.npz
-model_directory: /home/duanxin/Xyk/GMR/assets/body_models
-terrain: /home/duanxin/Xyk/omniretargeting/test_data/c167_1530_final_v3/scene.obj
-gender: neutral

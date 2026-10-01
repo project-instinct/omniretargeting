@@ -176,3 +176,7 @@ robot_models/*/*_floating.urdf
 # RLCR loop state is per-session working data, not project source.
 .humanize/rlcr/
 .humanize/.pending-session-id
+
+# Local tool state and licensed body models
+.omo/
+assets/body_models/
