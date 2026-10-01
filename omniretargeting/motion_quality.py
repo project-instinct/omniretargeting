@@ -32,6 +32,93 @@ def angle_degrees(a, b):
     return np.rad2deg(np.arccos(np.clip(np.sum(a * b, axis=-1), -1, 1)))
 
 
+def rotation_degrees(matrices):
+    """Angle of rotation matrices (..., 3, 3), robust near 0 and 180 degrees."""
+    from scipy.spatial.transform import Rotation
+
+    matrices = np.asarray(matrices, dtype=float)
+    angles = Rotation.from_matrix(matrices.reshape(-1, 3, 3)).magnitude()
+    return np.rad2deg(angles).reshape(matrices.shape[:-2])
+
+
+# Below this source speed a landmark has no reliable direction of motion.
+DIRECTION_MIN_SPEED_M_PER_S = 0.1
+
+
+def velocity_direction_degrees(
+    robot_points, source_points, fps, min_speed=DIRECTION_MIN_SPEED_M_PER_S
+):
+    """Angle between robot and source landmark velocities, (frames, landmarks).
+
+    Only directions are compared, so robot size and speed do not enter
+    (HOI-Retarget's "link velocity direction"). Central differences at the
+    original cadence; NaN where the source landmark is slower than
+    ``min_speed`` or the robot landmark does not move at all.
+    """
+    robot_points = np.asarray(robot_points, dtype=float)
+    source_points = np.asarray(source_points, dtype=float)
+    if len(robot_points) < 2:
+        return np.full(robot_points.shape[:-1], np.nan)
+    robot_velocity = np.gradient(robot_points, axis=0) * fps
+    source_velocity = np.gradient(source_points, axis=0) * fps
+    angles = angle_degrees(unit(robot_velocity), unit(source_velocity))
+    moving = np.linalg.norm(source_velocity, axis=-1) >= min_speed
+    return np.where(moving, angles, np.nan)
+
+
+def object_relative_drift_degrees(
+    robot_rotations, source_rotations, object_rotations, mask
+):
+    """Robot versus source rotation of a body inside a moving object's frame.
+
+    Within every contiguous ``mask`` run, each body's rotation in the object
+    frame is taken relative to the run's first frame, expressed in the object
+    frame (``B_t B_0^T``), so a constant robot/source body-frame offset
+    cancels. Returns, per frame, the angle between the two drifts: how much
+    the robot's grip turned on the object beyond what the source's did.
+    NaN outside ``mask``.
+    """
+    objects = np.asarray(object_rotations, dtype=float)
+    robot = objects.transpose(0, 2, 1) @ np.asarray(robot_rotations, dtype=float)
+    source = objects.transpose(0, 2, 1) @ np.asarray(source_rotations, dtype=float)
+    mask = np.asarray(mask, dtype=bool)
+    result = np.full(len(mask), np.nan)
+    edges = np.diff(np.concatenate(([0], mask.astype(int), [0])))
+    for start, stop in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        robot_drift = robot[start:stop] @ robot[start].T
+        source_drift = source[start:stop] @ source[start].T
+        result[start:stop] = rotation_degrees(
+            source_drift.transpose(0, 2, 1) @ robot_drift
+        )
+    return result
+
+
+def orientation_target_degrees(model, qpos, targets):
+    """Angle to each world or parent-relative orientation target, per frame.
+
+    ``targets`` use the sequence format (``robot_body``, optional
+    ``parent_body``, ``rotations`` (frames, 3, 3)). Returns {body: (frames,)}.
+    """
+    data = mujoco.MjData(model)
+    rotations = []
+    for q in np.asarray(qpos, dtype=float):
+        data.qpos[:] = q
+        mujoco.mj_kinematics(model, data)
+        rotations.append(data.xmat.reshape(-1, 3, 3).copy())
+    rotations = np.asarray(rotations).reshape(-1, model.nbody, 3, 3)
+    result = {}
+    for spec in targets:
+        current = rotations[:, model.body(spec["robot_body"]).id]
+        if spec.get("parent_body"):
+            parent = rotations[:, model.body(spec["parent_body"]).id]
+            current = parent.transpose(0, 2, 1) @ current
+        target = np.asarray(spec["rotations"], dtype=float)
+        result[spec["robot_body"]] = rotation_degrees(
+            target.transpose(0, 2, 1) @ current
+        )
+    return result
+
+
 def trajectory_metrics(
     model, qpos, source_positions, names, mapping, priority, tasks, fps
 ):
@@ -188,6 +275,9 @@ def trajectory_metrics(
     )
     return {
         "root_anchor_world_error_m": root_error,
+        "velocity_direction_deg": summary(
+            velocity_direction_degrees(robot, source, fps)
+        ),
         "direction": direction,
         "limb_configuration": configurations,
         "end_effectors": effectors,

@@ -203,3 +203,27 @@ def test_rooted_collision_is_reported_as_immovable_and_trajectory_stays_fixed():
         witness["body"] == "root"
         for witness in report["moving_collision"]["immovable_witnesses"]
     )
+
+
+def test_windowed_moving_correction_checks_composed_intervals(monkeypatch):
+    import omniretargeting.whole_body_correction as correction
+
+    monkeypatch.setattr(correction, "WHOLE_BODY_WINDOW_THRESHOLD", 4)
+    monkeypatch.setattr(correction, "WHOLE_BODY_WINDOW_FRAMES", 4)
+    model, short = _model_and_trajectory()
+    baseline = np.tile(short[0], (8, 1))
+    obj = _moving_box()
+    obj["translations"] = np.c_[np.linspace(-.15, .15, 8), np.zeros((8, 2))]
+    obj["rotations"] = np.tile(np.eye(3), (8, 1, 1))
+    obj["scales"] = np.ones(8)
+    task = _hand_task(model, baseline)
+    result, report = correct_whole_body_trajectory(
+        model, baseline, {"left_hand": task}, _priority(), _config(iterations=1),
+        scene_query=_far_scene(), scene_objects=[obj],
+    )
+    assert report["window_frames"] == 4
+    assert report["final_reasons"] == []
+    assert report["root_invariant"]
+    np.testing.assert_array_equal(result[:, :7], baseline[:, :7])
+    assert report["final_fidelity"]["ok"]
+    assert report["moving_collision"]["after"]["complete"]

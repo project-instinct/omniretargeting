@@ -1,7 +1,6 @@
 """Prepare the generic sequence solver from existing core correspondences."""
 
-from dataclasses import replace
-
+import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -54,6 +53,10 @@ def solve_core_sequence(
             if arm.get("shoulder_body"):
                 mapping[name] = arm["shoulder_body"]
     source_root_name = owner.smplx_joint_names[root_index]
+    if source_root_name in mapping:
+        priority = dict(priority, source_root_robot_body=mapping[source_root_name])
+        owner.retargeting_config["end_effector_priority"] = priority
+        retargeter.end_effector_config = priority
     if len(shoulders) == 2 and source_root_name in mapping:
         config.setdefault(
             "pose_axes",
@@ -69,6 +72,22 @@ def solve_core_sequence(
                 {"weights": {shoulders[0]: 1, shoulders[1]: -1}, "sigma": 0.06},
             ],
         )
+    # A model can float at its chest while the source root denotes the pelvis.
+    # Use the calibrated source rotation of that actual floating body, when
+    # available, rather than asking both chest and pelvis to share one rotation.
+    body_orientation_targets = sequence_body_orientation_targets(
+        retargeter, source_joint_orientations, None
+    )
+    if coordinates.root_d is not None:
+        floating_body = model.body(
+            int(model.jnt_bodyid[model.dof_jntid[coordinates.root_d]])
+        ).name
+        for target in body_orientation_targets:
+            if target["robot_body"] == floating_body and not target.get("parent_body"):
+                base_orientations = Rotation.from_matrix(target["rotations"]).as_quat(
+                    scalar_first=True
+                )
+                break
     if reference_trajectory is None:
         seed = getattr(retargeter, "robot_reference_qpos", None)
         initial = np.tile(model.qpos0 if seed is None else seed, (frames, 1))
@@ -90,6 +109,15 @@ def solve_core_sequence(
                             scalar_first=True
                         )
                     initial[f, root + 3 : root + 7] = orientation
+            if source_root_name in mapping:
+                data = mujoco.MjData(model)
+                body = model.body(mapping[source_root_name]).id
+                for frame, pose in enumerate(initial):
+                    data.qpos[:] = pose
+                    mujoco.mj_forward(model, data)
+                    initial[frame, root : root + 3] += (
+                        positions[frame, root_index] - data.xpos[body]
+                    )
     else:
         initial = np.asarray(reference_trajectory, dtype=float).copy()
     # Freeze source orientation targets before bootstrap. Its output must not
@@ -126,9 +154,7 @@ def solve_core_sequence(
         "environment_points": environment,
         "scene_query": retargeter.scene_query,
         "root_orientation_targets": orientation_reference,
-        "body_orientation_targets": sequence_body_orientation_targets(
-            retargeter, source_joint_orientations, orientation_reference
-        ),
+        "body_orientation_targets": body_orientation_targets,
     }
     initialization_report = None
     extra_tasks = (
@@ -136,8 +162,40 @@ def solve_core_sequence(
         getattr(owner, "last_self_contact_tasks", None),
         getattr(owner, "last_surface_contact_tasks", None),
         getattr(owner, "last_surface_pose_tasks", None),
+        getattr(owner, "last_surface_proximity_tasks", None),
     )
-    if config.pop("backend", "sequence") == "mink":
+    backend = config.pop("backend", "sequence")
+    if config.get("staged_contact_repair", False) and backend != "sequence":
+        raise ValueError("staged_contact_repair requires the strict sequence backend")
+    if getattr(owner, "_scene_objects", ()) and backend != "fast":
+        from .._sequence.scene import PrescribedSceneClearance
+        from ..sequence_retargeting import SEQUENCE_DEFAULTS
+
+        extra_tasks += (
+            PrescribedSceneClearance(
+                model,
+                owner._scene_objects,
+                frames,
+                clearance=config.get(
+                    "scene_clearance_m", SEQUENCE_DEFAULTS["scene_clearance_m"]
+                ),
+                query_config=config.get("moving_scene"),
+            ),
+        )
+    if backend == "fast":
+        # Speed-first backend: same objective terms, banded Gauss-Newton,
+        # scene grids, budgets verified afterwards (see _fast/pipeline.py).
+        from .._fast.pipeline import solve_fast_sequence
+
+        motion, report = solve_fast_sequence(
+            owner, model, initial, positions, owner.smplx_joint_names, mapping,
+            positions[:, root_index], tasks or {}, priority, config, common,
+            extra_tasks, reference_trajectory, callback=progress,
+        )
+        owner.last_sequence_report = report
+        owner.last_unprocessed_framewise_motion = motion.copy()
+        return motion
+    if backend == "mink":
         # UMR-style per-frame QPs warm-start from the previous frame, so the
         # relaxed whole-sequence bootstrap is not needed.
         from ..mink_retargeting import retarget_mink
@@ -151,36 +209,84 @@ def solve_core_sequence(
                 )
 
         motion, report = retarget_mink(
-            model, initial, positions, owner.smplx_joint_names, mapping,
-            positions[:, root_index], tasks or {}, priority, config=config,
-            callback=frame_progress, extra_tasks=extra_tasks, **common,
-        )
-        report["initialization"] = None
-        owner.last_sequence_report = report
-        owner.last_unprocessed_framewise_motion = motion.copy()
-        return motion
-    if reference_trajectory is None:
-        # A neutral/calibrated pose is not an IK solution. First acquire the
-        # source body/feet configuration before tightening interaction anchors;
-        # otherwise strong hand contacts can trap the legs on a folded branch.
-        # These are global continuation weights, never clip/frame overrides.
-        bootstrap_config = dict(config)
-        bootstrap_config.update(
-            contact_sigma_m=0.05, contact_normal_sigma_m=0.05, source_side_support=True
-        )
-        initial, initialization_report = retarget_sequence(
             model,
             initial,
             positions,
             owner.smplx_joint_names,
             mapping,
             positions[:, root_index],
-            {name: replace(task, contact_phase=None) for name, task in (tasks or {}).items()},
+            tasks or {},
             priority,
-            config=bootstrap_config,
-            callback=progress,
+            config=config,
+            callback=frame_progress,
+            extra_tasks=extra_tasks,
             **common,
         )
+        report["initialization"] = None
+        owner.last_sequence_report = report
+        owner.last_unprocessed_framewise_motion = motion.copy()
+        return motion
+    if reference_trajectory is None:
+        from .._sequence.source_pose import acquire_source_pose
+
+        initial, source_pose_report = acquire_source_pose(
+            model,
+            initial,
+            positions,
+            owner.smplx_joint_names,
+            mapping,
+            positions[:, root_index],
+            tasks or {},
+            priority,
+            config=config,
+            callback=progress,
+            solve=retarget_sequence,
+            **{
+                key: common[key]
+                for key in (
+                    "framerate",
+                    "root_orientation_targets",
+                    "body_orientation_targets",
+                )
+            },
+        )
+        source_pose_reference = initial.copy()
+        # Source-fit diagnostics do not abort optimization. Keep this reference
+        # fixed and continue under cumulative angular bounds; incompatible
+        # source/contact geometry remains a reported residual.
+        # The source-only solve has already selected the kinematic branch.
+        # Proceed directly to evidence-ordered contact acquisition: a second
+        # relaxed pass with contacts demoted can detach the feet for clearance
+        # and consume the same fixed posture budget before acquisition starts.
+        initialization_report = {"source_pose": source_pose_report}
+
+    contact_reference, contact_report = None, None
+    correction_reference = (
+        initial.copy() if reference_trajectory is not None else source_pose_reference
+    )
+    surface = getattr(owner, "last_surface_contact_tasks", None)
+    if any(np.any(t.contact_mask) for t in (tasks or {}).values()) or (
+        surface is not None and np.any(surface.active)
+    ):
+        # First acquire reachable world contacts with continuous root motion.
+        # Subsequent geometry/posture improvement must preserve that measured
+        # accuracy instead of buying clearance by detaching a hand or foot.
+        contact_reference, contact_report = retarget_sequence(
+            model,
+            initial,
+            positions,
+            owner.smplx_joint_names,
+            mapping,
+            positions[:, root_index],
+            tasks or {},
+            priority,
+            config=config,
+            callback=progress,
+            extra_tasks=extra_tasks,
+            correction_reference_trajectory=correction_reference,
+            **common,
+        )
+        initial = contact_reference.copy()
 
     motion, report = retarget_sequence(
         model,
@@ -195,8 +301,61 @@ def solve_core_sequence(
         **common,
         callback=progress,
         extra_tasks=extra_tasks,
+        endpoint_reference_trajectory=contact_reference,
+        correction_reference_trajectory=correction_reference,
+        contact_offset_choice=(
+            None if contact_report is None else contact_report["contact_offset_choice"]
+        ),
     )
+    if config.get("staged_contact_repair", False):
+        from ..staged_contact_repair import repair_contact_stages
+
+        motion, repair_report = repair_contact_stages(
+            model, motion, positions, owner.smplx_joint_names, mapping,
+            positions[:, root_index], tasks or {}, priority,
+            config=config, callback=progress, extra_tasks=extra_tasks,
+            endpoint_reference_trajectory=motion if contact_reference is None else contact_reference,
+            correction_reference_trajectory=correction_reference,
+            contact_offset_choice=report["contact_offset_choice"],
+            **common,
+        )
+        report["staged_contact_repair"] = repair_report
+        for stage in repair_report["stages"]:
+            if stage["accepted"]:
+                for key in ("final_residuals", "posture_envelope", "contact_role_residuals"):
+                    if key in stage["solver"]:
+                        report[key] = stage["solver"][key]
     report["initialization"] = initialization_report
+    report["contact_acquisition"] = contact_report
+    from .sequence_guard import bind_sequence_guard
+
+    bind_sequence_guard(
+        owner,
+        model,
+        motion,
+        motion if contact_reference is None else contact_reference,
+        correction_reference,
+        positions,
+        owner.smplx_joint_names,
+        mapping,
+        positions[:, root_index],
+        tasks or {},
+        priority,
+        config=config,
+        extra_tasks=extra_tasks,
+        contact_offset_choice=report["contact_offset_choice"],
+        **{key: value for key, value in common.items() if key != "framerate"},
+    )
+    if config.get("staged_contact_repair", False):
+        from .._sequence.contact_hold import ContactHoldAnchors, ContactHoldStage
+
+        guard = owner._sequence_acceptance_guard
+        if guard is not None:
+            guard.contact_stage = ContactHoldStage(
+                ContactHoldAnchors(guard, motion), None,
+                min(0.0001, guard.allowance),
+                continuity_reference=motion,
+            ).bind(guard)
     owner.last_sequence_report = report
     owner.last_unprocessed_framewise_motion = motion.copy()
     return motion

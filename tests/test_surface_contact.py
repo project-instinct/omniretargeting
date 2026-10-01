@@ -178,7 +178,11 @@ def test_full_body_scene_map_retains_source_vectors_and_releases(tmp_path):
     selected = report["source_sample_indices"]
     full = source["full_body"]
     points = np.einsum("tnij,ni->tnj", full["triangles"], full["barycentric"])
-    np.testing.assert_allclose(tasks.targets, points[:, selected])
+    np.testing.assert_allclose(tasks.source_vectors, points[:, selected] - tasks.environment_points)
+    # Contact anchors use the actual surface; an observed 5 mm gap remains in
+    # the immutable source vectors instead of being copied into the robot.
+    np.testing.assert_allclose(tasks.targets[tasks.active, 2], 0.4, atol=1e-9)
+    np.testing.assert_allclose(tasks.targets[~tasks.active], points[:, selected][~tasks.active])
     np.testing.assert_allclose(tasks.weights[:4].sum(1), 5)
     with pytest.raises(ValueError):
         tasks.targets[0, 0, 0] = 1

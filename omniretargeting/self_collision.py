@@ -9,7 +9,7 @@ from collections import OrderedDict
 import mujoco
 import numpy as np
 
-from .geometry_query import distance_direction, relative_point_jacobian
+from .geometry_query import GeometryQueryError, distance_direction, relative_point_jacobian
 from .collision_motion import CollisionMotionBounds
 
 
@@ -24,7 +24,21 @@ SELF_COLLISION_DEFAULTS = {
 }
 
 
+def _random_quaternion(rng):
+    value = rng.normal(size=4)
+    return value / np.linalg.norm(value)
+
+
+# Configurations that identify always-overlapping model geometry (see
+# ``SelfCollisionQuery._exclude_structural_overlaps``); fixed for reproducibility.
+STRUCTURAL_SAMPLES = 64
+STRUCTURAL_SEED = 0
+
+
 def self_collision_config(config=None):
+    from .config_validation import known_options
+
+    known_options(config, SELF_COLLISION_DEFAULTS, 'self_collision', extra=())
     cfg = {**SELF_COLLISION_DEFAULTS, **dict(config or {})}
     for key in SELF_COLLISION_DEFAULTS:
         cfg[key] = float(cfg[key])
@@ -89,14 +103,84 @@ class SelfCollisionQuery:
         self.pairs = np.asarray(pairs, dtype=int).reshape(-1, 2)
         self.pair_ids = self.pairs[:, 0] * model.ngeom + self.pairs[:, 1]
         self.pair_queries = 0
+        from .convex_mesh_distance import ConvexMeshDistance
+        self.mesh_distance = ConvexMeshDistance(model)
         self.motion_bounds = CollisionMotionBounds(model, self.geom_ids)
         self._segment_cache = OrderedDict()
+        self.structural_pairs = []
+        self._exclude_structural_overlaps()
 
-    def query(self, q=None, *, data=None, distance=None):
+    def fresh_state(self):
+        """Reuse immutable pair filtering and mesh hulls on this fixed model.
+
+        Structural overlap classification is deterministic model geometry, not
+        trajectory state. FK buffers, query counters and segment caches belong
+        to the new consumer; cached local hull vertices contain no pose data.
+        """
+        result = copy(self)
+        result.cfg = dict(self.cfg)
+        result.data = mujoco.MjData(self.model)
+        result.pairs, result.pair_ids = self.pairs.copy(), self.pair_ids.copy()
+        result.geom_ids = self.geom_ids.copy()
+        result.structural_pairs = [list(pair) for pair in self.structural_pairs]
+        result.mesh_distance = copy(self.mesh_distance)
+        result.mesh_distance.vertices = dict(self.mesh_distance.vertices)
+        result.pair_queries = 0
+        result._segment_cache = OrderedDict()
+        if hasattr(self, "_normal_model"):
+            result._normal_data = mujoco.MjData(self._normal_model)
+        return result
+
+    def _exclude_structural_overlaps(self):
+        """Drop pairs that interpenetrate in every sampled configuration.
+
+        As in MoveIt's collision-matrix setup ("always in collision"), such
+        overlaps belong to the model's collision geometry (e.g. a knee shell
+        reaching into the ankle), not to a motion. Samples: the default pose
+        and fixed-seed configurations of every joint within its limits (free
+        and ball joints at random poses). Pairs that separate in any sample
+        are kept.
+        """
+        model = self.model
+        rng = np.random.default_rng(STRUCTURAL_SEED)
+        joint_types = mujoco.mjtJoint
+        overlapping = None
+        for sample in range(STRUCTURAL_SAMPLES + 1):
+            q = model.qpos0.copy()
+            for joint in range(model.njnt) if sample else ():
+                address, kind = model.jnt_qposadr[joint], model.jnt_type[joint]
+                if kind == joint_types.mjJNT_FREE:
+                    q[address:address + 3] = rng.uniform(-1.0, 1.0, 3)
+                    q[address + 3:address + 7] = _random_quaternion(rng)
+                elif kind == joint_types.mjJNT_BALL:
+                    q[address:address + 4] = _random_quaternion(rng)
+                elif model.jnt_limited[joint]:
+                    q[address] = rng.uniform(*model.jnt_range[joint])
+                elif kind == joint_types.mjJNT_HINGE:
+                    q[address] = rng.uniform(-np.pi, np.pi)
+            try:
+                rows = self.query(q, distance=0.0)
+            except GeometryQueryError:
+                continue
+            current = {row["pair_index"] for row in rows if row["clearance"] < 0}
+            overlapping = current if overlapping is None else overlapping & current
+            if not overlapping:
+                return
+        keep = np.ones(len(self.pairs), bool)
+        keep[sorted(overlapping or ())] = False
+        self.structural_pairs = [
+            [model.body(int(model.geom_bodyid[a])).name, model.body(int(model.geom_bodyid[b])).name]
+            for a, b in self.pairs[~keep]]
+        self.pairs, self.pair_ids = self.pairs[keep], self.pair_ids[keep]
+
+    def query(self, q=None, *, data=None, distance=None, reuse=None):
         """Return nearby pairs with two witnesses and a first-body exit vector.
 
         Passing data reuses the caller's current FK. Errors and indeterminate
         normals are raised, never reported as collision-free configurations.
+        ``reuse`` (a dict owned by the caller, e.g. per frame) keeps this
+        query's pair results keyed by both geoms' exact transforms; a later
+        query copies an unchanged pair's result instead of recomputing it.
         """
         model = self.model
         if data is None:
@@ -111,15 +195,33 @@ class SelfCollisionQuery:
         nearby = ~bounded | (np.linalg.norm(delta, axis=1) <= radii + threshold)
         rows = []
         fromto = np.zeros(6)
+        kept = {}
         for index in np.flatnonzero(nearby):
             g1, g2 = map(int, self.pairs[index])
+            if reuse is not None:
+                # A pair's result depends only on its two geoms' placements.
+                key = (g1, g2, threshold, data.geom_xpos[g1].tobytes(), data.geom_xmat[g1].tobytes(),
+                       data.geom_xpos[g2].tobytes(), data.geom_xmat[g2].tobytes())
+                if key in reuse:
+                    row = kept[key] = reuse[key]
+                    if row is not None:
+                        rows.append({**row, "points": row["points"].copy(),
+                                     "direction": np.array(row["direction"], copy=True)})
+                    continue
             fromto[:] = 0
-            phi = float(mujoco.mj_geomDistance(model, data, g1, g2, threshold, fromto))
+            mesh_direction = None
+            if np.all(model.geom_type[[g1, g2]] == mujoco.mjtGeom.mjGEOM_MESH):
+                phi, witnesses, mesh_direction = self.mesh_distance.query(g1, g2, data)
+                fromto[:] = witnesses.ravel()
+            else:
+                phi = float(mujoco.mj_geomDistance(model, data, g1, g2, threshold, fromto))
             self.pair_queries += 1
             if phi >= threshold:
+                if reuse is not None:
+                    kept[key] = None
                 continue
             normal = None
-            if np.linalg.norm(fromto[:3] - fromto[3:]) <= 1e-10:
+            if mesh_direction is None and np.linalg.norm(fromto[:3] - fromto[3:]) <= 1e-10:
                 normal_data = data
                 # At numerical zero, normal-margin collision detection may
                 # omit the touching pair. Ask the collision engine with a
@@ -140,13 +242,20 @@ class SelfCollisionQuery:
                     if tuple(map(int, contact.geom)) == (g2, g1):
                         normal = -contact.frame[:3]
                         break
-            direction = distance_direction(phi, fromto, normal)
+            direction = (mesh_direction if mesh_direction is not None
+                         else distance_direction(phi, fromto, normal))
             rows.append({
                 "pair": [g1, g2], "pair_id": int(self.pair_ids[index]), "pair_index": int(index),
                 "body_ids": [int(model.geom_bodyid[g1]), int(model.geom_bodyid[g2])],
                 "clearance": phi, "points": fromto.reshape(2, 3).copy(),
                 "direction": direction,
             })
+            if reuse is not None:
+                kept[key] = {**rows[-1], "points": rows[-1]["points"].copy(),
+                             "direction": np.array(direction, copy=True)}
+        if reuse is not None:
+            reuse.clear()
+            reuse.update(kept)
         return rows
 
     def jacobian(self, row, data):
@@ -208,6 +317,8 @@ class SelfCollisionQuery:
         return {
             "status": "enabled" if len(self.pairs) else "no_eligible_pairs",
             "geometry": "collision_geoms_only", "geom_ids": self.geom_ids.tolist(),
+            "mesh_penetration": "full_convex_support_bounds",
+            "separated_mesh_clearance": "conservative_supporting_plane_gap",
             "pair_count": len(self.pairs), "config": self.cfg,
         }
 

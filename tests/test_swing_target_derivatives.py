@@ -9,16 +9,17 @@ import trimesh
 from omniretargeting.retargeting import GenericInteractionRetargeter
 
 
-@pytest.mark.parametrize("mode", ["relative", "world", "explicit", "contact", "no_root"])
+@pytest.mark.parametrize("mode", ["relative", "world", "explicit", "contact", "no_root", "mapped_anchor"])
 @pytest.mark.parametrize("reach", [None, 0.15, 2.0])
 def test_endpoint_residual_derivative_matches_recomputed_target(mode, reach):
     model = mujoco.MjModel.from_xml_string("""
     <mujoco><compiler angle="radian"/><worldbody>
       <body name="root"><freejoint/><geom type="sphere" size=".02"/>
+        <body name="pelvis" pos=".05 0 -.2"><joint name="waist" axis="0 1 0"/><geom size=".02"/>
         <body name="hand" pos=".3 .04 .1">
           <joint name="elbow" axis="0 1 0"/>
           <geom type="sphere" size=".02"/>
-        </body>
+        </body></body>
       </body>
     </worldbody></mujoco>
     """)
@@ -35,6 +36,8 @@ def test_endpoint_residual_derivative_matches_recomputed_target(mode, reach):
                 reach_reference_body="root", reach_reference_offset=[.08, 0, .04],
                 max_swing_reach=reach)
     config = {"enabled": True, "effectors": {name: spec}}
+    if mode == "mapped_anchor":
+        config["source_root_robot_body"] = "pelvis"
     if mode == "explicit":
         config["swing_target_z_offset"] = -.2
     retargeter = GenericInteractionRetargeter(

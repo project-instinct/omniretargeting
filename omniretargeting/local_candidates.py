@@ -12,6 +12,9 @@ import cvxpy as cp
 import mujoco
 import numpy as np
 
+from ._solver.targets import _world_target_regime
+
+from .conic_solver import solve_conic
 from .self_collision import bounded_collision_constraints
 from .contact import _is_surface_only_contact_mode
 from .geometry_query import relative_point_jacobian
@@ -64,7 +67,7 @@ def _evaluate(v, poses, start):
                     # world-tracking feet also score their immutable world target.
                     target = (
                         payload["tracking_position"]
-                        if spec.get("preserve_world_target", "foot" in name)
+                        if _world_target_regime(spec, payload)
                         else view.original_effectors[name]["position"][f]
                     )
                     score += float(
@@ -214,7 +217,7 @@ def _solve_pose(v, frame, warm, previous_delta, joints, planes):
             objective += cp.square(slack / 0.005)
             slacks.append(slack)
         try:
-            cp.Problem(cp.Minimize(objective), constraints).solve(
+            solve_conic(cp.Problem(cp.Minimize(objective), constraints),
                 solver="CLARABEL", max_iter=80
             )
         except cp.error.SolverError as exc:

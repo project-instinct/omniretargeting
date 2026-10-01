@@ -392,5 +392,16 @@ def _lock_contact_offsets(
             chosen[start:end] = int(
                 np.argmin(np.mean(distances[name][start:end], axis=0))
             )
+        # The free-to-contact handover must approach the SAME material point.
+        # Carry its identity outside contact too; window callers slice this
+        # full-timeline plan together with the task's approach reference.
+        from ..contact_schedule import approach_blend
+
+        task = spec["task"]
+        _, _, contact_frames = approach_blend(
+            task.tracking_positions, task.contact_positions, mask,
+            return_contact_frames=True,
+        )
+        chosen[~mask] = chosen[contact_frames[~mask]]
         selection[name] = chosen
     return selection

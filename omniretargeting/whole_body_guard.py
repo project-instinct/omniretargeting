@@ -6,7 +6,11 @@ import numpy as np
 from scipy import sparse
 
 from ._refinement.guard import RefinementGuard
+from ._solver.targets import _world_target_regime
+from .conic_constraints import LocalNormBounds, squared_residual_objective
+from .conic_solver import solve_conic
 from .contact import _is_surface_only_contact_mode
+from .contact_error_cache import reference_contact_errors
 from .moving_scene import interpolate_object, moving_regression_reasons
 from .scene_witness_guard import preserve_known_scene_samples
 from .trajectory_validation import TrajectoryValidator, _pose_velocity
@@ -33,18 +37,20 @@ class WholeBodyValidator(TrajectoryValidator):
         # Contact roles reorder the main solve only. Repair keeps every free
         # endpoint within its own budget around that solved trajectory.
         return self.whole_cfg[
-            "foot_position_budget" if "foot" in name else "free_position_budget"
+            "world_position_budget" if _world_target_regime(self.specs[name], self.specs[name]["task"].frame(frame)) else "free_position_budget"
         ]
 
     def _point_reasons(self, name, payload, position, original, frame=0):
+        if payload["contact"] and payload.get("surface_managed", False):
+            return []
         reasons = []
         budget = self.whole_cfg["contact_regression"]
         if (
-            "foot" in name
+            _world_target_regime(self.specs[name], payload)
             and np.linalg.norm(position - original)
             > self.swing_budget(name, frame) + 1e-8
         ):
-            reasons.append(f"whole_body_foot_position:{name}")
+            reasons.append(f"whole_body_world_position:{name}")
         if payload["contact"]:
             target = payload["contact_position"]
             projectors = [np.eye(3)]
@@ -88,12 +94,16 @@ class WholeBodyValidator(TrajectoryValidator):
     def interframe_contact(self, trajectory, frame, alpha, q):
         reasons, maximum = [], 0.0
         original = interpolated_pose(self.model, self.reference, frame, alpha)
+        if np.array_equal(original, q):
+            return reasons, maximum
         a, b = mujoco.MjData(self.model), mujoco.MjData(self.model)
         for data, pose in ((a, original), (b, q)):
             data.qpos[:] = pose
             mujoco.mj_forward(self.model, data)
         for name, spec in self.specs.items():
             payload = dict(spec["task"].frame(frame))
+            if payload["contact"] and payload.get("surface_managed", False):
+                continue
             following = spec["task"].frame(frame + 1)
             if (
                 payload["contact"]
@@ -135,7 +145,9 @@ class WholeBodyValidator(TrajectoryValidator):
                 self.point(b, name, frame),
                 self.point(a, name, frame),
             )
-            reasons.extend(self._point_reasons(name, payload, point, original_point, frame))
+            reasons.extend(
+                self._point_reasons(name, payload, point, original_point, frame)
+            )
             change = np.linalg.norm(point - original_point)
             maximum = max(maximum, float(change))
             if (
@@ -176,23 +188,23 @@ class WholeBodyGuard(RefinementGuard):
         self.last_geometry = None
 
     def _strict_endpoints(self, current, step):
-        v, constraints = self.validator, []
+        v = self.validator
+        rows = LocalNormBounds(len(current), len(v.qi))
         data = mujoco.MjData(v.model)
         for f, pose in enumerate(current):
             data.qpos[:] = pose
             mujoco.mj_forward(v.model, data)
             for name, spec in v.specs.items():
                 payload = spec["task"].frame(f)
+                if payload["contact"] and payload.get("surface_managed", False):
+                    continue
                 point = v.point(data, name, f)
                 original = v.original_effectors[name]["position"][f]
                 jac = np.zeros((3, v.model.nv))
                 mujoco.mj_jac(v.model, data, jac, None, point, spec["body_id"])
-                linear = point + jac[:, v.di] @ step[f]
-                if "foot" in name and np.isfinite(v.swing_budget(name, f)):
-                    constraints.append(
-                        cp.norm(linear - original)
-                        <= v.swing_budget(name, f)
-                    )
+                jac = jac[:, v.di]
+                if _world_target_regime(spec, payload) and np.isfinite(v.swing_budget(name, f)):
+                    rows.add(point - original, v.swing_budget(name, f), (f, jac))
                 if not payload["contact"]:
                     continue
                 projectors = [np.eye(3)]
@@ -206,10 +218,10 @@ class WholeBodyGuard(RefinementGuard):
                         np.linalg.norm(projector @ (original - target))
                         + v.whole_cfg["contact_regression"]
                     )
-                    constraints.append(cp.norm(projector @ (linear - target)) <= budget)
-        return constraints
+                    rows.add(projector @ (point - target), budget, (f, projector @ jac))
+        return rows.constraints(cp.vec(step, order="C"))
 
-    def solve(self, system, rhs, current, active_coordinates):
+    def solve(self, system, rhs, current, active_coordinates, *, editable_frames=None):
         v, cfg = self.validator, self.validator.whole_cfg
         frames, joints = len(current), len(v.qi)
         step = cp.Variable((frames, joints))
@@ -222,6 +234,10 @@ class WholeBodyGuard(RefinementGuard):
         inactive = ~np.asarray(active_coordinates, dtype=bool)
         if np.any(inactive):
             constraints.append(step[:, inactive] == 0)
+        if editable_frames is not None:
+            frozen = np.flatnonzero(~np.asarray(editable_frames, dtype=bool))
+            if len(frozen):
+                constraints.append(step[frozen, :] == 0)
         for bounds, lower in ((v.lower, True), (v.upper, False)):
             finite = np.isfinite(bounds)
             if np.any(finite):
@@ -239,10 +255,11 @@ class WholeBodyGuard(RefinementGuard):
                     cp.abs(cp.diff(correction, k=order, axis=0))
                     <= cfg[key] / v.fps**order
                 )
+        surface_rows = LocalNormBounds(frames, joints)
         for task in (v.self_contact_tasks, v.surface_contact_tasks):
             if task is None:
                 continue
-            old = task.errors(v.reference, v.frame_start)
+            old = reference_contact_errors(v, task)
             for f, pose in enumerate(current):
                 for index, residual, jac in task.position_rows(
                     pose, v.frame_start + f, v.di
@@ -251,12 +268,13 @@ class WholeBodyGuard(RefinementGuard):
                         max(old[f, index], task.cfg["tolerance"])
                         + task.cfg["regression"]
                     )
-                    constraints.append(cp.norm(residual + jac @ step[f]) <= budget)
+                    surface_rows.add(residual, budget, (f, jac))
+        constraints.extend(surface_rows.constraints(flat))
         constraints.extend(self._endpoint_constraints(current, step))
         constraints.extend(self._strict_endpoints(current, step))
         constraints.extend(self._scene_constraints(current, flat))
         constraints.extend(self._self_constraints(current, step))
-        objective = cp.sum_squares(system @ flat - rhs)
+        objective = squared_residual_objective(system, rhs, flat)
         active_rows = [
             (f, alpha, r)
             for f, alpha, r in self.collision_rows
@@ -290,16 +308,18 @@ class WholeBodyGuard(RefinementGuard):
             objective += cfg["collision_weight"] * cp.sum_squares(
                 collision_slack / cfg["collision_sigma"]
             )
-        problem = cp.Problem(cp.Minimize(objective), constraints)
+        problem = cp.Problem(
+            cp.Minimize(objective / max(float(rhs @ rhs), 1.0)), constraints
+        )
         try:
-            problem.solve(
-                solver="CLARABEL", max_iter=100, canon_backend=cp.SCIPY_CANON_BACKEND
-            )
+            solve_conic(problem, solver="CLARABEL", max_iter=100, direct_solve_method="qdldl")
         except cp.error.SolverError as exc:
             return None, {"status": "solver_failed", "reason": str(exc)}
         report = {
             "status": str(problem.status),
             "linearized_collision_rows": len(active_rows),
+            "compilation_seconds": problem.compilation_time,
+            "solver_seconds": problem.solver_stats.solve_time,
         }
         if (
             problem.status not in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE)
@@ -394,7 +414,7 @@ class WholeBodyGuard(RefinementGuard):
                 time = v.frame_start + f + alpha
                 before = query.cached(old, time)
                 after = (
-                    before if np.array_equal(old, new) else query.query(new, time, [])
+                    before if np.array_equal(old, new) else query.cached(new, time)
                 )
                 reasons.extend(
                     moving_regression_reasons(
@@ -433,20 +453,22 @@ class WholeBodyGuard(RefinementGuard):
             },
         }
 
-    def accept(self, current, change, merit):
+    def accept(self, current, change, merit, *, candidate_acceptance=None):
         v = self.validator
         before = self._baseline_geometry()
-        old_cost = merit(current)
+        old_cost = None
         record = {"accepted_alpha": 0.0, "rejections": []}
         for alpha in (1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625):
             trial = current.copy()
             trial[:, v.qi] += alpha * change
-            fidelity = v.fidelity(trial)
-            reasons = list(fidelity["reasons"])
+            reasons = (
+                ["fixed_sequence_budget"]
+                if candidate_acceptance is not None and not candidate_acceptance(trial)
+                else []
+            )
             if not reasons:
-                cost = merit(trial)
-                if cost >= old_cost - max(1e-10, abs(old_cost) * 1e-10):
-                    reasons.append("nonlinear_objective_not_improved")
+                fidelity = v.fidelity(trial)
+                reasons.extend(fidelity["reasons"])
             if not reasons:
                 after = v.geometry(trial)
                 reasons.extend(
@@ -454,6 +476,15 @@ class WholeBodyGuard(RefinementGuard):
                 )
                 if not reasons:
                     reasons.extend(preserve_known_scene_samples(v, trial, before))
+            if not reasons:
+                # Fixed motion/contact bounds reject many proposals before an
+                # objective comparison is needed. Evaluate the unchanged cost
+                # once, only for a candidate that reaches that comparison.
+                if old_cost is None:
+                    old_cost = merit(current)
+                cost = merit(trial)
+                if cost >= old_cost - max(1e-10, abs(old_cost) * 1e-10):
+                    reasons.append("nonlinear_objective_not_improved")
             if not reasons:
                 reasons, moving = self.moving_check(trial)
             if not reasons:

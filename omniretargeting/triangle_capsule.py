@@ -8,8 +8,14 @@ equal exits retain the intersection without inventing a gradient.
 No scene thickening, convexification, surface sampling, or asset copying is used.
 """
 
+from itertools import pairwise
+
 import numpy as np
 import trimesh
+
+
+def _dot_axis(values, axis):
+    return values @ axis if axis.ndim == 1 else np.einsum("ij,ij->i", values, axis)
 
 
 def intersecting_capsule_exit(start, end, radius, triangle):
@@ -40,11 +46,14 @@ def intersecting_capsule_exit(start, end, radius, triangle):
     return minimum, direction
 
 
-def segment_triangle_witnesses(start, end, triangles):
-    """Exact closest witnesses for one segment and each finite triangle.
+def segment_triangle_witnesses(start, end, triangles, *, groups=None):
+    """Exact closest witnesses for segments and finite triangles.
 
     Enumerate endpoint/face, segment/edge, and segment/face intersections.
     Degenerate triangles are covered by their edges and vertices.
+    ``start/end`` may be (3,) for a shared axis or (N, 3) for one per face.
+    Contiguous shared-axis ``groups`` retain the scalar-axis dot-product order
+    so rounding does not select a different face at a coplanar witness tie.
     """
     triangles = np.asarray(triangles, dtype=float).reshape(-1, 3, 3)
     start, end = np.asarray(start, float), np.asarray(end, float)
@@ -52,7 +61,18 @@ def segment_triangle_witnesses(start, end, triangles):
     if not count:
         return np.empty((0, 3)), np.empty((0, 3))
     axis = end - start
-    length2 = float(axis @ axis)
+
+    def dot_axis(values):
+        if groups is None:
+            return _dot_axis(values, axis)
+        return np.concatenate([
+            values[a:b] @ axis[a] for a, b in pairwise(groups)
+        ])
+
+    length2 = (
+        _dot_axis(axis, axis) if groups is None else
+        np.repeat([float(axis[a] @ axis[a]) for a in groups[:-1]], np.diff(groups))
+    )
     candidates = []
     normals = np.cross(triangles[:, 1] - triangles[:, 0],
                        triangles[:, 2] - triangles[:, 0])
@@ -62,7 +82,7 @@ def segment_triangle_witnesses(start, end, triangles):
         surface = triangles[:, 0].copy()
         if np.any(regular):
             surface[regular] = trimesh.triangles.closest_point(
-                triangles[regular], np.broadcast_to(endpoint, (sum(regular), 3))
+                triangles[regular], np.broadcast_to(endpoint, (count, 3))[regular]
             )
         candidates.append((np.broadcast_to(endpoint, (count, 3)), surface))
     for i in range(3):
@@ -74,11 +94,11 @@ def segment_triangle_witnesses(start, end, triangles):
             t = np.clip(np.einsum("ij,ij->i", endpoint - a, edge) / safe_edge2, 0, 1)
             candidates.append((np.broadcast_to(endpoint, (count, 3)), a + t[:, None] * edge))
         for vertex in (a, b):
-            s = np.clip((vertex - start) @ axis / max(length2, 1e-30), 0, 1)
+            s = np.clip(dot_axis(vertex - start) / np.maximum(length2, 1e-30), 0, 1)
             candidates.append((start + s[:, None] * axis, vertex))
-        cross = edge @ axis
+        cross = dot_axis(edge)
         w = start - a
-        d, e = w @ axis, np.einsum("ij,ij->i", w, edge)
+        d, e = dot_axis(w), np.einsum("ij,ij->i", w, edge)
         det = length2 * edge2 - cross**2
         usable = det > 1e-14 * np.maximum(length2 * edge2, 1e-30)
         denominator = np.where(usable, det, 1)
@@ -88,7 +108,7 @@ def segment_triangle_witnesses(start, end, triangles):
         p, surface = start + s[:, None] * axis, a + t[:, None] * edge
         p[~valid] = np.inf
         candidates.append((p, surface))
-    denominator = normals @ axis
+    denominator = dot_axis(normals)
     crossing = regular & (np.abs(denominator) > 1e-15)
     s = np.einsum("ij,ij->i", triangles[:, 0] - start, normals) / np.where(crossing, denominator, 1)
     point = start + s[:, None] * axis

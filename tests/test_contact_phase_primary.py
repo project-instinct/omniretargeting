@@ -8,10 +8,10 @@ import numpy as np
 import pytest
 import trimesh
 
-from omniretargeting.contact_phase import attach_contact_phase
+from omniretargeting.contact_phase import CONTACT_ROLES, attach_contact_phase
 from omniretargeting.contact_phase_observation import observe_effector_clearances
 from tests._contact_fixtures import _task
-from tests.test_contact_phase import case
+from tests.test_contact_phase import case, support_on
 from tests.test_full_body_surfaces import _markers
 
 
@@ -38,6 +38,7 @@ def hand_case(*, stance=False, hand_environment=0, hand_mode="sticking"):
         priority,
         model=model,
         source_clearances={"left_foot": np.full(frames, 0.2)},
+        support_evidence=support_on("left_foot", frames) if stance else None,
     )
     return model, q, tasks, priority, policy
 
@@ -81,7 +82,7 @@ def test_airborne_foot_yields_to_any_hand_contact(hand_environment):
     assert np.max(np.abs(after[:, reach] - 0.12)) < 0.002
     np.testing.assert_array_equal(after[:, :7], q[:, :7])
     assert report["surface_endpoint_guard"]["linear_failures"] == 0
-    assert policy.role("left_hand", 0) == ("support" if hand_environment == 0 else "follow")
+    assert policy.role("left_hand", 0) == "hold"
     assert policy.yields("left_foot", 0)
     assert all(tasks[n].contact_phase is policy for n in tasks)
     np.testing.assert_array_equal(tasks["left_foot"].tracking_positions[:, 0], -0.3)
@@ -175,14 +176,15 @@ def test_surface_only_contact_follows_without_locking_tangent(mode):
     along_surface = q.copy()
     along_surface[:, model.joint("reach").qposadr[0]] = 0.12
     # The hand travels 12 cm tangentially; both poses satisfy its normal task.
-    np.testing.assert_allclose(guard.priority_errors(q)[:, 3], 0, atol=1e-9)
-    np.testing.assert_allclose(guard.priority_errors(along_surface)[:, 3], 0, atol=1e-9)
+    level = CONTACT_ROLES.index("follow")
+    np.testing.assert_allclose(guard.priority_errors(q)[:, level], 0, atol=1e-9)
+    np.testing.assert_allclose(guard.priority_errors(along_surface)[:, level], 0, atol=1e-9)
     away_from_surface = along_surface.copy()
     away_from_surface[:, 2] += 0.03
     np.testing.assert_allclose(
-        guard.priority_errors(away_from_surface)[:, 3], 0.03, atol=1e-9
+        guard.priority_errors(away_from_surface)[:, level], 0.03, atol=1e-9
     )
-    np.testing.assert_allclose(guard.priority_errors(away_from_surface)[:, :3], 0)
+    np.testing.assert_allclose(guard.priority_errors(away_from_surface)[:, :level], 0)
     np.testing.assert_array_equal(tasks["left_hand"].contact_positions, original)
     np.testing.assert_array_equal(tasks["left_hand"].contact_modes, mode)
 
@@ -329,7 +331,7 @@ def test_core_attaches_primary_roles_without_dense_correspondence():
     assert all(t.contact_phase is None for t in tasks.values())
     prepare_surface_tasks(owner, solver, positions, scene, None)
     assert solver.contact_phase is owner.last_contact_phase
-    assert solver.contact_phase.role("left_hand", 0) == "support"
+    assert solver.contact_phase.role("left_hand", 0) == "hold"
     assert solver.contact_phase.yields("left_foot", 0)
     assert all(t.contact_phase is solver.contact_phase for t in tasks.values())
 
@@ -400,9 +402,9 @@ def test_free_hand_is_handed_over_to_its_anchor_without_an_onset_jump(monkeypatc
     assert np.max(np.diff(handed_over)) < 0.07
 
 
-def test_non_penetration_outranks_a_support_target_inside_the_scene():
-    # Like SMPL-X feet through the floor: the source anchor lies inside a
-    # wall. The body stops at the wall and reports the hand residual.
+def test_clearance_cannot_detach_a_protected_interaction():
+    # This deliberately incompatible fixture puts a protected target inside
+    # the wall. Report the collision instead of silently releasing the contact.
     from omniretargeting.scene_geometry import SceneQuery
     from omniretargeting.sequence_retargeting import retarget_sequence
 
@@ -418,8 +420,8 @@ def test_non_penetration_outranks_a_support_target_inside_the_scene():
                 "lock_root_z": True, "lock_root_orientation": True,
                 "world_tracking_sigma_m": 0.005},
     )
-    assert policy.role("left_hand", 0) == "support"
-    assert report["final_residuals"]["scene_depth_m"] < 1e-6
+    assert policy.role("left_hand", 0) == "hold"
+    assert 0.035 < report["final_residuals"]["scene_depth_m"] < 0.041
     reach = after[:, model.joint("reach").qposadr[0]]
-    np.testing.assert_allclose(reach, 0.08, atol=2e-3)
+    np.testing.assert_allclose(reach, 0.12, atol=2e-3)
     np.testing.assert_array_equal(tasks["left_hand"].contact_positions[:, 0], 0.12)

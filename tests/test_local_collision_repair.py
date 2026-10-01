@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import trimesh
 
+from omniretargeting.collision_window import _window_stats
 from omniretargeting.local_collision_repair import (
     TrajectoryValidator,
     local_repair_config,
@@ -44,6 +45,18 @@ def test_short_collision_interpolates_and_leaves_root_other_joints_and_outside_e
     np.testing.assert_array_equal(result[[0, 1, 2, 6, 7, 8]], q[[0, 1, 2, 6, 7, 8]])
 
 
+def test_local_repair_rejects_update_outside_cumulative_budget():
+    model, q, box = setup_motion()
+    q[3:6, 8] = 0.04
+    result, report = repair_local_collisions(
+        model, q, box, {}, {}, {}, framerate=30,
+        candidate_acceptance=lambda candidate: np.array_equal(candidate, q),
+    )
+    np.testing.assert_array_equal(result, q)
+    assert report["events"][0]["method"] == "fallback"
+    assert report["events"][0]["reason"] == "fixed_sequence_budget"
+
+
 def test_safe_motion_is_exact_noop_and_disabled_is_noop():
     model, q, box = setup_motion()
     result, report = repair_local_collisions(model, q, box, {}, {}, {}, framerate=30)
@@ -68,6 +81,42 @@ def test_saved_frames_safe_but_intermediate_pose_collides():
     assert check["interframe_max_depth"] > 0.04
     assert check["interframe_samples"] > 0
     assert check["method"] == "adaptive_discrete"
+
+
+def test_window_geometry_matches_full_timeline_with_boundary_intervals():
+    model, q, box = setup_motion(12)
+    q[4:7, 8] = 0.04
+    v = TrajectoryValidator(model, q, SceneQuery(box), {}, {}, local_repair_config({}), 30)
+    full = _window_stats(v.geometry(q), 3, 7, model)
+    with v.segment(2, 9) as view:
+        local = _window_stats(view.geometry(q[2:9]), 1, 5, model)
+    for key in (
+        "per_geom_depth", "interframe_depth", "self_depth", "interframe_self_depth",
+        "reliable_scene_depth", "interframe_reliable_scene_depth",
+    ):
+        np.testing.assert_allclose(local[key], full[key])
+    assert local["max_depth"] == full["max_depth"]
+    assert local["interframe_max_depth"] == full["interframe_max_depth"]
+
+
+def test_reused_intervals_match_fresh_validation_after_one_pose_changes():
+    model, q, box = setup_motion(12)
+    q[4:7, 8] = 0.04
+    v = TrajectoryValidator(model, q, SceneQuery(box), {}, {}, local_repair_config({}), 30)
+    v.geometry(q)
+    changed = q.copy()
+    changed[5, 8] += 0.01
+    reused = v.geometry(changed)
+    fresh = TrajectoryValidator(
+        model, q, SceneQuery(box), {}, {}, local_repair_config({}), 30
+    ).geometry(changed)
+    for key in (
+        "per_geom_depth", "interframe_depth", "self_depth", "interframe_self_depth",
+        "reliable_scene_depth", "interframe_reliable_scene_depth",
+    ):
+        np.testing.assert_allclose(reused[key], fresh[key])
+    assert reused["interframe_samples"] == fresh["interframe_samples"]
+    assert reused["records"] == fresh["records"]
 
 
 def test_interpolation_crossing_corner_is_rejected():
@@ -292,6 +341,13 @@ def test_shared_geometry_cache_reuses_poses_but_separates_scene_and_sampling():
     )
     dense.geometry(q)
     assert query.query_points > points
+    points = query.query_points
+    stricter = TrajectoryValidator(
+        model, q, query, {}, {}, {**cfg, "penetration_tolerance": 0.0005}, 30,
+        geometry_cache=cache,
+    )
+    stricter.geometry(q)
+    assert query.query_points > points
     remote_scene = scene.copy()
     remote_scene.apply_translation([10, 0, 0])
     other_query = SceneQuery(remote_scene)
@@ -322,6 +378,38 @@ def test_postprocessing_rejects_bad_fidelity_before_extra_geometry_and_reuses_in
     assert query.query_points == points
     assert report["query_points"] == 0
     assert report["after"]["max_depth"] == 0
+
+
+def test_postprocessing_respects_fixed_sequence_candidate_guard():
+    from omniretargeting.local_collision_repair import select_safe_postprocessing
+
+    model, baseline, scene = setup_motion()
+    candidate = baseline.copy()
+    candidate[:, 8] += 0.003
+    selected, _, report = select_safe_postprocessing(
+        model, baseline, candidate, scene, {}, {}, {},
+        candidate_acceptance=lambda poses: np.array_equal(poses, baseline),
+    )
+    np.testing.assert_array_equal(selected, baseline)
+    assert all(not decision["accepted"] for decision in report["decisions"])
+
+
+def test_many_postprocessing_blocks_keep_safe_changes_and_reject_bad_window():
+    from omniretargeting.local_collision_repair import select_safe_postprocessing
+
+    model, baseline, scene = setup_motion(300)
+    candidate = baseline.copy()
+    candidate[:, 8] += 0.003
+    candidate[150:155, 8] = 0.0
+    selected, checked, report = select_safe_postprocessing(
+        model, baseline, candidate, scene, {}, {}, {"max_query_points": None},
+        framerate=30,
+    )
+    assert len(report["decisions"]) > 20
+    assert 0.8 < report["accepted_fraction"] < 1
+    np.testing.assert_array_equal(selected[150:155], baseline[150:155])
+    np.testing.assert_array_equal(selected[25:30], candidate[25:30])
+    assert checked["max_depth"] <= 0.001
 
 
 def test_uncertain_scene_keeps_unknown_report_while_known_window_is_repaired():

@@ -8,11 +8,15 @@ from scipy import sparse
 from scipy.spatial import Delaunay, QhullError, cKDTree
 
 from .._refinement.math import _lock_contact_offsets, _skew_symmetric
-from .._solver.targets import _approach_contact_target, _transform_swing_target
+from .._solver.targets import (
+    _approach_contact_target,
+    _transform_swing_target,
+    _world_target_regime,
+)
 from ..contact import _is_surface_only_contact_mode
 from ..scene_geometry import collision_geom_ids, geom_surface_offsets
 from ..self_collision import SelfCollisionQuery
-from ..utils import calculate_laplacian_matrix, get_adjacency_list
+from ..utils import calculate_laplacian_matrix
 from .orientation import OrientationTargets
 
 
@@ -24,10 +28,26 @@ def frozen_array(value, shape, label):
     return value
 
 
+def _uniform_delaunay_laplacian(simplices, count):
+    """``calculate_laplacian_matrix(uniform_weight=True)`` of the simplex graph."""
+    first, second = np.triu_indices(simplices.shape[1], 1)
+    adjacency = np.zeros((count, count), dtype=bool)
+    adjacency[simplices[:, first], simplices[:, second]] = True
+    adjacency |= adjacency.T
+    degree = adjacency.sum(1)
+    connected = degree > 0
+    laplacian = np.zeros((count, count))
+    laplacian[adjacency] = -np.repeat(
+        np.ones(count)[connected] / degree[connected], degree[connected]
+    )
+    laplacian[np.flatnonzero(connected), np.flatnonzero(connected)] = 1.0
+    return laplacian
+
+
 def graph_operator(points, robot_count):
     """Use the source-fixed Delaunay graph; handle planar/short skeletons."""
     try:
-        adjacency = get_adjacency_list(Delaunay(points).simplices, len(points))
+        laplacian = _uniform_delaunay_laplacian(Delaunay(points).simplices, len(points))
     except QhullError:
         adjacency = {i: set() for i in range(len(points))}
         neighbors = cKDTree(points).query(points, k=min(5, len(points)))[1]
@@ -36,10 +56,11 @@ def graph_operator(points, robot_count):
                 if i != j:
                     adjacency[i].add(int(j))
                     adjacency[int(j)].add(i)
-    laplacian = calculate_laplacian_matrix(points, adjacency, uniform_weight=True)
-    return sparse.kron(
-        sparse.csr_matrix(laplacian)[:, :robot_count], sparse.eye(3)
-    ).toarray()
+        laplacian = calculate_laplacian_matrix(points, adjacency, uniform_weight=True)
+    operator = np.zeros((3 * len(points), 3 * robot_count))
+    for axis in range(3):
+        operator[axis::3, axis::3] = laplacian[:, :robot_count]
+    return operator
 
 
 class SequenceTasks:
@@ -77,6 +98,14 @@ class SequenceTasks:
         self.human.setflags(write=False)
         self.roots = frozen_array(root_positions, (self.frames, 3), "root_positions")
         self.bodyids = [model.body(mapping[name]).id for name in self.names]
+        free = np.flatnonzero(model.jnt_type == mujoco.mjtJoint.mjJNT_FREE)
+        self.root_body = (
+            model.body(priority["source_root_robot_body"]).id
+            if priority.get("source_root_robot_body") is not None
+            else int(model.jnt_bodyid[free[0]])
+            if len(free)
+            else None
+        )
         if environment_points is None:
             environment_points = np.empty((self.frames, 0, 3))
         env = np.asarray(environment_points, dtype=float)
@@ -194,6 +223,13 @@ class SequenceTasks:
             if scene_query is not None
             else []
         )
+        from .scene_cache import SceneTrajectoryQueries
+
+        self.scene_cache = (
+            SceneTrajectoryQueries(model, scene_query, self.shells)
+            if getattr(scene_query, "closed_sign_method", None) == "winding"
+            else None
+        )
         self.self_query = (
             SelfCollisionQuery(model, config.get("self_collision"))
             if config["self_collision_enabled"]
@@ -201,6 +237,7 @@ class SequenceTasks:
         )
         self.extra_tasks = tuple(task for task in extra_tasks if task is not None)
         from ..contact_phase import phase_policy
+
         self.contact_phase = phase_policy(*self.extra_tasks, *tasks.values())
         self.orientations = OrientationTargets(model, self.frames, orientation_targets)
 
@@ -212,15 +249,40 @@ class SequenceTasks:
         mujoco.mj_jac(self.model, self.data, jac, None, p, body)
         return p, jac[:, self.coords.cols]
 
-    def clearance_rows(self, stats=None):
+    def root_anchor(self, frame):
+        if self.root_body is None:
+            return self.roots[frame], np.zeros((3, self.coords.width))
+        return self.point(self.root_body)
+
+    def clearance_rows(self, stats=None, frame=None):
         """Scene and self clearance deficits (metres) at the forwarded pose."""
         stats = {} if stats is None else stats
-        for gid, offsets in self.shells:
-            points = (
-                offsets @ self.data.geom_xmat[gid].reshape(3, 3).T
-                + self.data.geom_xpos[gid]
-            )
-            measured = self.scene.query(points)
+        if frame is not None:
+            for task in self.extra_tasks:
+                if hasattr(task, "clearance_rows"):
+                    yield from task.clearance_rows(
+                        self.data.qpos, frame, self.coords.cols, stats
+                    )
+        # A closed scene's winding hierarchy is rebuilt by the libigl Python
+        # binding on each call. Query all original shell points together, then
+        # keep the same per-geom worst witness. Geometry and coverage are unchanged.
+        groups = [
+            offsets @ self.data.geom_xmat[gid].reshape(3, 3).T
+            + self.data.geom_xpos[gid]
+            for gid, offsets in self.shells
+        ]
+        queried = (
+            None
+            if self.scene_cache is None
+            else self.scene_cache.get(self.data.qpos, frame)
+        )
+        if queried is None and groups:
+            queried = self.scene.query(np.concatenate(groups))
+        begin = 0
+        for (gid, _), points in zip(self.shells, groups):
+            end = begin + len(points)
+            measured = {key: value[begin:end] for key, value in queried.items()}
+            begin = end
             clearance = measured["clearance"]
             reliable = np.flatnonzero(np.isfinite(clearance))
             if not len(reliable):
@@ -302,11 +364,22 @@ class SequenceTasks:
         for name, spec in self.effectors.items():
             target_data = spec["task"].frame(frame)
             active = target_data["contact"]
+            if active and target_data.get("surface_managed", False):
+                continue  # same contact is constrained by its rigid surface block
             offset = (
                 spec["contact_offsets"][self.choices[name][frame]]
                 if active
                 else spec["tracking_offset"]
             )
+            if not active:
+                share = target_data["approach_weight"]
+                # Handing over only the target but switching the robot point
+                # at onset leaves a jump equal to the center-to-contact offset.
+                # Blend the point in the body's local frame as well; its FK
+                # Jacobian then includes rotation of the entire offset.
+                offset = (1 - share) * offset + share * spec["contact_offsets"][
+                    self.choices[name][frame]
+                ]
             point, derivative = self.point(spec["body_id"], offset)
             witness = spec.get("support_witness")
             if (
@@ -355,32 +428,19 @@ class SequenceTasks:
                         stats["sticking_max_m"], float(np.linalg.norm(residual))
                     )
             else:
-                world = bool(spec.get("preserve_world_target", False))
-                root_z = (
-                    self.roots[frame, 2]
-                    if self.coords.root_q is None
-                    else pose[self.coords.root_q + 2]
-                )
+                world = _world_target_regime(spec, target_data)
+                root_point, root_jac = self.root_anchor(frame)
                 target = _transform_swing_target(
                     target_data["tracking_position"],
                     self.roots[frame],
-                    root_z - self.roots[frame, 2],
+                    root_point[2] - self.roots[frame, 2],
                     spec.get("swing_morphology_scale", 1.0),
                     world,
-                    robot_root_position=(
-                        None if self.coords.root_q is None
-                        else pose[self.coords.root_q : self.coords.root_q + 3]
-                    ),
+                    robot_root_position=root_point,
                 )
                 target, free_share = _approach_contact_target(target, target_data)
-                if (
-                    not world
-                    and self.coords.root_d is not None
-                ):
-                    for axis in range(3):
-                        column = self.coords.inverse.get(self.coords.root_d + axis)
-                        if column is not None:
-                            derivative[axis, column] -= free_share
+                if not world:
+                    derivative -= free_share * root_jac
                 add(
                     point - target,
                     derivative,
@@ -414,9 +474,17 @@ class SequenceTasks:
                         -_skew_symmetric(direction) @ angular_jac[:, self.coords.cols],
                         self.config["orientation_sigma"],
                     )
-        for residual, jac in self.clearance_rows(stats):
+        for residual, jac in self.clearance_rows(stats, frame):
             add(residual, jac, self.config["collision_sigma_m"])
         for task in self.extra_tasks:
             for weight, residual, jac in task.rows(pose, frame, self.coords.cols):
                 add(residual * np.sqrt(weight), jac * np.sqrt(weight), 1.0)
+            if hasattr(task, "position_rows") and hasattr(task, "modes"):
+                for index, residual, _ in task.position_rows(pose, frame, []):
+                    key = (
+                        "sticking_max_m"
+                        if task.modes[frame, index] == "sticking"
+                        else "contact_normal_max_m"
+                    )
+                    stats[key] = max(stats[key], float(np.linalg.norm(residual)))
         return np.concatenate(residuals), sparse.csr_matrix(np.vstack(matrices)), stats

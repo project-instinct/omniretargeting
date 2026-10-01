@@ -259,11 +259,40 @@ end-effector geometry, and genuine model-specific overrides:
 }
 ```
 
-Declaring interaction effectors automatically enables the shared policy; there
-is no preset selector or external algorithm-parameter JSON. Nested
+The shared contact and smoothing defaults apply to every profile. Declared
+effectors supply model-specific body names or contact offsets; there is no
+preset selector or external algorithm-parameter JSON. Nested
 robot-specific objects are merged recursively, while a scalar or list in the
 robot profile replaces the algorithm default. The bundled
-`unitree_g1_instinctmj.json` uses this compact form.
+`unitree_g1_instinctmj.json` includes calibration and geometry overrides. The
+G1 profiles have no joint-specific refinement weights, posture targets, or
+fixed per-frame joint-step limits. The TRUMANS full-sequence workflow uses the
+source-shaped pose and fixed correction budgets; other workflows inherit the
+shared refinement defaults.
+
+For a full TRUMANS clip review using the bundled G1 profile and SMPL-X body
+models, change only the data directory, segment, and output directory:
+
+```bash
+.venv/bin/python scripts/trumans_review_inputs.py \
+  --data /path/to/TRUMANS/Data_release \
+  --segment '2023-02-19@22-38-25' \
+  --output out/my_clip \
+  --solve
+```
+
+Use `--robot path/to/robot_profile.json` for a different robot and
+`--body-models path/to/body_models` if the body models are stored elsewhere.
+An optional `--support-evidence path/to/evidence.npy` supplies measured source
+support observations when available. This review keeps the source motion and
+scene at their original metric scale.
+
+CUDA conic solving is optional and uses the same clip and robot configuration.
+Install `.[gpu]`, then prefix a Python entry point with
+`.venv/bin/python scripts/run_gpu_solver.py --`. The launcher selects QOCO's
+CUDA backend for conic and bounded least-squares steps and returns to CLARABEL
+if a GPU conic solve fails. CPU remains the default; geometry preparation and
+collision checks still run on CPU.
 
 Robot self-collision avoidance is enabled by default, independently of the
 scene penetration resolver. It checks only collision-enabled geoms, respects

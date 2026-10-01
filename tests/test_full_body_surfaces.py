@@ -446,23 +446,21 @@ def test_added_dense_pose_preserves_framewise_primary_endpoint(monkeypatch):
     assert np.linalg.norm(result - initial) > 1e-4
 
 
-def test_adapter_world_surface_labels_do_not_require_effector_profile(monkeypatch):
+def test_surface_target_frame_follows_per_frame_clearance_not_adapter_part_labels(monkeypatch):
+    from dataclasses import replace
     model, source, mapping, q, _ = rig(monkeypatch)
-    world = source["full_body"]["sample_joint_indices"] == 2
-    source["full_body"]["sample_world_tracking"] = world
     shared = SurfaceMotion(model, source, model.qpos0, {"cache_dir": None}, mapping)
+    group = model.body_weldid[shared.body_ids] == model.body_weldid[model.body("b").id]
+    world = np.arange(len(q)) % 2 == 0
+    endpoint = replace(_task(np.zeros((len(q), 3)), np.zeros(len(q), bool)), swing_world_mask=world)
     task, _ = build_surface_pose_tasks(
-        model,
-        source,
-        model.qpos0,
-        q[:, :3],
-        np.zeros(3),
-        config={"morphology_scale": 0.5},
-        mapping=mapping,
-        surface_motion=shared,
+        model, source, model.qpos0, q[:, :3], np.zeros(3),
+        config={"morphology_scale": 0.5}, mapping=mapping, surface_motion=shared,
+        scene_tasks={"any_region": endpoint}, priority={"effectors": {"any_region": {"robot_body": "b"}}},
     )
-    np.testing.assert_array_equal(task.targets[:, world], shared.points[:, world])
-    assert not task.root_relative[world].any()
+    np.testing.assert_array_equal(task.targets[world][:, group], shared.points[world][:, group])
+    assert not task.root_relative[world][:, group].any()
+    assert task.root_relative[~world][:, group].all()
 
 
 def test_core_uses_selected_root_in_surface_reference_coordinates(monkeypatch):

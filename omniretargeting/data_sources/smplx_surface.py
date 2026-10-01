@@ -7,6 +7,7 @@ skin surfaces, never capsules fitted to joint centres.
 
 import numpy as np
 import trimesh
+from scipy.spatial.transform import Rotation
 
 
 def sample_smplx_surfaces(
@@ -71,6 +72,7 @@ def sample_smplx_surfaces(
              "neck", "left_clavicle", "right_clavicle", "head", "left_upper_arm", "right_upper_arm",
              "left_forearm", "right_forearm", "left_hand", "right_hand"]
     from .smplx import DEFAULT_SMPLX_TARGET_NAMES
+    from .smplx_inertia import skin_face_regions
     effectors = {7: "left_foot", 10: "left_foot", 8: "right_foot", 11: "right_foot",
                  20: "left_hand", 21: "right_hand"}
     return {
@@ -81,20 +83,28 @@ def sample_smplx_surfaces(
         "full_body": {
             "reference_vertices": vertices @ canonical_to_world.T,
             "faces": faces.copy(),
+            # Skin segment of every face (index into the 22 source joints):
+            # the rigid segments of the source inertia estimate.
+            "face_regions": skin_face_regions(model, 22),
             "face_ids": face_ids,
             "barycentric": bary,
             "triangles": np.asarray(posed_vertices[:, indices], dtype=np.float32),
             "labels": np.asarray(names)[joint],
             "joint_names": np.asarray(DEFAULT_SMPLX_TARGET_NAMES),
             "joint_parents": parents[:22].copy(),
+            # Target-frame semantics belong to the adapter, not robot link
+            # names or support inference. Keep authored feet paths in world.
+            "world_target_joints": np.asarray(DEFAULT_SMPLX_TARGET_NAMES)[[7, 8, 10, 11]],
             "sample_joint_indices": joint.copy(),
             "sample_effectors": np.array([effectors.get(int(i), "") for i in joint]),
-            "sample_world_tracking": np.isin(joint, [7, 8, 10, 11]),
             "reference_root_position": (
                 reference.joints.detach().cpu().numpy()[0, 0] @ canonical_to_world.T
             ),
             "reference_joint_positions": (
                 reference.joints.detach().cpu().numpy()[0, :22] @ canonical_to_world.T
+            ),
+            "reference_joint_orientations": np.tile(
+                Rotation.from_matrix(canonical_to_world).as_quat(scalar_first=True), (22, 1)
             ),
         },
     }

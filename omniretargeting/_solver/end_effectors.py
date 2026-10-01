@@ -16,6 +16,7 @@ from .targets import (
     _source_orientation_step,
     _swing_target_z_offset,
     _transform_swing_target,
+    _world_target_regime,
 )
 
 
@@ -224,16 +225,16 @@ class EndEffectorMixin:
         metric tolerance ``sigma`` makes each squared residual dimensionless.
         """
         self._protected_endpoint_residuals = {}
-        self._support_endpoint_residual = None
-        from ..contact_phase import phase_policy
+        self._role_endpoint_residuals = {}
+        from ..contact_phase import CONTACT_ROLES, phase_policy
         policy = phase_policy(self, getattr(self, "surface_contact_tasks", None))
         phase_frame = getattr(self, "_contact_phase_frame", None)
         if not self.end_effector_enabled or not targets:
             return None, None, None, [], 0, 0, 0
 
-        # Observed contact roles: support rows form their own first level;
-        # following contacts keep the existing contact level below them.
-        support_terms: List[cp.Expression] = []
+        # Metric position rows share a role level with arbitrary body patches.
+        # Orientation/tracking preferences remain in the later contact task.
+        role_terms = {role: [] for role in CONTACT_ROLES}
         contact_terms: List[cp.Expression] = []
         swing_terms: List[cp.Expression] = []
         swing_orientation_terms: List[cp.Expression] = []
@@ -243,7 +244,7 @@ class EndEffectorMixin:
                 continue
             spec = self.end_effectors[name]
             role = policy.role(name, phase_frame) if policy else None
-            level_terms = support_terms if role == "support" else contact_terms
+            level_terms = contact_terms
             body_id = spec["body_id"]
             confidence = float(np.clip(target_data.get("confidence", 1.0), 0.0, 1.0))
             transition_weight = float(
@@ -259,6 +260,8 @@ class EndEffectorMixin:
             up_direction = target_data.get("up_direction")
 
             if bool(target_data.get("contact", False)):
+                if target_data.get("surface_managed", False):
+                    continue
                 target = np.asarray(target_data["contact_position"], dtype=float).reshape(3)
                 offset_index = self._active_contact_offsets.get(name)
                 if offset_index is None:
@@ -295,6 +298,8 @@ class EndEffectorMixin:
                     and normal_norm > 1e-8
                 ):
                     self._protected_endpoint_residuals[name] = surface_normal @ residual
+                    if role in role_terms:
+                        role_terms[role].append(np.sqrt(weight) * (surface_normal @ residual))
                     level_terms.append(
                         np.sqrt(weight) * (surface_normal @ residual) / sigma
                     )
@@ -350,6 +355,8 @@ class EndEffectorMixin:
                             / transition_sigma
                         )
                 else:
+                    if role in role_terms:
+                        role_terms[role].append(np.sqrt(weight) * residual)
                     level_terms.append(np.sqrt(weight) * residual / sigma)
                 if normal_norm > 1e-8:
                     normal_tolerance = max(
@@ -427,10 +434,20 @@ class EndEffectorMixin:
                     continue
                 target = np.asarray(target_data["tracking_position"], dtype=float).reshape(3)
                 source_root_position = target_data.get("source_root_position")
+                anchor_body = self.end_effector_config.get("source_root_robot_body")
+                if anchor_body is None:
+                    root_point = self.robot_data.qpos[:3]
+                    root_jacobian = np.array([
+                        self.q_a_indices == axis for axis in range(3)
+                    ], dtype=float)
+                else:
+                    root_point, root_jacobian = self._point_position_and_jacobian(
+                        self.robot_model.body(anchor_body).id, np.zeros(3)
+                    )
                 swing_morphology_scale = float(spec["swing_morphology_scale"])
                 root_z_offset = _swing_target_z_offset(
                     self.end_effector_config,
-                    robot_root_z=float(self.robot_data.qpos[2]),
+                    robot_root_z=float(root_point[2]),
                     source_root_position=source_root_position,
                 )
                 # Contact positions remain exact world-space constraints.
@@ -442,20 +459,19 @@ class EndEffectorMixin:
                     source_root_position,
                     root_z_offset,
                     swing_morphology_scale,
-                    bool(spec["preserve_world_target"]),
-                    robot_root_position=self.robot_data.qpos[:3],
+                    _world_target_regime(spec, target_data),
+                    robot_root_position=root_point,
                 )
                 target, free_share = _approach_contact_target(target, target_data)
                 target_jacobian = np.zeros((3, self.nq_a), dtype=float)
                 if (
-                    not spec["preserve_world_target"]
+                    not _world_target_regime(spec, target_data)
                     and source_root_position is not None
                 ):
                     # Linearize the moving target as well as the endpoint.
-                    for axis in (0, 1):
-                        target_jacobian[axis, self.q_a_indices == axis] = free_share
-                    if self.end_effector_config.get("swing_target_z_offset") is None:
-                        target_jacobian[2, self.q_a_indices == 2] = free_share
+                    target_jacobian = free_share * root_jacobian
+                    if self.end_effector_config.get("swing_target_z_offset") is not None:
+                        target_jacobian[2] = 0
                 reach_body_id = int(spec["reach_reference_body_id"])
                 if reach_body_id >= 0:
                     reach_origin, origin_jacobian = self._point_position_and_jacobian(
@@ -484,13 +500,15 @@ class EndEffectorMixin:
                 residual = position - target + (jacobian - target_jacobian) @ dqa
                 # A world target held on a surface keeps its contact role;
                 # one observed clear of every surface yields to contacts.
-                if (spec["preserve_world_target"] or name in ("left_foot", "right_foot")) and not (
+                if _world_target_regime(spec, target_data) and not (
                     policy is not None and policy.yields(name, phase_frame)
                 ):
                     self._protected_endpoint_residuals[name] = residual
                 position_terms = (
-                    level_terms if role in ("support", "follow") else swing_terms
+                    level_terms if role in CONTACT_ROLES else swing_terms
                 )
+                if role in role_terms:
+                    role_terms[role].append(residual)
                 position_terms.append(residual / sigma)
                 if (
                     spec.get("track_orientation", False)
@@ -581,9 +599,9 @@ class EndEffectorMixin:
                     <= max_orientation_step
                 )
 
-        self._support_endpoint_residual = (
-            cp.hstack(support_terms) if support_terms else None
-        )
+        self._role_endpoint_residuals = {
+            role: cp.hstack(terms) for role, terms in role_terms.items() if terms
+        }
         contact_residual = cp.hstack(contact_terms) if contact_terms else None
         swing_residual = cp.hstack(swing_terms) if swing_terms else None
         swing_orientation_residual = (

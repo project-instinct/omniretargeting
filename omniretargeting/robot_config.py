@@ -37,8 +37,7 @@ def load_robot_config(config_path: str | Path) -> Dict[str, Any]:
     retargeting = raw.get("retargeting", {})
     if not isinstance(retargeting, dict):
         raise ValueError("retargeting must be a JSON object.")
-    if retargeting:
-        raw["retargeting"] = apply_retargeting_defaults(retargeting)
+    raw["retargeting"] = apply_retargeting_defaults(retargeting)
 
     if "joint_mapping" not in raw or not isinstance(raw["joint_mapping"], dict) or not raw["joint_mapping"]:
         raise ValueError("Robot config must contain non-empty 'joint_mapping'.")

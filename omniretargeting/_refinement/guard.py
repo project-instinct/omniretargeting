@@ -14,10 +14,9 @@ import mujoco
 import numpy as np
 from scipy import sparse
 
-from ..contact import _is_surface_only_contact_mode
+from ..conic_solver import solve_conic
 from ..scene_witness_guard import preserve_known_scene_samples
 from ..trajectory_validation import QueryBudgetExceeded
-from .math import _skew_symmetric
 
 
 class RefinementGuard:
@@ -45,98 +44,9 @@ class RefinementGuard:
         return self.before
 
     def _endpoint_constraints(self, current, step):
-        v, constraints = self.validator, []
-        data = mujoco.MjData(v.model)
-        for name, spec in v.specs.items():
-            task = spec["task"]
-            points, jacobians, rotations, rotation_jacobians = [], [], [], []
-            for f, q in enumerate(current):
-                data.qpos[:] = q
-                mujoco.mj_forward(v.model, data)
-                point = v.point(data, name, f)
-                jp, jr = np.zeros((3, v.model.nv)), np.zeros((3, v.model.nv))
-                mujoco.mj_jac(v.model, data, jp, jr, point, spec["body_id"])
-                points.append(point)
-                jacobians.append(jp[:, v.di])
-                rotations.append(data.xmat[spec["body_id"]].reshape(3, 3).copy())
-                rotation_jacobians.append(jr[:, v.di])
-            p0 = v.original_effectors[name]["position"]
-            linear = np.asarray(points) + cp.reshape(
-                sparse.block_diag(jacobians, format="csr") @ cp.vec(step, order="C"),
-                (len(current), 3),
-                order="C",
-            )
-            sticking = []
-            for f in range(len(current)):
-                payload = task.frame(f)
-                if not payload["contact"]:
-                    budget = v.swing_budget(name, f)
-                    if not np.isfinite(budget):
-                        continue
-                    constraints.append(cp.norm(linear[f] - p0[f]) <= budget)
-                    if spec.get("preserve_world_target", "foot" in name):
-                        target = payload["tracking_position"]
-                        constraints.append(
-                            cp.norm(linear[f] - target)
-                            <= np.linalg.norm(p0[f] - target) + budget
-                        )
-                    continue
-                projector = np.eye(3)
-                surface_only = _is_surface_only_contact_mode(payload["contact_mode"])
-                if surface_only:
-                    n = np.asarray(payload["surface_normal"], dtype=float)
-                    n = n / max(np.linalg.norm(n), 1e-12)
-                    projector = n[None, :]
-                target = payload["contact_position"]
-                old_error = np.linalg.norm(projector @ (p0[f] - target))
-                constraints += [
-                    cp.norm(projector @ (linear[f] - target))
-                    <= max(old_error, v.cfg["contact_tolerance"])
-                    + v.cfg["contact_regression"],
-                    cp.norm(projector @ (linear[f] - p0[f]))
-                    <= v.contact_change_budget(old_error),
-                ]
-                if payload["contact_mode"] == "sticking":
-                    if (sticking and sticking[-1] == f - 1
-                            and payload["environment_id"] == task.frame(f - 1)["environment_id"]):
-                        constraints.append(
-                            cp.norm(
-                                (linear[f] - p0[f] - linear[f - 1] + p0[f - 1]) * v.fps
-                            )
-                            <= v.cfg["support_slip_regression"]
-                        )
-                    sticking.append(f)
-                if not spec.get("track_orientation", False):
-                    continue
-                for axis in ["up"] if surface_only else ["up", "forward"]:
-                    targets = getattr(task, f"{axis}_directions")
-                    if targets is None:
-                        continue
-                    local = spec.get(
-                        "orientation_local_" + axis,
-                        [0, 0, 1] if axis == "up" else [1, 0, 0],
-                    )
-                    direction = rotations[f] @ local
-                    direction /= max(np.linalg.norm(direction), 1e-12)
-                    original = np.asarray(
-                        v.original_effectors[name][axis][f], dtype=float
-                    )
-                    original = original / max(np.linalg.norm(original), 1e-12)
-                    target_axis = np.asarray(targets[f], dtype=float)
-                    target_axis = target_axis / max(np.linalg.norm(target_axis), 1e-12)
-                    linear_axis = (
-                        direction
-                        - _skew_symmetric(direction) @ rotation_jacobians[f] @ step[f]
-                    )
-                    angle = np.arccos(np.clip(original @ target_axis, -1, 1))
-                    # Unit-vector chord length corresponding to the validator's
-                    # angle budget. Nonlinear angle checks still run below.
-                    constraints += [
-                        cp.norm(linear_axis - original) <= 2 * np.sin(0.02 / 2),
-                        cp.norm(linear_axis - target_axis)
-                        <= 2 * np.sin(min(angle + 0.02, np.pi) / 2),
-                    ]
-        return constraints
+        from ..endpoint_constraints import endpoint_constraints
+
+        return endpoint_constraints(self.validator, current, cp.vec(step, order="C"))
 
     def _scene_constraints(self, current, flat_step):
         v = self.validator
@@ -147,7 +57,12 @@ class RefinementGuard:
             raise QueryBudgetExceeded(
                 "scene query point budget before refinement constraints"
             )
-        frames = v.probe.probe_trajectory(current)
+        if limit is None:
+            from ..scene_probe_batch import probe_batches
+
+            frames = probe_batches(v.probe, current)
+        else:
+            frames = v.probe.probe_trajectory(current)
         if limit is not None and v.query.query_points - v.query_start > limit:
             raise QueryBudgetExceeded(
                 "scene query point budget in refinement constraints"
@@ -234,7 +149,7 @@ class RefinementGuard:
             cp.Minimize(0.5 * cp.sum_squares(system @ flat - rhs)), constraints
         )
         try:
-            problem.solve(
+            solve_conic(problem,
                 solver="CLARABEL", max_iter=100, canon_backend=cp.SCIPY_CANON_BACKEND
             )
         except cp.error.SolverError as exc:

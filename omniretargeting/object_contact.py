@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import numpy as np
 
+from .contact_correspondence import coherent_sample_indices
 from .contact_schedule import (
     _apply_contact_hysteresis,
     _iter_true_runs,
@@ -142,10 +143,15 @@ def merge_object_contacts(tasks, markers, objects, *, framerate, config=None):
             if getattr(original, key) is not None:
                 values[key] = np.array(getattr(original, key), copy=True)
         for surface_id, surface in enumerate(surfaces, 1):
-            distances, points, normals, velocity, _ = surface.observe(
+            distances, points, normals, velocity, local = surface.observe(
                 samples, framerate
             )
-            selected = np.argmin(distances, axis=1)
+            material_points = np.einsum('tni,tij->tnj', points - surface.translations[:, None],
+                                         surface.rotations) / surface.scales[:, None, None]
+            selected = coherent_sample_indices(
+                distances / surface.scales[:, None], material_points, local,
+                max_distance=exit_distance / surface.scales[:, None],
+                switch_weight=eff.get('contact_sample_switch_weight', 1.))
             rows = np.arange(frames)
             d, p, n, v = (
                 value[rows, selected]

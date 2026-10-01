@@ -17,13 +17,18 @@ from .surface_observation import ContactSurface
 from .trajectory_validation import QueryBudgetExceeded, local_repair_config
 from .whole_body_guard import WholeBodyGuard, WholeBodyValidator, interpolated_pose
 
+WHOLE_BODY_WINDOW_THRESHOLD = 256
+WHOLE_BODY_WINDOW_FRAMES = 96
+
 DEFAULTS = {
     "enabled": True,
     "iterations": 3,
+    # Locality of one secondary correction relative to the trajectory it
+    # receives, not a posture limit against the source motion.
     "max_joint_correction": 0.2,
     "trust_region": 0.06,
     "contact_regression": 0.001,
-    "foot_position_budget": 0.002,
+    "world_position_budget": 0.002,
     "free_position_budget": 0.02,
     "correction_velocity": 1.0,
     "correction_acceleration": 12.0,
@@ -45,6 +50,9 @@ DEFAULTS = {
 
 
 def whole_body_config(config=None):
+    from .config_validation import known_options
+
+    known_options(config, DEFAULTS, 'whole_body_correction', extra=('moving_scene',))
     cfg = {**DEFAULTS, **dict(config or {})}
     for key, default in DEFAULTS.items():
         if isinstance(default, bool):
@@ -203,6 +211,8 @@ def correct_whole_body_trajectory(
     validation_config=None,
     body_relation_tasks=None,
     contact_offset_choice=None,
+    geometry_cache=None,
+    candidate_acceptance=None,
 ):
     """Return a protected robot trajectory and an auditable acceptance report.
 
@@ -240,6 +250,7 @@ def correct_whole_body_trajectory(
         or not np.isfinite(result).all()
     ):
         raise ValueError("Whole-body correction requires a finite nonempty trajectory")
+    shared_geometry = validation_config is not None
     local = local_repair_config(
         {
             **dict(validation_config or {}),
@@ -251,11 +262,11 @@ def correct_whole_body_trajectory(
                     "correction_velocity",
                     "correction_acceleration",
                     "collision_regression",
-                    "penetration_tolerance",
-                    "motion_spacing",
-                    "max_substeps",
                 )
             },
+            **({} if shared_geometry else {
+                k: cfg[k] for k in ("penetration_tolerance", "motion_spacing", "max_substeps")
+            }),
             "max_query_points": None,
             "swing_position_budget": cfg["free_position_budget"],
         },
@@ -270,6 +281,7 @@ def correct_whole_body_trajectory(
         local,
         framerate,
         whole_body_config=cfg,
+        geometry_cache=geometry_cache,
         surface_contact_tasks=surface_contact_tasks,
         surface_pose_tasks=surface_pose_tasks,
         self_contact_tasks=self_contact_tasks,
@@ -312,6 +324,13 @@ def correct_whole_body_trajectory(
             for obj in scene_objects
         )
     )
+    # Contact budgets are defined against this immutable robot reference.
+    # Every temporal window and SQP sweep uses the same values.
+    validator.fixed_contact_errors = {
+        id(task): (validator.frame_start, task.errors(validator.reference, validator.frame_start))
+        for task in (surface_contact_tasks, self_contact_tasks)
+        if task is not None
+    }
     guard = WholeBodyGuard(validator, moving)
     objective = WholeBodyObjective(validator, moving)
     active = _active_coordinates(validator, moving)
@@ -324,7 +343,9 @@ def correct_whole_body_trajectory(
         surface_scope=_surface_scope(
             surface_contact_tasks, result, validator.di[active]
         ),
-        surface_before=surface_contact_tasks.metrics(result)
+        surface_before=surface_contact_tasks.metrics(
+            result, errors=validator.fixed_contact_errors[id(surface_contact_tasks)][1]
+        )
         if surface_contact_tasks is not None
         else None,
         fixed_marker_choices={
@@ -338,21 +359,54 @@ def correct_whole_body_trajectory(
                 baseline_fidelity=validator.fidelity(result),
             )
             return result, report
+        baseline_tick = time.perf_counter()
+        print("Whole-body correction: checking fixed scene baseline", flush=True)
         guard._baseline_geometry()
+        report["static_baseline_seconds"] = time.perf_counter() - baseline_tick
+        baseline_moving = None
         if moving is not None:
+            moving.prepare_trajectory(result)
             reasons, baseline_moving = guard.moving_check(result)
+            report["moving_baseline_seconds"] = time.perf_counter() - baseline_tick - report["static_baseline_seconds"]
             report["moving_collision"] = {
                 "status": "active",
                 "geometry": moving.describe(),
                 "before": baseline_moving,
             }
+            guard.last_moving = baseline_moving
             if reasons:
                 report.update(reason="baseline_moving_geometry_failed", reasons=reasons)
                 return result, report
-        for iteration in range(int(cfg["iterations"])):
+        windowed = len(result) > WHOLE_BODY_WINDOW_THRESHOLD
+        if windowed:
+            from .whole_body_windows import solve_windowed
+
+            result, window_report = solve_windowed(
+                validator, moving, result, cfg, active, guard,
+                core_frames=WHOLE_BODY_WINDOW_FRAMES,
+                candidate_acceptance=candidate_acceptance,
+                baseline_moving=baseline_moving,
+            )
+            report["iterations"].extend(window_report.pop("iterations"))
+            report.update(window_report)
+            if moving is not None:
+                coverage = [event["moving_coverage"] for event in report["iterations"]]
+                report["moving_collision"]["linearization_coverage"] = {
+                    key: sum(int(item[key]) for item in coverage)
+                    for key in ("poses", "reverse_available_facets", "reverse_selected_facets")
+                }
+                report["moving_collision"]["linearization_coverage"][
+                    "acceptance_checks_all_original_samples"
+                ] = True
+                report["moving_collision"]["immovable_witnesses"] = [
+                    witness for item in coverage
+                    for witness in item.get("immovable_witnesses", [])
+                ]
+        for iteration in range(0 if windowed else int(cfg["iterations"])):
             tick = time.perf_counter()
             guard.collision_rows = []
             if moving is not None:
+                moving.prepare_trajectory(result)
                 objective.moving_grid = []
                 available_facets = selected_facets = 0
                 for f in range(len(result)):
@@ -406,8 +460,16 @@ def correct_whole_body_trajectory(
                     }
                     for f, r in immovable
                 ]
+            moving_seconds = time.perf_counter() - tick
             matrix, rhs = objective.linearize(result)
+            linearization_seconds = time.perf_counter() - tick - moving_seconds
+            print(
+                f"Whole-body correction iteration {iteration}: "
+                f"moving={moving_seconds:.1f}s linearization={linearization_seconds:.1f}s; solving",
+                flush=True,
+            )
             change, solve = guard.solve(matrix, rhs, result, active)
+            solve["seconds"] = time.perf_counter() - tick - moving_seconds - linearization_seconds
             if change is None:
                 report["iterations"].append({"accepted_alpha": 0.0, "solve": solve})
                 break
@@ -416,7 +478,10 @@ def correct_whole_body_trajectory(
                     {"accepted_alpha": 0.0, "reason": "stationary", "solve": solve}
                 )
                 break
-            result, acceptance = guard.accept(result, change, objective)
+            result, acceptance = guard.accept(
+                result, change, objective,
+                candidate_acceptance=candidate_acceptance,
+            )
             acceptance.update(
                 iteration=iteration, solve=solve, seconds=time.perf_counter() - tick
             )

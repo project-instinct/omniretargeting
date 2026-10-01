@@ -30,29 +30,5 @@
     "left_hip": "L_Hip",
     "right_hip": "R_Hip",
     "spine": "Spine1"
-  },
-  "retargeting": {
-    "collision_detection_threshold": 0.1,
-    "terrain_sample_points": 100,
-    "penetration_resolver": "hard_constraint",
-    "foot_stabilization": {
-      "enabled": true,
-      "clearance": 0.01,
-      "surface_clearance": 0.005,
-      "contact_clearance": 0.04,
-      "contact_vertical_speed": 0.18,
-      "min_contact_frames": 3,
-      "anchor_frames": 3,
-      "xy_correction_gain": 1.0,
-      "xy_smoothing_window": 5,
-      "z_smoothing_window": 5,
-      "contact_point_height_band": 0.01,
-      "max_xy_correction": 0.08,
-      "max_surface_correction": 0.08,
-      "surface_iterations": 4,
-      "wall_red_axis_only": true,
-      "wall_normal_z_threshold": 0.35,
-      "wall_x_dominance_threshold": 0.5
-    }
   }
 }

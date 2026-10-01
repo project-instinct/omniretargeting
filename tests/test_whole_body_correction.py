@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 
 import mujoco
 import numpy as np
@@ -17,6 +18,7 @@ from omniretargeting.surface_contact import (
     transported_contact_normals,
 )
 from omniretargeting.surface_tasks import SurfaceBinding
+from omniretargeting.trajectory_validation import TrajectoryValidator, local_repair_config
 from omniretargeting.whole_body_correction import correct_whole_body_trajectory
 
 WHOLE_BODY_XML = """
@@ -141,7 +143,7 @@ def _config(**overrides):
         "max_joint_correction": 0.35,
         "trust_region": 0.08,
         "contact_regression": 0.001,
-        "foot_position_budget": 0.002,
+        "world_position_budget": 0.002,
         "free_position_budget": 0.02,
         "correction_velocity": 1.0,
         "correction_acceleration": 12.0,
@@ -276,6 +278,76 @@ def test_source_tasks_and_marker_identity_are_immutable(empty_scene):
             np.testing.assert_array_equal(getattr(task, key), value)
         else:
             assert getattr(task, key) == value
+
+
+def test_windowed_correction_keeps_fixed_reference_and_composed_budgets(
+    empty_scene, monkeypatch,
+):
+    import omniretargeting.whole_body_correction as correction
+
+    monkeypatch.setattr(correction, "WHOLE_BODY_WINDOW_THRESHOLD", 4)
+    monkeypatch.setattr(correction, "WHOLE_BODY_WINDOW_FRAMES", 4)
+    model, baseline = _model_and_baseline(frames=10)
+    desired = baseline[0].copy()
+    desired[model.joint("waist_pitch").qposadr] = 0.1
+    target = np.tile(_point(model, desired, "pelvis_surface"), (10, 1))
+    surface = _surface_task(model, baseline, target, frames=10)
+    result, report = correct_whole_body_trajectory(
+        model, baseline, {}, _priority(), _config(iterations=1),
+        scene_query=empty_scene, surface_contact_tasks=surface,
+    )
+    assert report["window_frames"] == 4
+    assert len({tuple(item["window"]) for item in report["iterations"]}) == 3
+    assert report["accepted_update_count"] == 3
+    assert report["final_reasons"] == []
+    assert report["root_invariant"]
+    np.testing.assert_array_equal(result[:, :7], baseline[:, :7])
+    assert report["final_fidelity"]["ok"]
+
+
+def test_validator_window_keeps_authored_approach_reference(empty_scene):
+    model, baseline = _model_and_baseline(frames=5)
+    targets = np.tile(_point(model, baseline[0], "hand_surface"), (5, 1))
+    task = replace(
+        _task("left_hand", targets),
+        approach_reference=(np.linspace(0, 1, 5), targets.copy()),
+    )
+    priority = _priority()
+    validator = TrajectoryValidator(
+        model, baseline, empty_scene, {"left_hand": task}, priority,
+        local_repair_config({"enabled": True}, priority=priority), 30.0,
+    )
+    with validator.segment(2, 3) as view:
+        payload = view.tasks["left_hand"].frame(0)
+        assert payload["approach_weight"] == 0.5
+        np.testing.assert_array_equal(payload["approach_position"], targets[2])
+
+
+def test_windowed_correction_checks_cumulative_guard_before_acceptance(
+    empty_scene, monkeypatch,
+):
+    import omniretargeting.whole_body_correction as correction
+
+    monkeypatch.setattr(correction, "WHOLE_BODY_WINDOW_THRESHOLD", 4)
+    monkeypatch.setattr(correction, "WHOLE_BODY_WINDOW_FRAMES", 4)
+    model, baseline = _model_and_baseline(frames=10)
+    desired = baseline[0].copy()
+    desired[model.joint("waist_pitch").qposadr] = 0.1
+    target = np.tile(_point(model, desired, "pelvis_surface"), (10, 1))
+    surface = _surface_task(model, baseline, target, frames=10)
+    result, report = correct_whole_body_trajectory(
+        model, baseline, {}, _priority(), _config(iterations=1),
+        scene_query=empty_scene, surface_contact_tasks=surface,
+        candidate_acceptance=lambda candidate: np.array_equal(candidate, baseline),
+    )
+    np.testing.assert_array_equal(result, baseline)
+    assert report["accepted_update_count"] == 0
+    assert report["final_reasons"] == []
+    assert any(
+        "fixed_sequence_budget" in rejection["reasons"]
+        for event in report["iterations"]
+        for rejection in event.get("rejections", [])
+    )
 
 
 def test_surface_pose_normal_transport_uses_source_face_motion_and_robot_reference_normal():

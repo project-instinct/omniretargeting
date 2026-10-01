@@ -15,6 +15,8 @@ from .collision_window import (
     _check_corridor as _check_corridor,
     _collision_score as _collision_score,
     _corridor_planes as _corridor_planes,
+    _local_fidelity as _local_fidelity,
+    _local_geometry as _local_geometry,
     _optimize_window as _optimize_window,
     _window_stats as _window_stats,
 )
@@ -188,25 +190,37 @@ def _event_windows(v, stats):
 def _point_corrections(v, before, after, event, records):
     a, b = event["window"]
     horizontal, vertical = 0.0, 0.0
-    d0, d1 = mujoco.MjData(v.model), mujoco.MjData(v.model)
+    if np.array_equal(before[a : b + 1], after[a : b + 1]):
+        return {
+            "horizontal_point_correction": horizontal,
+            "vertical_point_correction": vertical,
+        }
+    by_frame = {}
     for record in records:
-        f, gid = record["frame"], record["geom"]
-        if not a <= f <= b or record["alpha"]:
+        frame = record["frame"]
+        if a <= frame <= b and not record["alpha"]:
+            by_frame.setdefault(frame, []).append(record)
+    d0, d1 = mujoco.MjData(v.model), mujoco.MjData(v.model)
+    for frame, samples in by_frame.items():
+        if np.array_equal(before[frame], after[frame]):
             continue
-        d0.qpos[:] = before[f]
-        d1.qpos[:] = after[f]
+        d0.qpos[:] = before[frame]
+        d1.qpos[:] = after[frame]
         mujoco.mj_forward(v.model, d0)
         mujoco.mj_forward(v.model, d1)
-        local = d0.geom_xmat[gid].reshape(3, 3).T @ (
-            np.asarray(record["point"]) - d0.geom_xpos[gid]
-        )
-        delta = (
-            d1.geom_xpos[gid]
-            + d1.geom_xmat[gid].reshape(3, 3) @ local
-            - np.asarray(record["point"])
-        )
-        horizontal = max(horizontal, float(np.linalg.norm(delta[:2])))
-        vertical = max(vertical, abs(float(delta[2])))
+        for record in samples:
+            gid = record["geom"]
+            point = np.asarray(record["point"])
+            local = d0.geom_xmat[gid].reshape(3, 3).T @ (
+                point - d0.geom_xpos[gid]
+            )
+            delta = (
+                d1.geom_xpos[gid]
+                + d1.geom_xmat[gid].reshape(3, 3) @ local
+                - point
+            )
+            horizontal = max(horizontal, float(np.linalg.norm(delta[:2])))
+            vertical = max(vertical, abs(float(delta[2])))
     return {
         "horizontal_point_correction": horizontal,
         "vertical_point_correction": vertical,
@@ -230,6 +244,7 @@ def repair_local_collisions(
     surface_contact_tasks=None,
     surface_pose_tasks=None,
     contact_offset_choice=None,
+    candidate_acceptance=None,
 ):
     start_time = perf_counter()
     cfg = local_repair_config(config, priority=end_effector_config)
@@ -283,6 +298,7 @@ def repair_local_collisions(
     used = []
     try:
         for index, event in enumerate(events):
+            event_start = perf_counter()
             event.update(method="fallback", iterations=0)
             report["events"].append(event)
             if index >= cfg["max_windows"]:
@@ -296,6 +312,7 @@ def repair_local_collisions(
             if not event["joints"]:
                 event["reason"] = "no_local_scalar_chain"
                 continue
+            event_reference, event_stats = result.copy(), final_stats
             # An earlier event can modify adjacent fixed boundaries. Build the
             # candidate from the current output, while reference budgets stay fixed.
             initial = _interpolate(result, a, b, event["joints"], model)
@@ -308,29 +325,39 @@ def repair_local_collisions(
             if focus_self:
                 reasons = ["self_collision_projection"]
             if not reasons:
-                fidelity = v.fidelity(initial)
+                if candidate_acceptance is not None and not candidate_acceptance(initial):
+                    reasons.append("fixed_sequence_budget")
+            if not reasons:
+                fidelity = _local_fidelity(v, initial, a, b)
                 reasons.extend(fidelity["reasons"])
                 if not _check_corridor(v, initial, event, planes):
                     reasons.append("same_side_corridor")
                 if not reasons:
-                    check = v.geometry(initial)
+                    local_after = _local_geometry(v, initial, a, b)
                     reasons.extend(
                         v.compare_geometry(
                             before,
-                            _window_stats(check, a, b, model),
+                            local_after,
                             require_improvement=True,
                             allow_existing_uncertainty=True,
                         )
                     )
-                    if not reasons:
-                        reasons.extend(preserve_known_scene_samples(v, initial, original, a, b))
                     # Interpolation is accepted only if the event meets the
                     # detector's tolerance; partial progress uses bounded SQP.
                     if (
-                        _collision_score(_window_stats(check, a, b, model))[0]
+                        _collision_score(local_after)[0]
                         > cfg["penetration_tolerance"]
                     ):
                         reasons.append("interpolation_collision")
+                    if not reasons:
+                        reasons.extend(preserve_known_scene_samples(v, initial, original, a, b))
+                    if not reasons:
+                        reasons.extend(v.fidelity(initial)["reasons"])
+                        check = v.geometry(initial)
+                        reasons.extend(v.compare_geometry(
+                            before, _window_stats(check, a, b, model),
+                            require_improvement=True, allow_existing_uncertainty=True,
+                        ))
                     if not reasons:
                         result, final_stats = initial, check
                         event.update(
@@ -342,22 +369,37 @@ def repair_local_collisions(
                 candidate, directional = bidirectional_window(v, result, initial, event, planes)
                 event["bidirectional"] = directional
                 if candidate is not None:
-                    fidelity = v.fidelity(candidate)
-                    check = v.geometry(candidate)
-                    rejected = fidelity["reasons"] + v.compare_geometry(
-                        final_stats, check, require_improvement=True,
-                        allow_existing_uncertainty=True)
+                    rejected = (
+                        ["fixed_sequence_budget"]
+                        if candidate_acceptance is not None and not candidate_acceptance(candidate)
+                        else []
+                    )
+                    if not rejected:
+                        fidelity = _local_fidelity(v, candidate, a, b)
+                        local_after = _local_geometry(v, candidate, a, b)
+                        rejected.extend(fidelity["reasons"] + v.compare_geometry(
+                            _window_stats(final_stats, a, b, model), local_after,
+                            require_improvement=True,
+                            allow_existing_uncertainty=True))
                     if not rejected:
                         rejected.extend(preserve_known_scene_samples(v, candidate, original, a, b))
                     if not _check_corridor(v, candidate, event, planes):
                         rejected.append("same_side_corridor")
+                    if not rejected:
+                        rejected.extend(v.fidelity(candidate)["reasons"])
+                        check = v.geometry(candidate)
+                        rejected.extend(v.compare_geometry(
+                            final_stats, check, require_improvement=True,
+                            allow_existing_uncertainty=True,
+                        ))
                     if not rejected:
                         result, final_stats, initial = candidate, check, candidate
                         event.update(method="bidirectional_dp", reason="joint_checks_passed")
                         reasons = []
                         trial, polished, log = _optimize_window(
                             v, result, result, event, final_stats, planes,
-                            min(cfg["iterations"], cfg["dp_polish_iterations"]), polish=True)
+                            min(cfg["iterations"], cfg["dp_polish_iterations"]),
+                            polish=True, candidate_acceptance=candidate_acceptance)
                         event.update(optimization=log, iterations=log["iterations"])
                         if polished is not None:
                             result, final_stats = trial, polished
@@ -393,7 +435,8 @@ def repair_local_collisions(
                     else cfg["iterations"]
                 )
                 trial, check, log = _optimize_window(
-                    v, result, initial, event, final_stats, planes, first_budget
+                    v, result, initial, event, final_stats, planes, first_budget,
+                    candidate_acceptance=candidate_acceptance,
                 )
                 event.update(
                     iterations=log["iterations"],
@@ -417,7 +460,8 @@ def repair_local_collisions(
                     initial = _interpolate(result, a, b, event["joints"], model)
                     planes = _corridor_planes(v, event, original)
                     trial, check, extra = _optimize_window(
-                        v, result, initial, event, final_stats, planes, remaining
+                        v, result, initial, event, final_stats, planes, remaining,
+                        candidate_acceptance=candidate_acceptance,
                     )
                     event["attempts"].append(dict(window=[a, b], **extra))
                     event["iterations"] += extra["iterations"]
@@ -429,12 +473,14 @@ def repair_local_collisions(
                     elif event["method"] == "fallback":
                         event["reason"] = extra["reason"]
                     before = _window_stats(original, a, b, model)
+            if (event["method"] != "fallback" and candidate_acceptance is not None
+                    and not candidate_acceptance(result)):
+                result, final_stats = event_reference, event_stats
+                event.update(method="fallback", reason="fixed_sequence_budget")
             event["before"] = before
             event["after"] = _window_stats(final_stats, a, b, model)
             event["fidelity"] = v.fidelity(result)
-            event.update(
-                _point_corrections(v, reference, result, event, original["records"])
-            )
+            event["seconds"] = perf_counter() - event_start
             if event["method"] != "fallback":
                 used.append((a, b))
         # Verify the exact returned array after all windows have been composed.
@@ -551,6 +597,7 @@ def select_safe_postprocessing(
     surface_contact_tasks=None,
     surface_pose_tasks=None,
     contact_offset_choice=None,
+    candidate_acceptance=None,
 ):
     """Jointly accept existing refinement/postprocessing; never mix joint angles.
 
@@ -572,6 +619,8 @@ def select_safe_postprocessing(
         before = v.geometry(baseline)
         fidelity = v.fidelity(candidate)
         reasons = fidelity["reasons"]
+        if not reasons and candidate_acceptance is not None and not candidate_acceptance(candidate):
+            reasons = ["fixed_sequence_budget"]
         if not reasons:
             after = v.geometry(candidate)
             reasons = v.compare_geometry(before, after, allow_existing_uncertainty=True)
@@ -592,7 +641,6 @@ def select_safe_postprocessing(
             )
         size = max(1, int(cfg["max_window_seconds"] * framerate))
         changed = np.any(candidate != baseline, axis=1)
-        accepted = 0
         checked = before
         for a, b in _runs(changed):
             for start in range(a, b + 1, size):
@@ -608,14 +656,21 @@ def select_safe_postprocessing(
                     continue
                 trial = result.copy()
                 trial[start:end] = candidate[start:end]
-                fidelity = v.fidelity(trial)
+                fidelity = _local_fidelity(v, trial, start, end - 1)
                 failure = fidelity["reasons"]
+                if not failure and candidate_acceptance is not None and not candidate_acceptance(trial):
+                    failure = ["fixed_sequence_budget"]
                 geometry_evaluated = not failure
                 if geometry_evaluated:
-                    check = v.geometry(trial)
-                    failure = v.compare_geometry(before, check, allow_existing_uncertainty=True)
+                    local_after = _local_geometry(v, trial, start, end - 1)
+                    failure = v.compare_geometry(
+                        _window_stats(before, start, end - 1, model),
+                        local_after, allow_existing_uncertainty=True,
+                    )
                     if not failure:
-                        failure.extend(preserve_known_scene_samples(v, trial, before))
+                        failure.extend(preserve_known_scene_samples(
+                            v, trial, before, max(0, start - 1), min(len(trial) - 1, end)
+                        ))
                 decisions.append(
                     {
                         "window": [int(start), int(end - 1)],
@@ -625,9 +680,45 @@ def select_safe_postprocessing(
                     }
                 )
                 if not failure:
+                    result = trial
+        # Window decisions are provisional. Audit the composed full trajectory
+        # once, including all cross-window temporal and scene constraints.
+        checked = v.geometry(result)
+        final_failure = (
+            v.fidelity(result)["reasons"]
+            + v.compare_geometry(before, checked, allow_existing_uncertainty=True)
+            + preserve_known_scene_samples(v, result, before)
+        )
+        if candidate_acceptance is not None and not candidate_acceptance(result):
+            final_failure.append("fixed_sequence_budget")
+        if final_failure:
+            # Rare coupled failure: replay the accepted blocks with the original
+            # full-trajectory contract, keeping every independently safe block.
+            result, checked = np.asarray(baseline).copy(), before
+            for decision in decisions:
+                if not decision["accepted"]:
+                    continue
+                start, last = decision["window"]
+                trial = result.copy()
+                trial[start : last + 1] = candidate[start : last + 1]
+                failure = v.fidelity(trial)["reasons"]
+                if not failure and candidate_acceptance is not None and not candidate_acceptance(trial):
+                    failure = ["fixed_sequence_budget"]
+                if not failure:
+                    check = v.geometry(trial)
+                    failure = (
+                        v.compare_geometry(before, check, allow_existing_uncertainty=True)
+                        + preserve_known_scene_samples(v, trial, before)
+                    )
+                if failure:
+                    decision.update(accepted=False, reasons=sorted(set(failure)))
+                else:
                     result, checked = trial, check
-                    accepted += int(np.count_nonzero(changed[start:end]))
-        # ``checked`` is the exact last accepted assembly; no modification follows.
+        accepted = sum(
+            int(np.count_nonzero(changed[start : last + 1]))
+            for decision in decisions if decision["accepted"]
+            for start, last in [decision["window"]]
+        )
         return (
             result,
             checked,

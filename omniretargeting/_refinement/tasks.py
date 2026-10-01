@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import mujoco
 import numpy as np
+
+from .._solver.targets import _world_target_regime
 from scipy import sparse
 from scipy.spatial.transform import Rotation
 
@@ -89,6 +91,13 @@ def linearize_trajectory_tasks(
             if source_root_positions is None
             else source_root_positions[frame_idx]
         )
+        root_point = result[frame_idx, :3]
+        root_jacobian = np.zeros((3, model.nv))
+        anchor_body = end_effector_config.get("source_root_robot_body")
+        if anchor_body is not None:
+            anchor_id = model.body(anchor_body).id
+            root_point = data.xpos[anchor_id].copy()
+            mujoco.mj_jacBody(model, data, root_jacobian, None, anchor_id)
         if body_relation_tasks is not None:
             for weight, residual, jacobian in body_relation_tasks.rows(result[frame_idx], frame_idx, dof_indices):
                 append_block(frame_idx, jacobian, -residual, 1.0, weight)
@@ -103,14 +112,17 @@ def linearize_trajectory_tasks(
                 append_block(frame_idx, jacobian, -residual, 1.0, weight)
         root_z_offset = _swing_target_z_offset(
             end_effector_config,
-            robot_root_z=float(result[frame_idx, 2]),
+            robot_root_z=float(root_point[2]),
             source_root_position=source_root_position,
         )
         for name, spec in effectors.items():
+            target_jacobian = np.zeros((3, model.nv))
             task: SceneContactTask = spec["task"]
             body_id = int(spec["body_id"])
             rotation = data.xmat[body_id].reshape(3, 3).copy()
             in_contact = bool(task.contact_mask[frame_idx])
+            if in_contact and task.managed_frames[frame_idx]:
+                continue
             if in_contact:
                 contact_mode = (
                     str(task.contact_modes[frame_idx])
@@ -140,12 +152,16 @@ def linearize_trajectory_tasks(
                     source_root_position,
                     root_z_offset,
                     float(spec["swing_morphology_scale"]),
-                    bool(spec["preserve_world_target"]),
-                    robot_root_position=result[frame_idx, :3],
+                    _world_target_regime(spec, task.frame(frame_idx)),
+                    robot_root_position=root_point,
                 )
-                target_position, _ = _approach_contact_target(
+                target_position, free_share = _approach_contact_target(
                     target_position, task.frame(frame_idx)
                 )
+                if source_root_position is not None and not _world_target_regime(spec, task.frame(frame_idx)):
+                    target_jacobian = free_share * root_jacobian
+                    if end_effector_config.get("swing_target_z_offset") is not None:
+                        target_jacobian[2] = 0
                 reach_body_id = int(spec["reach_reference_body_id"])
                 if reach_body_id >= 0:
                     reach_rotation = data.xmat[reach_body_id].reshape(3, 3)
@@ -153,6 +169,15 @@ def linearize_trajectory_tasks(
                         data.xpos[reach_body_id]
                         + reach_rotation @ spec["reach_reference_offset"]
                     )
+                    delta = target_position - reach_origin
+                    distance = np.linalg.norm(delta)
+                    reach = spec["max_swing_reach"]
+                    if reach is not None and 0 < reach < distance:
+                        origin_jacobian = np.zeros((3, model.nv))
+                        mujoco.mj_jac(model, data, origin_jacobian, None, reach_origin, reach_body_id)
+                        direction = delta / distance
+                        projection = (reach / distance) * (np.eye(3) - np.outer(direction, direction))
+                        target_jacobian = origin_jacobian + projection @ (target_jacobian - origin_jacobian)
                     target_position = _clamp_target_to_reach(
                         target_position,
                         reach_origin,
@@ -177,6 +202,9 @@ def linearize_trajectory_tasks(
                 point,
                 body_id,
             )
+            # The articulated source anchor and a bounded reach origin can
+            # move through scalar joints even when the floating base is fixed.
+            jacobian_position -= target_jacobian
             position_delta = target_position - point
             if in_contact and _is_surface_only_contact_mode(contact_mode):
                 # A surface contact has only one positional coordinate, so
@@ -275,8 +303,8 @@ def linearize_trajectory_tasks(
                     source_root_position,
                     root_z_offset,
                     float(spec["swing_morphology_scale"]),
-                    bool(spec["preserve_world_target"]),
-                    robot_root_position=result[frame_idx, :3],
+                    _world_target_regime(spec, task.frame(frame_idx)),
+                    robot_root_position=root_point,
                 )
                 target_upper, target_forearm = (
                     _transported_arm_segment_targets(

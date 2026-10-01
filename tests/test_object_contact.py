@@ -185,6 +185,7 @@ def test_alternating_nearest_skin_sample_is_anchored_in_object_material_space():
     unanchored = _merge(
         tracking, markers, objects,
         anchor_contacts=False,
+        contact_sample_switch_weight=0.,
         require_normal_alignment=False,
         distance_threshold=0.02,
     )["hand"]
@@ -212,7 +213,7 @@ def test_alternating_nearest_skin_sample_is_anchored_in_object_material_space():
             require_normal_alignment=False,
             distance_threshold=0.02,
         )["hand"].contact_positions,
-        unanchored.contact_positions,
+        anchored.contact_positions,
     )
     np.testing.assert_array_equal(markers["hand"]["contact_samples"], original_samples)
     np.testing.assert_array_equal(markers["hand"]["tracking_positions"], original_tracking)

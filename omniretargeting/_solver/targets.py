@@ -52,6 +52,11 @@ def _swing_target_z_offset(
     return 0.0
 
 
+def _world_target_regime(spec, target):
+    """Observed clearance decides the frame; explicit overrides are prepared upstream."""
+    return bool(target.get("target_world", spec.get("preserve_world_target", False)))
+
+
 def _transform_swing_target(
     tracking_position: np.ndarray,
     source_root_position: np.ndarray | None,

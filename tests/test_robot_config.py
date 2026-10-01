@@ -81,12 +81,7 @@ def test_contact_retargeting_defaults_merge_robot_overrides(tmp_path: Path):
         ]
         == "test_left_hand"
     )
-    assert (
-        retargeting["end_effector_priority"]["effectors"]["left_hand"][
-            "preserve_world_target"
-        ]
-        is False
-    )
+    assert "preserve_world_target" not in retargeting["end_effector_priority"]["effectors"]["left_hand"]
     assert set(retargeting["end_effector_priority"]["effectors"]) == {"left_hand"}
     assert retargeting["trajectory_refinement"]["enabled"] is True
 
@@ -116,8 +111,8 @@ def test_compact_instinctmj_profile_expands_algorithm_defaults():
     assert loaded["retargeting"]["joint_limit_safety_fraction"] == 1.0
     assert priority["contact_detection"]["transition_frames"] == 4
     assert priority["effectors"]["left_hand"]["robot_body"] == "left_rubber_hand"
-    assert priority["effectors"]["left_hand"]["preserve_world_target"] is False
-    assert priority["effectors"]["left_foot"]["preserve_world_target"] is True
+    assert "preserve_world_target" not in priority["effectors"]["left_hand"]
+    assert "preserve_world_target" not in priority["effectors"]["left_foot"]
     assert priority["initial_foot_alignment"] is True
     assert priority["effectors"]["left_foot"]["tracking_offset"] == [0.04, 0.0, -0.035]
     assert priority["effectors"]["right_foot"]["tracking_offset"] == [0.04, 0.0, -0.035]
@@ -146,6 +141,21 @@ def test_compact_instinctmj_profile_expands_algorithm_defaults():
     assert penetration["max_depth_weight"] == pytest.approx(9.0)
     assert penetration["contact_anchor_exclusion_radius"] == pytest.approx(0.0)
     assert "swing_target_z_offset" not in priority
+
+
+@pytest.mark.parametrize("name", ["unitree_g1.json", "unitree_g1_instinctmj.json"])
+def test_g1_profiles_do_not_override_joint_refinement_by_body_part(name):
+    profile = REPO_ROOT / "robot_models" / "unitree_g1" / name
+    raw = json.loads(profile.read_text())
+    assert "trajectory_refinement" not in raw.get("retargeting", {})
+    refinement = load_robot_config(profile)["retargeting"]["trajectory_refinement"]
+    for key in (
+        "joint_step_avoidance",
+        "joint_temporal_weights",
+        "joint_posture_targets",
+        "swing_joint_step_avoidance",
+    ):
+        assert key not in refinement
 
 
 @pytest.mark.parametrize("profile_path", ROBOT_PROFILE_CASES)

@@ -1,7 +1,9 @@
 """Moving original meshes, reliable signed samples and reverse intersections.
 
 Objects have prescribed poses, never optimization coordinates. Open components
-remain unknown. Reverse witnesses prove sampled surface/robot intersections;
+remain globally unknown; fixed source observations can orient local patches,
+and nearly closed ones are signed where their winding number is decisive.
+Reverse witnesses prove sampled surface/robot intersections;
 their absence is not a certificate of collision-free geometry. In particular,
 we never replace a chair and its gaps by a single convex hull.
 """
@@ -14,7 +16,10 @@ from scipy.spatial import ConvexHull, cKDTree
 from scipy.spatial.transform import Rotation
 
 from .collision_motion import CollisionMotionBounds
-from .scene_geometry import SceneQuery, collision_geom_ids, geom_surface_offsets
+from .evidence_scope import EvidenceScope
+from .moving_reverse_cache import cached_reverse
+from .moving_sample_summary import summarize
+from .scene_geometry import HULL_TOLERANCE, SceneQuery, collision_geom_ids, geom_surface_offsets
 from .surface_observation import ContactSurface
 
 
@@ -96,7 +101,23 @@ class MovingSceneQuery:
                 scales=spec.get("scales"),
                 name=spec.get("name", "object"),
             )
-            query = SceneQuery(spec["mesh"], full_geometry=False)
+            evidence = spec.get("collision_evidence", {})
+            query = SceneQuery(
+                spec["mesh"], evidence.get("points"), evidence.get("normals"),
+                evidence_radius=evidence.get("radius", 0.15), full_geometry=False,
+                bounded_object=True,
+            )
+            face_components = np.empty(len(surface.faces), dtype=int)
+            for cid, (_, faces, _, _) in enumerate(query.components):
+                face_components[faces] = cid
+            observed_open = [cid for cid, component in enumerate(query.components)
+                             if not component[2] and query._component_query_data[cid][3]]
+            # Nearly closed components with volume: a sample their winding
+            # number puts inside penetrates them, whichever surface is nearest
+            # (``SceneQuery``). Zero-volume pieces cannot contain a sample.
+            nearly_closed = [cid for cid, component in enumerate(query.components)
+                             if not component[2] and query.nearly_closed(cid)
+                             and abs(component[0].volume) > 1e-12]
             samples = np.vstack(
                 [surface.vertices, surface.vertices[surface.faces].mean(axis=1)]
             )
@@ -108,6 +129,10 @@ class MovingSceneQuery:
                     "samples": samples,
                     "tree": cKDTree(samples),
                     "closed": [i for i, part in enumerate(query.components) if part[2]],
+                    "observed_open": observed_open,
+                    "nearly_closed": nearly_closed,
+                    "nearly_bounds": [np.asarray(query.components[cid][0].bounds) for cid in nearly_closed],
+                    "face_components": face_components,
                     "radius": float(np.max(np.linalg.norm(surface.vertices, axis=1))),
                 }
             )
@@ -116,6 +141,36 @@ class MovingSceneQuery:
         )
         self.query_count = 0
         self.cache = OrderedDict()
+        self.forward_cache = None
+        self.material_cache = OrderedDict()
+        self.reverse_cache = OrderedDict()
+        self.sample_keys = {}
+
+    def fresh_state(self):
+        """Reuse immutable mesh/BVH construction with independent query state.
+
+        Source geometry, material samples and certified hull memoization are
+        invariant for this sequence. Pose buffers, per-transform summaries,
+        query counters and trajectory prepasses belong to the new consumer.
+        """
+        import copy
+        result = copy.copy(self)
+        result.data = mujoco.MjData(self.model)
+        result.cfg = dict(self.cfg)
+        result.query_count = 0
+        result.cache = OrderedDict()
+        result.forward_cache = None
+        result.material_cache = OrderedDict()
+        result.reverse_cache = OrderedDict()
+        result.sample_keys = {}
+        return result
+
+    def prepare_trajectory(self, poses):
+        from ._sequence.moving_cache import MovingForwardQueries
+
+        if self.forward_cache is None:
+            self.forward_cache = MovingForwardQueries(self)
+        self.forward_cache.prepare(poses)
 
     def describe(self):
         return {
@@ -125,6 +180,10 @@ class MovingSceneQuery:
             "unknown_components": self.unknown_components,
             "closed_components": [len(o["closed"]) for o in self.objects],
             "reverse_samples": [len(o["samples"]) for o in self.objects],
+            "locally_observed_open_components": [len(o["observed_open"]) for o in self.objects],
+            "nearly_closed_components": [len(o["nearly_closed"]) for o in self.objects],
+            "local_evidence_points": [len(o["query"].evidence_points) for o in self.objects],
+            "open_forward_scope": "nearest original surface patch within the 3D source-evidence radius",
             "robot_collision_geoms": len(self.geom_ids),
             "reverse_primitive_geometry": "inscribed hull; sampled lower bound",
             "collision_free_certificate": False,
@@ -171,7 +230,7 @@ class MovingSceneQuery:
             **extra,
         )
 
-    def _forward_samples(self, obj, translation, rotation, scale, band):
+    def _forward_samples(self, obj, translation, rotation, scale, band, shells):
         """Batch identical signed queries across robot geoms per component.
 
         The Python fast-winding binding rebuilds its mesh acceleration data
@@ -180,7 +239,7 @@ class MovingSceneQuery:
         material sample and split the batched answers back into their geoms.
         """
         samples = {}
-        for shell in self.shells:
+        for shell in shells:
             gid = shell["geom_id"]
             world = (shell["offsets"] @ self.data.geom_xmat[gid].reshape(3, 3).T
                      + self.data.geom_xpos[gid])
@@ -207,6 +266,136 @@ class MovingSceneQuery:
                 start = stop
         return samples
 
+    def _material_samples(self, oid, obj, pose, time, translation, rotation, scale, band, shells):
+        """Reuse exact unchanged material transforms, never cached Jacobians.
+
+        Fixed-root local corrections often move only one limb. Object-side
+        witnesses on unchanged bodies remain identical across those candidates.
+        The cache is bounded and includes the exact prescribed object transform.
+        """
+        samples, missing, signatures = {}, [], {}
+        object_pose = (translation.tobytes(), rotation.tobytes(), float(scale))
+        for shell in shells:
+            gid = shell["geom_id"]
+            key = (oid, float(time), gid, self.data.geom_xpos[gid].tobytes(),
+                   self.data.geom_xmat[gid].tobytes(), object_pose, float(band))
+            signatures[gid] = key
+            entry = self.material_cache.get(key)
+            if entry is not None:
+                samples[gid] = entry
+                self.material_cache.move_to_end(key)
+            else:
+                missing.append(shell)
+        if missing:
+            prepared = None if self.forward_cache is None else self.forward_cache.get(pose, time, oid)
+            fresh = (self._forward_samples(obj, translation, rotation, scale, band, missing)
+                     if prepared is None else {shell["geom_id"]: prepared[shell["geom_id"]] for shell in missing})
+            self._open_forward_samples(obj, fresh, band / scale)
+            for gid, values in fresh.items():
+                key = signatures[gid]
+                values = summarize(self, oid, obj, gid, values, rotation, scale, band)
+                self.material_cache[key] = values
+                self.material_cache.move_to_end(key)
+                samples[gid] = values
+            while len(self.material_cache) > 8192:
+                self.material_cache.popitem(last=False)
+        return samples
+
+    def _open_forward_samples(self, obj, samples, band):
+        """Reliable local exits on the nearest original open patch only.
+
+        A robot point can lie entirely behind an open panel without any panel
+        sample inside the robot. Reverse intersections miss that case. Do not
+        extend every remote triangle into an infinite collision halfspace;
+        query the actual nearest component and require fixed source evidence.
+        A nearly closed component encloses its own volume: samples it can
+        decide by its winding number (``SceneQuery._decisive_winding``) are
+        not left unknown because another surface is nearest.
+        """
+        if not (obj["observed_open"] or obj["nearly_closed"]) or not samples:
+            return
+        gids = list(samples)
+        local = np.concatenate([samples[g][1] for g in gids])
+        surface = obj["surface"]
+        # Free-side evidence is local in 3D, not an infinite extrusion of a
+        # tangent patch. A distant head behind a lamp fragment is not proof
+        # that the head penetrates the lamp. Keep such samples unknown.
+        # The search bound only prunes; samples beyond it are out of scope.
+        query = obj["query"]
+        in_scope = np.zeros(len(local), bool)
+        if query.evidence_tree is not None:
+            scope = obj.get("scope")
+            if scope is None:
+                scope = obj["scope"] = EvidenceScope(
+                    query.evidence_tree, query.evidence_points, query.evidence_radius)
+            in_scope = scope(local)
+        # Outside the object's hull a sample is known outside at any distance.
+        # Beyond the activation band it needs no query: its distance to the
+        # object is at least its hull margin, so it has no row either.
+        outside = np.zeros(len(local), bool)
+        far = np.zeros(len(local), bool)
+        if query._hull is not None:
+            lower, upper = query._hull_bounds
+            box = np.linalg.norm(np.maximum(np.maximum(lower - local, local - upper), 0.), axis=1)
+            far = box > band
+            outside[far] = True
+            near = np.flatnonzero(~far)
+            classified = query.hull_classification(local[near], HULL_TOLERANCE, band)
+            outside[near], far[near] = classified.T
+        in_scope = (in_scope | outside) & ~far
+        # Nearest triangles are per point; out-of-scope samples never use one.
+        components = np.full(len(local), -1)
+        if in_scope.any():
+            _, triangles, _ = surface.tree.squared_distance(
+                surface.vertices, surface.faces, local[in_scope])
+            components[in_scope] = obj["face_components"][triangles]
+        begins = np.r_[0, np.cumsum([len(samples[g][1]) for g in gids])]
+        for index, gid in enumerate(gids):
+            far_indices = np.flatnonzero(far[begins[index]:begins[index + 1]])
+            if len(far_indices):
+                samples[gid][2]["hull"] = far_indices
+        # Same component order as before; components without samples are skipped.
+        present = set(np.unique(components[in_scope]).tolist())
+        known = np.zeros(len(local), bool)
+        for cid in obj["observed_open"]:
+            if cid not in present:
+                continue
+            selected = np.flatnonzero((components == cid) & in_scope)
+            known[selected] = self._store(samples, gids, begins, cid, selected,
+                                          obj["query"].query(local[selected], component_ids=[cid],
+                                                             outside_hull=outside[selected]))
+        # A nearly closed component encloses its own volume whichever surface
+        # is nearest: a sample still unknown near its bounds (``band``, object
+        # units) that its winding number decides inside penetrates it. Being
+        # outside it says nothing about the nearer, unknown surface.
+        unknown = np.flatnonzero(~known)
+        for cid, bounds in zip(obj["nearly_closed"], obj["nearly_bounds"]):
+            if not len(unknown):
+                break
+            candidates = unknown[np.all((local[unknown] >= bounds[0] - band)
+                                        & (local[unknown] <= bounds[1] + band), axis=1)]
+            gap = np.maximum(np.maximum(bounds[0] - local[candidates], local[candidates] - bounds[1]), 0)
+            selected = candidates[(components[candidates] != cid) & (np.linalg.norm(gap, axis=1) <= band)]
+            if not len(selected):
+                continue
+            signed = obj["query"].winding_side(local[selected], cid)
+            reliable = ~signed["uncertain"] & (signed["clearance"] < 0)
+            selected = selected[reliable]
+            known[selected] = self._store(samples, gids, begins, cid, selected,
+                                          {key: value[reliable] for key, value in signed.items()})
+            unknown = np.flatnonzero(~known)
+
+    @staticmethod
+    def _store(samples, gids, begins, cid, selected, signed):
+        for index, gid in enumerate(gids):
+            keep = (selected >= begins[index]) & (selected < begins[index + 1])
+            if np.any(keep):
+                samples[gid][2][cid] = (
+                    selected[keep] - begins[index],
+                    {key: value[keep] for key, value in signed.items()},
+                )
+        return ~np.asarray(signed["uncertain"], bool)
+
     def query(self, pose, time, dofs=None):
         dofs = np.arange(self.model.nv) if dofs is None else np.asarray(dofs, dtype=int)
         pose = np.asarray(pose, dtype=float)
@@ -220,6 +409,10 @@ class MovingSceneQuery:
             "rows": [],
             "forward_depth": np.zeros(shape),
             "reverse_depth": np.zeros(shape),
+            "open_evidence_depth": np.zeros(shape),
+            "unknown_open_samples": 0,
+            "open_known_samples": set(),
+            "open_penetrating_samples": set(),
             "forward_components": [],
             "unknown_components": self.unknown_components,
             "failures": [],
@@ -233,89 +426,49 @@ class MovingSceneQuery:
             translation, rotation, scale = interpolate_object(obj["surface"], time)
             component_depth = np.zeros((len(obj["query"].components), self.model.ngeom))
             result["forward_components"].append(component_depth)
-            forward_samples = self._forward_samples(obj, translation, rotation, scale, band)
-            for shell in self.shells:
+            # Both surfaces fit inside these spheres. Exclude distant robot
+            # geoms before material sampling, winding and reverse KD queries.
+            shells = [
+                shell for shell in self.shells
+                if np.linalg.norm(self.data.geom_xpos[shell["geom_id"]] - translation)
+                <= obj["radius"] * scale + shell["radius"] + band
+            ]
+            if not shells:
+                continue
+            forward_samples = self._material_samples(
+                oid, obj, pose, time, translation, rotation, scale, band, shells)
+            for shell in shells:
                 gid = shell["geom_id"]
                 center = self.data.geom_xpos[gid]
                 robot_rotation = self.data.geom_xmat[gid].reshape(3, 3)
-                world, _, component_samples = forward_samples[gid]
-                for cid, (ids, signed) in component_samples.items():
-                    if np.any(signed["uncertain"] | ~np.isfinite(signed["clearance"])):
-                        result["failures"].append(
-                            f"uncertain closed object {oid} component {cid} geom {gid}"
-                        )
-                        continue
-                    k = int(np.argmin(signed["clearance"]))
-                    clearance = float(signed["clearance"][k] * scale)
-                    component_depth[cid, gid] = max(0.0, -clearance)
-                    if clearance < band:
-                        direction = rotation @ signed["directions"][k]
-                        result["rows"].append(
-                            self._row(
-                                world[ids[k]],
-                                direction,
-                                clearance,
-                                gid,
-                                oid,
-                                ids[k],
-                                "closed_surface",
-                                dofs,
-                                component_id=cid,
-                            )
-                        )
+                summary = forward_samples[gid]
+                result["open_known_samples"].update(summary["known"])
+                result["open_penetrating_samples"].update(summary["penetrating"])
+                result["unknown_open_samples"] += summary["unknown"]
+                result["failures"].extend(summary["failures"])
+                for cid, closed, depth in summary["depths"]:
+                    component_depth[cid, gid] = depth
+                    if not closed:
+                        result["open_evidence_depth"][oid, gid] = max(
+                            result["open_evidence_depth"][oid, gid], depth)
+                for point, direction, clearance, sample, closed, cid in summary["rows"]:
+                    result["rows"].append(self._row(
+                        point, direction, clearance, gid, oid, sample,
+                        "closed_surface" if closed else "observed_open_surface", dofs,
+                        component_id=cid))
                 result["forward_depth"][oid, gid] = component_depth[:, gid].max(
                     initial=0
                 )
-                # Object-local sphere broad phase contains the entire robot hull.
-                indices = np.asarray(
-                    obj["tree"].query_ball_point(
-                        (center - translation) @ rotation / scale,
-                        (shell["radius"] + band) / scale,
-                    ),
-                    dtype=int,
-                )
-                if not len(indices):
-                    continue
-                points = obj["samples"][indices] @ rotation.T * scale + translation
-                in_robot = (points - center) @ robot_rotation
-                bounds = shell["bounds"]
-                keep = np.all(
-                    (in_robot >= bounds[0] - band) & (in_robot <= bounds[1] + band),
-                    axis=1,
-                )
-                indices, points, in_robot = indices[keep], points[keep], in_robot[keep]
-                if not len(indices):
-                    continue
-                values = in_robot @ shell["planes"][:, :3].T + shell["planes"][:, 3]
-                facets = np.argmax(values, axis=1)
-                phi = values[np.arange(len(values)), facets]
-                result["reverse_depth"][oid, gid] = max(0.0, -float(phi.min()))
-                result["reverse_witness_count"] += int(np.count_nonzero(phi < -1e-9))
-                selected = [
-                    int(np.flatnonzero(facets == face)[np.argmin(phi[facets == face])])
-                    for face in np.unique(facets[phi < band])
-                ]
-                selected.sort(key=lambda k: phi[k])
-                result["available_rows"] += len(selected)
-                selected = selected[: int(self.cfg["max_rows_per_geom"])]
-                for k in selected:
-                    # At a fixed object material point, moving the robot has the
-                    # opposite sign of moving that point out of the robot hull.
-                    direction = -(robot_rotation @ shell["planes"][facets[k], :3])
-                    result["rows"].append(
-                        self._row(
-                            points[k],
-                            direction,
-                            phi[k],
-                            gid,
-                            oid,
-                            indices[k],
-                            "reverse_surface",
-                            dofs,
-                            facet_id=int(facets[k]),
-                        )
-                    )
-                result["selected_rows"] += len(selected)
+                reverse = cached_reverse(self, oid, obj, shell, time, center,
+                                         robot_rotation, translation, rotation, scale, band)
+                result["reverse_depth"][oid, gid] = reverse["depth"]
+                result["reverse_witness_count"] += reverse["count"]
+                result["available_rows"] += reverse["available"]
+                for point, direction, phi, sample, facet in reverse["rows"]:
+                    result["rows"].append(self._row(point, direction, phi, gid, oid,
+                                                   sample, "reverse_surface", dofs,
+                                                   facet_id=facet))
+                result["selected_rows"] += len(reverse["rows"])
         return result
 
     def cached(self, pose, time):
@@ -325,7 +478,9 @@ class MovingSceneQuery:
             value = self.query(pose, time, [])
             value = {key: val for key, val in value.items() if key != "rows"}
             self.cache[key] = value
-            if len(self.cache) > 256:
+            # One window can contain thousands of interframe poses. Keep its
+            # exact scene answers through merit and nonlinear acceptance.
+            if len(self.cache) > 8192:
                 self.cache.popitem(last=False)
         self.cache.move_to_end(key)
         return self.cache[key]
@@ -338,6 +493,9 @@ def moving_regression_reasons(before, after, tolerance=0.0005, regression=0.0005
         reasons.append("moving_geometry_query_failed")
     if after["unknown_components"] != before["unknown_components"]:
         reasons.append("moving_geometry_coverage_changed")
+    if not before.get("open_penetrating_samples", set()).issubset(
+            after.get("open_known_samples", set())):
+        reasons.append("moving_local_evidence_lost")
     pairs = list(zip(before["forward_components"], after["forward_components"]))
     pairs.append((before["reverse_depth"], after["reverse_depth"]))
     for old, new in pairs:

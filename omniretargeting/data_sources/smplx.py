@@ -151,37 +151,28 @@ class SmplxDataSource(DataSource):
             import smplx
             import torch
 
-            from omniretargeting.foot_frames import (
-                calibrate_sole_rotation,
-                calibrations_to_metadata,
-                world_sole_rotations,
-            )
+            from .smplx_feet import smplx_sole_metadata
 
-            body_model = smplx.create(
-                self.model_directory, "smplx", gender=self.gender, use_pca=False
-            )
-            # The neutral template is enough: measured across body shapes the
-            # calibrated sole normal moves by less than a fifth of a degree,
-            # which is far below the accuracy the calibration itself achieves.
-            with torch.no_grad():
-                template = body_model()
-            template_vertices = template.vertices.detach().numpy()[0]
-            template_joints = template.joints.detach().numpy()[0]
-            weights = body_model.lbs_weights.detach().numpy()
-
-            rotations = {}
-            calibrations = {}
-            sole_vertex_ids = {}
-            for side, (ankle_idx, toe_idx) in self._FOOT_JOINTS.items():
-                mask = (weights[:, ankle_idx] + weights[:, toe_idx]) > 0.5
-                calibration = calibrate_sole_rotation(
-                    side, template_vertices, template_joints, mask, ankle_idx, toe_idx
+            result = getattr(self, "_sole_metadata_cache", None)
+            if result is None:
+                body_model = smplx.create(
+                    self.model_directory, "smplx", gender=self.gender, use_pca=False
                 )
-                calibrations[side] = calibration
-                rotations[side] = world_sole_rotations(orientations, calibration)
-                sole_vertex_ids[side] = self._sole_band_vertex_ids(
-                    template_vertices, mask, calibration.rotation[:, 2]
+                kwargs = {} if self.betas is None else {
+                    "betas": torch.as_tensor(self.betas[:10], dtype=torch.float32).reshape(1, -1)
+                }
+                with torch.no_grad():
+                    template = body_model(**kwargs)
+                result = smplx_sole_metadata(
+                    template.vertices.detach().cpu().numpy()[0],
+                    template.joints.detach().cpu().numpy()[0],
+                    body_model.lbs_weights.detach().cpu().numpy(), orientations,
+                    getattr(self, "_posed_vertices_cache", None),
                 )
+            # Raw loading populates this from the exact model gender and betas
+            # used for the source, rather than recreating a neutral subject.
+            result = {**result, "link_orientations": dict(result["link_orientations"])}
+            rotations = result["link_orientations"]
         except Exception as exc:  # noqa: BLE001 - degrade to positions-only
             print(f"Warning: could not calibrate SMPL-X foot sole frames: {exc}")
             return {}
@@ -202,27 +193,8 @@ class SmplxDataSource(DataSource):
             _SMPLX_ROOT_OFFSET,
         )
 
-        result = {
-            "link_orientations": rotations,
-            "foot_sole_calibration": calibrations_to_metadata(calibrations),
-            "foot_sole_vertex_ids": sole_vertex_ids,
-            # Kept so a consumer can measure the effector's own size without
-            # reloading the body model.
-            "foot_sole_template_vertices": template_vertices,
-        }
-
-        try:
-            centres = self._foot_sole_centres(sole_vertex_ids)
-            if centres:
-                result["foot_sole_centres"] = centres
-            points = self._foot_sole_points(sole_vertex_ids)
-            if points:
-                result["foot_sole_points"] = points
-        finally:
-            # The full posed vertex set is large and nothing downstream needs it
-            # once the sole has been read off.  Freed here rather than by the
-            # first reader, so a second reader still gets to run.
-            self._posed_vertices_cache = None
+        self._sole_metadata_cache = None
+        self._posed_vertices_cache = None
         return result
 
     @staticmethod
@@ -237,10 +209,9 @@ class SmplxDataSource(DataSource):
         per frame would let the tracked point slide around the sole as the foot
         rotates, which is indistinguishable from the foot itself sliding.
         """
-        ids = np.flatnonzero(np.asarray(foot_mask, dtype=bool))
-        heights = np.asarray(template_vertices, dtype=float)[ids] @ np.asarray(sole_normal, dtype=float)
-        take = max(4, int(round(band_fraction * len(ids))))
-        return ids[np.argsort(heights)[:take]]
+        from .smplx_feet import sole_band_vertex_ids
+
+        return sole_band_vertex_ids(template_vertices, foot_mask, sole_normal, band_fraction)
 
     def _foot_sole_points(self, sole_vertex_ids: dict) -> dict:
         """World positions of every sole band vertex, per frame.
@@ -500,13 +471,6 @@ class SmplxDataSource(DataSource):
             body_model.parents.cpu().numpy(),
             num_body_joints=22,
         )
-        end_effector_markers = _extract_smplx_end_effector_markers(
-            body_model,
-            output,
-            max_samples=32,
-            world_joint_orientations=orientations,
-            shape_betas=betas_tensor.detach().cpu().numpy(),
-        )
         # A clip can start mid-flip: its first pose is not a bind pose. Evaluate
         # the same shaped model at rest only for orientation calibration. This
         # separate reference does not transform the captured world trajectory.
@@ -517,6 +481,22 @@ class SmplxDataSource(DataSource):
                 body_pose=torch.zeros(1, 63),
                 transl=torch.zeros(1, 3),
             )
+        from .smplx_feet import smplx_sole_metadata
+
+        self._sole_metadata_cache = smplx_sole_metadata(
+            reference.vertices.detach().cpu().numpy()[0],
+            reference.joints.detach().cpu().numpy()[0],
+            body_model.lbs_weights.detach().cpu().numpy(), orientations,
+            self._posed_vertices_cache,
+        )
+        end_effector_markers = _extract_smplx_end_effector_markers(
+            body_model,
+            output,
+            max_samples=32,
+            world_joint_orientations=orientations,
+            shape_betas=betas_tensor.detach().cpu().numpy(),
+            sole_metadata=self._sole_metadata_cache,
+        )
         from .smplx_surface import sample_smplx_surfaces
         body_surfaces = sample_smplx_surfaces(
             body_model, reference, self._posed_vertices_cache, _SMPLX_ROOT_OFFSET.T,

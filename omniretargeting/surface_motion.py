@@ -17,15 +17,6 @@ class SurfaceMotion:
             model, source, reference_qpos, config, joint_mapping=mapping
         )
         full = source["full_body"]
-        self.world_tracking = np.array(
-            full.get("sample_world_tracking", np.zeros(len(self.bindings))),
-            dtype=bool,
-            copy=True,
-        )
-        if self.world_tracking.shape != (len(self.bindings),):
-            raise ValueError(
-                "Surface world-tracking labels must follow sample identities"
-            )
         triangles = np.asarray(full["triangles"], dtype=float)
         bary = np.asarray(full["barycentric"], dtype=float)
         if triangles.ndim != 4 or triangles.shape[1:] != (len(bary), 3, 3):

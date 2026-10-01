@@ -28,6 +28,7 @@ dependencies = [
     "robot_descriptions",
     "yourdfpy",
     "cvxpy",
+    "osqp>=1.0",
     "libigl",
     "tyro",
     # Additional dependencies for generic mesh processing
@@ -38,6 +39,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["mypy", "ruff", "pytest", "black"]
 test = ["pytest", "pytest-cov"]
+gpu = ["qoco>=0.3.2,<0.4", "qoco-cuda>=0.2.2,<0.3", "nvidia-cudss-cu13>=0.7.1,<0.8", "nvidia-cublas>=13.0,<14"]
 
 [project.scripts]
 omniretargeting-mjviser = "omniretargeting.mjviser_viewer:main"

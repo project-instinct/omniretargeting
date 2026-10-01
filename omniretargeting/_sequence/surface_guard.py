@@ -5,21 +5,30 @@ from types import SimpleNamespace
 import cvxpy as cp
 import mujoco
 import numpy as np
-from scipy import linalg, sparse
+from scipy import sparse
 
 from .._solver.targets import _approach_contact_target
+from ..conic_constraints import LocalNormBounds, squared_residual_objective
+from ..conic_solver import solve_conic
 from ..contact import _is_surface_only_contact_mode
+from ..contact_phase import CONTACT_ROLES
 
-# Non-penetration, endpoint support, surface support, following contacts.
-LEVELS = 4
+# Same role means the same level for endpoints and arbitrary body patches.
+LEVELS = len(CONTACT_ROLES)
 
 
 class SurfaceSequenceGuard:
-    def __init__(self, tasks, reference, allowance):
+    def __init__(self, tasks, reference, allowance, *, preserve_contacts=True):
         self.tasks, self.allowance = tasks, allowance
+        self.preserve_contacts = preserve_contacts
         self.bounds = []
         self.failures = 0
-        for frame, pose in enumerate(reference):
+        self.continuity = None
+        self.pose = None
+        self.contact_stage = None
+        self.step_priority_bounds = {}
+        self.step_priority_before = {}
+        for frame, pose in enumerate(reference if preserve_contacts else ()):
             self.bounds.append(
                 {
                     key: max(float(np.linalg.norm(residual)), tolerance) + regression
@@ -29,20 +38,29 @@ class SurfaceSequenceGuard:
                 }
             )
 
-    def rows(self, pose, frame):
+    def rows(self, pose, frame, *, full_surface_vectors=False):
         tasks = self.tasks
         tasks.data.qpos[:] = pose
         mujoco.mj_forward(tasks.model, tasks.data)
         for name, spec in tasks.effectors.items():
             target = spec["task"].frame(frame)
             active = target["contact"]
-            if not active and not spec.get("preserve_world_target", False):
+            if active and target.get("surface_managed", False):
+                continue
+            from .._solver.targets import _world_target_regime
+
+            if not active and not _world_target_regime(spec, target):
                 continue
             offset = (
                 spec["contact_offsets"][tasks.choices[name][frame]]
                 if active
                 else spec["tracking_offset"]
             )
+            if not active:
+                share = target["approach_weight"]
+                offset = (1 - share) * offset + share * spec["contact_offsets"][
+                    tasks.choices[name][frame]
+                ]
             point, jac = tasks.point(spec["body_id"], offset)
             residual = point - (
                 target["contact_position"]
@@ -54,7 +72,7 @@ class SurfaceSequenceGuard:
             # Observed clear of every surface: yields to contact levels.
             if policy is not None and not active and policy.yields(name, frame):
                 continue
-            if active and _is_surface_only_contact_mode(target["contact_mode"]):
+            if active and not full_surface_vectors and _is_surface_only_contact_mode(target["contact_mode"]):
                 normal = np.asarray(target["surface_normal"], float)
                 normal = normal / np.linalg.norm(normal)
                 tangent = np.eye(3) - np.outer(normal, normal)
@@ -79,7 +97,11 @@ class SurfaceSequenceGuard:
                 task, "cfg", {}
             ):
                 continue
-            for k, residual, jac in task.position_rows(pose, frame, tasks.coords.cols):
+            position_rows = (
+                getattr(task, "hold_position_rows", task.position_rows)
+                if full_surface_vectors else task.position_rows
+            )
+            for k, residual, jac in position_rows(pose, frame, tasks.coords.cols):
                 yield (
                     ("surface_contact", index, k),
                     residual,
@@ -88,36 +110,38 @@ class SurfaceSequenceGuard:
                     task.cfg["regression"],
                 )
 
-    def accepts(self, poses):
-        return all(
+    def accepts(self, poses, frames=None):
+        """Nonlinear budgets; ``frames`` checks only what a window step moved."""
+        if self.contact_stage is not None and not self.contact_stage.accepts(poses, frames):
+            return False
+        if self.continuity is not None and not _windowed(
+            self.continuity.accepts, poses, frames=frames
+        ):
+            return False
+        if self.pose is not None and not _windowed(
+            self.pose.accepts, poses, frames=frames
+        ):
+            return False
+        return not self.preserve_contacts or all(
             np.linalg.norm(residual) <= self.bounds[f][key] + 1e-7
-            for f, pose in enumerate(poses)
-            for key, residual, _, _, _ in self.rows(pose, f)
+            for f in (range(len(poses)) if frames is None else frames)
+            for key, residual, _, _, _ in self.rows(poses[f], f)
         )
 
     def priority_rows(self, pose, frame, level):
-        """Clearance, endpoint support, surface support, following contacts.
+        """Evidence-ordered contacts precede bounded clearance correction.
 
-        The source may itself be inside a surface (e.g. SMPL-X feet through
-        the floor). Non-penetration therefore comes first; a contact target
-        inside the scene then leaves a reported residual, not a penetration.
+        Contact anchors already lie on observed scene surfaces. Clearance must
+        not detach a support or buy a lower collision cost with a different pose.
+        Incompatible geometry leaves a reported residual.
         """
         policy = self.tasks.contact_phase
-        if level == 0:
-            tasks = self.tasks
-            tasks.data.qpos[:] = pose
-            mujoco.mj_forward(tasks.model, tasks.data)
-            for residual, jac in tasks.clearance_rows():
-                yield 1.0, residual, jac
-            return
-        if level == 2:
-            yield from policy.rows(pose, frame, self.tasks.coords.cols)
-            return
-        if level == 3:
-            yield from policy.rows(
-                pose, frame, self.tasks.coords.cols, role="follow"
-            )
-        role = "support" if level == 1 else "follow"
+        # Scene clearance stays in the secondary objective. Treating it as a
+        # per-frame contact role forbids a continuous support correction when
+        # it slightly increases clearance error in a neighbouring free frame.
+        # The fixed posture, continuity and attained-contact bounds still apply.
+        role = CONTACT_ROLES[level]
+        yield from policy.rows(pose, frame, self.tasks.coords.cols, role=role)
         for key, residual, jac, _, _ in self.rows(pose, frame):
             if (
                 key[0] == "endpoint"
@@ -126,84 +150,203 @@ class SurfaceSequenceGuard:
             ):
                 yield 1.0, residual, jac
 
-    def priority_errors(self, poses):
+    def priority_errors(self, poses, frames=None):
+        """Rows are frames (of ``frames`` when given), columns priority levels."""
         return np.array(
             [
                 [
                     np.sqrt(
                         sum(
                             w * float(r @ r)
-                            for w, r, _ in self.priority_rows(q, f, level)
+                            for w, r, _ in self.priority_rows(poses[f], f, level)
                         )
                     )
                     for level in range(LEVELS)
                 ]
-                for f, q in enumerate(poses)
+                for f in (range(len(poses)) if frames is None else frames)
             ]
         )
 
-    def solve(self, matrix, rhs, lower, upper, poses):
-        frames, width = lower.shape
-        flat = cp.Variable(frames * width)
+    def constraints(self, poses, flat, lower, upper, frames=None):
+        """Linearize the same immutable hard bounds for fitting and restoration.
+
+        With ``frames`` the step spans that window only; frames outside keep a
+        zero step, so every bound they alone determine is already satisfied.
+        """
+        count, width = lower.shape
+        window = range(len(poses)) if frames is None else frames
+        if self.pose is not None:
+            _windowed(self.pose.constrain_step, poses, lower, upper, frames=frames)
+        if self.contact_stage is not None:
+            self.contact_stage.constrain_step(poses, lower, upper, frames)
         constraints = [flat >= lower.ravel(), flat <= upper.ravel()]
+        if self.contact_stage is not None:
+            constraints.extend(self.contact_stage.constraints(poses, flat, frames))
+        if self.continuity is not None:
+            constraints.extend(
+                _windowed(self.continuity.constraints, poses, flat, frames=frames)
+            )
+        if self.pose is not None:
+            constraints.extend(
+                _windowed(self.pose.constraints, poses, flat, frames=frames)
+            )
         # One sparse affine map and one vectorized cone for all per-frame
         # bounds: thousands of tiny CVXPY expressions dominate compile time.
         blocks, bounds = [], []
-        for f, pose in enumerate(poses):
-            for key, residual, jac, _, _ in self.rows(pose, f):
-                blocks.append((f, residual, jac))
+        for f in window if self.preserve_contacts else ():
+            for key, residual, jac, _, _ in self.rows(poses[f], f):
+                blocks.append((f - window.start, residual, jac))
                 bounds.append(self.bounds[f][key])
         if blocks:
-            linear, offset, _ = _stack(blocks, frames, width, height=3)
+            linear, offset, _ = _stack(blocks, count, width, height=3)
+            # Measure each cone in units of its own error budget. This is an
+            # exact positive scaling, so millimetre contacts and large legacy
+            # residuals receive the same numerical feasibility accuracy.
+            scale = 1 / np.maximum(np.asarray(bounds), np.finfo(float).eps)
+            linear = sparse.diags(np.repeat(scale, 3)) @ linear
+            offset = offset * np.repeat(scale, 3)
             constraints.append(
                 cp.SOC(
-                    np.asarray(bounds),
+                    np.asarray(bounds) * scale,
                     cp.reshape(linear @ flat + offset, (3, len(blocks)), order="F"),
                     axis=0,
                 )
             )
-        factor, target = _least_squares_factor(matrix, rhs)
+        return constraints
+
+    def restore(self, origin, candidate, lower, upper, fraction=1.0, frames=None):
+        """Retract a tangent step onto the unchanged nonlinear feasible set.
+
+        Linearized rotations/bone directions can lie just outside a curved
+        boundary even when the conic step is feasible (the Maratos effect).
+        A minimum-change correction avoids endlessly shrinking that useful
+        tangent step. Every result is still checked against the original bounds.
+        """
+        from .restoration import restore_candidate
+
+        bounds = {
+            key: (1 - fraction) * self.step_priority_before[key] + fraction * bound
+            for key, bound in self.step_priority_bounds.items()
+        }
+        return restore_candidate(
+            self, origin, candidate, lower, upper, bounds, frames=frames
+        )
+
+    def restoration_constraints(self, poses, flat, lower, upper, bounds, frames=None):
+        constraints = self.constraints(poses, flat, lower, upper, frames)
+        start = 0 if frames is None else frames.start
+        rows = LocalNormBounds(lower.shape[0], self.tasks.coords.width)
+        for (level, frame), bound in bounds.items():
+            blocks = [
+                (np.sqrt(w) * r, np.sqrt(w) * j)
+                for w, r, j in self.priority_rows(poses[frame], frame, level)
+            ]
+            if blocks:
+                residual = np.concatenate([np.atleast_1d(r) for r, _ in blocks])
+                jac = np.vstack([np.atleast_2d(j) for _, j in blocks])
+                rows.add(residual, bound, (frame - start, jac))
+        return constraints + rows.constraints(flat)
+
+    def solve(self, matrix, rhs, lower, upper, poses, frames=None):
+        """Role-ordered conic step; ``frames`` restricts it to one window."""
+        count, width = lower.shape
+        window = range(len(poses)) if frames is None else frames
+        self.step_priority_bounds = {}
+        self.step_priority_before = {}
+        flat = cp.Variable(count * width)
+        constraints = self.constraints(poses, flat, lower, upper, frames)
+        hessian = (matrix.T @ matrix).tocsc()
+        hessian += 1e-8 * sparse.eye(hessian.shape[0], format="csc")
+        linear_target = np.asarray(matrix.T @ rhs).ravel()
         # A positive scale leaves the minimizer unchanged. At the raw O(1e7)
         # magnitude Clarabel stalls at its iteration cap and returns a point
         # that violates the millimetre bounds; at O(1) it converges.
-        objective = cp.sum_squares(factor @ flat - target) / max(
-            float(target @ target), 1e-12
-        )
+        # Keep the banded quadratic explicitly. Expressing its Cholesky factor
+        # as sum_squares creates one auxiliary residual variable per coordinate
+        # in CVXPY's conic reduction and makes long contact trajectories costly.
+        # J.T @ J is PSD by construction; no eigenvalue estimate is necessary.
+        objective = (
+            cp.quad_form(flat, cp.psd_wrap(hessian)) - 2 * linear_target @ flat
+        ) / max(float(rhs @ rhs), 1e-12)
         problem = cp.Problem(cp.Minimize(objective), constraints)
         try:
             policy = self.tasks.contact_phase
             if policy is not None:
+                improved = np.zeros(count, dtype=bool)
                 for level in range(LEVELS):
                     rows = [
-                        (f, np.sqrt(w) * r, np.sqrt(w) * j)
-                        for f, pose in enumerate(poses)
-                        for w, r, j in self.priority_rows(pose, f, level)
+                        (f - window.start, np.sqrt(w) * r, np.sqrt(w) * j)
+                        for f in window
+                        for w, r, j in self.priority_rows(poses[f], f, level)
                     ]
                     if not rows:
                         continue
-                    linear, offset, spans = _stack(rows, frames, width)
-                    expression = linear @ flat + offset
+                    linear, offset, spans = _stack(rows, count, width)
+                    padded, padded_offset, height = _pad_frame_rows(
+                        linear, offset, spans
+                    )
+                    expression = cp.reshape(
+                        padded @ flat + padded_offset,
+                        (height, len(spans)),
+                        order="F",
+                    )
+                    row_frames = sorted({row[0] for row in rows})
+                    before = np.array(
+                        [np.linalg.norm(offset[a:b]) for a, b in spans]
+                    )
+                    # The nonlinear acceptance contract is per frame. An
+                    # aggregate primary solve must not buy progress in one
+                    # frame by worsening another, only to reject that same
+                    # tradeoff at every line-search fraction afterwards.
+                    protected = ~improved[row_frames]
+                    if np.any(protected):
+                        constraints.append(
+                            cp.SOC(
+                                before[protected] + policy.tolerance,
+                                expression[:, protected],
+                                axis=0,
+                            )
+                        )
                     primary = cp.Problem(
                         cp.Minimize(
-                            cp.sum_squares(expression) + 1e-8 * cp.sum_squares(flat)
+                            (
+                                squared_residual_objective(linear, -offset, flat)
+                                + 1e-8 * cp.sum_squares(flat)
+                            )
+                            / max(float(offset @ offset), 1.0)
                         ),
                         constraints,
                     )
-                    primary.solve(solver=cp.CLARABEL)
+                    solve_conic(primary, solver=cp.CLARABEL, direct_solve_method="qdldl")
                     if (
                         primary.status not in {cp.OPTIMAL, cp.OPTIMAL_INACCURATE}
                         or flat.value is None
                     ):
                         self.failures += 1
-                        return SimpleNamespace(x=np.zeros(frames * width), status=0)
+                        return SimpleNamespace(x=np.zeros(count * width), status=0)
                     value = linear @ flat.value + offset
-                    constraints += [
-                        cp.norm(expression[a:b])
-                        <= float(np.linalg.norm(value[a:b])) + policy.tolerance
-                        for a, b in spans
-                    ]
+                    achieved = np.array(
+                        [np.linalg.norm(value[a:b]) for a, b in spans]
+                    )
+                    constraints.append(
+                        cp.SOC(
+                            achieved + policy.tolerance, expression, axis=0
+                        )
+                    )
+                    # Later levels may yield only if the retained upper bound
+                    # guarantees progress at an earlier level in this frame.
+                    improved[row_frames] |= (
+                        achieved + policy.tolerance < before - policy.tolerance
+                    )
+                    for frame, old, error in zip(row_frames, before, achieved):
+                        key = level, frame + window.start
+                        self.step_priority_before[key] = old
+                        self.step_priority_bounds[key] = min(
+                            error + policy.tolerance,
+                            old + policy.tolerance if not improved[frame] else np.inf,
+                        )
                 problem = cp.Problem(cp.Minimize(objective), constraints)
-            problem.solve(solver=cp.CLARABEL)
+            solve_conic(problem, solver=cp.CLARABEL, direct_solve_method="qdldl")
         except cp.error.SolverError:
             pass
         usable = (
@@ -213,33 +356,19 @@ class SurfaceSequenceGuard:
         if not usable:
             self.failures += 1
         return SimpleNamespace(
-            x=flat.value if usable else np.zeros(frames * width),
+            x=flat.value if usable else np.zeros(count * width),
             status=1 if usable else 0,
+            backend=(
+                f"priority_guard:{problem.solver_stats.solver_name}"
+                if usable and problem.solver_stats is not None
+                else "priority_guard"
+            ),
         )
 
 
-def _least_squares_factor(matrix, rhs):
-    """``R``, ``c`` with ``|R x - c|^2 = |A x - b|^2 + 1e-8 |x|^2 + const``.
-
-    Frames couple only through the temporal differences, so ``A^T A`` is
-    banded and its Cholesky factor has one row per coordinate instead of one
-    per residual (every dense surface sample in every frame). The minimizer
-    and conditioning are unchanged; the ridge equals the priority levels'
-    existing tie-break.
-    """
-    normal = sparse.triu(matrix.T @ matrix, format="coo")
-    size = normal.shape[0]
-    band = int(np.max(normal.col - normal.row, initial=0))
-    banded = np.zeros((band + 1, size))
-    np.add.at(banded, (band + normal.row - normal.col, normal.col), normal.data)
-    banded[band] += 1e-8
-    upper = linalg.cholesky_banded(banded)
-    factor = sparse.diags(
-        [upper[band - d, d:] for d in range(band + 1)], range(band + 1), format="csr"
-    )
-    # R^-T A^T b = R (R^T R)^-1 A^T b
-    target = factor @ linalg.cho_solve_banded((upper, False), matrix.T @ rhs)
-    return factor, target
+def _windowed(method, *args, frames=None):
+    """Call a guard method; pass a frame window only when one is requested."""
+    return method(*args) if frames is None else method(*args, frames)
 
 
 def _stack(blocks, frames, width, height=None):
@@ -266,4 +395,22 @@ def _stack(blocks, frames, width, height=None):
         (np.concatenate(data), (np.concatenate(row_ids), np.concatenate(col_ids))),
         shape=(start, frames * width),
     )
+    linear.eliminate_zeros()
     return linear, np.concatenate(offsets), [spans[f] for f in sorted(spans)]
+
+
+def _pad_frame_rows(linear, offset, spans):
+    """Stack varying frame residual lengths into one batch of exact norm cones."""
+    height = max(end - begin for begin, end in spans)
+    row_map = np.empty(linear.shape[0], dtype=int)
+    padded_offset = np.zeros((height, len(spans)), dtype=float)
+    for index, (begin, end) in enumerate(spans):
+        count = end - begin
+        row_map[begin:end] = index * height + np.arange(count)
+        padded_offset[:count, index] = offset[begin:end]
+    coo = linear.tocoo()
+    padded = sparse.coo_matrix(
+        (coo.data, (row_map[coo.row], coo.col)),
+        shape=(height * len(spans), linear.shape[1]),
+    ).tocsr()
+    return padded, padded_offset.ravel(order="F"), height

@@ -130,3 +130,16 @@ def test_capsule_barrel_diagonal_and_mesh_hull_are_sampled():
     vertices = meshmodel.mesh_vert
     assert all(np.min(np.linalg.norm(offsets - v, axis=1)) < 1e-6 for v in vertices)
     assert len(offsets) > len(vertices)
+
+
+def test_robot_collision_geoms_exclude_embedded_world_floor():
+    model = mujoco.MjModel.from_xml_string('''<mujoco><worldbody>
+      <geom name="world_floor" type="plane" size="0 0 1"/>
+      <body name="robot"><freejoint/><geom name="shell" type="sphere" size=".1"/>
+      <geom name="visual" type="sphere" size=".2" contype="0" conaffinity="0"/>
+      </body></worldbody></mujoco>''')
+    np.testing.assert_array_equal(collision_geom_ids(model), [model.geom('shell').id])
+    selected = collision_geom_ids(model, geom_groups=[0])
+    assert model.geom('world_floor').id not in selected
+    # Explicit group selection still includes the requested robot visual geom.
+    assert model.geom('visual').id in selected

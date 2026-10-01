@@ -2,7 +2,7 @@
 
 UMR III-C supplies persistent surface targets and reference-normal transport.
 Free positions here use calibrated morphology and a moving robot-root target;
-world-tracked feet and existing contact anchors retain their own semantics.
+observed free-target regimes and contact anchors retain their own semantics.
 """
 
 import mujoco
@@ -22,6 +22,9 @@ DEFAULTS = {
 
 
 def surface_pose_config(config=None):
+    from .config_validation import known_options
+
+    known_options(config, DEFAULTS, 'surface_pose', extra=('correspondence',))
     cfg = {**DEFAULTS, **(config or {})}
     for key in ("weight", "position_sigma", "normal_sigma", "endpoint_regression"):
         if not np.isfinite(cfg[key]) or cfg[key] <= 0:
@@ -84,10 +87,8 @@ class SurfacePoseTasks:
             )
         self.scale = float(self.cfg["morphology_scale"] or robot_extent / source_extent)
         scales = np.full(count, self.scale)
-        self.root_relative = np.full(count, bool(len(free)))
-        world_tracking = motion.world_tracking.copy()
-        self.root_relative[world_tracking] = False
-        scales[world_tracking] = 1.0
+        self.root_relative = np.full((frames, count), bool(len(free)))
+        world_tracking = np.zeros((frames, count), bool)
         self.position_active = self.valid.copy()
         self.normal_active = self.valid.copy()
         for name, spec in (priority or {}).get("effectors", {}).items():
@@ -100,12 +101,15 @@ class SurfacePoseTasks:
                 self.model.body_weldid[motion.body_ids]
                 == self.model.body_weldid[body_id]
             )
-            if spec.get("preserve_world_target", False):
-                self.root_relative[group] = False
-                world_tracking[group] = True
-                scales[group] = 1.0
-            else:
-                scales[group] = spec.get("swing_morphology_scale", self.scale)
+            task = (scene_tasks or {}).get(name)
+            world = np.ones(frames, bool)
+            if task is not None and task.swing_world_mask is not None:
+                world = task.swing_world_mask
+            elif "preserve_world_target" in spec:
+                world = np.full(frames, bool(spec["preserve_world_target"]))
+            self.root_relative[:, group] &= ~world[:, None]
+            world_tracking[:, group] = world[:, None]
+            scales[group] = spec.get("swing_morphology_scale", self.scale)
             if name in (scene_tasks or {}):
                 mask = np.asarray(scene_tasks[name].contact_mask, bool)
                 if mask.shape != (frames,):
@@ -140,10 +144,9 @@ class SurfacePoseTasks:
             motion.points - roots[:, None]
         ) + np.einsum("tnij,nj->tni", relative, offset)
         world = ~self.root_relative
-        self.targets[:, world] += roots[:, None]
-        # World supports retain the exact source-side world surface location;
-        # morphology calibration must not lift a free foot off its trajectory.
-        self.targets[:, world_tracking] = motion.points[:, world_tracking]
+        self.targets += np.where(world[..., None], roots[:, None], 0)
+        # Unknown clearance retains the immutable world observation.
+        self.targets[world_tracking] = motion.points[world_tracking]
         labels = np.array([b.part for b in self.bindings])
         self.weights = np.zeros(count)
         for label in np.unique(labels):
@@ -158,7 +161,7 @@ class SurfacePoseTasks:
             "position_frame_samples": int(self.position_active.sum()),
             "morphology_scale": self.scale,
             "correspondence": motion.diagnostics,
-            "position_targets": "calibrated_root_relative_except_world_tracked_effectors",
+            "position_targets": "calibrated_root_relative_with_observed_terminal_regimes",
             "normal_targets": "relative_source_face_rotation_of_robot_reference_normal",
         }
         for value in vars(self).values():
@@ -168,7 +171,7 @@ class SurfacePoseTasks:
     def at(self, pose, frame, index):
         point, normal, jac, jnormal = self.kinematics.at(pose, index)
         target = self.targets[frame, index]
-        if self.root_relative[index]:
+        if self.root_relative[frame, index]:
             data = self.kinematics.data
             if self._root_pose is None or not np.array_equal(self._root_pose, pose):
                 self._root_pose = np.array(pose, copy=True)
@@ -191,7 +194,7 @@ class SurfacePoseTasks:
             return
         point, normal, jac, jnormal = self.kinematics.batch(pose, indices)
         target = self.targets[frame, indices]
-        relative = self.root_relative[indices]
+        relative = self.root_relative[frame, indices]
         if relative.any():
             root = np.zeros((3, self.model.nv))
             mujoco.mj_jacBody(self.model, self.kinematics.data, root, None, self.root_body)

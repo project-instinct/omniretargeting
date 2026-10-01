@@ -1,9 +1,10 @@
 """Whole-body scene contact maps on fixed learned surface correspondences.
 
-UMR III-C: source and robot use the SAME environment point assignment. The
-residual is (robot_point - environment_point) - source_contact_vector. Both
-the environment points and source vectors remain in unscaled metric world
-coordinates. Only source-active samples generate objectives.
+Observed environment points and source contact vectors remain in unscaled
+metric world coordinates. Prepared active contacts target observed scene
+material points; source penetration is preserved as evidence, not copied into
+the robot goal. Low-level callers without explicit goals retain the UMR vector
+residual. Only source-active samples generate objectives.
 """
 
 from dataclasses import asdict, replace
@@ -12,8 +13,6 @@ import mujoco
 import numpy as np
 
 from .contact_schedule import _iter_true_runs
-from .surface_learning import bind_whole_body
-from .surface_observation import observe_contacts
 from .surface_tasks import SurfaceKinematics, _face_frames
 
 DEFAULTS = {
@@ -37,6 +36,9 @@ DEFAULTS = {
 
 
 def surface_contact_config(config=None):
+    from .config_validation import known_options
+
+    known_options(config, DEFAULTS, 'surface_contact', extra=('correspondence',))
     cfg = {**DEFAULTS, **(config or {})}
     if cfg["priority"] not in {"balanced", "after_end_effectors"}:
         raise ValueError(
@@ -89,9 +91,11 @@ def calibrate_contact_bindings(model, bindings, sample_indices, active, targets,
     candidates = [
         (i, int(model.geom(binding.robot_geom).id))
         for i, binding in enumerate(selected)
-        if (active[:, sample_indices[i]].any()
+        if (
+            active[:, sample_indices[i]].any()
             and model.geom_type[int(model.geom(binding.robot_geom).id)]
-            == mujoco.mjtGeom.mjGEOM_SPHERE)
+            == mujoco.mjtGeom.mjGEOM_SPHERE
+        )
     ]
     if not candidates:
         return tuple(selected), {"calibrated_samples": 0, "mean_shell_shift_m": 0.0}
@@ -108,10 +112,12 @@ def calibrate_contact_bindings(model, bindings, sample_indices, active, targets,
     for index, geom in candidates:
         sample = int(sample_indices[index])
         frames = np.flatnonzero(active[:, sample])
-        local_targets = np.array([
-            rotations[f][geom].T @ (targets[f, sample] - centers[f][geom])
-            for f in frames
-        ])
+        local_targets = np.array(
+            [
+                rotations[f][geom].T @ (targets[f, sample] - centers[f][geom])
+                for f in frames
+            ]
+        )
         direction = np.mean(local_targets, axis=0)
         norm = float(np.linalg.norm(direction))
         if norm < 1e-8:
@@ -148,9 +154,18 @@ class SurfaceContactTasks:
         surface_ids=None,
         pose_normal_targets=None,
         pose_normal_valid=None,
+        contact_targets=None,
+        effector_names=None,
     ):
         self.model, self.cfg = model, surface_contact_config(config)
         self.bindings = tuple(bindings)
+        self.effector_names = np.array(
+            [b.part for b in self.bindings] if effector_names is None else effector_names,
+            dtype=str, copy=True,
+        )
+        if self.effector_names.shape != (len(self.bindings),):
+            raise ValueError("Surface effector identities must match the bindings")
+        self.effector_names.setflags(write=False)
         self.kinematics = SurfaceKinematics(model, bindings)
         self.environment_points = np.array(environment_points, dtype=float, copy=True)
         self.source_vectors = np.array(source_vectors, dtype=float, copy=True)
@@ -169,7 +184,11 @@ class SurfaceContactTasks:
             dtype=int,
             copy=True,
         )
-        self.targets = self.environment_points + self.source_vectors
+        self.targets = (
+            self.environment_points + self.source_vectors
+            if contact_targets is None
+            else np.array(contact_targets, float, copy=True)
+        )
         # Environment normals describe contact, whereas transported robot
         # normals describe pose. They must never be silently interchanged.
         self.pose_normal_targets = (
@@ -259,13 +278,23 @@ class SurfaceContactTasks:
             array.setflags(write=False)
         self.diagnostics = diagnostics or {}
 
-    def position_rows(self, pose, frame, dofs):
+    def position_rows(self, pose, frame, dofs, *, project_sliding=True):
         for index in np.flatnonzero(self.active[frame]):
             point, _, jacobian, _ = self.kinematics.at(pose, int(index))
-            yield int(index), point - self.targets[frame, index], jacobian[:, dofs]
+            residual = point - self.targets[frame, index]
+            jacobian = jacobian[:, dofs]
+            if project_sliding and self.modes[frame, index] in {"sliding", "touch"}:
+                normal = self.normals[frame, index]
+                projector = np.outer(normal, normal) / (normal @ normal)
+                residual, jacobian = projector @ residual, projector @ jacobian
+            yield int(index), residual, jacobian
+
+    def hold_position_rows(self, pose, frame, dofs):
+        """Attained positions at each timestamp, including authored sliding."""
+        yield from self.position_rows(pose, frame, dofs, project_sliding=False)
 
     def rows(self, pose, frame, dofs, *, include_normals=True):
-        for index, residual, jacobian in self.position_rows(pose, frame, dofs):
+        for index, residual, jacobian in self.position_rows(pose, frame, dofs, project_sliding=False):
             yield (
                 self.weights[frame, index],
                 residual / self.cfg["sigma"],
@@ -298,8 +327,9 @@ class SurfaceContactTasks:
                 errors[frame, index] = np.linalg.norm(residual)
         return errors
 
-    def metrics(self, poses, frame_start=0):
-        errors = self.errors(poses, frame_start)
+    def metrics(self, poses, frame_start=0, *, errors=None):
+        if errors is None:
+            errors = self.errors(poses, frame_start)
         values = errors[np.isfinite(errors)]
         groups = {}
         labels = np.array([b.part for b in self.bindings])
@@ -343,6 +373,7 @@ class SurfaceContactTasks:
             "surface_contact_modes": self.modes,
             "surface_contact_surface_ids": self.surface_ids,
             "surface_contact_parts": np.array([b.part for b in self.bindings]),
+            "surface_contact_effector_names": self.effector_names,
             "surface_contact_face_ids": np.array([b.face_id for b in self.bindings]),
             "surface_contact_barycentric": np.array(
                 [b.barycentric for b in self.bindings]
@@ -377,6 +408,9 @@ def build_surface_contact_tasks(
     scene_objects=(),
     surface_motion=None,
     robot_seed_trajectory=None,
+    support_evidence=None,
+    source_contact_table=None,
+    scene_enclosed_free_space=False,
 ):
     cfg = surface_contact_config(config)
     report = {
@@ -403,17 +437,40 @@ def build_surface_contact_tasks(
         raise ValueError(
             "Whole-body skin samples must have shape (frames, samples, 3, 3)"
         )
-    frames, valid = _face_frames(triangles)
+    _, valid = _face_frames(triangles)
     points = np.einsum("tnij,ni->tnj", triangles, bary)
-    observation = observe_contacts(
-        np.where(valid[..., None], points, 0),
-        frames[..., 2],
-        valid,
-        scene_mesh,
-        cfg,
-        framerate=framerate,
-        scene_objects=scene_objects,
-    )
+    if source_contact_table is None:
+        from .source_contacts import build_source_contacts
+
+        source_contact_table = build_source_contacts(
+            full,
+            scene_mesh,
+            cfg,
+            framerate=framerate,
+            scene_objects=scene_objects,
+            scene_enclosed_free_space=scene_enclosed_free_space,
+            min_duration_s=cfg["min_contact_frames"] / framerate,
+        )
+    if source_contact_table.points.shape != points.shape or not np.allclose(
+        source_contact_table.points[valid], points[valid], atol=1e-9, rtol=0
+    ):
+        raise ValueError(
+            "Source contact table must address the unchanged skin observations"
+        )
+    observation = {
+        k: v.copy() if isinstance(v, np.ndarray) else v
+        for k, v in source_contact_table.observation.items()
+    }
+    observation["active"] = source_contact_table.active.copy()
+    report["source_contacts"] = source_contact_table.diagnostics
+    contact_targets = None
+    if support_evidence is not None:
+        from .support_observation import apply_support_observations
+
+        observation, contact_targets = apply_support_observations(
+            observation, points, valid, support_evidence
+        )
+        report["support_inference"] = observation["support_inference"]
     environment, normals, active = (
         observation[k] for k in ("environment", "normals", "active")
     )
@@ -425,13 +482,17 @@ def build_surface_contact_tasks(
             "reason": "no_source_surface_contact",
             "samples": len(bary),
         }
-    if surface_motion is not None:
-        bindings, binding_valid, correspondence = surface_motion.binding_result
-    else:
-        bindings, binding_valid, correspondence = bind_whole_body(
-            model, source, robot_reference_qpos, cfg.get("correspondence"),
-            joint_mapping=joint_mapping,
+    if surface_motion is None:
+        from .surface_motion import SurfaceMotion
+
+        surface_motion = SurfaceMotion(
+            model,
+            source,
+            robot_reference_qpos,
+            cfg.get("correspondence"),
+            mapping=joint_mapping,
         )
+    bindings, binding_valid, correspondence = surface_motion.binding_result
     active &= binding_valid[None, :]
     retained = np.flatnonzero(active.any(0))
     report.update(
@@ -450,6 +511,23 @@ def build_surface_contact_tasks(
     pose_normals, pose_valid = transported_contact_normals(
         model, source, selected, retained, robot_reference_qpos
     )
+    from .contact_anchors import SOURCE_ORIENTATION_TOLERANCE_RAD, build_rigid_anchors
+
+    anchor_targets, anchor_report = build_rigid_anchors(
+        model,
+        selected,
+        retained,
+        observation,
+        surface_motion,
+        scene_present=scene_mesh is not None and len(scene_mesh.faces) > 0,
+        scene_objects=scene_objects,
+        rotation_budget_rad=SOURCE_ORIENTATION_TOLERANCE_RAD,
+    )
+    contact_targets = points.copy()
+    contact_targets[:, retained] = np.where(
+        active[:, retained, None], anchor_targets, points[:, retained]
+    )
+    report["anchors"] = anchor_report
     vectors = points[:, retained] - environment[:, retained]
     vectors[~valid[:, retained]] = 0
     report.update(
@@ -479,11 +557,19 @@ def build_surface_contact_tasks(
         surface_ids=observation["surface_ids"][:, retained],
         pose_normal_targets=pose_normals,
         pose_normal_valid=pose_valid,
+        contact_targets=(
+            None if contact_targets is None else contact_targets[:, retained]
+        ),
     )
-    task.static_surface_id = 0 if scene_mesh is not None and len(scene_mesh.faces) else None
+    task.static_surface_id = (
+        0 if scene_mesh is not None and len(scene_mesh.faces) else None
+    )
+    task.source_contact_table = source_contact_table
     labels = np.asarray(full.get("sample_effectors", [""] * len(bary)))
     if labels.shape != (len(bary),):
         raise ValueError("Sample effector labels must follow surface identities")
+    task.effector_names = labels[retained].copy()
+    task.effector_names.setflags(write=False)
     outside = observation["clear_side"]
     task.source_clearances = {}
     for name in np.unique(labels):
@@ -494,7 +580,8 @@ def build_surface_contact_tasks(
         # samples are unknown, not evidence that a foot has lifted.
         task.source_clearances[str(name)] = np.where(
             (valid[:, group] & outside[:, group]).all(axis=1),
-            observation["distance"][:, group].min(axis=1), np.nan
+            observation["distance"][:, group].min(axis=1),
+            np.nan,
         )
     return task, report
 

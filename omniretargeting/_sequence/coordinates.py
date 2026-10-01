@@ -65,6 +65,17 @@ class Coordinates:
             mujoco.mj_integratePos(self.model, result[f], velocity, alpha)
         return result
 
+    def difference(self, origin, target):
+        """Tangent displacement whose unit integration reaches target."""
+        result = np.empty((len(origin), self.width))
+        velocity = np.empty(self.model.nv)
+        for frame in range(len(origin)):
+            mujoco.mj_differentiatePos(
+                self.model, velocity, 1.0, origin[frame], target[frame]
+            )
+            result[frame] = velocity[self.cols]
+        return result
+
     def bounds(self, q, angular_step, translation_step):
         lo = np.full((len(q), self.width), -angular_step)
         hi = -lo

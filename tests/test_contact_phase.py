@@ -1,4 +1,4 @@
-"""Observed contact roles order support > follow > free, without force optimization."""
+"""Geometric holds are distinct from mechanics-evidenced support."""
 
 import copy
 from dataclasses import replace
@@ -9,11 +9,20 @@ import numpy as np
 import pytest
 import trimesh
 
-from omniretargeting.contact_phase import attach_contact_phase, contact_phase_config
+from omniretargeting.contact_phase import CONTACT_ROLES, attach_contact_phase, contact_phase_config
 from omniretargeting._sequence.surface_guard import SurfaceSequenceGuard
 from omniretargeting.surface_contact import SurfaceContactTasks
 from omniretargeting.surface_tasks import SurfaceBinding
 from tests._contact_fixtures import _task
+
+
+def support_on(region, frames, surface_id=0):
+    from omniretargeting.contact_mechanics import ContactCandidate
+    from omniretargeting.contact_support import explain_source_support
+
+    patch = ContactCandidate("patch", [[0, 0, 0]], [[0, 0, 0]], [0, 0, 1], 0.0, 0.0)
+    return explain_source_support([[patch]] * frames, np.tile([0, 0, 10, 0, 0, 0], (frames, 1)),
+                                  {"patch": (region, surface_id)})
 
 
 def case(frames=6, stance=False, sole_mode=None):
@@ -76,7 +85,7 @@ def test_roles_follow_contact_timing_and_leave_source_unchanged():
     anchors = surface.targets.copy()
     policy = attach_contact_phase(surface, None, tasks, priority)
     assert policy.diagnostics["role_frames"]["left_foot"] == {
-        "support": [0, 1, 2, 6, 7, 8],
+        "hold": [0, 1, 2, 6, 7, 8],
         "free": [3, 4, 5],
     }
     assert [policy.yields("left_foot", f) for f in range(9)] == [False] * 3 + [
@@ -87,7 +96,8 @@ def test_roles_follow_contact_timing_and_leave_source_unchanged():
         (3, 6),
         (6, 9),
     ]
-    np.testing.assert_array_equal(policy.support[:, 0], True)
+    assert not policy.support.any()
+    np.testing.assert_array_equal(policy.surface_roles["hold"][:, 0], True)
     np.testing.assert_array_equal(surface.targets, anchors)
     assert not policy.diagnostics["physical_support_verified"]
     assert not policy.diagnostics["force_or_torque_optimization"]
@@ -98,12 +108,12 @@ def test_roles_follow_contact_timing_and_leave_source_unchanged():
     [
         ("wall", True),
         ("low_confidence", True),
-        ("moving_object", False),
+        ("moving_object", True),
         ("sliding", False),
         ("touch", False),
     ],
 )
-def test_surface_support_is_still_contact_with_the_static_scene(change, supports):
+def test_sticking_is_geometric_hold_on_static_or_moving_objects(change, supports):
     _, _, surface, tasks, priority = case()
     if change == "wall":
         surface.normals = np.tile([1, 0, 0], surface.normals.shape[:2] + (1,))
@@ -114,7 +124,8 @@ def test_surface_support_is_still_contact_with_the_static_scene(change, supports
     else:
         surface.modes = np.tile([change, "none"], (len(surface.active), 1))
     policy = attach_contact_phase(surface, None, tasks, priority)
-    np.testing.assert_array_equal(policy.support[:, 0], supports)
+    assert not policy.support.any()
+    np.testing.assert_array_equal(policy.surface_roles["hold"][:, 0], supports)
     np.testing.assert_array_equal(policy.follow_surface[:, 0], not supports)
     if not supports:
         assert len(list(policy.rows(np.asarray(surface.model.qpos0), 0, [],
@@ -131,17 +142,21 @@ def test_sliding_body_contact_enters_sequence_follow_priority():
     )
     guard = SurfaceSequenceGuard.__new__(SurfaceSequenceGuard)
     guard.tasks = task_set
-    rows = list(guard.priority_rows(q[0], 0, 3))
+    rows = list(guard.priority_rows(q[0], 0, CONTACT_ROLES.index("follow")))
     assert len(rows) == 1
-    assert np.linalg.norm(rows[0][1]) > 0
+    # Sliding priority protects the surface normal. Tangent tracking remains a
+    # secondary objective rather than falsely turning sliding into sticking.
+    assert np.linalg.norm(rows[0][1]) == 0
+    secondary = list(surface.rows(q[0], 0, np.arange(model.nv)))
+    assert any(np.linalg.norm(row[1]) > 0 for row in secondary)
 
 
 @pytest.mark.parametrize(
     ("sole_mode", "stance", "role", "yields"),
     [
-        ("sticking", False, "support", False),
+        ("sticking", False, "hold", False),
         ("sliding", False, "follow", False),
-        (None, True, "support", False),
+        (None, True, "hold", False),
         (None, False, "free", True),
     ],
 )
@@ -162,7 +177,7 @@ def test_unknown_or_moving_contacts_keep_protection():
     assert not policy.yields("left_foot", 0)
     _, _, surface, tasks, priority = case(stance=True)
     tasks["left_foot"] = replace(tasks["left_foot"], environment_ids=np.ones(6, int))
-    assert attach_contact_phase(surface, None, tasks, priority).role("left_foot", 0) == "follow"
+    assert attach_contact_phase(surface, None, tasks, priority).role("left_foot", 0) == "hold"
 
 
 def solve_case(stance, enabled):
@@ -170,7 +185,8 @@ def solve_case(stance, enabled):
     from tests.test_full_body_surfaces import _markers
 
     model, q, surface, tasks, priority = case(stance=stance)
-    attach_contact_phase(surface, None, tasks, priority, {"enabled": enabled})
+    attach_contact_phase(surface, None, tasks, priority, {"enabled": enabled},
+                         support_evidence=support_on("left_foot", len(q)) if stance else None)
     names = ["root", "abdomen", "foot"]
     positions = _markers(model, q, names)
     result, report = retarget_sequence(
@@ -265,10 +281,11 @@ def test_repair_keeps_ordinary_budgets_and_splits_windows_on_roles():
     # Roles reorder the main solve; repair still bounds every free endpoint.
     assert v.swing_budget("left_foot", 0) == cfg["swing_position_budget"]
     assert v.fidelity(after)["ok"]
-    assert ("contact_roles", (0,), ("free",)) in v.phase(0)
+    assert ("contact_roles", (), ("free",)) in v.phase(0)
+    assert ("surface_role", "hold", (0,)) in v.phase(0)
     wb_cfg = whole_body_config()
     w = WholeBodyValidator(*args, surface_contact_tasks=surface, whole_body_config=wb_cfg)
-    assert w.swing_budget("left_foot", 0) == wb_cfg["foot_position_budget"]
+    assert w.swing_budget("left_foot", 0) == wb_cfg["world_position_budget"]
     assert w.fidelity(after)["ok"]
     geometry = w.geometry(after)
     assert geometry["max_depth"] < 1e-6

@@ -193,7 +193,7 @@ def test_omomo_reuses_smplx_raw_path_and_preserves_object_metric_data(
     )
 
 
-def test_object_contact_merging_keeps_foot_baseline_before_hand_overlay(monkeypatch):
+def test_marker_only_object_contacts_share_one_pipeline_with_all_terminals(monkeypatch):
     frames = 3
     model = mujoco.MjModel.from_xml_string(
         """<mujoco><worldbody><body name="root"><freejoint/>
@@ -235,7 +235,7 @@ def test_object_contact_merging_keeps_foot_baseline_before_hand_overlay(monkeypa
             "enabled": True,
             "world_tracking_enabled": True,
             "preserve_noncontact_baseline": True,
-            "contact_detection": {"min_contact_frames": 1},
+            "effectors": {n: {"robot_body": "root"} for n in markers},
         },
     }
     retargeter.robot_height = 1.0
@@ -302,26 +302,21 @@ def test_object_contact_merging_keeps_foot_baseline_before_hand_overlay(monkeypa
         scene_objects=scene_objects,
     )
 
-    assert len(calls) == 2
-    assert set(calls[0]["end_effector_tasks"]) == {"left_foot", "right_foot"}
-    assert calls[1]["overlay_contact_names"] == {"left_hand"}
-    assert calls[0]["apply_surface_contacts"] is False
-    assert "apply_surface_contacts" not in calls[1]
-    assert np.array_equal(calls[1]["reference_trajectory"], np.full((frames, model.nq), 1.0))
-    overlay = calls[1]["end_effector_tasks"]
-    assert set(overlay) == {"left_hand", "left_foot", "right_foot"}
-    assert overlay["left_hand"].contact_mask.all()
-    assert np.all(overlay["left_hand"].environment_ids == 1)
+    assert len(calls) == 1
+    assert set(calls[0]["end_effector_tasks"]) == set(markers)
+    assert calls[0]["end_effector_tasks"]["left_hand"].contact_mask.all()
+    assert not calls[0]["end_effector_tasks"]["left_foot"].contact_mask.any()
+    assert calls[0]["end_effector_tasks"]["left_foot"].swing_world_mask.all()
     assert len(whole_calls) == 1
     whole = whole_calls[0]
     np.testing.assert_array_equal(
-        whole["candidate"], np.full((frames, model.nq), 2.0)
+        whole["candidate"], np.full((frames, model.nq), 1.0)
     )
     assert set(whole["tasks"]) == {"left_hand", "left_foot", "right_foot"}
     assert whole["tasks"]["left_hand"].contact_mask.all()
     assert np.all(whole["tasks"]["left_hand"].environment_ids == 1)
     assert whole["kwargs"]["scene_objects"][0] is scene_objects[0]
-    np.testing.assert_array_equal(result, np.full((frames, model.nq), 2.0))
+    np.testing.assert_array_equal(result, np.full((frames, model.nq), 1.0))
 
 
 def test_perform_retargeting_defers_surface_tasks_until_overlay(monkeypatch):

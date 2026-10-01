@@ -43,6 +43,9 @@ DEFAULTS = {
 
 
 def correspondence_config(config=None):
+    from .config_validation import known_options
+
+    known_options(config, DEFAULTS, 'surface correspondence', extra=())
     cfg = {**DEFAULTS, **(config or {})}
     for key in ("iterations", "neighbors"):
         if int(cfg[key]) != cfg[key] or cfg[key] < 1:

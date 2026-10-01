@@ -499,10 +499,15 @@ class OptimizationStepMixin:
         self_contact_residual = surface_residual(self.self_contact_tasks)
         surface_contact_residual = surface_residual(self.surface_contact_tasks)
         surface_pose_residual = surface_residual(self.surface_pose_tasks)
-        from ..contact_phase import phase_policy
+        from ..contact_phase import CONTACT_ROLES, phase_policy
         policy = phase_policy(self, self.surface_contact_tasks)
-        support_residual = surface_residual(policy)
-        follow_surface_residual = surface_residual(policy, role="follow")
+        role_residuals = {}
+        for role in CONTACT_ROLES:
+            residuals = [surface_residual(policy, role=role),
+                         getattr(self, "_role_endpoint_residuals", {}).get(role)]
+            residuals = [r for r in residuals if r is not None]
+            if residuals:
+                role_residuals[role] = cp.hstack(residuals)
 
         return solve_hierarchy(
             retargeter=self,
@@ -515,9 +520,7 @@ class OptimizationStepMixin:
             self_contact_residual=self_contact_residual,
             surface_contact_residual=surface_contact_residual,
             surface_pose_residual=surface_pose_residual,
-            support_residual=support_residual,
-            follow_surface_residual=follow_surface_residual,
-            support_endpoint_residual=getattr(self, "_support_endpoint_residual", None),
+            role_residuals=role_residuals,
             prioritize_surface_contact=(self.surface_contact_tasks is not None
                                         and self.surface_contact_tasks.cfg["priority"] == "after_end_effectors"),
             dqa=dqa,

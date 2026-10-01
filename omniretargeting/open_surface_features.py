@@ -7,10 +7,23 @@ import trimesh
 class OpenSurfaceFeatures:
     def __init__(self, mesh):
         self.mesh = mesh
+        # Plain copies of the immutable mesh arrays: trimesh's tracked
+        # properties validate their cache on every access.
+        self.faces = np.array(mesh.faces, dtype=int)
+        self.face_normals = np.array(mesh.face_normals, dtype=float)
+        self.triangles = np.array(mesh.triangles, dtype=float)
         self.incident = [set() for _ in mesh.vertices]
-        for face, vertices in enumerate(mesh.faces):
+        for face, vertices in enumerate(self.faces):
             for vertex in vertices:
                 self.incident[int(vertex)].add(face)
+        self._feature_faces = {}
+
+    def _incident_faces(self, vertices):
+        faces = self._feature_faces.get(vertices)
+        if faces is None:
+            incident = set.intersection(*(self.incident[v] for v in vertices))
+            faces = self._feature_faces[vertices] = np.asarray(sorted(incident), int)
+        return faces
 
     def reliable_witnesses(
         self,
@@ -34,36 +47,59 @@ class OpenSurfaceFeatures:
         candidates = np.flatnonzero(reliable)
         if not len(candidates):
             return reliable
-        triangles = self.mesh.triangles[face_ids[candidates]]
+        triangles = self.triangles[face_ids[candidates]]
         bary = trimesh.triangles.points_to_barycentric(triangles, nearest[candidates])
         feature_rows = np.flatnonzero(np.any(bary <= 1e-7, axis=1))
-        groups = {}
-        for row in feature_rows:
-            face = int(face_ids[candidates[row]])
-            vertices = tuple(sorted(map(int, self.mesh.faces[face][bary[row] > 1e-7])))
-            if not vertices:
-                reliable[candidates[row]] = False
-                continue
-            groups.setdefault(vertices, []).append(int(candidates[row]))
-        for vertices, rows in groups.items():
-            rows = np.asarray(rows, int)
-            incident = set.intersection(*(self.incident[v] for v in vertices))
-            faces = np.asarray(sorted(incident), int)
-            normals = np.asarray(self.mesh.face_normals)[faces]
+        # Group feature samples by the sorted vertices of their edge/vertex.
+        members = candidates[feature_rows]
+        keys = np.sort(np.where(bary[feature_rows] > 1e-7, self.faces[face_ids[members]], -1), axis=1)
+        degenerate = keys[:, -1] < 0
+        reliable[members[degenerate]] = False
+        members, keys = members[~degenerate], keys[~degenerate]
+        # Sorted vertex triples (entries in [-1, V)) as one integer: integer
+        # order is their row order, so features and groups match np.unique.
+        base = len(self.incident) + 1
+        if base**3 < 2**62:
+            codes = ((keys[:, 0] + 1) * base + keys[:, 1] + 1) * base + keys[:, 2] + 1
+            unique, first, inverse = np.unique(codes, return_index=True, return_inverse=True)
+            features = keys[first]
+        else:
+            features, inverse = np.unique(keys, axis=0, return_inverse=True)
+            unique = features
+        order = np.argsort(inverse.ravel(), kind="stable")
+        groups = np.split(members[order], np.cumsum(np.bincount(inverse.ravel(), minlength=len(unique)))[:-1])
+        crease = []
+        for feature, rows in zip(features, groups):
+            faces = self._incident_faces(tuple(int(v) for v in feature if v >= 0))
+            normals = self.face_normals[faces]
             offset = points[rows] - nearest[rows]
-            if len(faces) == 1:
+            coplanar = np.all(np.abs(normals @ normals[0]) >= 1 - 1e-6)
+            if len(faces) == 1 or coplanar:
+                # Multiple coplanar faces can meet at an external corner.
+                # Their shared vertex is not necessarily an internal seam:
+                # a tangential offset lies beyond the finite observed patch.
                 tangent = offset - (offset @ normals[0])[:, None] * normals[0]
                 reliable[rows] &= np.linalg.norm(tangent, axis=1) <= 1e-7 * (
                     1 + np.linalg.norm(offset, axis=1)
                 )
                 continue
-            if np.all(normals @ normals[0] >= 1 - 1e-6):
-                continue  # A triangulation seam on the same plane.
-            distances, indices = evidence_tree.query(
-                nearest[rows], k=min(4, len(evidence_points))
-            )
-            distances = np.asarray(distances).reshape(len(rows), -1)
-            indices = np.asarray(indices).reshape(len(rows), -1)
+            crease.append((rows, normals, offset))
+        if not crease:
+            return reliable
+        # Pruned as in ``SceneQuery.query``: missing neighbors are never eligible.
+        # One query for all crease samples; neighbours are found per point.
+        every = np.concatenate([rows for rows, _, _ in crease])
+        all_distances, all_indices = evidence_tree.query(
+            nearest[every], k=min(4, len(evidence_points)),
+            distance_upper_bound=evidence_radius * (1 + 1e-9) + 1e-12,
+        )
+        all_distances = np.asarray(all_distances).reshape(len(every), -1)
+        all_indices = np.minimum(np.asarray(all_indices).reshape(len(every), -1), len(evidence_points) - 1)
+        start = 0
+        for rows, normals, offset in crease:
+            distances = all_distances[start:start + len(rows)]
+            indices = all_indices[start:start + len(rows)]
+            start += len(rows)
             alignment = np.einsum("nkj,fj->nkf", evidence_normals[indices], normals)
             eligible = (distances[..., None] <= evidence_radius) & (
                 np.abs(alignment) >= 0.8

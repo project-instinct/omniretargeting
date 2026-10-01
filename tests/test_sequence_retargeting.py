@@ -164,6 +164,34 @@ def test_fast_prescribed_contact_motion_is_not_delayed_or_made_root_relative(fps
     assert report["final_residuals"]["sticking_max_m"] < 0.006
 
 
+def test_secondary_smoothing_preserves_fast_source_shaped_joint_change():
+    model = slider_model(1)
+    source_shaped = np.array([0.0, 0.0, 0.48, 0.48, 0.48])[:, None]
+    source = np.zeros((len(source_shaped), 1, 3))
+    source[:, 0, 0] = source_shaped[:, 0]
+    source[:, 0, 2] = 0.15
+    original_source = source.copy()
+    original_reference = source_shaped.copy()
+
+    solved, _ = retarget_sequence(
+        model,
+        source_shaped,
+        source,
+        ["marker"],
+        {"marker": "link_0"},
+        source[:, 0],
+        {},
+        {},
+        framerate=30,
+        config={"self_collision_enabled": False, "iterations": 6},
+        correction_reference_trajectory=source_shaped,
+    )
+
+    np.testing.assert_allclose(solved, source_shaped, atol=1e-7)
+    assert np.array_equal(source, original_source)
+    assert np.array_equal(source_shaped, original_reference)
+
+
 def test_final_validator_keeps_the_sequence_material_marker():
     import trimesh
     from omniretargeting.scene_geometry import SceneQuery

@@ -128,8 +128,13 @@ class RigidGeometryQuery:
         self.open_parts = [
             (cid, part, faces)
             for cid, (part, faces, closed, _tree) in enumerate(scene_query.components)
-            if not closed
+            if not closed or scene_query.enclosed_free_space
         ]
+        from .triangle_candidates import TriangleCandidates
+
+        self.triangle_candidates = {
+            cid: TriangleCandidates(part) for cid, part, _ in self.open_parts
+        }
         self.surface_intersection_queries = 0
         self.ambiguous_surface_intersections = 0
         spec = mujoco.MjSpec()
@@ -137,7 +142,9 @@ class RigidGeometryQuery:
         spec.option.ccd_tolerance = 1e-9
         spec.option.ccd_iterations = 100
         for cid, (part, _faces, closed, _tree) in enumerate(scene_query.components):
-            if not closed or not part.is_convex:
+            # A navigable volume is not a solid obstacle, even when its
+            # boundary happens to be convex. Keep its original triangles.
+            if scene_query.enclosed_free_space or not closed or not part.is_convex:
                 continue
             # Every original vertex lies on/in this convex component, and every
             # face bounds it. Float conversion error is verified after compile.
@@ -333,13 +340,16 @@ class RigidGeometryQuery:
         finally:
             self.model.opt.disableflags = flags
 
-    def query(self, robot_data, activation_distance):
+    def query(self, robot_data, activation_distance, *, active_geom_ids=None):
+        active = None if active_geom_ids is None else set(map(int, active_geom_ids))
         for gid, (_qg, _qb, mocap) in self.mapping.items():
             self.data.mocap_pos[mocap] = robot_data.geom_xpos[gid]
             mujoco.mju_mat2Quat(self.data.mocap_quat[mocap], robot_data.geom_xmat[gid])
         mujoco.mj_forward(self.model, self.data)
         rows = []
         for gid, (qg, _qb, _mocap) in self.mapping.items():
+            if active is not None and gid not in active:
+                continue
             for cid, sg in self.scene_ids.items():
                 # Conservative bounding spheres, independent of MuJoCo's
                 # contact candidate filtering (which can omit contained geoms).
@@ -414,14 +424,19 @@ class RigidGeometryQuery:
                             "unsigned_distance": np.nan,
                         }
                     )
-        rows.extend(self._open_surface_rows(robot_data, activation_distance))
+        rows.extend(self._open_surface_rows(robot_data, activation_distance, active))
         return rows
 
-    def _open_surface_rows(self, data, activation_distance):
-        from .triangle_capsule import segment_triangle_witnesses, intersecting_capsule_exit
+    def _open_surface_rows(self, data, activation_distance, active=None):
+        from .triangle_capsule import (
+            intersecting_capsule_exit,
+            segment_triangle_witnesses,
+        )
 
-        rows = []
+        jobs, starts, ends, triangles = [], [], [], []
         for gid in self.mapping:
+            if active is not None and gid not in active:
+                continue
             kind = self.robot.geom_type[gid]
             if kind not in (mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_SPHERE):
                 continue  # Other shapes retain the existing triangle query.
@@ -429,50 +444,62 @@ class RigidGeometryQuery:
             half = float(self.robot.geom_size[gid, 1]) if kind == mujoco.mjtGeom.mjGEOM_CAPSULE else 0.0
             offset = data.geom_xmat[gid].reshape(3, 3)[:, 2] * half
             start, end = data.geom_xpos[gid] - offset, data.geom_xpos[gid] + offset
-            lo = np.minimum(start, end) - radius - activation_distance
-            hi = np.maximum(start, end) + radius + activation_distance
-            for cid, part, faces in self.open_parts:
-                if np.any(hi < part.bounds[0]) or np.any(lo > part.bounds[1]):
-                    continue
-                ids = np.asarray(sorted(part.triangles_tree.intersection(np.r_[lo, hi])), dtype=int)
+            for cid, _part, faces in self.open_parts:
+                candidates = self.triangle_candidates[cid]
+                ids = candidates.query(start, end, radius + activation_distance)
                 if not len(ids):
                     continue
                 self.pair_queries += 1
                 self.surface_intersection_queries += 1
-                axis_points, surface_points = segment_triangle_witnesses(start, end, part.triangles[ids])
-                distances = np.linalg.norm(axis_points - surface_points, axis=1)
-                clearances = distances - radius
-                exits = {}
-                for hit in np.flatnonzero(distances <= 1e-10):
-                    depth, direction = intersecting_capsule_exit(start, end, radius, part.triangles[ids[hit]])
-                    clearances[hit] = -depth
-                    exits[int(hit)] = direction
-                k = int(np.argmin(clearances))
-                distance = float(distances[k])
-                clearance = float(clearances[k])
-                if clearance >= activation_distance:
-                    continue
-                ambiguous = distance <= 1e-10 and exits[k] is None
-                if ambiguous:
-                    self.ambiguous_surface_intersections += 1
-                if distance > 1e-10:
-                    direction = (axis_points[k] - surface_points[k]) / distance
-                elif not ambiguous:
-                    direction = exits[k]
-                    translated_axis, surface = segment_triangle_witnesses(
-                        start - clearance * direction, end - clearance * direction,
-                        part.triangles[ids[k]][None],
-                    )
-                    axis_points[k] = translated_axis[0] + clearance * direction
-                    surface_points[k] = surface[0]
-                else:
-                    direction = np.zeros(3)
-                rows.append(dict(
-                    clearance=clearance, directions=direction,
-                    points=axis_points[k] - radius * direction,
-                    surface_points=surface_points[k], geom_ids=gid,
-                    body_ids=int(self.robot.geom_bodyid[gid]), obstacle_ids=cid,
-                    surface_ids=int(faces[ids[k]]), confidence=0.0 if ambiguous else 1.0,
-                    uncertain=ambiguous, unsigned_distance=distance,
-                ))
+                jobs.append((gid, cid, faces, candidates.triangles, ids, start, end, radius))
+                starts.append(np.broadcast_to(start, (len(ids), 3)))
+                ends.append(np.broadcast_to(end, (len(ids), 3)))
+                triangles.append(candidates.triangles[ids])
+        if not jobs:
+            return []
+        axes, surfaces = segment_triangle_witnesses(
+            np.concatenate(starts), np.concatenate(ends), np.concatenate(triangles),
+            groups=np.cumsum([0, *map(len, triangles)]),
+        )
+        rows, offset = [], 0
+        for gid, cid, faces, triangle_data, ids, start, end, radius in jobs:
+            axis_points = axes[offset : offset + len(ids)].copy()
+            surface_points = surfaces[offset : offset + len(ids)].copy()
+            offset += len(ids)
+
+            distances = np.linalg.norm(axis_points - surface_points, axis=1)
+            clearances = distances - radius
+            exits = {}
+            for hit in np.flatnonzero(distances <= 1e-10):
+                depth, direction = intersecting_capsule_exit(start, end, radius, triangle_data[ids[hit]])
+                clearances[hit] = -depth
+                exits[int(hit)] = direction
+            k = int(np.argmin(clearances))
+            distance = float(distances[k])
+            clearance = float(clearances[k])
+            if clearance >= activation_distance:
+                continue
+            ambiguous = distance <= 1e-10 and exits[k] is None
+            if ambiguous:
+                self.ambiguous_surface_intersections += 1
+            if distance > 1e-10:
+                direction = (axis_points[k] - surface_points[k]) / distance
+            elif not ambiguous:
+                direction = exits[k]
+                translated_axis, surface = segment_triangle_witnesses(
+                    start - clearance * direction, end - clearance * direction,
+                    triangle_data[ids[k]][None],
+                )
+                axis_points[k] = translated_axis[0] + clearance * direction
+                surface_points[k] = surface[0]
+            else:
+                direction = np.zeros(3)
+            rows.append({
+                "clearance": clearance, "directions": direction,
+                "points": axis_points[k] - radius * direction,
+                "surface_points": surface_points[k], "geom_ids": gid,
+                "body_ids": int(self.robot.geom_bodyid[gid]), "obstacle_ids": cid,
+                "surface_ids": int(faces[ids[k]]), "confidence": 0.0 if ambiguous else 1.0,
+                "uncertain": ambiguous, "unsigned_distance": distance,
+            })
         return rows

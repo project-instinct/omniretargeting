@@ -108,7 +108,7 @@ class RobotGeometryMixin:
 
             if body_id < 0:
                 for joint_name in joint_candidates:
-                    body_name = self.valid_joint_mapping.get(joint_name)
+                    body_name = getattr(self, "valid_joint_mapping", {}).get(joint_name)
                     if body_name:
                         body_id = self._body_name_to_id(body_name)
                         if body_id >= 0:
@@ -160,12 +160,41 @@ class RobotGeometryMixin:
         retargeting = dict(self.retargeting_config)
         priority = dict(retargeting.get("end_effector_priority", {}) or {})
         raw_effectors = dict(priority.get("effectors", {}) or {})
+        if self.robot_model.ngeom and getattr(self, "valid_joint_mapping", None):
+            from ..terminal_effectors import infer_terminal_effectors
+
+            raw_effectors = infer_terminal_effectors(
+                self.robot_model, self.valid_joint_mapping, raw_effectors
+            )
+            priority["effectors"] = raw_effectors
         if not raw_effectors:
             return
 
+        # Resolve robot anatomy at the profile boundary. Solver scopes consume
+        # this explicit grouping, never names of source rigs or effectors.
+        feet = self._resolve_foot_body_ids(self._get_foot_stabilization_config())
+        foot_welds = {int(self.robot_model.body_weldid[b]) for b in feet.values() if b > 0}
         effectors: Dict[str, Dict[str, Any]] = {}
         for name, raw_spec in raw_effectors.items():
             spec = dict(raw_spec or {})
+            body_id = self._body_name_to_id(str(spec.get("robot_body", "")))
+            ancestor = body_id
+            while ancestor > 0 and int(self.robot_model.body_weldid[ancestor]) not in foot_welds:
+                ancestor = int(self.robot_model.body_parentid[ancestor])
+            if ancestor > 0 and len(foot_welds) == 2:
+                # Terminal inference can follow an unmapped distal joint,
+                # e.g. an ankle roll after the mapped ankle pitch body.
+                spec.setdefault("local_repair_group", "lower_limbs")
+                from ..foot_frames import robot_sole_directions
+                try:
+                    forward, up = robot_sole_directions(self.robot_model, body_id)
+                except ValueError as error:
+                    spec["sole_orientation_calibration"] = {"status": "unavailable", "reason": str(error)}
+                else:
+                    spec.setdefault("track_orientation", True)
+                    spec.setdefault("orientation_local_forward", forward.tolist())
+                    spec.setdefault("orientation_local_up", up.tolist())
+                    spec["sole_orientation_calibration"] = {"status": "geometry"}
             tracking_offset = spec.get("tracking_offset")
             contact_offsets = spec.get("contact_offsets")
             if tracking_offset is not None and contact_offsets is not None:

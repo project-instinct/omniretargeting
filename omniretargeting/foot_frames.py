@@ -11,8 +11,10 @@ anything.
 This module defines both halves of the contract:
 
 * the source side calibrates ``joint frame -> sole frame`` once on the shaped
-  template, using the thinnest principal axis of the foot volume as the sole
-  normal and the ankle-to-toe vector projected into the sole plane as forward;
+  template, refining the thinnest volume axis against the lowest skin band,
+  with the ankle-to-toe vector projected into the sole plane as forward.
+  SMPL-X adapters carry this frame using fixed skin material points when
+  available; toe-joint transport is the positions-only fallback;
 * the robot side reads its sole off the foot body's collision geoms, with an
   optional configured ``body frame -> sole frame`` rotation as an override.
 
@@ -46,6 +48,7 @@ __all__ = [
     "DerivedSole",
     "derive_sole_from_points",
     "sample_body_collision_points",
+    "robot_sole_directions",
 ]
 
 
@@ -410,3 +413,36 @@ def sample_body_collision_points(model, body_id: int, max_points: int = 512) -> 
     if not clouds:
         return np.zeros((0, 3))
     return np.vstack(clouds)
+
+
+def robot_sole_directions(model, body_id):
+    """Geometry-derived sole axes, signed by the robot's reference heading.
+
+    The normal comes from the sole surface; its forward axis is the longest
+    in-plane geometric direction. Root heading fixes only the sign (or the
+    otherwise ambiguous axis of a square patch), not the surface normal.
+    """
+    import mujoco
+
+    points = sample_body_collision_points(model, body_id)
+    sole = derive_sole_from_points(points)
+    up = sole.normal
+    height = points @ up
+    band = points[height <= height.min() + .01]
+    centered = band - band.mean(axis=0)
+    centered -= (centered @ up)[:, None] * up
+    _, values, axes = np.linalg.svd(centered, full_matrices=False)
+    data = mujoco.MjData(model)
+    mujoco.mj_kinematics(model, data)
+    root = body_id
+    while model.body_parentid[root] > 0:
+        root = int(model.body_parentid[root])
+    heading = data.xmat[body_id].reshape(3, 3).T @ data.xmat[root].reshape(3, 3)[:, 0]
+    heading -= up * (heading @ up)
+    if np.linalg.norm(heading) < 1e-8:
+        raise ValueError('Reference robot heading cannot orient the sole plane')
+    heading /= np.linalg.norm(heading)
+    forward = heading if len(values) < 2 or values[1] > .9 * values[0] else axes[0]
+    if forward @ heading < 0:
+        forward = -forward
+    return forward, up

@@ -19,7 +19,7 @@ from mink.limits.limit import Constraint
 from scipy.spatial.transform import Rotation
 
 from ._sequence.surface_guard import LEVELS
-from .contact_phase import PRIORITY_TOLERANCE
+from .contact_phase import PRIORITY_TOLERANCE, priority_progress
 from .sequence_retargeting import prepare_sequence, priority_guard, sequence_config
 
 MINK_DEFAULTS = {"frame_iterations": 10, "qp_solver": "clarabel"}
@@ -267,8 +267,8 @@ def retarget_mink(
                 after = level_errors(candidate, frame)
                 new = problem.rows(candidate, frame, past)
                 new_cost = float(new[0] @ new[0])
-                better = bool(np.sum(after**2) < np.sum(before**2) - 1e-10)
-                if np.all(after <= before + PRIORITY_TOLERANCE) and (new_cost < cost or better):
+                valid, better = priority_progress(before[None], after[None], PRIORITY_TOLERANCE)
+                if valid and (new_cost < cost or better):
                     pose, (residual, jacobian, stats), cost = candidate, new, new_cost
                     accepted = True
                     break

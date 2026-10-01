@@ -84,8 +84,9 @@ def _extract_smplx_end_effector_markers(
     max_samples: int = 32,
     world_joint_orientations: Optional[np.ndarray] = None,
     shape_betas: Optional[np.ndarray] = None,
+    sole_metadata: Optional[dict] = None,
 ) -> Dict[str, Dict[str, np.ndarray]]:
-    """Extract coherent hand/foot samples and rigid semantic foot frames."""
+    """Extract skin samples and shared, material-derived semantic foot frames."""
     vertices = smplx_output.vertices.detach().cpu().numpy()
     weights = body_model.lbs_weights.detach().cpu().numpy()
     template = body_model.v_template.detach().cpu().numpy()
@@ -131,11 +132,19 @@ def _extract_smplx_end_effector_markers(
             }
             continue
 
+        # Tracking keeps the established forefoot centroid. Contact geometry
+        # includes heel and side walls as well: a rolling foot can touch there
+        # while its forefoot and horizontal rest sole are both separated.
+        contact_ids = vertex_ids
+        sampling_template = template
+        if name in ("left_foot", "right_foot"):
+            ankle, toe = (7, 10) if name == "left_foot" else (8, 11)
+            contact_ids = np.flatnonzero(weights[:, ankle] + weights[:, toe] > 0.5)
+            sampling_template = shaped_template
         local_ids = _farthest_point_sample_indices(
-            template[vertex_ids],
-            max_samples=max_samples,
+            sampling_template[contact_ids], max_samples=max_samples,
         )
-        sampled_vertex_ids = vertex_ids[local_ids]
+        sampled_vertex_ids = contact_ids[local_ids]
         part_vertices = vertices[:, vertex_ids, :]
         markers[name] = {
             "tracking_positions": np.mean(part_vertices, axis=1),
@@ -195,53 +204,18 @@ def _extract_smplx_end_effector_markers(
             ankle_idx = 7 if name == "left_foot" else 8
             foot_idx = 10 if name == "left_foot" else 11
 
-            # Calibrate one rigid, right-handed foot frame on the shaped
-            # neutral template.  Per-frame PCA has no persistent eigenvector
-            # identity and can turn skin deformation into apparent foot
-            # rotation.  The template's thinnest axis is the sole normal; its
-            # sign is fixed toward the ankle.  Ankle-to-foot gives the
-            # semantic toe direction, projected into the sole plane because
-            # rotation-matrix axes must be orthogonal.
-            template_part = shaped_template[vertex_ids]
-            centered_template = template_part - np.mean(template_part, axis=0)
-            covariance = centered_template.T @ centered_template / max(
-                len(template_part), 1
-            )
-            _, eigenvectors = np.linalg.eigh(covariance)
-            template_up = eigenvectors[:, 0]
-            toward_ankle = (
-                template_joints[ankle_idx] - np.mean(template_part, axis=0)
-            )
-            if float(np.dot(template_up, toward_ankle)) < 0.0:
-                template_up *= -1.0
-            template_up /= max(float(np.linalg.norm(template_up)), 1e-10)
-
-            template_forward = (
-                template_joints[foot_idx] - template_joints[ankle_idx]
-            )
-            template_forward -= template_up * float(
-                np.dot(template_up, template_forward)
-            )
-            template_forward /= max(
-                float(np.linalg.norm(template_forward)), 1e-10
-            )
-            template_lateral = np.cross(template_up, template_forward)
-            template_lateral /= max(
-                float(np.linalg.norm(template_lateral)), 1e-10
-            )
-            template_forward = np.cross(template_lateral, template_up)
-
             if world_joint_orientations is not None:
-                rotations = Rotation.from_quat(
-                    np.asarray(world_joint_orientations)[:, foot_idx],
-                    scalar_first=True,
-                ).as_matrix()
-                markers[name]["forward_directions"] = np.einsum(
-                    "tij,j->ti", rotations, template_forward
-                )
-                markers[name]["up_directions"] = np.einsum(
-                    "tij,j->ti", rotations, template_up
-                )
+                if sole_metadata is None:
+                    from .smplx_feet import smplx_sole_metadata
+
+                    sole_metadata = smplx_sole_metadata(
+                        shaped_template, template_joints, weights,
+                        world_joint_orientations, vertices,
+                    )
+                side = "left" if name == "left_foot" else "right"
+                rotations = sole_metadata["link_orientations"][side]
+                markers[name]["forward_directions"] = rotations[:, :, 0].copy()
+                markers[name]["up_directions"] = rotations[:, :, 2].copy()
             else:
                 # This path is retained for direct helper use.  Raw SMPL-X
                 # loading supplies joint rotations and therefore uses the

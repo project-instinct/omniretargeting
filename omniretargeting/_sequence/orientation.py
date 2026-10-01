@@ -4,8 +4,6 @@ import mujoco
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from .._refinement.math import _skew_symmetric
-
 
 class OrientationTargets:
     """World or parent-relative rotation residuals with exact axis Jacobians.
@@ -39,32 +37,38 @@ class OrientationTargets:
                     sigma,
                 )
             )
+        self.bodies = np.array([body for body, _, _, _ in self.targets], dtype=int)
+        self.parents = np.array([0 if parent is None else parent for _, parent, _, _ in self.targets], dtype=int)
+        self.relative = np.array([parent is not None for _, parent, _, _ in self.targets], dtype=bool)
+        self.jacobian_bodies = np.unique(np.concatenate([self.bodies, self.parents]))
+        self.scales = np.sqrt(2.0) * np.array([sigma for _, _, _, sigma in self.targets])
 
     def rows(self, data, columns, frame):
-        residuals, matrices, errors = [], [], []
-        for body, parent, targets, sigma in self.targets:
-            current = data.xmat[body].reshape(3, 3)
-            angular = np.zeros((3, self.model.nv))
-            mujoco.mj_jacBody(self.model, data, None, angular, body)
-            if parent is not None:
-                parent_rotation = data.xmat[parent].reshape(3, 3)
-                parent_angular = np.zeros_like(angular)
-                mujoco.mj_jacBody(self.model, data, None, parent_angular, parent)
-                current = parent_rotation.T @ current
-                angular = parent_rotation.T @ (angular - parent_angular)
-            target = targets[frame]
-            # Three axes constrain pitch, roll and heading. Division by sqrt(2)
-            # gives the small-angle rotation-vector norm, without an Euler wrap.
-            scale = np.sqrt(2.0) * sigma
-            residuals.append((current - target).T.ravel() / scale)
-            matrices.append(
-                np.vstack(
-                    [
-                        -_skew_symmetric(current[:, axis]) @ angular[:, columns]
-                        for axis in range(3)
-                    ]
-                )
-                / scale
-            )
-            errors.append(float(Rotation.from_matrix(target @ current.T).magnitude()))
-        return residuals, matrices, max(errors, default=0.0)
+        if not self.targets:
+            return [], [], 0.0
+        # A parent can appear in many targets: compute its angular Jacobian
+        # once and batch the tiny axis products over all targets.
+        body_angular = np.zeros((self.model.nbody, 3, self.model.nv))
+        for body in self.jacobian_bodies:
+            if body:
+                mujoco.mj_jacBody(self.model, data, None, body_angular[body], int(body))
+        current = data.xmat[self.bodies].reshape(-1, 3, 3).copy()
+        angular = body_angular[self.bodies]
+        relative = self.relative
+        parent_rotation = data.xmat[self.parents[relative]].reshape(-1, 3, 3).transpose(0, 2, 1)
+        current[relative] = parent_rotation @ current[relative]
+        angular[relative] = parent_rotation @ (angular[relative] - body_angular[self.parents[relative]])
+        targets = np.stack([targets[frame] for _, _, targets, _ in self.targets])
+        # Three axes constrain pitch, roll and heading. Division by sqrt(2)
+        # gives the small-angle rotation-vector norm, without an Euler wrap.
+        residuals = (current - targets).transpose(0, 2, 1).reshape(-1, 9) / self.scales[:, None]
+        axes = current.transpose(0, 2, 1)
+        cross = np.zeros((*axes.shape, 3))
+        x, y, z = (axes[..., axis] for axis in range(3))
+        cross[..., 0, 1], cross[..., 0, 2] = z, -y
+        cross[..., 1, 0], cross[..., 1, 2] = -z, x
+        cross[..., 2, 0], cross[..., 2, 1] = y, -x
+        matrices = (cross @ angular[:, None, :, columns]).reshape(len(self.targets), 9, len(columns))
+        matrices /= self.scales[:, None, None]
+        errors = targets @ current.transpose(0, 2, 1)
+        return list(residuals), list(matrices), float(Rotation.from_matrix(errors).magnitude().max())

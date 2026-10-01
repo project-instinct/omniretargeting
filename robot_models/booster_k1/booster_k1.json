@@ -393,53 +393,6 @@
     "right_hip": "R_Hip",
     "spine": "Spine1"
   },
-  "retargeting": {
-    "collision_detection_threshold": 0.1,
-    "solver_max_iter": {
-      "first_frame": 50,
-      "subsequent": 10
-    },
-    "terrain_sample_points": 100,
-    "penetration_resolver": "hard_constraint",
-    "foot_stabilization": {
-      "enabled": true,
-      "clearance": 0.01,
-      "surface_clearance": 0.005,
-      "contact_clearance": 0.04,
-      "contact_vertical_speed": 0.18,
-      "min_contact_frames": 3,
-      "anchor_frames": 3,
-      "xy_correction_gain": 1.0,
-      "xy_smoothing_window": 5,
-      "z_smoothing_window": 5,
-      "contact_point_height_band": 0.01,
-      "max_xy_correction": 0.08,
-      "max_surface_correction": 0.08,
-      "surface_iterations": 4,
-      "wall_red_axis_only": true,
-      "wall_normal_z_threshold": 0.35,
-      "wall_x_dominance_threshold": 0.5
-    },
-    "replace_cylinders_with_capsules": false,
-    "joint_regularization_boost": {
-      "default": 0.001,
-      "joints": {
-        "*shoulder*roll*": 0.2,
-        "*shoulder*yaw*": 0.2,
-        "*hip*yaw*": 0.2
-      }
-    },
-    "effectors": {
-      "left": {
-        "body": "left_foot_link",
-        "role": "foot"
-      },
-      "right": {
-        "body": "right_foot_link",
-        "role": "foot"
-      }
-    }
-  },
   "default_joint_positions": {
     "T-Pose": {
       "AAHead_yaw": 0.0,

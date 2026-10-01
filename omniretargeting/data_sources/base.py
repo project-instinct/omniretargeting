@@ -131,7 +131,7 @@ class MotionData:
         # resampled is silently misaligned in time, and nothing downstream can
         # detect that: the arrays are still well formed, just describing
         # different instants.
-        for key in ("foot_sole_centres", "foot_sole_points"):
+        for key in ("foot_sole_centres", "foot_sole_points", "foot_sole_fit_rms"):
             series_by_name = new_metadata.get(key)
             if isinstance(series_by_name, dict):
                 new_metadata[key] = {
@@ -150,7 +150,7 @@ class MotionData:
                 resampled_marker = {}
                 for key, series in marker.items():
                     series = np.asarray(series)
-                    if series.shape[0] != T:
+                    if key == "vertex_ids" or series.shape[0] != T:
                         resampled_marker[key] = series
                         continue
                     if key == "source_contact_mask":
@@ -169,6 +169,22 @@ class MotionData:
                             np.linalg.norm(values, axis=-1, keepdims=True), 1e-10
                         )
                     resampled_marker[key] = values
+                if {"forward_directions", "up_directions"}.issubset(marker):
+                    from scipy.spatial.transform import Rotation
+
+                    forward = np.asarray(marker["forward_directions"])
+                    up = np.asarray(marker["up_directions"])
+                    # The two axes describe one rigid frame. Independent
+                    # normalized linear interpolation can make them disagree
+                    # with each other and with the shared sole rotation.
+                    frames = np.stack((forward, np.cross(up, forward), up), axis=-1)
+                    if np.allclose(np.swapaxes(frames, -1, -2) @ frames, np.eye(3), atol=1e-6):
+                        quats = Rotation.from_matrix(frames).as_quat(scalar_first=True)
+                        values = Rotation.from_quat(
+                            slerp_interpolate(quats, dst_indices, axis=0), scalar_first=True,
+                        ).as_matrix()
+                        resampled_marker["forward_directions"] = values[:, :, 0]
+                        resampled_marker["up_directions"] = values[:, :, 2]
                 resampled_markers[name] = resampled_marker
             new_metadata["end_effector_markers"] = resampled_markers
 

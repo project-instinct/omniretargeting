@@ -14,6 +14,7 @@ from ._core.feet import FootStabilizationMixin
 from ._core.geometry import RobotGeometryMixin
 from ._core.motion import FramewiseMotionMixin
 from ._core.postprocessing import MotionPostprocessingMixin
+from ._core.scaling import TerrainScalingMixin
 from ._core.visualization import TrajectoryVisualizationMixin
 
 try:
@@ -52,8 +53,11 @@ def _select_penetration_safe_refinement(
     after: Mapping[str, Any],
 ) -> tuple[np.ndarray, Mapping[str, Any], float]:
     """Compatibility entry point: joint acceptance with local rollback, no blends."""
+    # The retired global depth reporting threshold never grants permission for
+    # new pointwise collisions. Do not forward it as an optimizer option.
+    repair_config = {k: v for k, v in penetration_config.items() if k != "target_max_depth"}
     result, stats, report = select_safe_postprocessing(
-        model, baseline, refined, scene_mesh, {}, {}, penetration_config,
+        model, baseline, refined, scene_mesh, {}, {}, repair_config,
     )
     if not stats:
         stats = dict(before)
@@ -100,6 +104,7 @@ def _partition_end_effector_markers(
 
 
 class OmniRetargeter(
+    TerrainScalingMixin,
     FramewiseMotionMixin,
     RobotGeometryMixin,
     FootStabilizationMixin,
@@ -267,6 +272,8 @@ class OmniRetargeter(
         body_surface_samples=None,
         scene_objects=None,
         object_points: np.ndarray | None = None,
+        source_support_evidence=None,
+        source_control_evidence=None,
     ) -> Tuple[float, np.ndarray]:
         """
         Retarget SMPLX motion to the robot on the terrain.
@@ -277,6 +284,8 @@ class OmniRetargeter(
                 ``(T, 4)`` as wxyz quaternions (the ``MotionData`` contract),
                 or the legacy ``(T, 3)`` axis-angle representation.
             base_translations: Optional source-root world translations.
+            source_support_evidence: Optional source-only net-wrench contact explanations.
+            source_control_evidence: Optional source-only coordinated object-follow evidence.
             object_points: Optional fixed world samples on moving objects,
                 with shape (T, N, 3); shared by source and robot interaction meshes.
             source_joint_orientations: Optional source global joint
@@ -382,116 +391,18 @@ class OmniRetargeter(
         end_effector_cfg = dict(
             retargeting_config.get("end_effector_priority", {}) or {}
         )
-        semantic_contact_enabled = bool(end_effector_cfg.get("enabled", False))
-        world_tracking_enabled = bool(
-            end_effector_cfg.get("world_tracking_only", False)
-            or end_effector_cfg.get("world_tracking_enabled", False)
-        )
-        semantic_tasks: Dict[str, SceneContactTask] = {}
-        world_tasks: Dict[str, SceneContactTask] = {}
-        end_effector_tasks: Dict[str, SceneContactTask] = {}
-        processed_markers = {}
-        if (semantic_contact_enabled or world_tracking_enabled) and end_effector_markers:
-            processed_markers = {
-                name: {
-                    key: (
-                        np.asarray(value, dtype=bool)
-                        if key == "source_contact_mask"
-                        else (
-                            np.asarray(value, dtype=float) * terrain_scale
-                            if key
-                            in ("tracking_positions", "contact_samples")
-                            else np.asarray(value, dtype=float)
-                        )
-                    )
-                    for key, value in marker.items()
-                }
-                for name, marker in end_effector_markers.items()
-            }
-            semantic_markers, world_markers = _partition_end_effector_markers(
-                processed_markers,
-                end_effector_cfg,
-                semantic_contact_enabled=semantic_contact_enabled,
-                world_tracking_enabled=world_tracking_enabled,
+        end_effector_cfg['contact_detection'] = {
+            **end_effector_cfg.get('contact_detection', {}),
+            'scene_enclosed_free_space': retargeting_config.get('scene_enclosed_free_space', False),
+        }
+        end_effector_tasks, processed_markers = {}, {}
+        self.last_source_contact_table = None
+        if end_effector_cfg.get("enabled", False):
+            from ._core.contact_inputs import unified_contact_inputs
+            end_effector_tasks, processed_markers = unified_contact_inputs(
+                self, body_surface_samples, processed_trajectory, scaled_terrain,
+                scene_objects or (), end_effector_markers, float(framerate or 30.0),
             )
-            if semantic_contact_enabled:
-                semantic_tasks = infer_scene_contact_tasks(
-                    semantic_markers,
-                    scaled_terrain,
-                    framerate=float(framerate or 30.0),
-                    config=end_effector_cfg.get("contact_detection", {}),
-                )
-                contact_summary = ", ".join(
-                    f"{name}={int(np.count_nonzero(task.contact_mask))}/{len(task.contact_mask)}"
-                    for name, task in semantic_tasks.items()
-                )
-                print(f"Inferred SMPL-X scene contacts (frames): {contact_summary}")
-                end_effector_tasks.update(semantic_tasks)
-            if world_tracking_enabled:
-                hinted_world_markers = {
-                    name: marker
-                    for name, marker in world_markers.items()
-                    if marker.get("source_contact_mask") is not None
-                }
-                direct_world_markers = {
-                    name: marker
-                    for name, marker in world_markers.items()
-                    if name not in hinted_world_markers
-                }
-                if hinted_world_markers and semantic_contact_enabled:
-                    world_tasks.update(
-                        infer_scene_contact_tasks(
-                            hinted_world_markers,
-                            scaled_terrain,
-                            framerate=float(framerate or 30.0),
-                            config=end_effector_cfg.get(
-                                "contact_detection", {}
-                            ),
-                        )
-                    )
-                else:
-                    direct_world_markers.update(hinted_world_markers)
-                world_tasks.update(
-                    build_world_tracking_tasks(direct_world_markers)
-                )
-                end_effector_tasks.update(world_tasks)
-                if hinted_world_markers and semantic_contact_enabled:
-                    hinted_summary = ", ".join(
-                        f"{name}={int(np.count_nonzero(task.contact_mask))}/"
-                        f"{len(task.contact_mask)}"
-                        for name, task in world_tasks.items()
-                        if name in hinted_world_markers
-                    )
-                    print(
-                        "Using source contact timing plus scene-projected "
-                        "world targets: " + hinted_summary
-                    )
-                if direct_world_markers:
-                    print(
-                        "Using per-frame SMPL-X world tracking without contact "
-                        "classification or anchors: "
-                        + ", ".join(direct_world_markers)
-                    )
-        elif semantic_contact_enabled or world_tracking_enabled:
-            print(
-                "End-effector world tracking requested, but no SMPL-X "
-                "end-effector markers were supplied; using whole-body retargeting."
-            )
-        if scene_objects and semantic_contact_enabled and end_effector_markers:
-            from .object_contact import merge_object_contacts
-            end_effector_tasks = merge_object_contacts(
-                end_effector_tasks, processed_markers, scene_objects,
-                framerate=float(framerate or 30.0), config=end_effector_cfg.get("contact_detection", {}),
-            )
-            # The baseline/overlay decision must use the final contact plan.
-            # Keeping the old static-only hand plan skips the foot baseline
-            # for an object-only grasp, then local-chain constraints freeze
-            # the legs and base at the neutral initialization.
-            semantic_tasks = {name: end_effector_tasks[name] for name in semantic_tasks}
-            print("Moving-object contacts (frames): " + ", ".join(
-                f"{name}={int(np.count_nonzero(task.contact_mask & (task.environment_ids > 0)))}"
-                for name, task in end_effector_tasks.items() if task.environment_ids is not None
-            ))
         if retargeting_config.get("sequence_solver", {}).get("enabled", False):
             end_effector_tasks = {
                 name: replace(task, preserve_contact_anchors=True)
@@ -500,12 +411,22 @@ class OmniRetargeter(
         self.last_end_effector_tasks = end_effector_tasks
         self._contact_phase_markers = processed_markers
         self.last_contact_phase = None
-        self._contact_phase_clearances = None
         self.last_body_relation_tasks = None
         if (body_surface_samples is not None or scene_objects) and terrain_scale != 1.0:
             raise ValueError("Body surface contact requires unscaled metric source and scene")
         self._body_surface_samples = body_surface_samples
-        self._scene_objects = tuple(scene_objects or ())
+        self._source_support_evidence = source_support_evidence
+        self._source_control_evidence = source_control_evidence
+        # Source dynamics (``source_support_evidence``) need the global joint
+        # orientations of the same timeline.
+        self._source_joint_orientations = source_joint_orientations
+        self._support_evidence_built = source_support_evidence is not None
+        self.last_source_support_diagnostics = (
+            {"status": "supplied"} if source_support_evidence is not None
+            else {"status": "disabled", "reason": "not_built"})
+        self._sequence_acceptance_guard = None
+        from .moving_evidence import source_object_evidence
+        self._scene_objects = source_object_evidence(scene_objects, self.last_source_contact_table)
         self._source_framerate = float(framerate or 30.0)
         self.last_surface_contact_tasks = None
         self.last_surface_contact_diagnostics = {"status": "disabled", "reason": "not_built"}
@@ -525,15 +446,19 @@ class OmniRetargeter(
         from .self_collision import self_collision_config
         local_cfg["self_collision"] = self_collision_config(retargeting_config.get("self_collision"))
         self.scene_query = SceneQuery.from_tasks(
-            scaled_terrain, end_effector_tasks, full_geometry=local_cfg["full_geometry"]
+            scaled_terrain, end_effector_tasks, full_geometry=local_cfg["full_geometry"],
+            enclosed_free_space=retargeting_config.get('scene_enclosed_free_space', False),
+            closed_sign_method=retargeting_config.get('scene_closed_sign_method', 'winding'),
         )
         effective_config = dict(retargeting_config, local_collision_repair=local_cfg)
         effective_config["active_stages"] = dict(
             robot_scale=1.0, scene_scale=float(terrain_scale),
             framewise_scene_constraints=retargeting_config.get("penetration_resolver", "hard_constraint") == "hard_constraint",
             self_collision=bool(retargeting_config.get("self_collision_enabled", True)),
-            moving_object_contacts=bool(scene_objects and semantic_contact_enabled),
-            moving_object_collision_constraints=False,
+            moving_object_contacts=bool(scene_objects and end_effector_cfg.get("enabled", False)),
+            moving_object_collision_constraints=bool(
+                scene_objects and retargeting_config.get("sequence_solver", {}).get("enabled", False)
+            ),
             trajectory_refinement=bool(retargeting_config.get("trajectory_refinement", {}).get("enabled", False) and (end_effector_tasks or local_cfg["self_collision_enabled"])),
             smoothing=bool(retargeting_config.get("trajectory_smoothing", {}).get("enabled", False)),
             local_collision_repair=bool(local_cfg["enabled"]),
@@ -581,43 +506,28 @@ class OmniRetargeter(
             retargeting_kwargs["source_reference_joint_positions"] = (
                 processed_reference_joint_positions
             )
-        preserve_noncontact_baseline = bool(
-            end_effector_cfg.get("preserve_noncontact_baseline", False)
-        )
         sequence_enabled = bool(retargeting_config.get("sequence_solver", {}).get("enabled", False))
-        if sequence_enabled:
-            preserve_noncontact_baseline = False
-        if (
-            preserve_noncontact_baseline
-            and semantic_tasks
-            and world_tasks
-            and any(np.any(task.contact_mask) for task in semantic_tasks.values())
-        ):
-            print(
-                "Building foot-tracking baseline before applying hand-contact "
-                "overlay. Non-contact frames remain identical to the baseline."
+        if end_effector_tasks:
+            retargeting_kwargs["end_effector_tasks"] = end_effector_tasks
+        retargeted_motion = self._perform_retargeting(
+            processed_trajectory, scaled_terrain, **retargeting_kwargs
+        )
+        if sequence_enabled and self.last_sequence_report.get("backend") == "fast":
+            # The fast backend verifies its own budgets and treats clearance
+            # with grids of the original geometry; the original triangles are
+            # audited separately instead of repaired frame by frame here.
+            retargeted_motion = self._clamp_final_joint_safety_limits(retargeted_motion)
+            effective_config["sequence_solver_report"] = self.last_sequence_report
+            self.last_collision_diagnostics = dict(
+                effective_config=effective_config,
+                postprocessing={"status": "skipped_fast_backend"},
+                accepted_qpos_sha256=trajectory_digest(retargeted_motion),
+                validation_scope="fast budgets reported; original-geometry audit required separately",
             )
-            baseline_motion = self._perform_retargeting(
-                processed_trajectory,
-                scaled_terrain,
-                end_effector_tasks=world_tasks,
-                apply_surface_contacts=False,
-                **retargeting_kwargs,
-            )
-            retargeted_motion = self._perform_retargeting(
-                processed_trajectory,
-                scaled_terrain,
-                end_effector_tasks=end_effector_tasks,
-                reference_trajectory=baseline_motion,
-                overlay_contact_names=set(semantic_tasks),
-                **retargeting_kwargs,
-            )
-        else:
             if end_effector_tasks:
-                retargeting_kwargs["end_effector_tasks"] = end_effector_tasks
-            retargeted_motion = self._perform_retargeting(
-                processed_trajectory, scaled_terrain, **retargeting_kwargs
-            )
+                self._report_final_motion_quality(retargeted_motion, end_effector_tasks)
+            return terrain_scale, retargeted_motion
+        end_effector_cfg = getattr(self, "retargeting_config", {}).get("end_effector_priority", end_effector_cfg)
         framewise_motion = np.asarray(retargeted_motion, dtype=float).copy()
         effective_config["active_stages"]["sequence_solver"] = sequence_enabled
         if sequence_enabled:
@@ -730,23 +640,32 @@ class OmniRetargeter(
         )
 
         record_relations("postprocessing_candidate", retargeted_motion)
+        print("Postprocessing acceptance: checking full trajectory", flush=True)
+        sequence_guard = self._sequence_acceptance_guard if sequence_enabled else None
+        sequence_accepts = None if sequence_guard is None else sequence_guard.accepts
         retargeted_motion, postprocess_geometry, postprocess_report = select_safe_postprocessing(
             self.robot_model, framewise_motion, retargeted_motion, scaled_terrain,
             validation_tasks, validation_priority, local_cfg,
             framerate=float(framerate or 30.0), scene_query=self.scene_query,
             geometry_cache=geometry_cache,
+            candidate_acceptance=sequence_accepts,
             **sequence_choices,
             **({"body_relation_tasks": relation_tasks} if relation_tasks is not None else {}),
             **({"self_contact_tasks": self.last_self_contact_tasks} if self.last_self_contact_tasks is not None else {}),
             **({"surface_contact_tasks": self.last_surface_contact_tasks} if self.last_surface_contact_tasks is not None else {}),
             **({"surface_pose_tasks": self.last_surface_pose_tasks} if self.last_surface_pose_tasks is not None else {}),
         )
+        print("Postprocessing acceptance: " + diagnostics_json({
+            key: postprocess_report.get(key) for key in ("accepted_fraction", "seconds")
+        }), flush=True)
         record_relations("before_local_repair", retargeted_motion)
+        print("Local collision repair: starting", flush=True)
         retargeted_motion, local_report = repair_local_collisions(
             self.robot_model, retargeted_motion, scaled_terrain,
             validation_tasks, validation_priority, local_cfg,
             framerate=float(framerate or 30.0), scene_query=self.scene_query,
             geometry_cache=geometry_cache,
+            candidate_acceptance=sequence_accepts,
             **sequence_choices,
             **({"surface_tasks": surface_tasks} if surface_tasks is not None else {}),
             **({"body_relation_tasks": relation_tasks} if relation_tasks is not None else {}),
@@ -755,6 +674,7 @@ class OmniRetargeter(
             **({"surface_pose_tasks": self.last_surface_pose_tasks} if self.last_surface_pose_tasks is not None else {}),
         )
         record_relations("after_local_repair", retargeted_motion)
+        print("Local collision repair: finished", flush=True)
         # Final coupled stage uses the accepted robot motion as its fixed
         # reference. Later smoothing/repair cannot undo object avoidance or
         # select different material contact markers.
@@ -768,10 +688,16 @@ class OmniRetargeter(
             surface_contact_tasks=self.last_surface_contact_tasks,
             surface_pose_tasks=self.last_surface_pose_tasks,
             contact_offset_choice=local_report.get("contact_offset_choice"),
+            geometry_cache=geometry_cache,
+            candidate_acceptance=sequence_accepts,
         )
         record_relations("whole_body_correction", retargeted_motion)
+        if sequence_enabled:
+            from ._core.sequence_guard import preserve_sequence_budgets
+            retargeted_motion, whole_body_report["sequence_budget_guard"] = preserve_sequence_budgets(self, retargeted_motion)
+            record_relations("sequence_budget_acceptance", retargeted_motion)
         effective_config["active_stages"]["whole_body_correction"] = whole_body_report["status"] not in {"disabled", "no_active_tasks"}
-        effective_config["active_stages"]["moving_object_collision_constraints"] = whole_body_report["moving_collision"].get("status") == "active"
+        effective_config["active_stages"]["moving_object_collision_constraints"] |= whole_body_report["moving_collision"].get("status") == "active"
         print("Whole-body correction: " + diagnostics_json({
             key: whole_body_report.get(key) for key in (
                 "status", "accepted_update_count", "root_invariant", "max_joint_correction", "seconds"
@@ -833,110 +759,6 @@ class OmniRetargeter(
             self._report_final_motion_quality(retargeted_motion, end_effector_tasks)
 
         return terrain_scale, retargeted_motion
-
-
-    def _compute_terrain_scale(
-        self,
-        smplx_trajectory: np.ndarray,
-    ) -> float:
-        """
-        Compute the appropriate scaling factor for the terrain.
-
-        This implementation assumes the terrain provided corresponds to the real-world scale
-        relative to the robot's size.
-        """
-        # Default implementation: Scale based on robot vs human height ratio only
-        # This assumes the terrain mesh is already at a "human scale" (e.g. captured or designed for humans)
-        # and we just need to adjust it for the robot's size.
-
-        # Estimate human height from SMPLX trajectory
-        # Height ≈ (head Z - min foot Z) in standing pose
-        # Or more robustly: Max height difference in trajectory
-
-        # Use simple heuristic if we don't have betas to calculate exact height
-        # Assuming typical human height of 1.7m if estimation fails or is unreliable
-        estimated_human_height = 1.7
-
-        if smplx_trajectory is not None and len(smplx_trajectory) > 0:
-            # Estimate height from joints
-            # SMPLX/SMPL joints: 0: Pelvis, 10/11: Feet, 15: Head (approx)
-            # We can find the max vertical extent across all frames
-
-            # Find the frame where the person is most upright (max head height)
-            # Assuming Z is up
-            head_joint_name = self.height_estimation_config.get("head_joint", "Head")
-            foot_joint_names = self.height_estimation_config.get("foot_joints", ["L_Foot", "R_Foot"])
-            head_top_offset = float(self.height_estimation_config.get("head_top_offset", 0.12))
-
-            head_idx = self.smplx_joint_indices.get(head_joint_name, 15)
-            foot_indices = [
-                self.smplx_joint_indices[name]
-                for name in foot_joint_names
-                if name in self.smplx_joint_indices
-            ]
-            if not foot_indices:
-                foot_indices = [10, 11]  # fallback defaults
-
-            # Check if we have enough joints
-            if smplx_trajectory.shape[1] > head_idx and all(idx < smplx_trajectory.shape[1] for idx in foot_indices):
-                # Calculate height per frame: Head Z - Average Foot Z
-                head_z = smplx_trajectory[:, head_idx, 2]
-
-                # Use min foot Z per frame as ground reference relative to body
-                feet_z = np.min(smplx_trajectory[:, foot_indices, 2], axis=1)
-
-                # Height per frame
-                heights = head_z - feet_z
-
-                # Use the maximum height observed (standing pose)
-                # Add offset for top of head (head joint is in neck/center of head)
-                # Approx 10-15cm from head joint to top of head
-                estimated_human_height = np.max(heights) + head_top_offset
-
-                # Sanity check: Constrain to reasonable human range [1.4, 2.2]
-                estimated_human_height = np.clip(estimated_human_height, 1.4, 2.2)
-
-                print(f"Estimated human height from trajectory: {estimated_human_height:.3f}m")
-
-        scale_factor = self.robot_height / estimated_human_height
-
-        print(f"Computed terrain scale factor: {scale_factor:.4f} (Robot: {self.robot_height}m, Human Est: {estimated_human_height:.3f}m)")
-
-        return float(scale_factor)
-
-    def _extract_foot_positions(self, smplx_trajectory: np.ndarray) -> np.ndarray:
-        """Extract foot positions from SMPLX trajectory."""
-        # SMPLX joint indices for feet
-        # L_Foot: 10, R_Foot: 11 (standard SMPLX ordering)
-        foot_indices = [10, 11]
-
-        foot_positions = []
-        for frame in smplx_trajectory:
-            for foot_idx in foot_indices:
-                if foot_idx < len(frame):
-                    foot_positions.append(frame[foot_idx])
-
-        return np.array(foot_positions)
-
-    def _scale_terrain_mesh(self, scale_factor: float) -> trimesh.Trimesh:
-        """Scale the terrain mesh by the given factor."""
-        scaled_mesh = self.terrain_mesh.copy()
-        scaled_mesh.apply_scale(scale_factor)
-        return scaled_mesh
-
-    def _process_smplx_trajectory(
-        self,
-        smplx_trajectory: np.ndarray,
-        terrain_scale: float
-    ) -> np.ndarray:
-        """Process SMPLX trajectory for retargeting."""
-        # Apply terrain scaling to trajectory coordinates
-        scaled_trajectory = smplx_trajectory * terrain_scale
-
-        # Transform coordinate system if needed (SMPLX uses different convention)
-        # TODO: Add coordinate system transformation if needed
-
-        return scaled_trajectory
 
 
     def get_robot_dof(self) -> int:

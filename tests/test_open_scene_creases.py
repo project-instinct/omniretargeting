@@ -118,3 +118,34 @@ def test_distant_evidence_backed_interior_normal_is_not_dropped():
     assert not result["uncertain"][0]
     assert result["clearance"][0] == pytest.approx(-2.0)
     np.testing.assert_allclose(result["directions"][0], [1, 0, 0], atol=1e-7)
+
+
+@pytest.mark.parametrize('size', [.001, 1.])
+@pytest.mark.parametrize('reverse_faces', [False, True])
+def test_boundary_vertex_shared_by_triangles_is_not_an_infinite_patch(size, reverse_faces):
+    from scipy.spatial.transform import Rotation
+
+    mesh = trimesh.Trimesh(
+        vertices=np.array([[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]]) * size,
+        faces=[[0, 1, 2], [0, 2, 3]], process=False,
+    )
+    rotation = Rotation.from_rotvec([.4, -.2, .7]).as_matrix()
+    mesh.vertices = np.asarray(mesh.vertices) @ rotation.T
+    if reverse_faces:
+        mesh.faces = mesh.faces[::-1, ::-1]
+    corner = np.array([size, size, 0.]) @ rotation.T
+    query = SceneQuery(mesh, [corner], [rotation[:, 2]], evidence_radius=3.)
+    points = np.array([[size+.04, size+.04, -.1], [0., 0., -.1]]) @ rotation.T
+    result = query.query(points)
+    assert result['uncertain'][0]
+    assert np.isnan(result['clearance'][0])
+    assert not result['uncertain'][1]
+    assert result['clearance'][1] == pytest.approx(-.1)
+
+
+def test_finite_crease_endpoint_does_not_extrude_past_its_boundary():
+    query = SceneQuery(floor_wall_crease(), [[1, -1, 0], [1, -1, 0]],
+                       [[0, 0, 1], [1, 0, 0]], evidence_radius=2.)
+    result = query.query([[.9, -1.1, -.1]])
+    assert result['uncertain'][0]
+    assert np.isnan(result['clearance'][0])

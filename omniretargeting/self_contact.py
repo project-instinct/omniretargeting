@@ -31,6 +31,9 @@ DEFAULTS = {
 
 
 def self_contact_config(config=None):
+    from .config_validation import known_options
+
+    known_options(config, DEFAULTS, 'self_contact', extra=('correspondence',))
     result = {**DEFAULTS, **(config or {})}
     for key in (
         "distance",
@@ -142,8 +145,9 @@ class SelfContactTasks:
                 values[f, index] = np.linalg.norm(residual)
         return values
 
-    def metrics(self, poses, frame_start=0):
-        errors = self.errors(poses, frame_start)
+    def metrics(self, poses, frame_start=0, *, errors=None):
+        if errors is None:
+            errors = self.errors(poses, frame_start)
         groups = {}
         for k, event in enumerate(self.events):
             values = errors[:, k]

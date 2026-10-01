@@ -4,6 +4,45 @@ from ..local_collision_repair import diagnostics_json
 from ..surface_motion import SurfaceMotion
 
 
+def _prepare_source_support(owner, source, positions, scene, config):
+    """Derive source net-wrench support evidence once, unless supplied.
+
+    It tells contacts the source dynamics need (support) from ones that only
+    touch; ``contact_phase`` assigns roles from it and keeps geometric roles
+    where the mechanics cannot explain a frame.
+    """
+    from ..contact_phase import contact_phase_config
+    from ..source_support_evidence import build_source_support_evidence
+    from ..surface_contact import surface_contact_config
+
+    if getattr(owner, "_support_evidence_built", False):
+        return
+    owner._support_evidence_built = True
+    if not contact_phase_config(config.get("contact_phase_priority"))["enabled"]:
+        owner.last_source_support_diagnostics = {"status": "disabled", "reason": "contact_phase_disabled"}
+        return
+    evidence, table, report = build_source_support_evidence(
+        (source or {}).get("full_body"),
+        positions,
+        getattr(owner, "smplx_joint_names", ()),
+        getattr(owner, "_source_joint_orientations", None),
+        scene,
+        surface_contact_config(config.get("surface_contact")),
+        framerate=getattr(owner, "_source_framerate", 30.0),
+        scene_objects=getattr(owner, "_scene_objects", ()),
+        scene_enclosed_free_space=config.get("scene_enclosed_free_space", False),
+        table=getattr(owner, "last_source_contact_table", None),
+    )
+    owner._source_support_evidence = evidence
+    if table is not None:
+        owner.last_source_contact_table = table
+    owner.last_source_support_diagnostics = report
+    print("source_support: " + diagnostics_json(
+        {k: report.get(k) for k in ("status", "reason", "explained_frames", "frames",
+                                    "support_region_frames", "moving_object_candidates_excluded", "fixed_object_frames",
+                                    "skin_sample_spacing_m", "support_patch_frames", "support_patch_demoted_candidates")}))
+
+
 def prepare_surface_tasks(
     owner,
     retargeter,
@@ -70,6 +109,7 @@ def prepare_surface_tasks(
         )
     scene_built = False
     if apply_scene_contacts and not getattr(owner, "_surface_contacts_built", False):
+        _prepare_source_support(owner, source, positions, scene, config)
         owner.last_surface_contact_tasks, owner.last_surface_contact_diagnostics = (
             build_surface_contact_tasks(
                 owner.robot_model,
@@ -81,11 +121,24 @@ def prepare_surface_tasks(
                 framerate=getattr(owner, "_source_framerate", 30.0),
                 scene_objects=getattr(owner, "_scene_objects", ()),
                 robot_seed_trajectory=robot_seed_trajectory,
+                support_evidence=getattr(owner, "_source_support_evidence", None),
+                source_contact_table=getattr(owner, "last_source_contact_table", None),
+                scene_enclosed_free_space=config.get("scene_enclosed_free_space", False),
                 **shared,
             )
         )
         owner._surface_contacts_built = True
+        contact_task = owner.last_surface_contact_tasks
+        owner.last_source_contact_table = getattr(contact_task, "source_contact_table", getattr(owner, "last_source_contact_table", None))
         scene_built = True
+        from .._sequence.proximity import build_surface_proximity
+
+        owner.last_surface_proximity_tasks = build_surface_proximity(
+            owner.robot_model, source, motion, scene,
+            getattr(owner, '_scene_objects', ()), config.get('surface_contact'),
+            getattr(owner, '_source_framerate', 30.),
+            source_contact_table=owner.last_source_contact_table,
+        )
     if not owner._surface_pose_built or scene_built:
         root = owner._resolve_source_root_index()
         # Resolve the chosen source root in the surface's own shaped-rest
@@ -147,6 +200,30 @@ def prepare_surface_tasks(
         phase_cfg = contact_phase_config(config.get("contact_phase_priority"))
         if (
             phase_cfg["enabled"]
+            and getattr(owner, "_source_control_evidence", None) is None
+            and not getattr(owner, "_control_evidence_built", False)
+        ):
+            # Evidence supplied by the caller is kept; otherwise derive it from
+            # the same skin contact observations and prescribed object motion.
+            from ..object_control_evidence import build_object_control_evidence
+
+            surface_task = getattr(owner, "last_surface_contact_tasks", None)
+            objects = list(getattr(owner, "_scene_objects", None) or ())
+            if surface_task is not None and objects:
+                owner._source_control_evidence = build_object_control_evidence(
+                    surface_task, objects, len(positions),
+                    getattr(owner, "_source_framerate", 30.0),
+                    scene_present=scene is not None and len(scene.faces) > 0,
+                )
+            owner._control_evidence_built = True
+            evidence = getattr(owner, "_source_control_evidence", None)
+            if evidence is not None:
+                print("object_control: " + diagnostics_json({
+                    k: evidence.diagnostics[k]
+                    for k in ("control_frames", "control_region_frames", "observation_budget_m")
+                }))
+        if (
+            phase_cfg["enabled"]
             and getattr(owner, "_contact_phase_clearances", None) is None
         ):
             owner._contact_phase_clearances = observe_effector_clearances(
@@ -164,6 +241,8 @@ def prepare_surface_tasks(
             phase_cfg,
             model=owner.robot_model,
             source_clearances=getattr(owner, "_contact_phase_clearances", None),
+            support_evidence=getattr(owner, "_source_support_evidence", None),
+            control_evidence=getattr(owner, "_source_control_evidence", None),
         )
     retargeter.contact_phase = (
         getattr(owner, "last_contact_phase", None) if apply_scene_contacts else None

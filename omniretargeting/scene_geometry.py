@@ -9,20 +9,27 @@ resolution; it is not a collision-free certificate.
 
 from __future__ import annotations
 
+import hashlib
+import weakref
 from itertools import product
 
 import igl
 import mujoco
 import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
 import trimesh
-from scipy.spatial import ConvexHull, cKDTree
+from scipy.spatial import ConvexHull, QhullError, cKDTree
 
 
 def collision_geom_ids(model, geom_groups=None, body_tokens=None):
+    """Select robot geoms; a model's world floor is environment, not robot."""
     groups = None if geom_groups is None else set(map(int, geom_groups))
     tokens = None if body_tokens is None else tuple(str(t).lower() for t in body_tokens)
     selected = []
     for gid in range(model.ngeom):
+        if model.geom_bodyid[gid] == 0:
+            continue
         if groups is None:
             if not (model.geom_contype[gid] or model.geom_conaffinity[gid]):
                 continue
@@ -39,13 +46,34 @@ def collision_geom_ids(model, geom_groups=None, body_tokens=None):
     return np.asarray(selected, dtype=int)
 
 
+# Shells already sampled for a model: (geom, spacing) -> (geometry digest, offsets).
+_SHELLS = weakref.WeakKeyDictionary()
+
+
 def geom_surface_offsets(model, geom_id, spacing=None):
     """Geom-frame collision shell, with box edges and capsule thickness.
 
     Meshes use the convex hull of compiled MuJoCo vertices (MuJoCo's mesh
     collision representation). No vertex stride removes extremities. ``spacing``
     bounds the sampling grid spacing; callers enforce query budgets explicitly.
+    A shell is sampled once per model geometry; callers receive a copy.
     """
+    geom_id = int(geom_id)
+    digest = hashlib.sha1(np.asarray(model.geom_size[geom_id], dtype=float).tobytes())
+    digest.update(int(model.geom_type[geom_id]).to_bytes(4, "little"))
+    if int(model.geom_type[geom_id]) == mujoco.mjtGeom.mjGEOM_MESH:
+        mid = int(model.geom_dataid[geom_id])
+        start, n = int(model.mesh_vertadr[mid]), int(model.mesh_vertnum[mid])
+        digest.update(np.ascontiguousarray(model.mesh_vert[start : start + n], dtype=float).tobytes())
+    cache = _SHELLS.setdefault(model, {})
+    key = (geom_id, None if spacing is None else float(spacing))
+    cached = cache.get(key)
+    if cached is None or cached[0] != digest.digest():
+        cached = cache[key] = (digest.digest(), _geom_surface_offsets(model, geom_id, spacing))
+    return cached[1].copy()
+
+
+def _geom_surface_offsets(model, geom_id, spacing=None):
     kind = int(model.geom_type[geom_id])
     size = np.asarray(model.geom_size[geom_id], dtype=float)
 
@@ -108,31 +136,70 @@ def geom_surface_offsets(model, geom_id, spacing=None):
         vertices = np.asarray(model.mesh_vert[start : start + n], dtype=float)
         hull = ConvexHull(vertices)
         points = [vertices[hull.vertices]]
-        for face in hull.simplices:
-            a, b, c = vertices[face]
-            divisions = (
-                count(
-                    max(
-                        np.linalg.norm(b - a),
-                        np.linalg.norm(c - a),
-                        np.linalg.norm(c - b),
-                    ),
-                    3,
-                )
-                - 1
-            )
-            points.append(
-                np.asarray(
-                    [
-                        a + (i * (b - a) + j * (c - a)) / divisions
-                        for i in range(divisions + 1)
-                        for j in range(divisions + 1 - i)
-                    ]
-                )
-            )
+        corners = vertices[hull.simplices]
+        divisions = np.array([
+            count(max(np.linalg.norm(b - a), np.linalg.norm(c - a), np.linalg.norm(c - b)), 3) - 1
+            for a, b, c in corners
+        ])
+        # Faces with equal subdivision share one barycentric grid; each point
+        # is still a + (i (b - a) + j (c - a)) / divisions.
+        for size in np.unique(divisions):
+            a, b, c = (corners[divisions == size, k][:, None] for k in range(3))
+            i, j = np.array([(i, j) for i in range(size + 1) for j in range(size + 1 - i)]).T
+            grid = a + (i[None, :, None] * (b - a) + j[None, :, None] * (c - a)) / size
+            points.append(grid.reshape(-1, 3))
         return np.unique(np.vstack(points), axis=0)
     # Infinite robot planes and heightfields have no finite sample shell.
     raise ValueError(f"Unsupported moving collision geom {geom_id}: type {kind}")
+
+
+def _boundary_loops(mesh):
+    """Boundary loops of the triangle chain and a cone cap closing each.
+
+    Edges whose directed uses do not cancel form the chain's boundary;
+    non-manifold seams whose orientations cancel are not boundary. Returns
+    ``(loops, cap_vertices, cap_faces)``: per connected loop its bounding
+    sphere (centre, radius) and length, and fan triangles from each centre
+    that cancel the boundary, so that the chain plus caps is closed.
+    """
+    faces = np.asarray(mesh.faces)
+    directed = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]])
+    edges, inverse = np.unique(np.sort(directed, axis=1), axis=0, return_inverse=True)
+    net = np.bincount(inverse.ravel(), weights=np.where(directed[:, 0] < directed[:, 1], 1., -1.),
+                      minlength=len(edges)).round().astype(int)
+    edges, net = edges[net != 0], net[net != 0]
+    vertices = np.asarray(mesh.vertices, dtype=float)
+    if not len(edges):
+        return [], np.zeros((0, 3)), np.zeros((0, 3), int)
+    _, labels = connected_components(
+        coo_matrix((np.ones(len(edges)), (edges[:, 0], edges[:, 1])), shape=(len(vertices),) * 2),
+        directed=False)
+    loops, cap_vertices, cap_faces = [], [], []
+    for label in np.unique(labels[edges[:, 0]]):
+        selected = labels[edges[:, 0]] == label
+        ends = vertices[np.unique(edges[selected])]
+        center = 0.5 * (ends.min(axis=0) + ends.max(axis=0))
+        length = float((np.linalg.norm(vertices[edges[selected, 0]] - vertices[edges[selected, 1]], axis=1)
+                        * np.abs(net[selected])).sum())
+        loops.append((center, float(np.linalg.norm(ends - center, axis=1).max()), length))
+        # A chain edge lo->hi (net > 0) is cancelled by the cap edge hi->lo.
+        apex = len(vertices) + len(cap_vertices)
+        cap_vertices.append(center)
+        for (lo, hi), count in zip(edges[selected], net[selected]):
+            triangle = [apex, hi, lo] if count > 0 else [apex, lo, hi]
+            cap_faces.extend([triangle] * abs(int(count)))
+    return loops, np.asarray(cap_vertices), np.asarray(cap_faces, dtype=int)
+
+
+# Margin of the convex-hull outside test, in mesh units (qhull rounding).
+HULL_TOLERANCE = 1e-9
+# A generalized winding number this close to 0 or 1 is decisive (the same
+# tolerance as for closed and nearly closed components).
+WINDING_TOLERANCE = 0.01
+# Winding grid of a bounded object's open component: cells along its longest
+# extent, and the depth (in cells) beyond which evidence-inside points are vetted.
+WINDING_GRID_CELLS = 64
+WINDING_GRID_DEPTH = 2.0
 
 
 class SceneQuery:
@@ -145,7 +212,8 @@ class SceneQuery:
 
     def __init__(
         self, mesh, evidence_points=None, evidence_normals=None, evidence_radius=0.15,
-        *, full_geometry=True,
+        *, full_geometry=True, enclosed_free_space=False, closed_sign_method='winding',
+        bounded_object=False,
     ):
         if mesh is None or not len(mesh.faces) or not len(mesh.vertices):
             raise ValueError("Scene collision query requires nonempty mesh geometry")
@@ -153,6 +221,13 @@ class SceneQuery:
             raise ValueError("Scene collision mesh contains nonfinite vertices")
         self.mesh = mesh
         self.full_geometry = bool(full_geometry)
+        self.enclosed_free_space = bool(enclosed_free_space)
+        if closed_sign_method not in ('winding', 'pseudonormal'):
+            raise ValueError('closed_sign_method must be winding or pseudonormal')
+        self.closed_sign_method = closed_sign_method
+        self._closed_normals = []
+        if self.enclosed_free_space and not (mesh.is_watertight and mesh.is_winding_consistent):
+            raise ValueError('Enclosed free space requires an oriented watertight boundary')
         self.geometry_backends = {}
         self.query_points = 0
         self.query_calls = 0
@@ -161,6 +236,7 @@ class SceneQuery:
         self.components = []
         self._component_query_data = []
         self._component_features = []
+        self._completions = []
         self.evidence_radius = float(evidence_radius)
         points = np.asarray(
             evidence_points if evidence_points is not None else [], dtype=float
@@ -177,12 +253,42 @@ class SceneQuery:
             np.linalg.norm(self.evidence_normals, axis=1, keepdims=True), 1e-9
         )
         self.evidence_tree = cKDTree(self.evidence_points) if np.any(valid) else None
+        # A bounded object is the closure of its recorded surface: the mesh
+        # plus caps spanning its boundary loops, all inside the convex hull of
+        # its vertices, the domain of the winding-number segmentation (Jacobson
+        # et al. 2013). Free-side evidence extends an open patch's local side;
+        # it cannot put a point inside where no closure can be: outside that
+        # hull, or where the patch's generalized winding number is decisively
+        # zero (nothing encloses the point, e.g. the free space in a chair's
+        # concavity). Opt-in: terrain continues below its lowest vertex, and
+        # enclosed free space has its solid outside the room shell. A flat
+        # mesh has no hull; an open sheet has |w| near 1/2 beside it.
+        self.bounded_object = bool(bounded_object) and not self.enclosed_free_space
+        self._winding_grids = {}
+        self._hull = None
+        if self.bounded_object:
+            try:
+                self._hull = ConvexHull(np.asarray(mesh.vertices, dtype=float)).equations
+            except QhullError:
+                self._hull = None
+            self._hull_bounds = np.asarray(mesh.vertices, dtype=float).min(0), np.asarray(mesh.vertices, dtype=float).max(0)
         # Preserve all faces, including singleton/open components.
         groups = trimesh.graph.connected_components(
             mesh.face_adjacency, nodes=np.arange(len(mesh.faces)), min_len=1
         )
+        if self.enclosed_free_space:
+            # An enclosing room and its oppositely oriented obstacle shells
+            # describe ONE free volume. Treating each shell as a solid makes
+            # every point inside the room appear deeply penetrating. Keep all
+            # faces and sum their winding, including the holes/obstacles.
+            groups = [np.arange(len(mesh.faces))]
         for faces in groups:
             part = mesh.submesh([faces], append=True, repair=False)
+            # Derive directions from original triangles, independent of stale
+            # normals supplied by a file or cached across mesh transforms.
+            normals, valid = trimesh.triangles.normals(part.triangles)
+            if valid.all():
+                part.face_normals = normals
             closed = bool(
                 part.is_watertight
                 and part.is_winding_consistent
@@ -191,8 +297,22 @@ class SceneQuery:
             tree = igl.AABB()
             tree.init(np.asarray(part.vertices), np.asarray(part.faces))
             self.components.append((part, np.asarray(faces, dtype=int), closed, tree))
+            from .closed_surface_normals import ClosedSurfaceNormals
+            self._closed_normals.append(
+                ClosedSurfaceNormals(part) if closed and closed_sign_method == 'pseudonormal' else None)
             from .open_surface_features import OpenSurfaceFeatures
             self._component_features.append(None if closed else OpenSurfaceFeatures(part))
+            # Nearly closed: capping every boundary loop adds at most 1% of the
+            # surface (the winding tolerance); a cone cap has area at most
+            # length * radius / 2. Fragments and open sheets, whose caps are as
+            # large as themselves, keep only evidence-based sides.
+            completion = None
+            if not closed:
+                loops, cap_vertices, cap_faces = _boundary_loops(part)
+                if sum(l * r / 2 for _, r, l in loops) <= 0.01 * part.area:
+                    completion = (loops, np.vstack([np.asarray(part.vertices, float), cap_vertices]),
+                                  np.vstack([np.asarray(part.faces), cap_faces]).astype(np.int64))
+            self._completions.append(completion)
             vertices, triangles = np.asarray(part.vertices), np.asarray(part.faces)
             # Evidence can orient a nearest surface point only if an evidence
             # ball intersects this component. Check the actual triangles once;
@@ -213,9 +333,135 @@ class SceneQuery:
         # Geometry and evidence are immutable, so centre culling can never
         # discard a geom in this case; its prepass would only repeat queries.
         self.has_unsigned_only_components = any(
-            not component[2] and not data[3]
-            for component, data in zip(self.components, self._component_query_data)
-        )
+            self._unsigned_only(cid) for cid in range(len(self.components)))
+
+    def hull_margin(self, points, beyond=np.inf):
+        """Lower bound of each point's distance outside the hull (``bounded_object``).
+
+        Positive only outside the hull, where it bounds the distance to the
+        object from below; -inf without a certificate. Points farther than
+        ``beyond`` outside the vertices' bounding box keep that box distance
+        (also a lower bound); only the rest evaluate every hull plane.
+        """
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        if self._hull is None:
+            return np.full(len(points), -np.inf)
+        lower, upper = self._hull_bounds
+        margin = np.linalg.norm(np.maximum(np.maximum(lower - points, points - upper), 0.), axis=1)
+        near = np.flatnonzero(margin <= beyond)
+        if len(near):
+            margin[near] = (points[near] @ self._hull[:, :3].T + self._hull[:, 3]).max(axis=1)
+        return margin
+
+    def _winding_free(self, cid, points, dist, enclosed):
+        """Indices of ``enclosed`` points no closure of component ``cid`` encloses.
+
+        Evidence decides near the surface. Farther than WINDING_GRID_DEPTH grid
+        cells, where the generalized winding number is harmonic across the
+        point's cell, all eight cell corners of a once-computed grid must be
+        decisively zero. One exact fast-winding call per query cost 16 ms for a
+        32k-face object; the grid costs that once.
+        """
+        grid = self._winding_grids.get(cid)
+        if grid is None:
+            vertices, triangles, bounds, _ = self._component_query_data[cid]
+            spacing = max(float(np.max(bounds[1] - bounds[0])), 1e-9) / WINDING_GRID_CELLS
+            lower = bounds[0] - spacing
+            counts = np.floor((bounds[1] + spacing - lower) / spacing).astype(int) + 2
+            axes = [lower[axis] + spacing * np.arange(counts[axis]) for axis in range(3)]
+            nodes = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+            winding = np.abs(igl.fast_winding_number(vertices, triangles, nodes)).reshape(counts)
+            grid = self._winding_grids[cid] = (lower, spacing, winding)
+        lower, spacing, winding = grid
+        candidates = np.flatnonzero(enclosed & (dist >= WINDING_GRID_DEPTH * spacing))
+        if not len(candidates):
+            return candidates
+        base = np.floor((points[candidates] - lower) / spacing).astype(int)
+        inside = np.all((base >= 0) & (base < np.array(winding.shape) - 1), axis=1)
+        free = np.zeros(len(candidates), bool)
+        cells = base[inside]
+        grid_free = np.ones(len(cells), bool)
+        for corner in product((0, 1), repeat=3):
+            index = cells + corner
+            grid_free &= winding[index[:, 0], index[:, 1], index[:, 2]] < WINDING_TOLERANCE
+        free[inside] = grid_free
+        # Beyond the grid (e.g. a small scan fragment nearest to a far point),
+        # evaluate the winding number directly: such points are rare.
+        if not inside.all():
+            vertices, triangles, _, _ = self._component_query_data[cid]
+            outside = candidates[~inside]
+            free[~inside] = np.abs(igl.fast_winding_number(vertices, triangles, points[outside])) < WINDING_TOLERANCE
+        return candidates[free]
+
+    def outside_hull(self, points):
+        """Points strictly outside the object's convex hull (``bounded_object``)."""
+        return self.hull_classification(points, HULL_TOLERANCE)[:, 0]
+
+    def hull_classification(self, points, *thresholds):
+        """Exact threshold decisions with certified cell reuse (no margin approximation)."""
+        from .convex_hull_scope import ConvexHullScope
+
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        if self._hull is None:
+            return np.zeros((len(points), len(thresholds)), bool)
+        scope = getattr(self, '_hull_scope', None)
+        if scope is None:
+            scope = self._hull_scope = ConvexHullScope(self._hull, self._hull_bounds)
+        return scope.classify(points, thresholds, self.hull_margin)
+
+    def _unsigned_only(self, cid):
+        """Open, without evidence and not nearly closed: unknown everywhere."""
+        return (not self.components[cid][2] and not self._component_query_data[cid][3]
+                and self._completions[cid] is None)
+
+    def _decisive_winding(self, cid, points, dist):
+        """Points on a definite side of every completion of this component.
+
+        A nearly closed component plus a cone cap on each boundary loop is a
+        closed chain with an integer winding number off its surface
+        (generalized winding numbers, Jacobson et al. 2013). Any other cap
+        inside a loop's bounding sphere differs by a closed surface there, so
+        outside all spheres the side does not depend on the cap. Decided:
+        outside the spheres, off the surface, and within 0.01 of 0 or 1 (the
+        closed-component tolerance, with the same exact fallback).
+        """
+        completion = self._completions[cid]
+        decided = np.zeros(len(points), bool)
+        if completion is None or not len(points):
+            return decided, decided.copy()
+        loops, vertices, triangles = completion
+        candidate = dist >= 1e-8
+        for center, radius, _ in loops:
+            candidate &= np.linalg.norm(points - center, axis=1) > radius
+        winding = np.zeros(len(points))
+        if np.any(candidate):
+            winding[candidate] = np.abs(igl.fast_winding_number(vertices, triangles, points[candidate]))
+        ambiguous = candidate & (winding >= 0.01) & (np.abs(winding - 1) >= 0.01)
+        if np.any(ambiguous):
+            winding[ambiguous] = np.abs(igl.winding_number(vertices, triangles, points[ambiguous]))
+        decided = candidate & ((winding < 0.01) | (np.abs(winding - 1) < 0.01))
+        return decided, winding > 0.5
+
+    def nearly_closed(self, cid):
+        return self._completions[cid] is not None
+
+    def winding_side(self, points, cid):
+        """``query`` fields of one nearly closed component from its winding
+        number alone; points it cannot decide are uncertain (NaN)."""
+        points = np.asarray(points, dtype=float).reshape(-1, 3)
+        _, faces, _, tree = self.components[cid]
+        vertices, triangles, _, _ = self._component_query_data[cid]
+        d2, tid, near = tree.squared_distance(vertices, triangles, points)
+        dist = np.sqrt(np.maximum(d2, 0))
+        decided, inside = self._decisive_winding(cid, points, dist)
+        sign = np.where(inside, -1.0, 1.0)
+        offset = points - near
+        directions = sign[:, None] * offset / np.maximum(dist[:, None], 1e-9)
+        directions[~decided] = 0.0
+        return {"clearance": np.where(decided, sign * dist, np.nan), "directions": directions,
+                "surface_points": near, "surface_ids": faces[tid],
+                "obstacle_ids": np.full(len(points), cid), "confidence": np.where(decided, 0.5, 0.0),
+                "uncertain": ~decided, "unsigned_distance": dist}
 
     @classmethod
     def from_tasks(cls, mesh, tasks, **kwargs):
@@ -243,16 +489,18 @@ class SceneQuery:
             "backend": "libigl cached triangle AABB / closed-component winding number",
             "global_sdf_for_open_mesh": False,
             "full_geometry_enabled": self.full_geometry,
+            "enclosed_free_space": self.enclosed_free_space,
+            "closed_sign_method": self.closed_sign_method,
             "unsigned_only_components": sum(
-                not component[2] and not data[3]
-                for component, data in zip(self.components, self._component_query_data)
-            ),
+                self._unsigned_only(cid) for cid in range(len(self.components))),
+            "nearly_closed_components": sum(
+                completion is not None for completion in self._completions),
             "component_query_points": self.component_query_points,
             "component_query_calls": self.component_query_calls,
             "geometry_queries": [backend.describe() for backend in self.geometry_backends.values()],
         }
 
-    def query(self, points, *, component_ids=None):
+    def query(self, points, *, component_ids=None, outside_hull=None):
         points = np.asarray(points, dtype=float).reshape(-1, 3)
         self.query_points += len(points)
         self.query_calls += 1
@@ -272,7 +520,7 @@ class SceneQuery:
             if n == 0:
                 break
             vertices, triangles, bounds, has_evidence = self._component_query_data[cid]
-            if not closed and not has_evidence:
+            if self._unsigned_only(cid):
                 # This component remains unknown at EVERY distance. It cannot
                 # supply a signed constraint, but still supplies the nearest
                 # unsigned surface/witness. Its AABB lower bound can only omit
@@ -306,7 +554,13 @@ class SceneQuery:
             offset = points - near
             normals = np.asarray(mesh.face_normals)[tid]
             reliable = np.ones(n, dtype=bool)
-            if closed:
+            if closed and self._closed_normals[cid] is not None:
+                normals, reliable = self._closed_normals[cid].at(tid, near)
+                normals *= (1 if mesh.volume > 0 else -1)
+                if self.enclosed_free_space:
+                    normals *= -1
+                sign = np.where(np.sum(offset * normals, axis=1) >= 0, 1., -1.)
+            elif closed:
                 # Winding magnitude handles consistently reversed shells without
                 # altering the source scene; ambiguous/nonmanifold results fail closed.
                 winding = np.zeros(n)
@@ -321,19 +575,35 @@ class SceneQuery:
                             points[in_bounds],
                         )
                     )
+                # The fast multipole approximation can be inconclusive very
+                # close to a thin solid. Resolve just those samples by exact
+                # solid-angle winding, rather than loosening the reliability
+                # threshold or aborting an otherwise valid contact trajectory.
+                ambiguous = ((winding >= 0.01) & (np.abs(winding - 1) >= 0.01)
+                             & (dist >= 1e-8))
+                if np.any(ambiguous):
+                    winding[ambiguous] = np.abs(igl.winding_number(
+                        vertices, triangles, points[ambiguous]))
                 reliable = (
                     (winding < 0.01) | (np.abs(winding - 1) < 0.01) | (dist < 1e-8)
                 )
                 sign = np.where(winding > 0.5, -1.0, 1.0)
                 normals = normals * (1 if mesh.volume > 0 else -1)
+                if self.enclosed_free_space:
+                    sign = -sign
+                    normals = -normals
             else:
                 reliable[:] = False
                 if self.evidence_tree is not None:
+                    # The bound only prunes: a missing neighbor has infinite
+                    # distance and is never eligible; its index is clamped.
                     distances, indices = self.evidence_tree.query(
-                        near, k=min(4, len(self.evidence_points))
+                        near, k=min(4, len(self.evidence_points)),
+                        distance_upper_bound=self.evidence_radius * (1 + 1e-9) + 1e-12,
                     )
                     distances = np.asarray(distances).reshape(n, -1)
-                    indices = np.asarray(indices).reshape(n, -1)
+                    indices = np.minimum(np.asarray(indices).reshape(n, -1),
+                                         len(self.evidence_points) - 1)
                     alignment = np.einsum(
                         "nij,nj->ni", self.evidence_normals[indices], normals
                     )
@@ -350,6 +620,23 @@ class SceneQuery:
                     points, near, tid, reliable, self.evidence_tree,
                     self.evidence_points, self.evidence_normals, self.evidence_radius,
                 )
+                # A nearly closed component (cracks, non-manifold seams) has a
+                # decisive generalized winding number away from its defects
+                # (Jacobson et al. 2013). Where the evidence votes leave a point
+                # unknown (they are unstable deep inside such a solid), it
+                # states the side; indecisive points (holes) stay unknown.
+                gap = np.flatnonzero(~reliable)
+                if len(gap):
+                    decided, inside = self._decisive_winding(cid, points[gap], dist[gap])
+                    sign[gap[decided]] = np.where(inside[decided], -1.0, 1.0)
+                    reliable[gap[decided]] = True
+                if outside_hull is None:
+                    outside_hull = self.outside_hull(points)
+                outside = outside_hull
+                sign[outside] = 1.0
+                reliable[outside] = True
+                if self.bounded_object:
+                    sign[self._winding_free(cid, points, dist, reliable & (sign < 0))] = 1.0
             signed = sign * dist
             # Unknown components cannot be discarded just because their nearest
             # surface is far away. Keep this flag even if another component is known.
@@ -474,7 +761,11 @@ class ScenePenetrationProbe:
             )
             if self.geometry_backend is not None:
                 previous_queries = self.geometry_backend.pair_queries
-                rows = self.geometry_backend.query(data, self.margin)
+                # A confirmed free centre farther than the geom's bounding
+                # radius plus margin cannot produce a rigid contact either.
+                rows = self.geometry_backend.query(
+                    data, self.margin, active_geom_ids=self.geom_ids[near]
+                )
                 self.query.query_points += self.geometry_backend.pair_queries - previous_queries
                 if rows:
                     for key in frame:

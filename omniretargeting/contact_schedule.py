@@ -74,7 +74,7 @@ def _progress(distance, far, near):
     return np.clip((distance[far] - distance) / span, 0.0, 1.0)
 
 
-def approach_blend(tracking, anchors, contact_mask):
+def approach_blend(tracking, anchors, contact_mask, *, return_contact_frames=False):
     """Hand a free target to its contact anchor by the source's own progress.
 
     For a run starting at ``s`` with anchor ``A``, the source endpoint's
@@ -91,9 +91,11 @@ def approach_blend(tracking, anchors, contact_mask):
     frames = len(tracking)
     weights = np.zeros(frames)
     references = tracking.copy()
+    contact_frames = np.arange(frames)
     runs = list(_iter_true_runs(np.asarray(contact_mask, dtype=bool)))
     if not runs or not np.isfinite(tracking).all():
-        return weights, references
+        result = (weights, references, contact_frames)
+        return result if return_contact_frames else result[:2]
     bounds = [(None, runs[0])] + list(zip(runs, runs[1:])) + [(runs[-1], None)]
     for before, after in bounds:
         start = 0 if before is None else before[1]
@@ -119,6 +121,7 @@ def approach_blend(tracking, anchors, contact_mask):
                 window = np.arange(start, split + 1)
                 weights[window] = share[window]
                 references[window] = tracking[window] + anchors[last] - tracking[last]
+                contact_frames[window] = last
         if after is not None:
             share = _progress(reach, split, first)
             if share is not None:
@@ -128,4 +131,6 @@ def approach_blend(tracking, anchors, contact_mask):
                 references[window[use]] = (
                     tracking[window[use]] + anchors[first] - tracking[first]
                 )
-    return weights, references
+                contact_frames[window[use]] = first
+    result = (weights, references, contact_frames)
+    return result if return_contact_frames else result[:2]
