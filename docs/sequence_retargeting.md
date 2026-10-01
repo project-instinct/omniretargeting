@@ -341,8 +341,7 @@ misinterpreted as environment contact tasks.
   stationary proposals skip redundant line searches; residuals stay reported.
   Entry and final reports separately audit the original source/robot posture
   budgets. Inherited fast-backend excess is not a successful posture certificate,
-  even when the repair's non-regression checks pass. See the
-  [game-animation and IK research](pose_preserving_collision_research.md).
+  even when the repair's non-regression checks pass.
 - Not optimized in the main least-squares solve: self-collision, body-relation,
   self-contact and surface-pose
   tasks (listed as `skipped_tasks`), and the framewise post-processing stages

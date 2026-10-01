@@ -14,7 +14,7 @@
 代码为独立实现，不导入官方代码、权重或机器人资产。
 
 基于 UMR `e24fc070` 重新核对的受约束全身求解、运动物体避碰与验收计划见
-[方法对照计划](umr_constrained_whole_body_plan.md)。其中明确区分官方机制、
+commit `b4b0939` 中的 `docs/umr_constrained_whole_body_plan.md`。其中明确区分官方机制、
 本项目已有实现及尚待实现的扩展。
 
 ## 固定表面对应

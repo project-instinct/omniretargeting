@@ -12,7 +12,7 @@ Python 文件保持在 1000 行以内。按职责拆分，保留原有入口和�
 | `_sequence/windows.py` | 长片段受保护修正步的时间窗口划分与窗口子问题 | 其余帧步长固定为零，所有硬约束与非线性验收不变；相邻轮次窗口边界错开半个窗口。见 [使用说明](sequence_retargeting.md#guarded-steps-numerics-and-runtime) |
 | `_fast/pipeline.py` / `solve_fast_sequence` | CLI `--solver fast` 的速度优先整段后端：源形参考 → 接触/场景 → 预算验证与局部重加权 | `objective.py`：打包任务与分块并行评估；`terms.py`：与 `SequenceTasks` 等价的逐帧行；`rows.py`：按刚体 6×6 矩累加法方程；`solver.py`：带状 Levenberg–Marquardt 与精确关节限位/根部平移界；`reference.py`：按源世界/身体相对目标拟合高度、不可变参考的布局检查与姿态/源方向报告；`shape_step.py`：固定包络内的约束方向与非线性可行性恢复；`acquisition_guard.py`：接触获取阶段的支撑/未解释保持法向保护；`contact_guard.py`：不可变接触精度及位置验收；`continuity.py`：逐坐标和根部转动时序验收；`penetration.py`：自由部位穿插修正；`mesh_repair.py`：所有静态/运动物体和自碰撞的原网格有限关节修正，不依赖距离场是否失效；`collision_manifold.py`：与采样密度及查询分块无关的有界多点见证；`repair_step.py`：每组最大深度 epigraph 与最小关节改动子问题；`repair_limits.py`：固定根部、接触锚点、源姿态和逐关节时序预算；`sdf.py`：由原始三角形采样的场景网格缓存；`kinematics.py`：整段正运动学。见 [使用说明](sequence_retargeting.md#fast-backend) |
 | `scene_probe_batch.py` | 批量查询原始场景，供无查询预算的离线验收使用 | 保留中心剔除、所有采样点和双向窄相位见证；显式查询预算保留逐次计数 |
-| `triangle_candidates.py` / `triangle_capsule.py` | 胶囊／球体对原始有限三角形的保守筛选和批量最近点 | 保留穿面退出向量、歧义及并列见证顺序；见 [算法提速记录](algorithm_runtime_20260924.md) |
+| `triangle_candidates.py` / `triangle_capsule.py` | 胶囊／球体对原始有限三角形的保守筛选和批量最近点 | 保留穿面退出向量、歧义及并列见证顺序 |
 | `_sequence/scene_cache.py` / `moving_cache.py` | 原始静态和运动网格的整段查询批处理 | 不减少采样点；材料坐标查询、姿态失效及雅可比有等价性测试 |
 | `core.py` / `OmniRetargeter` | 初始化、接触任务准备、重定向和后处理编排 | `_core/motion.py`：逐帧执行；`source_root.py`：源根部参考（躯干朝向估计与根关节选择）；`scaling.py`：可选地形缩放因子与源轨迹缩放；`geometry.py`：机器人几何推断；`feet.py`：足部稳定和局部表面修正；`postprocessing.py`：平滑、关节安全限制和质量报告；`visualization.py`：Matplotlib 预览 |
 | `retargeting.py` / `GenericInteractionRetargeter` | 机器人配置、交互网格和逐帧优化循环 | `_solver/step.py`：组装 SQP 问题；`constraints.py`：接触链和根部约束；`hierarchy.py`：分层求解和步长保护；`orientation.py`、`pose.py`、`end_effectors.py`：各类目标；`kinematics.py`：Jacobian 和碰撞约束；`targets.py`：目标变换和关节限制 |
@@ -73,15 +73,13 @@ pytest -q tests
   local joint/contact/continuity budgets.
 - `_fast/parallel_geometry.py`: frame-parallel original-mesh measurement for the
   repair. Complete measurements equal the serial result; a rejected candidate
-  stops all workers at the first rejection found (same decision). See
-  [runtime notes](mesh_repair_runtime_20260927.md).
+  stops all workers at the first rejection found (same decision).
 - `moving_reverse_cache.py`: exact-transform original-mesh reverse witnesses;
   Jacobians remain current, with unchanged sample coverage and unknown states.
 - `conic_solver.py`: shared conic entry point. `solve_conic_working_set` solves a
   small correction by exact constraint generation (same optimum); the fast
   restoration uses it only with `_fast/shape_step.WORKING_SET_RESTORATION`
   (off by default). Fast-objective values do not depend on the worker chunking.
-  See [runtime notes 2026-09-29](runtime_20260929.md).
 - `evidence_scope.py`: the open-surface "within the evidence radius" test by
   conservatively classified cells; only boundary cells query the KD tree.
 - `_fast/proposals.py`: the damping attempts of one LM iteration; after a

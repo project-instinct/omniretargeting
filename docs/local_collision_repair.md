@@ -304,7 +304,7 @@ trajectories are byte-identical to the repair-only replay. The main-workspace
 full pytest suite and a complete default CLI run of 78 verify the promotion;
 the latter's final qpos is byte-identical to `foot_v18lr/78`. Full timings,
 collision-body depths/frames, relation reports, test logs and SHA256 manifests
-are linked in `docs/runtime_20260929.md` (final default acceptance subsection).
+are linked in `docs/runtime_20260929.md` at commit `b4b0939` (final default acceptance subsection).
 
 The unified acquisition fix is not accepted: clip 5 trades away free-hand
 fidelity and clip 485 increases the left-hand object penetration. Stopping
@@ -365,7 +365,7 @@ a separate six-clip plus chair experiment.
 这是修正连续性合同的实际成本，不冒称提速。获取等 optimize 阶段逐位一致；
 主工作区 78 最终 qpos 与 B 逐位一致。54 项定向、1318 项全量测试通过，8 跳过。
 全部 SHA256、逐秒负载、每段世界/真实自由目标误差、碰撞体深度/部位/帧、
-关系角与最终 TRUMANS 椅子/手腕报告见 `docs/runtime_20260929.md` 第十轮。
+关系角与最终 TRUMANS 椅子/手腕报告见 commit `b4b0939` 中 `docs/runtime_20260929.md` 第十轮。
 
 未修改源轨迹、接触目标、layout/时间窗口、物理容差、修复进展门或迭代数。
 统一获取 lr、fs、root-roundoff 仍隔离；新叶端基线不用于追认旧候选。

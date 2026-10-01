@@ -8,7 +8,7 @@ CLI 在帧级求解、既有轨迹后处理和局部修复之后调用此阶段�
 
 方法审阅固定于 UMR commit
 [`e24fc070030dc0bb0b2c024ecb9f795a3995d725`](https://github.com/hanyang9/UMR/tree/e24fc070030dc0bb0b2c024ecb9f795a3995d725)。
-具体来源和未采用的默认配置见 [方法对照计划](umr_constrained_whole_body_plan.md)。
+具体来源和未采用的默认配置见 commit `b4b0939` 中的 `docs/umr_constrained_whole_body_plan.md`。
 
 - 复用学习得到的固定人体三角形/重心坐标与机器人局部表面点对应；接触向量保持同一个
   源侧环境点分配。求解和验收不重新选择更有利的表面点。

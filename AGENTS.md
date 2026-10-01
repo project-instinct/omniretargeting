@@ -10,7 +10,7 @@ module map: [code layout](docs/code_layout.md).
 
 - Use the project interpreter: `.venv/bin/python`.
 - Contact-aware changes: `.venv/bin/python -m pytest -q tests/test_contact_priority.py` (~2 s).
-- Full suite: `.venv/bin/python -m pytest -q tests`.
+- Full suite: `.venv/bin/python -m pytest -q tests` (~2 min).
 - CLI: `.venv/bin/python -m omniretargeting.main --solver {framewise,sequence,mink,fast} ...`
   (arguments in `README.md`).
 
