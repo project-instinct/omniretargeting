@@ -14,6 +14,54 @@ def _certify(task):
     return DualWrenchCone(contacts, origin=origin).check(wrench, uncertainty)
 
 
+def _patch_keep(entry):
+    """Names a contracted frame keeps as support: necessary plus restored."""
+    return (
+        {name for patch in entry["necessary"] for name in patch}
+        | set(entry.get("restored", ()))
+    )
+
+
+def _restore_short_demotions(plan, min_frames):
+    """Restore demotion runs shorter than the source derivative window.
+
+    A demotion (support contracted to optional) is only trusted once it
+    holds for at least ``min_frames`` consecutive frames: shorter changes
+    sit below the temporal resolution of the source dynamics itself (the
+    Savitzky-Golay derivative window behind ``demand["derivative_window"]``),
+    so the candidate stays protected as a possible support instead of being
+    released. The rule is strictly one-directional: short support segments
+    are never demoted, and frames the union never contracted are untouched.
+    """
+    restored = {}
+    if min_frames <= 1 or not plan:
+        return restored
+    demotion = {}
+    for frame, entry in plan.items():
+        if entry["contracted"]:
+            for name in entry["demoted"]:
+                demotion.setdefault(name, []).append(frame)
+    for name in sorted(demotion):
+        frames = sorted(demotion[name])
+        runs, start, previous = [], frames[0], frames[0]
+        for frame in frames[1:]:
+            if frame != previous + 1:
+                runs.append((start, previous))
+                start = frame
+            previous = frame
+        runs.append((start, previous))
+        for first, last in runs:
+            if last - first + 1 >= min_frames:
+                continue
+            for frame in range(first, last + 1):
+                restored.setdefault(frame, []).append(name)
+    for frame, names in restored.items():
+        entry = plan[frame]
+        entry["restored"] = sorted(set(names))
+        entry["demoted"] = sorted(set(entry["demoted"]) - set(names))
+    return restored
+
+
 def _patch_necessity(scenarios, unions, by_frame, wrench, uncertainty, origin,
                      skin_spacing, map_function):
     """Contract certified unions to their necessary support patches.
@@ -50,6 +98,7 @@ def _patch_necessity(scenarios, unions, by_frame, wrench, uncertainty, origin,
         plan[f] = {
             "patches": patches,
             "necessary": [],
+            "restored": [],
             "demoted": [],
             "contracted": False,
             "link_distance_m": float(link),
@@ -101,7 +150,8 @@ def _patch_necessity(scenarios, unions, by_frame, wrench, uncertainty, origin,
 
 
 def combine_support_scenarios(
-    scenarios, wrench, *, origin, uncertainty=0.0, map_function=map, skin_spacing=0.0
+    scenarios, wrench, *, origin, uncertainty=0.0, map_function=map, skin_spacing=0.0,
+    min_demotion_frames=0,
 ):
     """Protect a feasible union, never pick a convenient friction/gap assumption.
 
@@ -113,11 +163,18 @@ def combine_support_scenarios(
     measured source skin sampling distance). If exactly the necessary patches
     are feasible alone in every scenario, the union contracts to them and the
     remaining contacts are optional; otherwise the whole union keeps its
-    alternative-protecting semantics. Disagreement remains unknown; geometric
-    holds are still protected by the downstream policy. No new contact is
-    created by a nominal-only explanation. The independent certificates may
-    be computed by ``map_function`` (e.g. a process pool's ``map``); the
-    result does not depend on it.
+    alternative-protecting semantics. Demotion is additionally guarded by the
+    source dynamics' own temporal resolution: a candidate demoted for fewer
+    than ``min_demotion_frames`` consecutive frames -- the Savitzky-Golay
+    derivative window, ``demand["derivative_window"]``, supplied by
+    ``source_support_evidence`` -- is restored to support, because the
+    evidence cannot resolve changes that fast. That guard never removes
+    support: short support segments and uncontracted frames stay untouched.
+    Disagreement remains unknown; geometric holds are still protected by the
+    downstream policy. No new contact is created by a nominal-only
+    explanation. The independent certificates may be computed by
+    ``map_function`` (e.g. a process pool's ``map``); the result does not
+    depend on it.
     """
     scenarios = tuple(scenarios)
     if not scenarios:
@@ -155,6 +212,7 @@ def combine_support_scenarios(
     plan = _patch_necessity(
         scenarios, unions, by_frame, wrench, uncertainty, origin,
         float(skin_spacing), map_function)
+    _restore_short_demotions(plan, int(min_demotion_frames))
     explanations, candidates, certificates = [], [], []
     for f in range(frames):
         rows = [e.explanations[f] for e in scenarios]
@@ -167,8 +225,7 @@ def combine_support_scenarios(
         contracted = bool(known and entry and entry["contracted"])
         row = deepcopy(rows[0])
         if contracted:
-            row["support_sets"] = [
-                sorted(name for patch in entry["necessary"] for name in patch)]
+            row["support_sets"] = [sorted(_patch_keep(entry))]
             row["support_set_semantics"] = "necessary_patches_of_certified_union"
         else:
             row["support_sets"] = [sorted(union)] if known else []
@@ -200,8 +257,9 @@ def combine_support_scenarios(
         if contracted:
             # The necessary patches alone explain the demand in every
             # scenario and over the whole uncertainty box; every other
-            # patch is provably an optional explanation.
-            keep = {name for patch in entry["necessary"] for name in patch}
+            # patch is provably an optional explanation. Restored names
+            # rejoin the support set and its necessary roles together.
+            keep = _patch_keep(entry)
             roles = {
                 name: (
                     "necessary_support_candidate" if name in keep else "optional_contact"
@@ -222,15 +280,19 @@ def combine_support_scenarios(
             "support_patches": {
                 "semantics": "same_surface_single_linkage_of_environment_contact_points",
                 "skin_spacing_m": float(skin_spacing),
+                "min_demotion_frames": int(min_demotion_frames),
                 "frames_grouped": len(plan),
                 "frames_contracted": sum(
                     1 for entry in plan.values() if entry["contracted"]),
                 "demoted_candidate_frames": sum(
                     len(entry["demoted"]) for entry in plan.values()),
+                "restored_candidate_frames": sum(
+                    len(entry["restored"]) for entry in plan.values()),
                 "per_frame": {
                     str(f): {
                         "patches": entry["patches"],
                         "necessary": entry["necessary"],
+                        "restored": entry["restored"],
                         "demoted": entry["demoted"],
                         "contracted": entry["contracted"],
                         "link_distance_m": entry["link_distance_m"],

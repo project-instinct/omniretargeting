@@ -299,6 +299,9 @@ def test_indeterminate_self_geometry_retains_entry_and_reports_failure(monkeypat
 
 def test_unknown_candidate_geometry_is_rejected_instead_of_treated_as_zero_depth(monkeypatch):
     import omniretargeting._fast.mesh_repair as repair
+    from omniretargeting._fast import repair_prediction
+    # Exercise trial-query rejection independently of predicted-progress stopping.
+    monkeypatch.setattr(repair_prediction, "PREDICTIVE_GATING", False)
     objective, poses, _ = _objective(temporal=True)
     obj = _open_object(objective, poses)
     original = OriginalGeometry.measure

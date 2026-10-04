@@ -13,6 +13,7 @@ from .kinematics import TrajectoryKinematics
 from .repair_limits import CONTACT_DRIFT
 from .rows import _block_rows
 from .surface_presence import body_penetration, on_surface
+from .contact_protection import endpoint_protection, surface_protection
 
 NUMERICAL_SLACK = 1e-7
 
@@ -45,16 +46,18 @@ class ContactGuard:
 
     Only evidenced active contacts participate. Managed endpoints are covered
     by their material samples, and free tracking targets never become contacts.
-    All active surface roles participate, including mechanically unverified
-    holds. Full vectors preserve authored motion at each timestamp. For modes
+    In priority mode only the original acquisition protection masks participate;
+    other contacts remain tracking objectives. Legacy secondary corrections keep
+    their existing active-contact scope. Full vectors preserve authored motion at each timestamp. For modes
     with independent tangent tasks, those errors are also bounded. The normal
     error of every contact point that lies on an original surface is bounded
     independently, including sticking, so vector improvement cannot conceal
     separation. A point off every surface (``surface_presence``) keeps only its
     full-distance bound: it may approach its target, not be pinned beside it.
-    Non-penetration precedes contacts: full and normal errors (and a held
-    position) may grow by the penetration depth of the point's own body at the
-    acquired pose, and no further.
+    Non-penetration precedes contacts: full, normal and tangent errors (and a
+    held position) may grow by the penetration depth of the point's own body
+    at the acquired pose, and no further. This one frozen allowance belongs
+    to that body only; it is never renewed at a candidate pose.
     """
 
     def __init__(self, objective, acquired, *, preserve_positions=False):
@@ -68,12 +71,15 @@ class ContactGuard:
         self.coords = objective.coords
         self.model = objective.model
         self.objective = objective
+        self.priority = getattr(objective, 'priority_clearance', None)
         self.kin = TrajectoryKinematics(objective.model, objective.coords.cols, cache=objective.kin.cache)
         self.penetration = body_penetration(objective, poses)
         self.kin.evaluate(poses, with_jacobian=False)
         self.groups = []
         for effector in objective.effectors:
             active = np.asarray(effector["active"], bool) & ~np.asarray(effector["managed"], bool)
+            if self.priority is not None:
+                active = active & endpoint_protection(objective, effector)
             if not active.any():
                 continue
             self._add(
@@ -84,16 +90,21 @@ class ContactGuard:
                 np.asarray(effector["normal"])[:, None], objective.cfg["endpoint_regression_m"],
             )
         for index, surface in enumerate(objective.surfaces):
-            if not np.asarray(surface["active"]).any():
+            active = np.asarray(surface['active'], bool)
+            if self.priority is not None:
+                active = active & surface_protection(objective, surface)
+            if not active.any():
                 continue
             modes = np.asarray(surface["task"].modes)
             self._add(
                 f"surface_{index}", "surface", surface["geoms"], surface["local"],
-                surface["targets"], surface["active"],
+                surface["targets"], active,
                 np.isin(modes, ("sliding", "touch", "transition")), surface["normals"],
                 surface["task"].cfg["regression"],
             )
         self.groups = tuple(self.groups)
+        if self.priority is not None:
+            self.priority.register(self)
 
     def _add(self, name, kind, indices, local, targets, active, projected, normals, allowance):
         if not np.isfinite(allowance) or allowance < 0:
@@ -147,6 +158,8 @@ class ContactGuard:
 
     def repair_bounds(self, poses):
         """Keep full, normal and tangent precision in the correction proposal."""
+        if self.priority is not None:
+            return [], []
         self.kin.evaluate(poses)
         linear, norms = [], []
         for group in self.groups:
@@ -180,15 +193,49 @@ class ContactGuard:
             if projected.any():
                 tangent = error - along[..., None] * normal
                 tangent_jac = jac - normal[..., None] * normal_jac[..., None, :]
-                add_norm(tangent_jac, tangent, group.acquired[..., 2] + group.tolerance, projected)
+                add_norm(tangent_jac, tangent,
+                         group.acquired[..., 2] + group.tolerance + group.yielded, projected)
             if self.preserve_positions and held.any():
                 add_norm(jac, points - group.positions, group.tolerance + group.yielded, held)
         return linear, norms
 
-    def accepts(self, candidate):
+    def window_dependencies(self, frames):
+        return frames
+
+    def qp_bounds(self, poses, *, frames=None):
+        if frames is None:
+            return self.repair_bounds(poses)
+        if self.priority is not None:
+            return [], []  # Coordinator owns these soft rows and funded acceptance.
+        from .priority_contacts import PriorityContacts
+        from .priority_window_contacts import frozen_bounds
+        return frozen_bounds(PriorityContacts(self, type(self).__name__), poses, frames)
+
+    def accepts(self, candidate, *, frames=None):
+        if frames is not None:
+            return not self.violation_frames(candidate, frames=frames).any()
+        if self.priority is not None:
+            return self.priority.accepts(candidate)
         return self.diagnostics(candidate)["accepted"]
 
+    def violation_frames(self, candidate, *, frames=None):
+        if frames is not None:
+            if self.priority is not None:
+                return self.priority.violation_frames(candidate, frames=frames)
+            from .priority_contacts import PriorityContacts
+            from .priority_window_contacts import frozen_violations
+            return frozen_violations(PriorityContacts(self, type(self).__name__), candidate, frames)
+        """Frames ``accepts`` rejects (all of them for an invalid candidate)."""
+        if self.priority is not None:
+            return self.priority.violation_frames(candidate)
+        report = self.diagnostics(candidate)
+        bad = np.full(self.shape[0], "reason" in report)
+        bad[report["violating_frames"]] = True
+        return bad
+
     def diagnostics(self, candidate):
+        if self.priority is not None:
+            return self.priority.diagnostics(candidate)
         poses = np.asarray(candidate, dtype=float)
         report = {
             "fixed_acquisition": True, "targets_modified": False,
@@ -212,7 +259,7 @@ class ContactGuard:
             # Points off every surface keep only their full-distance bound.
             checked = np.stack((group.active, group.established, group.established), axis=-1)
             regression = np.where(checked, regression, 0.)
-            allowance = group.tolerance + np.stack((group.yielded, group.yielded, np.zeros_like(group.yielded)), axis=-1)
+            allowance = group.tolerance + group.yielded[..., None]
             excess = regression - allowance
             invalid = checked & (~np.isfinite(errors) | (excess > NUMERICAL_SLACK))
             frames = np.any(invalid, axis=(1, 2))

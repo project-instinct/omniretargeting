@@ -13,9 +13,17 @@ from .contact_schedule import _iter_true_runs
 def source_material_rotations(orientation, surface_rotation):
     """Average the same material frames at every timestamp, never active slots."""
     relative = surface_rotation[:, None].transpose(0, 1, 3, 2) @ orientation
-    return np.asarray(
-        [Rotation.from_matrix(frame).mean().as_matrix() for frame in relative]
-    )
+    if not len(relative):
+        return np.asarray([])
+    # Flatten to retain SciPy's original Cython matrix conversion. Its ND
+    # backend uses a different conversion and can change rounding.
+    quaternions = Rotation.from_matrix(relative.reshape(-1, 3, 3)).as_quat()
+    quaternions = quaternions.reshape(relative.shape[:2] + (4,))
+    # Rotation.mean computes (weights * q).T.dot(q), then returns the last
+    # eigenvector without normalization. Keep a separate left operand: using
+    # q.T @ q can select a symmetric BLAS shortcut with different rounding.
+    _, vectors = np.linalg.eigh(quaternions.copy().transpose(0, 2, 1) @ quaternions)
+    return Rotation(vectors[:, :, -1], normalize=False).as_matrix()
 
 
 def fit_moving_anchor(

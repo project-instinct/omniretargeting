@@ -30,6 +30,21 @@ class ContactCandidate:
     sample_indices: np.ndarray | None = None
 
     def rays(self, origin, length_scale):
+        """Wrench rays (force, moment/length_scale) of this contact, or None across a gap.
+
+        Every subset test of one frame asks for the same rays: they are
+        computed once per origin and scale and then shared (read-only).
+        """
+        key = (np.asarray(origin, float).tobytes(), float(length_scale))
+        cache = self.__dict__.get("_ray_cache")
+        if cache is None:
+            cache = {}
+            object.__setattr__(self, "_ray_cache", cache)
+        if key not in cache:
+            cache[key] = self._rays(origin, length_scale)
+        return cache[key]
+
+    def _rays(self, origin, length_scale):
         observed = np.asarray(self.observed_points, float).reshape(-1, 3)
         points = np.asarray(self.surface_points, float).reshape(-1, 3)
         normals = np.broadcast_to(np.asarray(self.normals, float), points.shape).copy()
@@ -56,6 +71,21 @@ class ContactCandidate:
         ):
             return None  # mechanics cannot create a force across a real gap
         normals /= np.linalg.norm(normals, axis=1, keepdims=True)
+        if self.mode == "sticking":
+            axes = np.eye(3)[np.argmin(np.abs(normals), axis=1)]
+            first = np.cross(normals, axes)
+            # Each cross product has one zero component. This rowwise norm
+            # retains the scalar norm's sum while avoiding per-point calls.
+            first /= np.linalg.norm(first, axis=1, keepdims=True)
+            second = np.cross(normals, first)
+            angles = np.arange(self.friction_sides) * (2 * np.pi / self.friction_sides)
+            directions = normals[:, None] + self.friction * (
+                np.cos(angles)[None, :, None] * first[:, None]
+                + np.sin(angles)[None, :, None] * second[:, None])
+            force = directions.reshape(-1, 3)
+            locations = np.repeat(points, self.friction_sides, axis=0)
+            moment = np.cross(locations - origin, force) / length_scale
+            return np.c_[force, moment]
         forces, locations = [], []
         for i, (point, normal) in enumerate(zip(points, normals)):
             if self.mode == "sliding":
@@ -79,11 +109,9 @@ class ContactCandidate:
                 first /= np.linalg.norm(first)
                 second = np.cross(normal, first)
                 # Inscribed polygon: conservative relative to circular Coulomb friction.
-                directions = [
-                    normal + self.friction * (np.cos(a) * first + np.sin(a) * second)
-                    for a in np.arange(self.friction_sides)
-                    * (2 * np.pi / self.friction_sides)
-                ]
+                angles = np.arange(self.friction_sides) * (2 * np.pi / self.friction_sides)
+                directions = normal + self.friction * (
+                    np.cos(angles)[:, None] * first + np.sin(angles)[:, None] * second)
             forces.extend(directions)
             locations.extend([point] * len(directions))
         force = np.asarray(forces)
@@ -185,7 +213,7 @@ class WrenchCone:
         }
 
 
-def _minimal_dual_subsets(indices, check):
+def _minimal_dual_subsets(indices, check, seeds=()):
     """Enumerate minimal explanations by excluding a member of each solution.
 
     Any different minimal support must omit at least one member of a known
@@ -193,6 +221,7 @@ def _minimal_dual_subsets(indices, check):
     subset when a few contacts are necessary among many geometric candidates.
     """
     pending, visited, minimal = [tuple(indices)], set(), set()
+    valid_seeds = {}
     while pending:
         chosen = pending.pop()
         if chosen in visited:
@@ -206,11 +235,25 @@ def _minimal_dual_subsets(indices, check):
             # exhaustive semantics when no feasible certificate is available.
             pending.extend(tuple(i for i in chosen if i != k) for k in chosen)
             continue
-        reduced = chosen
-        for index in chosen:
-            trial = tuple(i for i in reduced if i != index)
-            if check(trial)["status"] == "feasible":
-                reduced = trial
+        reduced = None
+        for seed in seeds:
+            if not set(seed) <= set(chosen):
+                continue
+            if seed not in valid_seeds:
+                valid_seeds[seed] = (
+                    check(seed)["status"] == "feasible"
+                    and all(check(tuple(i for i in seed if i != k))["status"] == "infeasible"
+                            for k in seed)
+                )
+            if valid_seeds[seed]:
+                reduced = seed
+                break
+        if reduced is None:
+            reduced = chosen
+            for index in chosen:
+                trial = tuple(i for i in reduced if i != index)
+                if check(trial)["status"] == "feasible":
+                    reduced = trial
         minimal.add(reduced)
         pending.extend(tuple(i for i in chosen if i != k) for k in reduced)
     return sorted(minimal)
@@ -224,6 +267,8 @@ def explain_contacts(
     uncertainty=0.0,
     max_candidates=8,
     method="facets",
+    detail="full",
+    prior_minimal=(),
 ):
     """Compare sets, retain alternatives, and never delete all redundant supports."""
     contacts = tuple(contacts)
@@ -232,31 +277,127 @@ def explain_contacts(
         raise ValueError("Candidate names must be unique and their number bounded")
     if method not in {"facets", "dual"}:
         raise ValueError("Wrench feasibility method must be facets or dual")
+    if detail not in {"full", "source", "object"}:
+        raise ValueError("Contact explanation detail must be full, source or object")
     from .wrench_feasibility import DualWrenchCone
 
     cone_type = WrenchCone if method == "facets" else DualWrenchCone
     checks = {}
+    geometry_checks = {}
+    feasible_masks, infeasible_masks = [], []
     full = tuple(range(len(contacts)))
 
-    def check(chosen):
-        if chosen not in checks:
+    def check(chosen, *, certify=False):
+        if chosen not in checks or (certify and checks[chosen].get("_inferred")):
+            mask = sum(1 << i for i in chosen)
+            if detail != "full" and not certify:
+                known_feasible = any(mask & known == known for known in feasible_masks)
+                known_infeasible = any(mask & known == mask for known in infeasible_masks)
+                if known_feasible != known_infeasible:
+                    checks[chosen] = {"status": "feasible" if known_feasible else "infeasible",
+                                      "excluded_geometry": [], "_inferred": True}
+                    return checks[chosen]
             cone = cone_type([contacts[i] for i in chosen], origin=origin)
-            checks[chosen] = cone.check(wrench, uncertainty)
+            if method == "dual":
+                # Rejected contacts contribute no rays. Different subsets can
+                # therefore ask exactly the same LP/uncertainty-box question.
+                # Keep row order, duplicates and every bit (including signed
+                # zero); only the excluded-name diagnostic is subset-specific.
+                key = cone.rays.tobytes()
+                if key not in geometry_checks:
+                    geometry_checks[key] = cone.check(wrench, uncertainty)
+                checks[chosen] = dict(geometry_checks[key], excluded_geometry=list(cone.excluded))
+            else:
+                checks[chosen] = cone.check(wrench, uncertainty)
+            if detail != "full":
+                result = checks[chosen]
+                if result["status"] == "feasible" and not any(
+                    mask & known == known for known in feasible_masks
+                ):
+                    feasible_masks[:] = [known for known in feasible_masks if known & mask != mask]
+                    feasible_masks.append(mask)
+                elif (result["status"] == "infeasible"
+                      and result.get("max_scaled_violation", 0.0) > 1e-6
+                      and not any(mask & known == mask for known in infeasible_masks)):
+                    infeasible_masks[:] = [known for known in infeasible_masks if known & mask != known]
+                    infeasible_masks.append(mask)
         return checks[chosen]
 
-    check(full)
-    check(())
-    for i in full:
-        check(tuple(j for j in full if j != i))
+    full_result = check(full)
+    if detail != "full" and (
+        full_result["status"] == "uncertain"
+        or (full_result["status"] == "infeasible"
+            and full_result["max_scaled_violation"] > 1e-6)
+    ):
+        # A subset's cone is contained in the full cone. If the full cone
+        # cannot certify feasibility of the wrench box, neither can a
+        # subset. Keep borderline infeasibility on the exhaustive path to
+        # avoid amplifying numerical classification at the LP tolerance.
+        roles = {name: ("geometry_rejected" if name in full_result["excluded_geometry"]
+                        else "unexplained") for name in names} if detail == "source" else {}
+        return {"roles": roles, "full": full_result, "flight": None,
+                "minimal_feasible_sets": [], "hypotheses": [],
+                "physical_execution_verified": False, "force_distribution_inferred": False}
+    if detail == "full":
+        check(())
+    if detail == "full":
+        for i in full:
+            check(tuple(j for j in full if j != i))
     if method == "dual":
         accepted = tuple(
             i for i in full if names[i] not in checks[full]["excluded_geometry"]
         )
-        _minimal_dual_subsets(accepted, check)
+        seeds = []
+        if detail != "full" and full_result["status"] == "feasible":
+            by_name = {names[i]: i for i in accepted}
+            for prior in prior_minimal:
+                if any(name not in by_name for name in prior):
+                    continue
+                seed = tuple(sorted(by_name[name] for name in prior))
+                seeds.append(seed)
+            # A feasible S whose every member is necessary in the full set
+            # is the only minimal set. All strict subsets of full omitting an
+            # S member are infeasible, so no other alternative can exist.
+            if (len(seeds) == 1
+                    and check(seeds[0])["status"] == "feasible"
+                    and all(check(tuple(i for i in seeds[0] if i != k))["status"] == "infeasible"
+                            for k in seeds[0])
+                    and all(check(tuple(i for i in full if i != k))["status"] == "infeasible"
+                            for k in seeds[0])):
+                minimal = [seeds[0]]
+            else:
+                minimal = _minimal_dual_subsets(accepted, check, seeds)
+        else:
+            minimal = _minimal_dual_subsets(accepted, check)
     else:
         for count in range(len(contacts) + 1):
             for chosen in combinations(range(len(contacts)), count):
                 check(chosen)
+        minimal = None
+    if detail != "full":
+        if detail == "source":
+            roles = {}
+            minimal_names = [set(names[i] for i in indices) for indices in minimal]
+            for i, name in enumerate(names):
+                if name in full_result["excluded_geometry"]:
+                    roles[name] = "geometry_rejected"
+                elif full_result["status"] == "feasible" and minimal_names:
+                    roles[name] = ("necessary_support_candidate"
+                                   if all(name in support for support in minimal_names)
+                                   else "optional_contact")
+                else:
+                    roles[name] = "unexplained"
+        else:
+            roles = {}
+        return {
+            "roles": roles,
+            "full": full_result,
+            "flight": None,
+            "minimal_feasible_sets": [[names[i] for i in indices] for indices in minimal],
+            "hypotheses": [],
+            "physical_execution_verified": False,
+            "force_distribution_inferred": False,
+        }
     roles = {}
     for i, name in enumerate(names):
         removed = checks[tuple(j for j in full if j != i)]
@@ -274,10 +415,11 @@ def explain_contacts(
         for indices, result in checks.items()
         if result["status"] == "feasible" and not result["excluded_geometry"]
     ]
+    feasible_sets = [set(indices) for indices in feasible]
     minimal = [
         indices
-        for indices in feasible
-        if not any(set(other) < set(indices) for other in feasible)
+        for indices, members in zip(feasible, feasible_sets)
+        if not any(other < members for other in feasible_sets)
     ]
     return {
         "roles": roles,

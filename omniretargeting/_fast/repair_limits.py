@@ -110,6 +110,8 @@ class RepairLimits:
         self.anchors = [point.copy() for point, _, _ in self.points]
         self.original_anchors = [point.copy() for point in self.anchors]
         self.movable_body = None
+        # Frames the current repair group may move (None: all), see repair_frames.
+        self.frame_mask = None
         self.penetration_yield = np.zeros((self.frames, objective.model.nbody))
         self.penetration_yield.setflags(write=False)
         self._penetration_yield_frozen = False
@@ -241,9 +243,20 @@ class RepairLimits:
         weld = self.objective.model.body_weldid[bodies]
         return (weld[None] == self.movable_body) & (budget == CONTACT_DRIFT)
 
-    def constraints(self, poses, *, restore_layout=False):
+    def constraints(self, poses, *, restore_layout=False, projection=None):
+        if OPTIONS.repair_defect_windows and not getattr(self, '_repair_frame_view', False):
+            from .repair_sparse_frames import constraints
+            compact = constraints(self, poses, restore_layout=restore_layout, projection=projection)
+            if compact is not None:
+                return compact
         self.kin.evaluate(poses)
-        bounds = LinearBounds(self.frames * self.width)
+        if projection is None:
+            bounds = LinearBounds(self.frames * self.width)
+        else:
+            from .repair_projected import ProjectedBounds
+            from .repair_redundancy import PROJECTED_RESTORATION_REDUNDANCY, RestorationBounds
+            kind = RestorationBounds if restore_layout and PROJECTED_RESTORATION_REDUNDANCY else ProjectedBounds
+            bounds = kind(self.frames * self.width, projection, self.frames, self.width)
         values = poses[:, self.coords.qi].ravel()
         bounds.set_box(self.lower.ravel() - values - 1e-8, self.upper.ravel() - values + 1e-8)
         for op, budget in self.differences:
@@ -299,7 +312,13 @@ class RepairLimits:
         for guard in guards:
             if not hasattr(guard, "repair_bounds"):
                 continue
-            linear, norms = (guard.repair_bounds(poses, restore=True)
+            from .repair_contact_rows import contact_bounds
+            from .repair_layout_rows import layout_bounds
+            cached = None if projection is None else contact_bounds(guard, poses)
+            if cached is None and projection is not None:
+                cached = layout_bounds(guard, poses, restore=restore_layout and guard is shape)
+            linear, norms = (cached if cached is not None else
+                             guard.repair_bounds(poses, restore=True)
                              if restore_layout and guard is shape else guard.repair_bounds(poses))
             for matrix, lower, upper in linear:
                 bounds.add(matrix @ selector, lower, upper)

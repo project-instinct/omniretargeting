@@ -239,16 +239,22 @@ class FrameTerms:
         kin = self.kin
         for prox in self.proximities:
             geoms = prox["geoms"]
-            rotation = kin.geom_xmat[:, geoms]
             normal = prox["normals"]
-            direction = -np.matmul(normal[..., None, :], rotation)[..., 0, :]
-            local = np.zeros_like(direction)
-            for geom in np.unique(geoms):
-                index = np.flatnonzero(geoms == geom)
-                local[:, index] = support_points(
-                    self.model, int(geom), direction[:, index].reshape(-1, 3)
-                ).reshape(self.frames, len(index), 3)
-            points = kin.geom_xpos[:, geoms] + np.matmul(rotation, local[..., None])[..., 0]
+            accelerated_points = getattr(self, '_proximity_points', None)
+            if accelerated_points is not None:
+                points = accelerated_points(prox)
+            else:
+                rotation = kin.geom_xmat[:, geoms]
+                direction = -np.matmul(normal[..., None, :], rotation)[..., 0, :]
+                local = np.zeros_like(direction)
+                for geom in np.unique(geoms):
+                    index = np.flatnonzero(geoms == geom)
+                    directions = direction[:, index].reshape(-1, 3)
+                    accelerated = getattr(self, '_proximity_support', None)
+                    support = (support_points(self.model, int(geom), directions)
+                               if accelerated is None else accelerated(prox, int(geom), directions))
+                    local[:, index] = support.reshape(self.frames, len(index), 3)
+                points = kin.geom_xpos[:, geoms] + np.matmul(rotation, local[..., None])[..., 0]
             error = np.einsum("fki,fki->fk", points - prox["environment"], normal) - prox["gaps"]
             scale = prox["scale"]
             rows = _point_rows(normal, points - kin.xpos[:, prox["bodies"]]) * scale[..., None]
@@ -332,6 +338,9 @@ class FrameTerms:
         reduced afterwards with contacts held, and contacts on a penetrating
         body may yield by its depth (``surface_presence.body_penetration``).
         """
+        from .window_tracking import skips_proxy_collision
+        if skips_proxy_collision(self):
+            return
         if self.scene_sdf is None and not self.objects:
             return
         kin, cfg = self.kin, self.cfg
@@ -372,8 +381,13 @@ class FrameTerms:
 
         Like scene clearance, self-penetration precedes contacts while they
         are acquired (``clearance_scale``). The query is the one of the
-        original-mesh repair: every eligible pair, exact convex distances.
+        original-mesh repair: every eligible pair. The optional acquisition
+        accelerator screens a physical band before the original mesh hinge;
+        repair stays authoritative.
         """
+        from .window_tracking import skips_proxy_collision
+        if skips_proxy_collision(self):
+            return
         query = getattr(self, "self_collision", None)
         if query is None:
             return
@@ -382,15 +396,33 @@ class FrameTerms:
         cols = self.coords.cols
         per_frame, deepest = [], 0.0
         unknown = 0
+        batch = None
+        if getattr(self, 'evaluation_backend', 'legacy') != 'legacy':
+            from .batched_self_collision import BatchedSelfCollision, NativeUnavailable
+            if not hasattr(self, '_self_batch'):
+                import multiprocessing
+                workers = 1 if multiprocessing.current_process().daemon else 12
+                try:
+                    from .fast_self_collision import acquisition_self_collision
+                    self._self_batch = acquisition_self_collision(query, workers)
+                except NativeUnavailable:
+                    self._self_batch = None
+            if self._self_batch is not None:
+                if hasattr(self, '_self_seed_provider'):
+                    self._self_batch.seed_provider = self._self_seed_provider
+                batch, unknown = self._self_batch.rows(poses, self.kin, acc.jacobian, target)
         for frame, pose in enumerate(poses):
             try:
-                rows = [row for row in query.query(pose) if row["clearance"] < target]
+                measured = query.query(pose) if batch is None else batch[frame]
+                rows = [row for row in measured
+                        if row.get('hinge_clearance', row['clearance']) < target]
             except GeometryQueryError:
                 # Indeterminate here: no row; the original-mesh audit reports it.
                 unknown += 1
                 rows = []
-            per_frame.append([(row["clearance"] - target,
-                               query.jacobian(row, query.data)[cols] if acc.jacobian else None)
+            per_frame.append([(row.get('hinge_clearance', row['clearance']) - target,
+                               (row['_jacobian'] if batch is not None else query.jacobian(row, query.data))[cols]
+                               if acc.jacobian else None)
                               for row in rows])
             deepest = max(deepest, max((-row["clearance"] for row in rows), default=0.0))
         stats["self_depth_m"] = max(stats.get("self_depth_m", 0.0), deepest)
@@ -460,3 +492,6 @@ class FrameTerms:
             rows, jac = guard.hinge_rows(self.kin, frames, self.envelope_weight, ENVELOPE_SIGMA, acc.jacobian)
             if rows is not None:
                 acc.add(rows, jac)
+        if getattr(self, '_soft_bulk_layouts', ()):
+            from .soft_frame_rows import add_layout
+            add_layout(self, acc, stats)

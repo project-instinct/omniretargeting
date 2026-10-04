@@ -12,6 +12,23 @@ def _unit(vectors):
 def _block_rows(blocks, width):
     """Sparse block-diagonal matrix from per-frame (frames, k, width) blocks."""
     frames, rows, _ = blocks.shape
+    from .guard_acceleration import enabled
+
+    if enabled():
+        # Unique columns already occur in ascending order in every row.
+        # COO sorting/duplicate summation cannot change these coefficients.
+        # Copy data: eliminate_zeros compacts it in place, and callers may
+        # still use their dense Jacobian to construct another cone.
+        size = frames * width
+        dtype = np.int32 if max(size, blocks.size) < 2**31 else np.int64
+        columns = np.broadcast_to(
+            np.arange(frames, dtype=dtype)[:, None, None] * width
+            + np.arange(width, dtype=dtype), blocks.shape).reshape(-1).copy()
+        pointer = np.arange(frames * rows + 1, dtype=dtype) * width
+        matrix = sparse.csr_matrix((blocks.ravel().copy(), columns, pointer),
+                                   shape=(frames * rows, size))
+        matrix.eliminate_zeros()
+        return matrix
     r = np.arange(frames * rows).repeat(width)
     c = (np.arange(frames)[:, None, None] * width + np.arange(width)).repeat(rows, 1)
     matrix = sparse.csr_matrix(
@@ -105,6 +122,36 @@ class _Accumulator:
             pull = np.matmul(residual[:, None, index], rows)
             self.hessian += np.matmul(spatial.transpose(0, 2, 1), np.matmul(moment, spatial))
             self.gradient += np.matmul(pull, spatial)[:, 0]
+
+
+class _DeferredRows:
+    """Prepare independent families early; insert them in reference order.
+
+    Combining their normal equations before insertion changes round-off.
+    Keep each add separate so a collision query can overlap later families
+    without changing any per-frame addition or BLAS reduction.
+    """
+
+    def __init__(self, with_jacobian):
+        self.jacobian = with_jacobian
+        self.parts = []
+
+    def add(self, residual, jacobian=None):
+        residual = np.asarray(residual, dtype=float)
+        cost = np.square(residual).reshape(len(residual), -1).sum(axis=1)
+        hessian = gradient = None
+        if self.jacobian:
+            hessian = np.matmul(jacobian.transpose(0, 2, 1), jacobian)
+            gradient = np.matmul(residual[:, None, :], jacobian)[:, 0]
+        self.parts.append((cost, hessian, gradient))
+
+    def insert(self, accumulator):
+        for cost, hessian, gradient in self.parts:
+            accumulator.frame_cost += cost
+            if self.jacobian:
+                accumulator.hessian += hessian
+                accumulator.gradient += gradient
+        accumulator.cost = float(accumulator.frame_cost.sum())
 
 
 def _point_rows(directions, levers):

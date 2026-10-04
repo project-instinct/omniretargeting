@@ -150,7 +150,7 @@ class MotionData:
                 resampled_marker = {}
                 for key, series in marker.items():
                     series = np.asarray(series)
-                    if key == "vertex_ids" or series.shape[0] != T:
+                    if key == "vertex_ids" or series.ndim == 0 or series.shape[0] != T:
                         resampled_marker[key] = series
                         continue
                     if key == "source_contact_mask":

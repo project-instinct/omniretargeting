@@ -1,7 +1,7 @@
 """Bounded bidirectional candidates and edge-checked local selection.
 
 Independent algorithm implementation inspired by UMR's solve_sequence and
-select_bidirectional_dp (8c4db7db); see docs/umr_scene_interaction.md.
+select_bidirectional_dp (UMR 8c4db7db).
 Directions only change warm starts. Contact tasks, marker choices, root poses,
 and frame indices are frozen by the parent TrajectoryValidator.
 """

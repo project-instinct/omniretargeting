@@ -414,12 +414,14 @@ def build_surface_contact_tasks(
 ):
     cfg = surface_contact_config(config)
     report = {
-        "status": "disabled",
+        "status": "unresolved",
+        "enabled": True,
         "reason": "missing_whole_body_skin_samples",
         "configuration": cfg,
     }
     if not cfg["enabled"]:
-        return None, {**report, "reason": "configured_off"}
+        return None, {**report, "status": "disabled", "enabled": False,
+                      "reason": "configured_off"}
     if source is None or "full_body" not in source:
         return None, report
     if robot_reference_qpos is None:

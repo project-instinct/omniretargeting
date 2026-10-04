@@ -228,7 +228,25 @@ class SequenceContinuityGuard:
             constraints.extend(rows.constraints(flat))
         return constraints
 
+    def window_dependencies(self, frames):
+        from .._fast.window_guards import guard_dependencies
+        return guard_dependencies(self, frames, len(self.reference['joints'][0]))
+
+    def qp_bounds(self, poses, *, frames=None):
+        from .._fast.window_guards import guard_qp_bounds
+        return guard_qp_bounds(self, poses, frames=range(len(poses)) if frames is None else frames)
+
+    def qp_values(self, poses, *, frames=None):
+        from .._fast.window_guards import guard_qp_values
+        linear, cones = guard_qp_values(self, poses, frames=range(len(poses)) if frames is None else frames)
+        return ([(lo, hi) for _, lo, hi in linear],
+                [(residual, upper) for _, residual, upper in cones])
+
     def accepts(self, poses, frames=None):
+        if frames is not None:
+            from .._fast.window_guards import guard_accepts
+            good = guard_accepts(self, poses, frames=frames)
+            return good
         """Nonlinear check; ``frames`` limits it to differences a window moved."""
         window = range(len(poses)) if frames is None else frames
         first = max(0, window.start - 3)
@@ -242,3 +260,20 @@ class SequenceContinuityGuard:
             if not np.all(size <= bound[lo:hi] + ACCEPTANCE_SLACK):
                 return False
         return True
+
+    def violation_frames(self, poses, *, frames=None):
+        if frames is not None:
+            from .._fast.window_guards import guard_violation_frames
+            return guard_violation_frames(self, poses, frames=frames)
+        """Frames of every difference stencil ``accepts`` rejects."""
+        signals = self.signals(poses)
+        bad = np.zeros(len(poses), bool)
+        for (name, order), bound in self.bounds.items():
+            if len(poses) <= order:
+                continue
+            size = _change_size(name, np.diff(signals[name][0], n=order, axis=0))
+            rows = ~(size <= bound + ACCEPTANCE_SLACK)
+            rows = rows.any(axis=1) if rows.ndim > 1 else rows
+            for offset in range(order + 1):
+                bad[offset:offset + len(rows)] |= rows
+        return bad

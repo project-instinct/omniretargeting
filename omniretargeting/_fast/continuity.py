@@ -57,11 +57,12 @@ def correction_derivatives(coords, fixed, motion):
             for order in (1, 2, 3) if len(motion) > order}
 
 
-def audit_continuity(coords, fixed, motion):
+def audit_continuity(coords, fixed, motion, *, correction=None):
     """Report strict and relaxed checks separately, per coordinate and stencil."""
+    use_correction = OPTIONS.correction_budget if correction is None else correction
     before, after = derivatives(coords, fixed), derivatives(coords, motion)
     correction = correction_derivatives(coords, fixed, motion)
-    budget_values = correction if OPTIONS.correction_budget else after
+    budget_values = correction if use_correction else after
     strict_frames = np.zeros(len(motion), bool)
     chatter_frames = np.zeros(len(motion), bool)
     budget_frames = np.zeros(len(motion), bool)
@@ -96,7 +97,7 @@ def audit_continuity(coords, fixed, motion):
         }
     return {
         "units": "metres or radians per frame difference; orders 1, 2, 3",
-        "budget_signal": ("correction relative to immutable reference" if OPTIONS.correction_budget
+        "budget_signal": ("correction relative to immutable reference" if use_correction
                           else "absolute executed derivatives"),
         "round_off_slack": ROUND_OFF,
         "channels": channels,
@@ -130,7 +131,26 @@ class CorrectionContinuity:
                 if name in ('root_translation_order_2', 'root_translation_order_3'):
                     self.norm_bounds[name] = windowed_budget(np.linalg.norm(value, axis=1))
 
-    def accepts(self, poses):
+    def window_dependencies(self, frames):
+        from .window_guards import guard_dependencies
+        return guard_dependencies(self, frames, len(self.fixed))
+
+    def qp_bounds(self, poses, *, frames=None):
+        from .window_guards import guard_qp_bounds
+        return guard_qp_bounds(self, poses, frames=range(len(poses)) if frames is None else frames)
+
+    def qp_values(self, poses, *, frames=None):
+        from .window_guards import guard_qp_values
+        linear, cones = guard_qp_values(self, poses, frames=range(len(poses)) if frames is None else frames)
+        return ([(lo, hi) for _, lo, hi in linear],
+                [(residual, upper) for _, residual, upper in cones])
+
+    def accepts(self, poses, frames=None):
+        if frames is not None:
+            from .window_guards import guard_accepts
+            good = guard_accepts(self, poses, frames=frames)
+            self.rejections += not good
+            return good
         values = (correction_derivatives(self.coords, self.fixed, poses) if self.correction
                   else derivatives(self.coords, poses))
         good = all(np.isfinite(values[k]).all() and np.all(np.abs(values[k]) <= v + ROUND_OFF)
@@ -139,6 +159,23 @@ class CorrectionContinuity:
                             for k, v in self.norm_bounds.items())
         self.rejections += not good
         return bool(good)
+
+    def violation_frames(self, poses, *, frames=None):
+        if frames is not None:
+            from .window_guards import guard_violation_frames
+            return guard_violation_frames(self, poses, frames=frames)
+        """Frames of every difference stencil ``accepts`` rejects."""
+        values = (correction_derivatives(self.coords, self.fixed, poses) if self.correction
+                  else derivatives(self.coords, poses))
+        bad = np.zeros(len(poses), bool)
+        excess = [~(np.abs(values[k]) <= v + ROUND_OFF) for k, v in self.bounds.items()]
+        excess += [~(np.linalg.norm(values[k], axis=1) <= v + ROUND_OFF)
+                   for k, v in self.norm_bounds.items()]
+        for rows in excess:
+            rows = rows.any(axis=1) if rows.ndim > 1 else rows
+            for offset in range(len(poses) - len(rows) + 1):
+                bad[offset:offset + len(rows)] |= rows
+        return bad
 
     def linearizations(self, poses):
         """Derivatives of the selected signal in model tangent coordinates."""

@@ -11,7 +11,7 @@ import viser
 from mjviser import ViserMujocoScene
 from scipy.spatial.transform import Rotation
 
-from omniretargeting._viewer_motion import SMPLX_BODY_PARENTS
+from omniretargeting._viewer_motion import SMPLX_BODY_PARENTS, source_body_parents
 from omniretargeting.viser_playback import (
     serve_recording,
     use_rigid_instance_updates,
@@ -93,11 +93,18 @@ def run(args):
     source_points = server.scene.add_point_cloud(
         "/source/joints", points=source[0], colors=(35, 110, 255), point_size=0.018
     )
+    parents = (
+        source_body_parents(payload["source_joint_names"])
+        if "source_joint_names" in payload
+        else None
+    )
+    if parents is None:
+        parents = SMPLX_BODY_PARENTS[: source.shape[1]]
     bones = np.array(
         [
             (parent, child)
-            for child, parent in enumerate(SMPLX_BODY_PARENTS)
-            if 0 <= parent < source.shape[1] and child < source.shape[1]
+            for child, parent in enumerate(parents)
+            if 0 <= parent < source.shape[1]
         ]
     )
     source_bones = server.scene.add_line_segments(

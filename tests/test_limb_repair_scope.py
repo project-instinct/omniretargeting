@@ -172,6 +172,10 @@ def test_endpoint_ancestry_cannot_create_an_unsafe_scope():
 
 def test_solver_proposal_cannot_bypass_upper_body_lock(monkeypatch):
     import omniretargeting._fast.mesh_repair as repair
+    from omniretargeting._fast import repair_prediction
+
+    # Exercise the scope guard independently of predicted-progress stopping.
+    monkeypatch.setattr(repair_prediction, "PREDICTIVE_GATING", False)
 
     objective, poses, plane, _ = _floor_problem(0.004)
     # A numerically finite solver proposal with a waist coordinate must be

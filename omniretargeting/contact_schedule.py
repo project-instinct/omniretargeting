@@ -11,13 +11,16 @@ def _sigmoid(value: np.ndarray) -> np.ndarray:
 
 
 def _iter_true_runs(mask: np.ndarray):
-    start = None
-    for idx, value in enumerate(np.r_[mask, False]):
-        if value and start is None:
-            start = idx
-        elif not value and start is not None:
-            yield start, idx
-            start = None
+    values = np.asarray(mask, dtype=bool)
+    if values.ndim == 0:
+        values = values.reshape(1)
+    elif values.ndim != 1:
+        # Preserve the legacy shape error from np.r_[mask, False].
+        np.r_[values, False]
+    padded = np.zeros(values.size + 2, dtype=np.int8)
+    padded[1:-1] = values
+    changes = np.flatnonzero(np.diff(padded))
+    yield from zip(changes[::2].tolist(), changes[1::2].tolist())
 
 
 def _close_short_gaps(mask: np.ndarray, max_gap_frames: int) -> np.ndarray:

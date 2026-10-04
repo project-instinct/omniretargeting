@@ -24,6 +24,87 @@ PARC_MS_BODY_PARENTS = np.array(
     dtype=int,
 )
 
+# (joint name, parent name or None) for source adapters whose storage order
+# differs from SMPL-X. Visualization must follow the source hierarchy, never
+# assume one canonical ordering across different loaders.
+_NAMED_BODY_ORDERS = (
+    (
+        ("Pelvis", None),
+        ("L_Hip", "Pelvis"),
+        ("R_Hip", "Pelvis"),
+        ("Spine1", "Pelvis"),
+        ("L_Knee", "L_Hip"),
+        ("R_Knee", "R_Hip"),
+        ("Spine2", "Spine1"),
+        ("L_Ankle", "L_Knee"),
+        ("R_Ankle", "R_Knee"),
+        ("Spine3", "Spine2"),
+        ("L_Foot", "L_Ankle"),
+        ("R_Foot", "R_Ankle"),
+        ("Neck", "Spine3"),
+        ("L_Collar", "Spine3"),
+        ("R_Collar", "Spine3"),
+        ("Head", "Neck"),
+        ("L_Shoulder", "L_Collar"),
+        ("R_Shoulder", "R_Collar"),
+        ("L_Elbow", "L_Shoulder"),
+        ("R_Elbow", "R_Shoulder"),
+        ("L_Wrist", "L_Elbow"),
+        ("R_Wrist", "R_Elbow"),
+    ),
+    (
+        ("Hips", None),
+        ("LeftUpLeg", "Hips"),
+        ("LeftLeg", "LeftUpLeg"),
+        ("LeftFoot", "LeftLeg"),
+        ("LeftToe", "LeftFoot"),
+        ("RightUpLeg", "Hips"),
+        ("RightLeg", "RightUpLeg"),
+        ("RightFoot", "RightLeg"),
+        ("RightToe", "RightFoot"),
+        ("Spine", "Hips"),
+        ("Spine1", "Spine"),
+        ("Spine2", "Spine1"),
+        ("Neck", "Spine2"),
+        ("Head", "Neck"),
+        ("LeftShoulder", "Spine2"),
+        ("LeftArm", "LeftShoulder"),
+        ("LeftForeArm", "LeftArm"),
+        ("LeftHand", "LeftForeArm"),
+        ("RightShoulder", "Spine2"),
+        ("RightArm", "RightShoulder"),
+        ("RightForeArm", "RightArm"),
+        ("RightHand", "RightForeArm"),
+    ),
+)
+
+
+def source_body_parents(joint_names) -> np.ndarray | None:
+    """Resolve body-bone parents from actual source joint names.
+
+    Returns ``None`` when the names are not one of the known body orders, so
+    callers can keep their legacy fallback instead of drawing wrong bones.
+    """
+    names = [str(name).strip().casefold() for name in joint_names]
+    if not names or len(set(names)) != len(names):
+        return None
+    for order in _NAMED_BODY_ORDERS:
+        named_parents = {
+            name.casefold(): None if parent is None else parent.casefold()
+            for name, parent in order
+        }
+        if not set(names).issubset(named_parents):
+            continue
+        index = {name: i for i, name in enumerate(names)}
+        parents = []
+        for name in names:
+            parent = named_parents[name]
+            parents.append(-1 if parent is None else index[parent])
+        if -1 in parents[1:]:
+            continue
+        return np.asarray(parents, dtype=int)
+    return None
+
 
 def _parc_ms_body_forward(joints: np.ndarray) -> np.ndarray:
     """Recover PARC's +X body axis from pelvis, torso and hip positions."""

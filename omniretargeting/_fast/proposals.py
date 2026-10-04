@@ -35,7 +35,8 @@ def backtrack(objective, poses, direction, guards):
     frames, width = objective.frames, objective.width
     for alpha in ((1.,) if not guards else ALPHAS):
         trial = objective.project(coords.integrate(poses, direction.reshape(frames, width), alpha))
-        if all(guard.accepts(trial) for guard in guards):
+        from .priority_merit import check_trial
+        if check_trial(objective, trial, guards):
             return trial, alpha
     return None, 0.
 
@@ -56,7 +57,7 @@ class Attempts:
     """Banded and conic proposals of the attempts of one iteration."""
 
     def __init__(self, objective, poses, system, gradient, diagonal, held, radial, rhs,
-                 dampings, band_step, conic_step):
+                 dampings, band_step, conic_step, model=None):
         self.objective, self.poses = objective, poses
         self.system, self.gradient, self.diagonal = system, gradient, diagonal
         self.held, self.radial, self.rhs = held, radial, rhs
@@ -64,6 +65,7 @@ class Attempts:
         self._band_step, self._conic_step = band_step, conic_step
         self.cache = {}
         self.conic_numbers = {}
+        self.model = model
 
     def _banded(self, attempt):
         guards = guards_of(self.objective)[1]
@@ -84,8 +86,9 @@ class Attempts:
     def _conic(self, attempt):
         guards = guards_of(self.objective)[1]
         before = _counters(guards)
+        kwargs = {} if self.model is None else {'model': self.model}
         result = self._conic_step(self.objective, self.poses, self.system, self.gradient,
-                                  self.diagonal, self.conic_damping(attempt), guards)
+                                  self.diagonal, self.conic_damping(attempt), guards, **kwargs)
         return result, [a - b for a, b in zip(_counters(guards), before)]
 
     def _take(self, kind, attempt):

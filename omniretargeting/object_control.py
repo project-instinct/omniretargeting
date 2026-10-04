@@ -99,8 +99,12 @@ def observe_object_control(
         pb, sb, mb, ib, cb = source[b]
         if ca == cb:
             continue
+        overlap = ma & mb & (ia == ib)
+        pair_points = pair_surfaces = None
         for object_id, (pose, finite_pose) in poses.items():
-            mask = ma & mb & (ia == object_id) & (ib == object_id)
+            mask = overlap & (ia == object_id)
+            if not mask.any():
+                continue
             for start, stop in _iter_true_runs(mask):
                 event = {
                     "regions": [a, b],
@@ -110,8 +114,11 @@ def observe_object_control(
                     "decision": "undecided",
                 }
                 events.append(event)
-                points = np.stack([pa[start:stop], pb[start:stop]], axis=1)
-                surfaces = np.stack([sa[start:stop], sb[start:stop]], axis=1)
+                if pair_points is None:
+                    pair_points = np.stack([pa, pb], axis=1)
+                    pair_surfaces = np.stack([sa, sb], axis=1)
+                points = pair_points[start:stop]
+                surfaces = pair_surfaces[start:stop]
                 if (
                     not finite_pose[start:stop].all()
                     or not np.isfinite(points).all()

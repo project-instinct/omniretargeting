@@ -41,6 +41,9 @@ def body_penetration(objective, poses):
     on that body may yield so that clearance, which precedes contacts, can be
     restored. Bodies away from every field have zero depth.
     """
+    priority = getattr(objective, 'priority_clearance', None)
+    if priority is not None:
+        return priority.frozen_depth(poses)
     provider = getattr(objective, "frozen_original_depth", None)
     if provider is not None:
         return provider(poses)
@@ -50,11 +53,16 @@ def body_penetration(objective, poses):
     if not fields:
         return depth
     welds = model.body_weldid[model.geom_bodyid[np.asarray(objective.shell_geoms)]]
-    if hasattr(objective, "deepest_fields"):
+    # An explicit per-objective provider (CPU/device/window geometry, or a test
+    # fixture) owns the measurement protocol. Do not let ``deepest_fields``
+    # install the bulk helper over it before reading depth.
+    provider = objective.__dict__.get("_deepest_samples")
+    provider_is_bulk = getattr(provider, "__self__", None) is not None
+    if hasattr(objective, "deepest_fields") and (provider is None or provider_is_bulk):
         deepest = objective.deepest_fields(poses)
     else:
         objective.kin.evaluate(poses, with_jacobian=False)
-        deepest = [objective._deepest_samples(*field[1:]) for field in fields]
+        deepest = [provider(*field[1:]) for field in fields]
     for clearance, *_ in deepest:
         sunk = np.where(np.isfinite(clearance), np.maximum(-clearance, 0.0), 0.0)
         for column, weld in enumerate(welds):

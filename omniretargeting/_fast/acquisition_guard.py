@@ -15,39 +15,45 @@ target or buried in an object wall, only crosses the extension of the
 target's tangent plane. It may approach its target but not recede from it.
 """
 
+import os
+
 import cvxpy as cp
 import numpy as np
 
 from .kinematics import TrajectoryKinematics
 from .rows import _block_rows
 from .surface_presence import body_penetration, on_surface
+from .contact_protection import endpoint_protection, surface_protection
+
+
+# Default endpoint slack is min(1 mm, endpoint_regression_m=1 mm) = 1 mm.
+# Surface and self-contact regression defaults are 2 mm, hence also 1 mm here.
+# Runtime margins must stay below the smallest configured slack; half the
+# frozen bound is only an additional per-sample safety clamp.
+HINGE_MARGIN_M = float(os.environ.get('OMNIRETARGETING_FAST_HINGE_MARGIN', '0'))
 
 
 class AcquisitionNormalGuard:
     def __init__(self, objective, reference):
         self.objective = objective
+        self.priority = getattr(objective, 'priority_clearance', None)
         self.kin = TrajectoryKinematics(objective.model, objective.coords.cols, cache=objective.kin.cache)
         self.kin.evaluate(reference, with_jacobian=False)
         self.groups, self.names = [], []
         self.penetration = body_penetration(objective, reference)
-        policy = objective.tasks.contact_phase
         for eff in objective.effectors:
-            protected = ~eff['surface_only'] if policy is None else np.array([
-                policy.role(eff['name'], f) in ('support', 'hold')
-                for f in range(objective.frames)])
+            protected = endpoint_protection(objective, eff)
             active = eff['active'] & ~eff['managed'] & protected
             self._add('endpoint', np.array([eff['body']]), eff['offset'][:, None],
                       eff['contact'][:, None], eff['normal'][:, None], active[:, None],
                       min(.001, objective.cfg['endpoint_regression_m']), name=eff['name'])
         for index, surf in enumerate(objective.surfaces):
-            roles = getattr(policy, 'surface_roles', {})
-            if getattr(policy, 'surface', None) is surf['task']:
-                protected = roles.get('support', False) | roles.get('hold', False)
-            else:
-                protected = surf['sticking']
+            protected = surface_protection(objective, surf)
             self._add('surface', surf['geoms'], surf['local'], surf['targets'],
                       surf['normals'], surf['active'] & protected,
                       min(.001, surf['task'].cfg['regression']), name=f'surface_{index}')
+        if self.priority is not None:
+            self.priority.register(self)
 
     def _points(self, kind, indices, local):
         if kind == 'surface':
@@ -80,10 +86,48 @@ class AcquisitionNormalGuard:
         self.groups.append((kind, *values))
         self.names.append(name or kind)
 
-    def accepts(self, poses):
+    def window_dependencies(self, frames):
+        return frames
+
+    def qp_bounds(self, poses, *, frames=None):
+        if frames is None:
+            return self.repair_bounds(poses)
+        if self.priority is not None:
+            return [], []  # Coordinator owns these soft rows and funded acceptance.
+        from .priority_contacts import PriorityContacts
+        from .priority_window_contacts import frozen_bounds
+        return frozen_bounds(PriorityContacts(self, type(self).__name__), poses, frames)
+
+    def accepts(self, poses, *, frames=None):
+        if frames is not None:
+            return not self.violation_frames(poses, frames=frames).any()
+        if self.priority is not None:
+            return self.priority.accepts(poses)
         return self.diagnostics(poses)['accepted']
 
+    def violation_frames(self, poses, *, frames=None):
+        if frames is not None:
+            if self.priority is not None:
+                return self.priority.violation_frames(poses, frames=frames)
+            from .priority_contacts import PriorityContacts
+            from .priority_window_contacts import frozen_violations
+            return frozen_violations(PriorityContacts(self, type(self).__name__), poses, frames)
+        """Frames ``accepts`` rejects: a protected point beyond its bound."""
+        if self.priority is not None:
+            return self.priority.violation_frames(poses)
+        self.kin.evaluate(poses, with_jacobian=False)
+        bad = np.zeros(len(poses), bool)
+        for kind, indices, local, target, normal, active, established, bound, yielded in self.groups:
+            offset = self._points(kind, indices, local) - target
+            along = np.sum(offset * normal, axis=-1)
+            gap = np.where(established, np.maximum(along - bound - yielded, -along - bound),
+                           np.linalg.norm(offset, axis=-1) - bound - yielded)
+            bad |= np.any(active & ~(gap <= 1e-7), axis=1)
+        return bad
+
     def diagnostics(self, poses):
+        if self.priority is not None:
+            return self.priority.diagnostics(poses)
         if not np.isfinite(poses).all():
             return dict(accepted=False, max_excess_m=float('inf'))
         self.kin.evaluate(poses, with_jacobian=False)
@@ -102,16 +146,20 @@ class AcquisitionNormalGuard:
                              excess_m=maximum, frozen_penetration_yield_m=float(yielded[frame, sample]))
             excess = max(excess, maximum)
         return dict(accepted=bool(np.isfinite(excess) and excess <= 1e-7),
-                    max_excess_m=excess, worst_constraint=worst, fixed_pre_acquisition_reference=True,
+                    max_excess_m=excess, worst_constraint=worst,
+                    fixed_pre_acquisition_reference=not hasattr(self, '_regression_reference'),
+                    bound_reference=getattr(self, '_regression_reference', 'fixed_pre_acquisition'),
                     protected_frame_points=sum(int(g[5].sum()) for g in self.groups),
                     on_surface_frame_points=sum(int(g[6].sum()) for g in self.groups),
                     penetration_yield_max_m=float(max((g[8][g[5]].max(initial=0) for g in self.groups),
                                                       default=0.)))
 
-    def hinge_rows(self, kin, frames, weight, sigma, with_jacobian):
+    def hinge_rows(self, kin, frames, weight, sigma, with_jacobian, *, inner_margin=None):
         """Stiff one-sided rows of the same bounds on another trajectory's
         kinematics (``kin`` covers ``frames``), so an unconstrained step
         already respects them; acceptance remains ``accepts``."""
+        if self.priority is not None:
+            return None, None
         rows, jacs = [], []
         scale = np.asarray(weight, dtype=float)[:, None] / sigma
         for kind, indices, local, target, normal, active, established, bound, yielded in self.groups:
@@ -126,9 +174,11 @@ class AcquisitionNormalGuard:
             along = np.sum(offset * normal[frames], axis=-1)
             distance = np.linalg.norm(offset, axis=-1)
             held, reach = (active & established)[frames], (active & ~established)[frames]
-            out = np.maximum(along - bound[frames] - yielded[frames], 0.)
-            inward = np.maximum(-along - bound[frames], 0.)
-            far = np.maximum(distance - bound[frames] - yielded[frames], 0.)
+            margin = np.minimum(HINGE_MARGIN_M if inner_margin is None else inner_margin,
+                                .5 * bound[frames])
+            out = np.maximum(along - bound[frames] - yielded[frames] + margin, 0.)
+            inward = np.maximum(-along - bound[frames] + margin, 0.)
+            far = np.maximum(distance - bound[frames] - yielded[frames] + margin, 0.)
             residual = np.where(held, out + inward, np.where(reach, far, 0.))
             rows.append(residual * scale)
             if with_jacobian:
@@ -144,6 +194,8 @@ class AcquisitionNormalGuard:
     def repair_bounds(self, poses):
         """The same frozen bounds in sparse tangent coordinates: normal rows
         for points on a surface, full-distance cones for the others."""
+        if self.priority is not None:
+            return [], []
         self.kin.evaluate(poses)
         linear, norms = [], []
         width = self.objective.width

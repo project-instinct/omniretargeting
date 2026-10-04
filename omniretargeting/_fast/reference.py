@@ -115,7 +115,26 @@ class ReferenceShape:
             errors[length < 1e-10, i] = np.pi
         return np.where(self.pose.direction_valid, errors, 0.0)
 
-    def accepts(self, poses):
+    def window_dependencies(self, frames):
+        from .window_guards import guard_dependencies
+        return guard_dependencies(self, frames, len(self.seed))
+
+    def qp_bounds(self, poses, *, frames=None):
+        from .window_guards import guard_qp_bounds
+        return guard_qp_bounds(self, poses, frames=range(len(poses)) if frames is None else frames)
+
+    def qp_values(self, poses, *, frames=None):
+        from .window_guards import guard_qp_values
+        linear, cones = guard_qp_values(self, poses, frames=range(len(poses)) if frames is None else frames)
+        return ([(lo, hi) for _, lo, hi in linear],
+                [(residual, upper) for _, residual, upper in cones])
+
+    def accepts(self, poses, frames=None):
+        if frames is not None:
+            from .window_guards import guard_accepts
+            good = guard_accepts(self, poses, frames=frames)
+            self.rejections += not good
+            return good
         if not np.isfinite(poses).all():
             self.rejections += 1
             return False
@@ -125,7 +144,10 @@ class ReferenceShape:
             self.rejections += 1
         return bool(good)
 
-    def violation_frames(self, poses):
+    def violation_frames(self, poses, *, frames=None):
+        if frames is not None:
+            from .window_guards import guard_violation_frames
+            return guard_violation_frames(self, poses, frames=frames)
         self.kin.evaluate(poses, with_jacobian=False)
         bad = np.zeros(len(poses), bool)
         for envelope in self.envelopes:

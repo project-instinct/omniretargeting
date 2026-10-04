@@ -47,9 +47,12 @@ class TrajectoryKinematics:
         # Four exact candidates retain an accepted state alongside trial states.
         self.cache = OrderedDict() if cache is None else cache
 
-    def evaluate(self, poses, with_jacobian=True):
+    def evaluate(self, poses, with_jacobian=True, *, native=None):
         model, data = self.model, self.data
         poses = np.asarray(poses)
+        if native is None:
+            from .guard_acceleration import enabled
+            native = enabled() and len(poses) >= 64
         key = (self.columns.tobytes(), poses.shape, poses.dtype.str, poses.tobytes())
         previous = self.cache.get(key)
         if previous is not None and (not with_jacobian or 'jacp' in previous):
@@ -66,7 +69,12 @@ class TrajectoryKinematics:
         if with_jacobian:
             jacp = np.zeros((frames, model.nbody, 3, model.nv))
             jacr = np.zeros((frames, model.nbody, 3, model.nv))
-        for frame, pose in enumerate(poses):
+        computed = False
+        if native:
+            from .native_kinematics import evaluate_kinematics
+            computed = evaluate_kinematics(self, poses, jacp if with_jacobian else None,
+                                          jacr if with_jacobian else None)
+        for frame, pose in enumerate(() if computed else poses):
             data.qpos[:] = pose
             mujoco.mj_kinematics(model, data)
             self.xpos[frame] = data.xpos
@@ -111,6 +119,24 @@ class TrajectoryKinematics:
         Returns (frames, k, 3, width).
         """
         bodies = np.asarray(bodies, dtype=int)
+        from .guard_acceleration import enabled
+
+        if (enabled() and self.jacp.shape[-1] and np.asarray(points).dtype == np.float64
+                and bodies.ndim in (1, 2) and np.all((bodies >= 0) & (bodies < self.model.nbody))):
+            from .batched_self_collision import NativeUnavailable
+            from .native_point_rows import NativePointRows
+
+            try:
+                previous = getattr(self, '_native_point_inputs', None)
+                if previous is None or previous[0] is not self.jacp or previous[1] is not self.jacr:
+                    self._native_point_rows = NativePointRows(self)
+                    # Subset Jacobians need contiguous copies. Retain their
+                    # original arrays as well, so recycled object IDs cannot
+                    # mistake a later pose for the previously copied inputs.
+                    self._native_point_inputs = self.jacp, self.jacr
+                return self._native_point_rows.jacobians(bodies, points)
+            except NativeUnavailable:
+                pass
         if bodies.ndim == 1:
             jacp, jacr, origin = (
                 self.jacp[:, bodies],

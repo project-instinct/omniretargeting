@@ -1,0 +1,83 @@
+{
+  "name": "unitree_g1_lafan1",
+  "urdf_path": "g1_29dof_popsicle.urdf",
+  "joint_mapping": {
+    "Hips": "pelvis",
+    "Spine2": "torso_link",
+    "LeftUpLeg": "left_hip_roll_link",
+    "RightUpLeg": "right_hip_roll_link",
+    "Spine": "waist_yaw_link",
+    "LeftLeg": "left_knee_link",
+    "RightLeg": "right_knee_link",
+    "LeftFoot": "left_ankle_roll_link",
+    "RightFoot": "right_ankle_roll_link",
+    "LeftArm": "left_shoulder_roll_link",
+    "RightArm": "right_shoulder_roll_link",
+    "LeftForeArm": "left_elbow_link",
+    "RightForeArm": "right_elbow_link",
+    "LeftHand": "left_wrist_roll_link",
+    "RightHand": "right_wrist_roll_link"
+  },
+  "base_orientation": {
+    "pelvis": "Hips",
+    "left_hip": "LeftUpLeg",
+    "right_hip": "RightUpLeg",
+    "spine": "Spine2",
+    "root_position": "Hips"
+  },
+  "retargeting": {
+    "end_effector_priority": {
+      "pose_direction": {
+        "edges": [
+          ["Hips", "Spine2"],
+          ["LeftArm", "LeftForeArm"],
+          ["LeftForeArm", "LeftHand"],
+          ["RightArm", "RightForeArm"],
+          ["RightForeArm", "RightHand"],
+          ["LeftUpLeg", "LeftLeg"],
+          ["LeftLeg", "LeftFoot"],
+          ["RightUpLeg", "RightLeg"],
+          ["RightLeg", "RightFoot"]
+        ]
+      },
+      "body_orientation": {
+        "frame": "parent_relative",
+        "reference_pose": {
+          "left_shoulder_pitch_joint": 0.0,
+          "left_shoulder_roll_joint": 1.5707963267948966,
+          "left_shoulder_yaw_joint": 0.0,
+          "left_elbow_joint": 1.5707963267948966,
+          "right_shoulder_pitch_joint": 0.0,
+          "right_shoulder_roll_joint": -1.5707963267948966,
+          "right_shoulder_yaw_joint": 0.0,
+          "right_elbow_joint": 1.5707963267948966
+        },
+        "tasks": {
+          "Spine": {"enabled": false},
+          "LeftUpLeg": {"robot_body": "left_hip_yaw_link"},
+          "RightUpLeg": {"robot_body": "right_hip_yaw_link"},
+          "LeftArm": {"robot_body": "left_shoulder_yaw_link"},
+          "RightArm": {"robot_body": "right_shoulder_yaw_link"},
+          "LeftHand": {"robot_body": "left_wrist_yaw_link"},
+          "RightHand": {"robot_body": "right_wrist_yaw_link"}
+        }
+      },
+      "effectors": {
+        "left_hand": {"robot_body": "left_wrist_yaw_link"},
+        "right_hand": {"robot_body": "right_wrist_yaw_link"},
+        "left_foot": {
+          "robot_body": "left_ankle_roll_link",
+          "preserve_world_target": true,
+          "tracking_offset": [0.04, 0.0, -0.035],
+          "contact_offsets": [[0.04, 0.0, -0.035]]
+        },
+        "right_foot": {
+          "robot_body": "right_ankle_roll_link",
+          "preserve_world_target": true,
+          "tracking_offset": [0.04, 0.0, -0.035],
+          "contact_offsets": [[0.04, 0.0, -0.035]]
+        }
+      }
+    }
+  }
+}

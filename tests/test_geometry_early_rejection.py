@@ -45,8 +45,11 @@ def test_early_rejection_matches_full_query_and_acceptance_keeps_full_timeline(
 
 def test_incomplete_query_cannot_be_accepted_as_improved_clearance(monkeypatch):
     import omniretargeting._fast.mesh_repair as repair
+    from omniretargeting._fast import repair_prediction
     from omniretargeting._fast.repair_limits import RepairLimits
 
+    # Reach candidate geometry so this still exercises incomplete-query rejection.
+    monkeypatch.setattr(repair_prediction, "PREDICTIVE_GATING", False)
     objective, poses, _ = _objective(temporal=True)
     obj = _open_object(objective, poses)
     original = OriginalGeometry.measure

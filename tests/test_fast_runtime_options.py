@@ -10,7 +10,11 @@ def test_default_enables_only_validated_options(monkeypatch):
     monkeypatch.delenv('OMNIRETARGETING_FAST_ENABLE', raising=False)
     monkeypatch.delenv('OMNIRETARGETING_FAST_DISABLE', raising=False)
     enabled = {name for name, value in RuntimeOptions.from_environment().describe().items() if value}
-    assert enabled == {'parallel_shortening', 'parallel_repair_restore', 'repair_support_continuity'}
+    assert enabled == {
+        'parallel_shortening', 'parallel_repair_restore', 'repair_support_continuity',
+        'fast_self_collision', 'bulk_cpu_geometry', 'repair_triage',
+        'repair_fast_gate', 'repair_parallel_groups',
+    }
 
 
 def test_independent_switches(monkeypatch):

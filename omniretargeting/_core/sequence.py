@@ -142,10 +142,14 @@ def solve_core_sequence(
     )
 
     def progress(_pose, record):
-        if record["iteration"] % 5 == 0 or record["alpha"] == 0:
+        if record.get("iteration", 0) % 5 == 0 or record.get("alpha") == 0:
+            # Window records of the windowed solver carry no trajectory-wide
+            # contact statistic; print it only when the record has it.
+            contact = record.get("sticking_max_m")
             print(
-                f"Sequence {record['phase']} {record['iteration']}: "
-                f"cost={record['after']:.3f}, contact={record['sticking_max_m']:.5f} m",
+                f"Sequence {record.get('phase')} {record.get('iteration')}: "
+                f"cost={record.get('after', float('nan')):.3f}"
+                + ("" if contact is None else f", contact={contact:.5f} m"),
                 flush=True,
             )
 

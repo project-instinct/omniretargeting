@@ -144,7 +144,8 @@ def build_full_body_self_contact(
 ):
     from .self_contact import SelfContactTasks
 
-    report = {"status": "disabled", "reason": "missing_source_topology", "events": []}
+    report = {"status": "unresolved", "enabled": True,
+              "reason": "missing_source_topology", "events": []}
     full = source["full_body"]
     topology = _topology(full, len(full["face_ids"]))
     if topology is None:

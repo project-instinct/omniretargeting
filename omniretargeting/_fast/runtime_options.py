@@ -27,6 +27,7 @@ class RuntimeOptions:
     submillimeter_repair: bool = False
     reuse_original_geometry: bool = False
     lazy_repair_restoration: bool = False
+    direct_repair_restoration: bool = False
     conic_trust_damping: bool = False
     correction_budget: bool = False
     parallel_shortening: bool = True
@@ -34,6 +35,29 @@ class RuntimeOptions:
     repair_support_continuity: bool = True
     accept_short_banded: bool = False
     active_joint_bounds: bool = False
+    window_qp: bool = False
+    local_conic_restoration: bool = False
+    direct_acquisition_qp: bool = False
+    objective_soc: bool = False
+    frame_step_lengths: bool = False
+    priority_clearance: bool = False
+    priority_zero_yield_descent: bool = False
+    windowed_priority: bool = False
+    window_geometry_generation: bool = False
+    seed_continuity: bool = False
+    coarse_acquisition: bool = False
+    fast_self_collision: bool = True
+    bulk_cpu_geometry: bool = True
+    barrier_acquisition: bool = False
+    continuity_hinge_acquisition: bool = False
+    active_set_acquisition: bool = False
+    repair_triage: bool = True
+    repair_fast_gate: bool = True
+    repair_parallel_groups: bool = True
+    repair_defect_windows: bool = False
+    soft_acquisition: bool = False
+    soft_acquisition_v4: bool = False
+    soft_acquisition_v5: bool = False
 
     @classmethod
     def from_environment(cls):

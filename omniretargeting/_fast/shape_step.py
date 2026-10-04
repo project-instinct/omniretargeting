@@ -9,9 +9,11 @@ import cvxpy as cp
 import numpy as np
 from scipy import sparse
 
-from ..conic_solver import solve_conic
+from ..conic_solver import gpu_enabled, solve_conic
 from .._sequence.restoration import restore_candidate
 from .rows import _merge_identical
+from .runtime_options import OPTIONS
+from .window_qp import WINDOW_FRAMES, solve_windows
 
 
 def _guard_constraints(guards, poses, flat):
@@ -59,6 +61,13 @@ def _pin_root(objective, poses, lower, upper):
 WORKING_SET_RESTORATION = True
 
 
+def _canonical_window(objective):
+    from .legacy_window_qp import WindowObjective
+    # The assembler reproduces WindowGuard.constraints specifically. Other
+    # objectives and optional conic backends keep their established path.
+    return isinstance(objective, WindowObjective) and not gpu_enabled() and not OPTIONS.window_qp
+
+
 class _ShapeRestoration:
     def __init__(self, objective):
         self.objective = objective
@@ -84,6 +93,9 @@ class _ShapeRestoration:
 
 def restore_shape_step(objective, origin, step):
     """Correct curvature error without changing the source reference or bounds."""
+    if _canonical_window(objective):
+        from .window_canonical import restore_step
+        return restore_step(objective, origin, step)
     coords = objective.coords
     candidate = objective.project(coords.integrate(origin, step.reshape(len(origin), -1), 1.))
     lower, upper = coords.bounds(origin, objective.cfg["angular_step_rad"],
@@ -109,6 +121,17 @@ def bounded_shape_step(objective, poses, system, gradient, diagonal, damping):
                                           objective.lower - poses[:, coords.qi])
     hi[:, coords.scalar_cols] = np.minimum(hi[:, coords.scalar_cols],
                                           objective.upper - poses[:, coords.qi])
+    scale = max(float(np.linalg.norm(gradient, ord=np.inf)), 1.)
+    if _canonical_window(objective):
+        from .window_canonical import canonical_data, solve_data
+        data = canonical_data(objective, poses, lo, hi, matrix * (2 * (1 / scale)),
+                              (2 * gradient) * (1 / scale))
+        from .window_qoco import WINDOW_QOCO_PROPOSALS, solve_proposal
+        if WINDOW_QOCO_PROPOSALS:
+            step = solve_proposal(data, count)
+            if step is not None:
+                return step
+        return solve_data(data, count)
     flat = cp.Variable(count)
     constraints = [flat >= lo.ravel(), flat <= hi.ravel()]
     # Both frozen reference layouts (seed and acquired reference) apply;
@@ -116,9 +139,13 @@ def bounded_shape_step(objective, poses, system, gradient, diagonal, damping):
     box = np.maximum(np.abs(lo), np.abs(hi))
     constraints += shape.constraints(poses, flat, np.where(np.isfinite(box), box, 1e3))
     constraints += _guard_constraints(objective.candidate_guards, poses, flat)
-    scale = max(float(np.linalg.norm(gradient, ord=np.inf)), 1.)
     problem = cp.Problem(cp.Minimize((cp.quad_form(flat, cp.psd_wrap(matrix)) + 2 * gradient @ flat) / scale),
                          constraints)
+    if OPTIONS.window_qp and len(poses) >= 2 * WINDOW_FRAMES:
+        # Temporal block-coordinate step: every linearized bound stays exact.
+        step = solve_windows(problem, flat, len(poses), coords.width)
+        if step is not None:
+            return step
     try:
         solve_conic(problem, solver=cp.CLARABEL, direct_solve_method="qdldl")
     except cp.error.SolverError:

@@ -211,8 +211,10 @@ def build_self_contact_tasks(
     *, surface_motion=None,
 ):
     cfg = self_contact_config(config)
-    report = {"status": "disabled", "reason": "missing_skin_samples", "events": []}
+    report = {"status": "unresolved", "enabled": True,
+              "reason": "missing_skin_samples", "events": []}
     if not cfg["enabled"]:
+        report.update(status="disabled", enabled=False)
         report["reason"] = "configured_off"
         return None, report
     if source is None or robot_reference_qpos is None:

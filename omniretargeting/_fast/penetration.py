@@ -40,6 +40,30 @@ def _runs(mask):
     return list(zip(edges[0::2], edges[1::2]))
 
 
+def _worker_plane_clearance(span):
+    from .objective import _WORKER
+    return _WORKER["objective"]._plane_clearance(span)[0][span[0]:span[1]]
+
+
+def _chunked_plane_clearance(objective):
+    """``_plane_clearance()[0]``; long trajectories in temporary forked workers."""
+    import multiprocessing
+    import os
+    from .objective import (CHUNKS_PER_WORKER, MIN_CHUNK_FRAMES, TEMPORARY_DEEPEST_FRAMES,
+                            WORKERS, _temporary_pool)
+    from .bulk_geometry import prepare
+    prepare(objective)  # Warm grid kernels before temporary clearance workers.
+    chunks = min(CHUNKS_PER_WORKER * WORKERS, objective.frames // MIN_CHUNK_FRAMES)
+    if (chunks < 2 or objective.frames < TEMPORARY_DEEPEST_FRAMES or not hasattr(os, "fork")
+            or multiprocessing.current_process().daemon):
+        return objective._plane_clearance()[0]
+    edges = np.linspace(0, objective.frames, chunks + 1).astype(int)
+    spans = list(zip(edges[:-1], edges[1:]))
+    with _temporary_pool(objective, min(WORKERS, chunks)) as pool:
+        parts = pool.map(_worker_plane_clearance, spans, chunksize=1)
+    return np.concatenate(parts)
+
+
 class PenetrationStages:
     """Stage preparation and plane rows; mixed into ``FastObjective``."""
 
@@ -68,20 +92,31 @@ class PenetrationStages:
             points = np.einsum("nji,nsj->nsi", rotation[frames], points - translation[frames][:, None])
         if scales is not None:
             points = points / scales[frames, None, None]
-        values = sdf.query(points, gradient=False)
+        from .bulk_geometry import prepare
+        from .sdf import GridSDF
+        prepare(self)
+        helper = getattr(self, '_bulk_geometry', None)
+        values = (helper.query(sdf, points) if helper is not None and type(sdf) is GridSDF
+                  else sdf.query(points, gradient=False))
         return values if scales is None else values * scales[frames, None]
 
-    def _plane_clearance(self):
+    def _plane_clearance(self, span=None):
         """Height above its plane of the lowest inside sample, per plane pair.
 
         Returns (frames, geoms) clearance (+inf without a plane or without an
-        inside sample) and the chosen world points.
+        inside sample) and the chosen world points. With ``span`` (start,
+        stop) only those frames are measured; every pair is independent.
         """
         clearance = np.full(self.plane_field.shape, np.inf)
         chosen = np.zeros((*self.plane_field.shape, 3))
         target = self.cfg["scene_clearance_m"]
         for field in np.unique(self.plane_field[self.plane_field >= 0]):
             frames, geoms = np.nonzero(self.plane_field == field)
+            if span is not None:
+                keep = (frames >= span[0]) & (frames < span[1])
+                frames, geoms = frames[keep], geoms[keep]
+                if not len(frames):
+                    continue
             points, valid = self._shell_points(frames, geoms)
             value = self._inside(int(field), frames, points)
             normal = self.plane_normal[frames, geoms]
@@ -195,7 +230,7 @@ class PenetrationStages:
     def support_depth(self, poses):
         """Depth below its support plane of each geom's lowest inside sample."""
         self.kin.evaluate(poses, with_jacobian=False)
-        clearance, _ = self._plane_clearance()
+        clearance = _chunked_plane_clearance(self)
         target = self.cfg["scene_clearance_m"]
         return np.where(np.isfinite(clearance), np.maximum(target - clearance, 0.0), 0.0)
 

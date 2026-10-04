@@ -152,8 +152,14 @@ def test_fast_pipeline_restores_callers_blas_threads(monkeypatch, fail):
         return [info["num_threads"] for info in threadpoolctl.threadpool_info()
                 if info["user_api"] == "blas"]
 
-    def solve(*args):
+    released = []
+
+    def solve(*args, resources):
         assert counts() and set(counts()) == {1}
+        # Geometry workers belong to this solve even when it raises. Check
+        # their cleanup as well as restoration of the caller's BLAS settings.
+        resources.callback(released.append, "geometry")
+        assert not released
         if fail:
             raise RuntimeError("test solve failure")
         return "result"
@@ -167,4 +173,4 @@ def test_fast_pipeline_restores_callers_blas_threads(monkeypatch, fail):
         else:
             assert fast_pipeline.solve_fast_sequence(*([None] * 13)) == "result"
         assert counts() == before
-
+        assert released == ["geometry"]

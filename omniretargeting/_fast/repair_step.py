@@ -7,6 +7,9 @@ The conic solution remains a proposal for exact nonlinear acceptance.
 import numpy as np
 from scipy import sparse
 
+from .runtime_options import OPTIONS
+from .window_qp import WINDOW_FRAMES, solve_standard
+
 
 def solve_step(limits, poses, geometry, measurement, baseline, projection, *,
                collision_sigma, local_angle):
@@ -15,7 +18,7 @@ def solve_step(limits, poses, geometry, measurement, baseline, projection, *,
     variables = projection.shape[1]
     if not variables:
         return None, "no_local_dofs"
-    constraints = limits.constraints(poses)
+    constraints = limits.constraints(poses, projection=projection)
     collision, phi = geometry.linear_rows(measurement)
     budgets = np.array([baseline["depths"].get(key, 0.) for key, _ in measurement["rows"]])
     # Keep the nonlinear guard's tiny tolerance in reserve. Spending it in
@@ -66,7 +69,9 @@ def solve_step(limits, poses, geometry, measurement, baseline, projection, *,
     positive_rows = sparse.hstack((sparse.csc_matrix((count, joint_variables)), -sparse.eye(count)),
                                  format="csc") @ diagonal
     blocks, targets = [matrix, maximum_rows, positive_rows], [rhs, phi[selected], np.zeros(count)]
-    cones = [clarabel.NonnegativeConeT(len(rhs) + len(selected) + count)]
+    nonneg = len(rhs) + len(selected) + count
+    cones = [clarabel.NonnegativeConeT(nonneg)]
+    soc_sizes = []
     for jac, residual, allowed in constraints.cones():
         dimension = residual.shape[1]
         jac = (jac @ projection).tocsr()
@@ -86,20 +91,40 @@ def solve_step(limits, poses, geometry, measurement, baseline, projection, *,
                                         shape=(norm_count * (dimension + 1), variables)))
         targets.append(np.c_[allowed / normalization, residual / normalization[:, None]].ravel())
         cones.extend(clarabel.SecondOrderConeT(dimension + 1) for _ in range(norm_count))
+        soc_sizes += [dimension + 1] * norm_count
     matrix, rhs = sparse.vstack(blocks, format="csc"), np.concatenate(targets)
-    settings = clarabel.DefaultSettings()
-    settings.verbose = False
-    settings.max_iter = 100
-    settings.tol_gap_abs = settings.tol_gap_rel = settings.tol_feas = 1e-9
-    solver = clarabel.DefaultSolver(sparse.triu(diagonal @ hessian @ diagonal, format="csc"),
-                                    gradient * scale, matrix, rhs,
-                                    cones, settings)
-    solution = solver.solve()
-    status = str(solution.status)
+
+    def settings():
+        value = clarabel.DefaultSettings()
+        value.verbose = False
+        value.max_iter = 100
+        value.tol_gap_abs = value.tol_gap_rel = value.tol_feas = 1e-9
+        return value
+
     # Numerical termination is only a proposal. Exact nonlinear limits and
     # original geometry below decide acceptance, including after backtracking.
-    if status not in {"Solved", "AlmostSolved", "InsufficientProgress", "MaxIterations"} or not np.isfinite(solution.x).all():
+    accepted = {"Solved", "AlmostSolved", "InsufficientProgress", "MaxIterations"}
+    quadratic = sparse.triu(diagonal @ hessian @ diagonal, format="csc")
+    columns_per_frame = joint_variables // limits.frames
+    if (OPTIONS.window_qp and limits.frames >= 2 * WINDOW_FRAMES
+            and columns_per_frame * limits.frames == joint_variables):
+        # Temporal block coordinates (``window_qp``): joint columns are
+        # frame-major; each epigraph belongs to its collision key's frame.
+        frame_of = np.r_[np.arange(joint_variables) // columns_per_frame, [key[0] for key in keys]]
+        x = solve_standard(quadratic, gradient * scale, matrix, rhs, nonneg, soc_sizes, frame_of,
+                           limits.frames, settings=settings, accepted=accepted)
+        if x is not None:
+            step = projection @ (x[:joint_variables] * scale[:joint_variables])
+            return step.reshape(limits.frames, limits.width), "Windowed"
+    from . import repair_qoco
+    if repair_qoco.QOCO_REPAIR_QP:
+        from types import SimpleNamespace
+        x = repair_qoco.solve(dict(P=quadratic, c=gradient * scale, A=matrix, b=rhs,
+                                  dims=SimpleNamespace(zero=0, nonneg=nonneg, soc=soc_sizes)))
+        if x is not None:
+            return (projection @ (x[:joint_variables] * scale[:joint_variables])).reshape(limits.frames, limits.width), "QOCO_SOLVED"
+    solution = clarabel.DefaultSolver(quadratic, gradient * scale, matrix, rhs, cones, settings()).solve()
+    status = str(solution.status)
+    if status not in accepted or not np.isfinite(solution.x).all():
         return None, status
     return (projection @ (np.asarray(solution.x[:joint_variables]) * scale[:joint_variables])).reshape(limits.frames, limits.width), status
-
-

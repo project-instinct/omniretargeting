@@ -5,6 +5,7 @@ Source net-wrench evidence, when supplied, determines support priority for ANY
 body region, including sliding contacts and prescribed moving objects. Without
 that evidence, stationary scene contacts retain geometric holding priority;
 this fallback has the separate, explicitly unverified ``hold`` role.
+Frames with unresolved source mechanics protect sliding contacts as holds too.
 An endpoint observed clear of every surface is free. Solvers order
 support > unresolved hold > control > follow > free > posture
 (Kanajar et al., RO-MAN 2017, Sec. IV-A: support tasks before posture), so a
@@ -82,6 +83,7 @@ class ContactRoles:
         model=None,
         support_evidence=None,
         control_evidence=None,
+        unresolved_support_frames=None,
     ):
         self.surface = surface
         self.model = surface.model if surface is not None else model
@@ -97,6 +99,16 @@ class ContactRoles:
             raise ValueError(
                 "Source object-control evidence must share the original timeline"
             )
+        if unresolved_support_frames is None:
+            unresolved_support_frames = np.zeros(frames, bool)
+            if support_evidence is not None:
+                unresolved_support_frames[
+                    support_evidence.diagnostics.get("unexplained_frames", [])
+                ] = True
+        unresolved = np.array(unresolved_support_frames, dtype=bool, copy=True)
+        if unresolved.shape != (frames,):
+            raise ValueError("Unresolved mechanics must share the original timeline")
+        unresolved.setflags(write=False)
 
         def observed_role(region, surface_id, frame, sticking):
             support = (
@@ -106,6 +118,10 @@ class ContactRoles:
             )
             if support == "support":
                 return "support"
+            # A failed mechanics explanation cannot unload any observed
+            # contact, including sliding ones. No new contact is created.
+            if unresolved[frame]:
+                return "hold"
             if (
                 control_evidence is not None
                 and control_evidence.role(region, surface_id, frame) == "control"
@@ -215,6 +231,7 @@ class ContactRoles:
             if control_evidence is None
             else control_evidence.diagnostics,
             "fallback_roles_are_geometric_only": True,
+            "unresolved_support_frames": np.flatnonzero(unresolved).tolist(),
             "role_frames": {
                 name: {
                     r: np.flatnonzero(role == r).tolist()
@@ -325,6 +342,7 @@ def attach_contact_phase(
     source_clearances=None,
     support_evidence=None,
     control_evidence=None,
+    unresolved_support_frames=None,
 ):
     """Attach one role table; replace frozen primary tasks without changing arrays.
 
@@ -353,6 +371,7 @@ def attach_contact_phase(
             model=model,
             support_evidence=support_evidence,
             control_evidence=control_evidence,
+            unresolved_support_frames=unresolved_support_frames,
         )
     for task in (surface, pose):
         if task is not None:

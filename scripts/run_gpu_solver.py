@@ -25,10 +25,12 @@ def main() -> None:
         raise SystemExit("GPU dependencies missing; install omniretargeting[gpu]")
     link_dir = Path(__file__).resolve().parents[1] / "out" / "gpu_runtime" / "lib"
     link_dir.mkdir(parents=True, exist_ok=True)
-    link = link_dir / "libcudss.so"
-    if link.is_symlink() or link.exists():
-        link.unlink()
-    link.symlink_to(cudss)
+    # qoco-cuda loads the library by its unversioned or its SONAME-1 name.
+    for name in ("libcudss.so", "libcudss.so.1"):
+        link = link_dir / name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(cudss)
 
     libraries = [str(link_dir), str(cuda_lib)]
     for candidate in (

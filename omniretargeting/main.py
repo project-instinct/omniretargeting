@@ -523,6 +523,9 @@ def main():
             retarget_motion_kwargs["end_effector_markers"] = end_effector_markers
         if source_motion_data is not None:
             retarget_motion_kwargs["body_surface_samples"] = source_motion_data.metadata.get("body_surface_samples")
+            inertia_model = source_motion_data.metadata.get("source_inertia_model")
+            if inertia_model is not None:
+                retarget_motion_kwargs["source_inertia_model"] = inertia_model
             if source_motion_data.object_points is not None:
                 retarget_motion_kwargs["object_points"] = source_motion_data.object_points
             if source_motion_data.metadata.get("scene_objects"):

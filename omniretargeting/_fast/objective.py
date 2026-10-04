@@ -9,6 +9,7 @@ original-triangle queries; the original triangles are audited afterwards.
 """
 
 import copy
+from contextlib import contextmanager
 import itertools
 import multiprocessing
 import os
@@ -20,6 +21,7 @@ from scipy import sparse
 from scipy.ndimage import gaussian_filter1d
 from scipy.spatial.transform import Rotation
 
+from ..cpu_budget import available_cpus
 from .._sequence.coordinates import temporal_operators
 from .._solver.targets import _world_target_regime
 from ..contact import _is_surface_only_contact_mode
@@ -43,13 +45,30 @@ from .terms import (  # noqa: F401 - re-exported
 ROLE_WEIGHTS = {"support": 4.0, "hold": 2.0, "control": 2.0, "follow": 1.0}
 # Per-frame terms are independent: frames are split across forked workers.
 # The worker count changes scheduling only, never the computed values.
-WORKERS = max(1, min(12, (os.cpu_count() or 2) // 2))
+WORKERS = max(1, min(12, available_cpus() // 2))
 # Shorter chunks cost more in process round trips than they save. Frames
 # near contacts and scene surfaces cost far more than free ones, so the
 # trajectory is split into more chunks than workers and scheduled dynamically.
 MIN_CHUNK_FRAMES = 7
 CHUNKS_PER_WORKER = 2
+# Shorter trajectories measure their clearance fields serially without a pool.
+TEMPORARY_DEEPEST_FRAMES = 120
+# Small windows amortize device transfers poorly; keep their reference pool.
+MIN_ACCELERATED_FRAMES = 64
 _WORKER = {}
+
+
+def _owned_pool(objective):
+    """A pool's task/result threads exist only in the process that made it."""
+    pool = getattr(objective, 'pool', None)
+    if pool is None:
+        return None
+    owner = getattr(objective, '_pool_pid', None)
+    if owner is None:
+        # Also cover an objective whose pool predates the ownership marker.
+        workers = getattr(pool, '_pool', ())
+        owner = getattr(workers[0], '_parent_pid', os.getpid()) if workers else os.getpid()
+    return pool if owner == os.getpid() else None
 
 
 def _worker_init():
@@ -76,12 +95,32 @@ def _worker_evaluate(task):
     return result
 
 
+@contextmanager
+def _temporary_pool(objective, workers):
+    """Forked workers inheriting ``objective``; the parent's registry is restored."""
+    saved = dict(_WORKER)
+    _WORKER.clear()
+    _WORKER["objective"] = objective
+    try:
+        pool = multiprocessing.get_context("fork").Pool(workers, _worker_init)
+    finally:
+        _WORKER.clear()
+        _WORKER.update(saved)
+    try:
+        yield pool
+    finally:
+        pool.close()
+        pool.join()
+
+
 def _worker_deepest(task):
     start, stop, poses = task
     chunks = _WORKER.setdefault("chunks", {})
     chunk = chunks.get((start, stop))
     if chunk is None:
         chunk = chunks[start, stop] = _WORKER["objective"].for_frames(slice(start, stop))
+    from .bulk_geometry import prepare
+    prepare(chunk)
     chunk.kin.evaluate(poses, with_jacobian=False)
     return [chunk._deepest_samples(*field[1:]) for field in chunk._clearance_fields()]
 
@@ -229,6 +268,11 @@ class FastObjective(FrameTerms, PenetrationStages):
         self.source_shape = None
         self.candidate_guards = []
         self.fixed_root = None
+        # Exact accelerated rows passed the full LM/trajectory comparison.
+        # Keep the reference pool available through the explicit legacy switch.
+        self.evaluation_backend = os.environ.get('OMNIRETARGETING_FAST_OBJECTIVE', 'auto')
+        if self.evaluation_backend not in ('legacy', 'cpu', 'gpu', 'auto'):
+            raise ValueError('OMNIRETARGETING_FAST_OBJECTIVE must be legacy, cpu, gpu or auto')
 
     # ----- packing of immutable task data -------------------------------------
     def _pack_interaction(self):
@@ -500,11 +544,18 @@ class FastObjective(FrameTerms, PenetrationStages):
     )
     PER_FRAME_PROXIMITY = ("environment", "normals", "gaps", "scale")
 
-    def for_frames(self, frames):
+    def for_frames(self, frames, *, kinematics=None):
         """Shallow copy restricted to a contiguous slice of frames."""
         chunk = copy.copy(self)
+        # Device and collision caches belong to one trajectory, never a slice.
+        for name in ('_gpu_frames', '_self_batch'):
+            chunk.__dict__.pop(name, None)
+        if '_bulk_geometry' in chunk.__dict__:
+            for name in ('_bulk_geometry', '_proximity_support', '_deepest_samples'):
+                chunk.__dict__.pop(name, None)
         chunk.frames = frames.stop - frames.start
-        chunk.kin = TrajectoryKinematics(self.model, self.coords.cols)
+        chunk.kin = (TrajectoryKinematics(self.model, self.coords.cols)
+                     if kinematics is None else kinematics)
         chunk.interaction = self.interaction[frames]
         tasks = self.tasks
         chunk.tasks = SimpleNamespace(
@@ -552,6 +603,8 @@ class FastObjective(FrameTerms, PenetrationStages):
 
     def evaluate_frames(self, poses, with_jacobian, envelope_weight):
         """Per-frame terms of this (chunk) objective, plus root kinematics."""
+        from .bulk_geometry import prepare
+        prepare(self)
         self.envelope_weight = envelope_weight
         self.kin.evaluate(poses, with_jacobian)
         acc = _Accumulator(self.frames, self.width, with_jacobian)
@@ -561,13 +614,17 @@ class FastObjective(FrameTerms, PenetrationStages):
         self._effector_terms(acc, stats)
         self._surface_terms(acc, stats)
         self._proximity_terms(acc, stats)
-        self._clearance_terms(acc, stats, poses)
-        self._plane_terms(acc, stats)
-        self._self_collision_terms(poses, acc, stats)
+        if getattr(self, '_soft_bulk_signals', False):
+            from .soft_frame_rows import add_clearance
+            add_clearance(self, poses, acc, stats)
+        else:
+            self._clearance_terms(acc, stats, poses)
+            self._plane_terms(acc, stats)
+            self._self_collision_terms(poses, acc, stats)
         self._reference_terms(poses, acc, stats)
         self._envelope_terms(poses, acc, stats)
         effector_point, effector_jacobian = self._effector_points(with_jacobian)
-        return {
+        result = {
             "cost": acc.cost,
             "frame_cost": acc.frame_cost,
             "hessian": acc.hessian if with_jacobian else None,
@@ -578,13 +635,32 @@ class FastObjective(FrameTerms, PenetrationStages):
             "effector_point": effector_point,
             "effector_jacobian": effector_jacobian,
         }
+        if getattr(self, '_soft_bulk_signals', False):
+            result['soft_guard_cost'] = getattr(acc, 'soft_guard_cost', 0.)
+            result['soft_clearance_cost'] = acc.soft_clearance_cost
+            result['soft_priority_extra'] = acc.soft_priority_extra
+        return result
 
     def start_workers(self):
         """Fork workers inheriting this objective; False if already running."""
+        if getattr(self, 'pool', None) is not None and _owned_pool(self) is None:
+            self.pool, self.worker_output = None, None
+        from .guard_acceleration import enabled
+        if enabled():
+            from .guard_signals import prepare
+            prepare(self)
+        if self._gpu_evaluator() is not None:
+            if getattr(self, '_gpu_workers_active', False):
+                return False
+            self._gpu_workers_active = True
+            return True
         if getattr(self, "pool", None) is not None:
             return False
-        self.chunks = min(CHUNKS_PER_WORKER * WORKERS, self.frames // MIN_CHUNK_FRAMES)
-        if self.chunks > 1 and hasattr(os, "fork"):
+        from .bulk_geometry import prepare, worker_schedule
+        prepare(self)  # Build once before fork; children inherit the library.
+        workers, chunks_per_worker = worker_schedule(WORKERS, CHUNKS_PER_WORKER)
+        self.chunks = min(chunks_per_worker * workers, self.frames // MIN_CHUNK_FRAMES)
+        if self.chunks > 1 and hasattr(os, "fork") and not multiprocessing.current_process().daemon:
             context = multiprocessing.get_context("fork")
             shapes = {
                 "hessian": (self.frames, self.width, self.width),
@@ -601,10 +677,15 @@ class FastObjective(FrameTerms, PenetrationStages):
             _WORKER.clear()
             _WORKER["objective"] = self
             _WORKER["output"] = self.worker_output
-            self.pool = context.Pool(min(WORKERS, self.chunks), _worker_init)
+            self._pool_pid = os.getpid()
+            self.pool = context.Pool(min(workers, self.chunks), _worker_init)
         return True
 
     def stop_workers(self):
+        self._gpu_workers_active = False
+        if getattr(self, 'pool', None) is not None and _owned_pool(self) is None:
+            self.pool, self.worker_output = None, None
+            return
         if getattr(self, "pool", None) is not None:
             self.pool.close()
             self.pool.join()
@@ -620,13 +701,24 @@ class FastObjective(FrameTerms, PenetrationStages):
         in frame order: each (frame, geom) pair is independent of the others.
         ``self.kin`` is left evaluated at ``poses`` either way.
         """
-        pool = getattr(self, "pool", None)
-        if pool is None:
+        from .bulk_geometry import prepare
+        prepare(self)
+        pool = _owned_pool(self)
+        chunks = min(CHUNKS_PER_WORKER * WORKERS, self.frames // MIN_CHUNK_FRAMES)
+        if pool is None and (chunks < 2 or self.frames < TEMPORARY_DEEPEST_FRAMES or not hasattr(os, "fork")
+                             or multiprocessing.current_process().daemon):
             self.kin.evaluate(poses, with_jacobian=False)
             return [self._deepest_samples(*field[1:]) for field in self._clearance_fields()]
-        edges = np.linspace(0, self.frames, self.chunks + 1).astype(int)
+        edges = np.linspace(0, self.frames, (self.chunks if pool is not None else chunks) + 1).astype(int)
         bounds = list(itertools.pairwise(edges))
-        parts = pool.map(_worker_deepest, [(a, b, poses[a:b]) for a, b in bounds], chunksize=1)
+        tasks = [(a, b, poses[a:b]) for a, b in bounds]
+        if pool is None:
+            # No evaluation pool (e.g. the GPU evaluator): the same chunked
+            # measurement in temporary forked workers.
+            with _temporary_pool(self, min(WORKERS, chunks)) as temporary:
+                parts = temporary.map(_worker_deepest, tasks, chunksize=1)
+        else:
+            parts = pool.map(_worker_deepest, tasks, chunksize=1)
         fields = []
         for field in range(len(parts[0])):
             pieces = [part[field] for part in parts]
@@ -638,10 +730,38 @@ class FastObjective(FrameTerms, PenetrationStages):
         self.kin.evaluate(poses, with_jacobian=False)
         return fields
 
-    def evaluate(self, poses, with_jacobian=True):
+    def prepare_window_evaluation(self):
+        """Prepare single-threaded CPU window kernels before forking."""
+        from .window_objective import prepare_window_evaluation
+        return prepare_window_evaluation(self)
+
+    def window_kinematics(self, poses, frames, with_jacobian=True):
+        """Exact local FK, with immutable arrays and global body/geom IDs."""
+        from .frame_kinematics import window_kinematics
+        kin = window_kinematics(self, poses, frames, with_jacobian)
+        guards = list(self.candidate_guards)
+        if self.source_shape is not None:
+            guards.append(self.source_shape)
+        for guard in guards:
+            guard._window_frame_cache = self._window_frame_cache
+        return kin
+
+    def window_dependencies(self, frames):
+        """Fixed frames that any original temporal stencil can depend on."""
+        from .window_objective import window_dependencies
+        return window_dependencies(self, frames)
+
+    def evaluate(self, poses, with_jacobian=True, *, frames=None):
         """Cost, per-frame normal equations and sparse temporal rows."""
-        pool = getattr(self, "pool", None)
-        if pool is None:
+        if frames is not None:
+            from .window_objective import evaluate_window
+            return evaluate_window(self, poses, with_jacobian, frames)
+        pool = _owned_pool(self)
+        gpu = self._gpu_evaluator()
+        if gpu is not None:
+            parts = [gpu.evaluate(poses, with_jacobian, self.envelope_weight)]
+            pool = None
+        elif pool is None:
             parts = [self.evaluate_frames(poses, with_jacobian, self.envelope_weight)]
         else:
             edges = np.linspace(0, self.frames, self.chunks + 1).astype(int)
@@ -677,8 +797,49 @@ class FastObjective(FrameTerms, PenetrationStages):
         paths = (collect("effector_point"), collect("effector_jacobian") if with_jacobian else None)
         temporal_r, temporal_j = self._temporal_terms(poses, with_jacobian, root_point, root_jac, paths)
         acc.cost += float(temporal_r @ temporal_r)
+        from .window_tracking import collision_stats
+        stats = collision_stats(self, poses, stats)
         self.stats = stats
-        return acc, temporal_r, temporal_j, stats, None
+        signals = None
+        if getattr(self, '_soft_bulk_signals', False):
+            signals = dict(root_point=root_point, root_jacobian=root_jac,
+                           guard_cost=sum(part.get('soft_guard_cost', 0.) for part in parts),
+                           clearance_cost=sum(part.get('soft_clearance_cost', 0.) for part in parts),
+                           priority_extra=sum(part.get('soft_priority_extra', 0.) for part in parts))
+        return acc, temporal_r, temporal_j, stats, signals
+
+    def _gpu_evaluator(self):
+        """CUDA belongs to the caller process; inherited workers keep CPU FK."""
+        backend = getattr(self, 'evaluation_backend', 'legacy')
+        from .runtime_options import OPTIONS
+        # The opt-in CPU kernels own auto dispatch; an explicit GPU request
+        # still selects CUDA. Otherwise later stages bypass the bulk hooks.
+        if backend == 'auto' and OPTIONS.bulk_cpu_geometry:
+            return None
+        if backend not in ('gpu', 'auto'):
+            return None
+        if backend == 'auto' and (self.temporal_reference is None or self.frames < MIN_ACCELERATED_FRAMES):
+            return None
+        if getattr(self, '_gpu_pid', os.getpid()) != os.getpid():
+            return None
+        if not hasattr(self, '_gpu_frames'):
+            self._gpu_pid = os.getpid()
+            self._gpu_frames = None
+            try:
+                import torch
+            except ImportError:
+                return None
+            if torch.cuda.is_available():
+                try:
+                    from .batched_self_collision import native_library, NativeUnavailable
+                    native_library()
+                    from .gpu_objective import GPUFrameEvaluator
+                    self._gpu_frames = GPUFrameEvaluator(self)
+                except (ImportError, NativeUnavailable):
+                    # Unsupported hardware/dependencies retain the reference
+                    # pool. Numerical/runtime errors are never hidden here.
+                    pass
+        return self._gpu_frames
 
     def _temporal_terms(self, poses, with_jacobian, root_point, root_jac, paths=None):
         coords = self.coords

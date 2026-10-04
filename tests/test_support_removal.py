@@ -89,3 +89,100 @@ def test_absent_mode_does_not_override_a_present_contact():
     evidence = explain_source_support([[feet, stuck]], wrench, regions)
     result = combine_support_scenarios([evidence], wrench, origin=np.zeros(3))
     assert result.role("left_hand", 0, 0) == "follow"
+
+
+def _demotion_fixture(pattern, min_demotion_frames=0):
+    """A linked seat patch (A1, A2) versus a floor foot X, per-frame wrench types.
+
+    The seat contacts sit at height 0.5 with a 0.15 m gap, so a skin spacing
+    of 0.2 m links them into one patch; X lies on the floor on the x-axis at
+    (0.4, 0, 0), a separate patch whose tangential force can stay radial and
+    balance tau_z. Wrench types (force [0, 0, 10]):
+    - "U" (tau=(5, -5)): no feasible support set; an unexplained frame that
+      splits the timeline into independent segments.
+    - "D" (tau=(0, -0.7)): the seat patch alone is minimal and an X-pair is
+      minimal too, so X joins the union while the patch is necessary and
+      sufficient: X is demoted.
+    - "S" (tau=(0, -2.0)): beyond the seat patch's torque span; X belongs to
+      every minimal set, so X is necessary support.
+    """
+    def seat(name, x):
+        return ContactCandidate(name, [[x, 0, 0.5]], [[x, 0, 0.5]], [0, 0, 1], 0.6, 0)
+
+    foot = ContactCandidate("X", [[0.4, 0, 0]], [[0.4, 0, 0]], [0, 0, 1], 0.6, 0)
+    wrenches = {
+        "U": [0.0, 0, 10, 5.0, -5.0, 0.0],
+        "D": [0.0, 0, 10, 0.0, -0.7, 0.0],
+        "S": [0.0, 0, 10, 0.0, -2.0, 0.0],
+    }
+    frames = [[seat("A1", 0.0), seat("A2", 0.15), foot] for _ in pattern]
+    wrench = np.asarray([wrenches[p] for p in pattern], float)
+    regions = {"A1": ("seat_a", 0), "A2": ("seat_b", 0), "X": ("foot", 1)}
+    evidence = explain_source_support(frames, wrench, regions)
+    return combine_support_scenarios(
+        [evidence], wrench, origin=np.zeros(3), skin_spacing=0.2,
+        min_demotion_frames=min_demotion_frames)
+
+
+def test_short_demotion_run_is_restored_to_support():
+    # Frames 1-2 demote X for only two frames, shorter than the source
+    # dynamics' derivative window: the run is restored to support.
+    pattern = ["U", "D", "D", "U", "U"]
+    unguarded = _demotion_fixture(pattern)
+    assert [unguarded.role("foot", 1, f) for f in range(5)] == [
+        None, "follow", "follow", None, None]
+    guarded = _demotion_fixture(pattern, min_demotion_frames=4)
+    assert [guarded.role("foot", 1, f) for f in range(5)] == [
+        None, "support", "support", None, None]
+    assert guarded.explanations[1]["support_sets"] == [["A1", "A2", "X"]]
+    assert guarded.explanations[1]["roles"]["X"] == "necessary_support_candidate"
+    patches = guarded.diagnostics["support_patches"]
+    assert patches["restored_candidate_frames"] == 2
+    assert patches["demoted_candidate_frames"] == 0
+    assert patches["per_frame"]["1"]["restored"] == ["X"]
+    assert patches["per_frame"]["1"]["demoted"] == []
+    assert patches["min_demotion_frames"] == 4
+
+
+def test_demotion_run_at_least_the_window_stays_optional():
+    # A four-frame demotion run meets the derivative window: it is resolved
+    # evidence, not chatter, and stays optional.
+    pattern = ["U", "D", "D", "D", "D"]
+    guarded = _demotion_fixture(pattern, min_demotion_frames=4)
+    assert [guarded.role("foot", 1, f) for f in range(5)] == [
+        None, "follow", "follow", "follow", "follow"]
+    patches = guarded.diagnostics["support_patches"]
+    assert patches["restored_candidate_frames"] == 0
+    assert patches["per_frame"]["1"]["restored"] == []
+    assert patches["per_frame"]["1"]["demoted"] == ["X"]
+
+
+def test_short_support_segment_is_not_reverse_filled():
+    # X is necessary in frames 1-2 only. The rule restores demotions; it never
+    # releases a support segment, however short, and the S segment keeps X.
+    pattern = ["U", "S", "S", "U", "D", "D", "D", "D"]
+    guarded = _demotion_fixture(pattern, min_demotion_frames=4)
+    assert [guarded.role("foot", 1, f) for f in range(8)] == [
+        None, "support", "support", None, "follow", "follow", "follow", "follow"]
+
+
+def test_explain_and_combine_passes_the_source_derivative_window(monkeypatch):
+    from omniretargeting import source_support_evidence as module
+
+    captured = {}
+    real = module.combine_support_scenarios
+
+    def spy(scenarios, wrench, **kwargs):
+        captured.update(kwargs)
+        return real(scenarios, wrench, **kwargs)
+
+    monkeypatch.setattr(module, "combine_support_scenarios", spy)
+    foot = ContactCandidate("foot", [[0, 0, 0]], [[0, 0, 0]], [0, 0, 1], 0.6, 0)
+    demand = {
+        "wrench": np.asarray([[0.0, 0, 10, 0, 0, 0]]),
+        "origin": np.zeros(3),
+        "derivative_disagreement": np.zeros((1, 6)),
+        "derivative_window": 7,
+    }
+    module._explain_and_combine((((foot,),),), {"foot": ("left_foot", 0)}, demand)
+    assert captured["min_demotion_frames"] == 7

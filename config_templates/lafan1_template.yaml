@@ -6,7 +6,7 @@
 #
 # Usage:
 #   python -m omniretargeting.main \
-#     --robot-config robot_models/unitree_g1/unitree_g1.json \
+#     --robot-config robot_models/unitree_g1/unitree_g1_lafan1.json \
 #     --source-config config_templates/lafan1_template.yaml \
 #     --output output.npz \
 #     --save-video output.mp4
@@ -27,6 +27,12 @@ motion: /path/to/lafan1/motion.bvh
 # Notes:
 # - BVH files from LAFAN1 use Y-up coordinate system (converted to Z-up automatically)
 # - Bone names are extracted from the BVH hierarchy and used as target_names
-# - Human height is estimated from head and foot positions in the first frame
+# - Human height is estimated from head and foot positions across the motion
 # - Position units are automatically converted from cm to meters
-# - Root orientation is returned as axis-angle (rotvec) for consistency
+# - Joint orientations are world-frame wxyz quaternions, rotated along with positions
+# - Standard LAFAN1 skeletons provide a fixed anatomical T-pose for calibration
+# - Source contact roles and support mechanics run by default, including BVH input
+# - Sole markers and thin-rod segment inertias are explicit geometric approximations
+# - Unexplained mechanics protects observed contacts; it never creates contacts
+# - Whole-body skin tasks report unresolved when the BVH supplies no skin surface
+# - The floating base is selected/calibrated by the retargeting pipeline

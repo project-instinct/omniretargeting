@@ -1,7 +1,7 @@
 """Optional engineering surface normals, with stable identities and no scaling.
 
 UMR algorithm reference: relative reference-face normal transport and per-FK
-slot caching; independent implementation, provenance in umr_scene_interaction.md.
+slot caching (UMR 8c4db7db); independent implementation.
 This is not learned correspondence. Source adapters must supply real surfaces
 and explicitly corresponding reference poses, all in the same metric world frame.
 """

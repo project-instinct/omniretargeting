@@ -8,6 +8,7 @@ do not need solver-specific tuning.
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from types import SimpleNamespace
 
 import cvxpy as cp
@@ -31,6 +32,16 @@ WORKING_SET_MARGIN = 1e-6
 WORKING_SET_ROUNDS = 16
 # Beyond this share of all rows the complete problem is solved instead.
 WORKING_SET_FRACTION = 0.5
+# Smaller problems stay on CLARABEL with the GPU backend: a CUDA solve has a
+# fixed setup cost that a few-variable contact or anchor problem never repays.
+GPU_MIN_VARIABLES = 2000
+
+
+@lru_cache(maxsize=64)
+def _soc_descriptor(size):
+    """Clarabel copies immutable cone dimensions into each private solver."""
+    import clarabel
+    return clarabel.SecondOrderConeT(size)
 
 
 def gpu_enabled() -> bool:
@@ -43,17 +54,18 @@ def gpu_strict() -> bool:
     return os.environ.get("OMNIRETARGETING_CONIC_BACKEND", "").lower() == "qoco_cuda_strict"
 
 
-def solve_conic(problem: cp.Problem, **cpu_options) -> float | None:
+def solve_conic(problem: cp.Problem, *, cpu_only: bool = False, **cpu_options) -> float | None:
     """Solve with the selected backend, retaining CLARABEL as GPU fallback.
 
     Set ``OMNIRETARGETING_CONIC_BACKEND=qoco_cuda`` to use QOCO's CUDA linear
     algebra. ``qoco_cuda_strict`` exposes GPU failures during validation.
-    The default is the established CLARABEL path.
+    The default is the established CLARABEL path. ``cpu_only`` keeps a caller
+    on CLARABEL with either backend.
     """
     backend = os.environ.get("OMNIRETARGETING_CONIC_BACKEND", "clarabel").lower()
     if backend not in {"clarabel", "qoco_cuda", "qoco_cuda_strict"}:
         raise ValueError(f"Unknown conic backend: {backend}")
-    if backend == "clarabel":
+    if backend == "clarabel" or cpu_only or problem.size_metrics.num_scalar_variables < GPU_MIN_VARIABLES:
         return _solve_cpu(problem, cpu_options)
 
     gpu_options = {
@@ -119,8 +131,12 @@ def solve_conic_working_set(problem: cp.Problem, **cpu_options) -> float | None:
     multipliers zero, it is the optimum of the complete problem (unique for a
     strictly convex objective). Any other outcome falls back to
     ``solve_conic`` on the complete problem.
+
+    The small working-set problems stay on the CPU with the GPU backend too
+    (a GPU solve costs more than one of them); only the complete-problem
+    fallback uses the selected backend.
     """
-    if gpu_enabled() or str(cpu_options.get("solver", "")).upper() != cp.CLARABEL:
+    if str(cpu_options.get("solver", "")).upper() != cp.CLARABEL:
         return solve_conic(problem, **cpu_options)
     import clarabel
 
@@ -163,7 +179,7 @@ def solve_conic_working_set(problem: cp.Problem, **cpu_options) -> float | None:
             break
         kinds = ([clarabel.ZeroConeT(zero)] if zero else []) + (
             [clarabel.NonnegativeConeT(int(keep_linear.sum()))] if keep_linear.any() else [])
-        kinds += [clarabel.SecondOrderConeT(int(sizes[c])) for c in cones]
+        kinds += [_soc_descriptor(int(sizes[c])) for c in cones]
         solution = clarabel.DefaultSolver(quadratic, linear, matrix[rows].tocsc(), offset[rows],
                                           kinds, settings).solve()
         iterations += solution.iterations

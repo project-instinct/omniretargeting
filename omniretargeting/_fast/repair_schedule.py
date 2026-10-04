@@ -34,6 +34,11 @@ class RepairSchedule:
         self.total += 1
         return group, self.attempts[group] - 1
 
+    def peek_first(self, count):
+        """Look ahead without consuming attempts or predicting group retries."""
+        available = max(0, self.total_limit - self.total)
+        return [group for group in self.ready[:available] if self.attempts[group] == 0][:count]
+
     def retry(self, group):
         self.deferred.pop(group, None)
         self._enqueue(group)

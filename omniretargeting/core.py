@@ -274,6 +274,7 @@ class OmniRetargeter(
         object_points: np.ndarray | None = None,
         source_support_evidence=None,
         source_control_evidence=None,
+        source_inertia_model=None,
     ) -> Tuple[float, np.ndarray]:
         """
         Retarget SMPLX motion to the robot on the terrain.
@@ -285,6 +286,8 @@ class OmniRetargeter(
                 or the legacy ``(T, 3)`` axis-angle representation.
             base_translations: Optional source-root world translations.
             source_support_evidence: Optional source-only net-wrench contact explanations.
+            source_inertia_model: Adapter-declared segment COM offsets, masses
+                and COM inertia tensors; enables source mechanics without skin.
             source_control_evidence: Optional source-only coordinated object-follow evidence.
             object_points: Optional fixed world samples on moving objects,
                 with shape (T, N, 3); shared by source and robot interaction meshes.
@@ -420,7 +423,10 @@ class OmniRetargeter(
         # Source dynamics (``source_support_evidence``) need the global joint
         # orientations of the same timeline.
         self._source_joint_orientations = source_joint_orientations
+        self._source_inertia_model = source_inertia_model
         self._support_evidence_built = source_support_evidence is not None
+        self._object_support_built = False
+        self.last_object_support_diagnostics = {"status": "disabled", "reason": "not_built"}
         self.last_source_support_diagnostics = (
             {"status": "supplied"} if source_support_evidence is not None
             else {"status": "disabled", "reason": "not_built"})

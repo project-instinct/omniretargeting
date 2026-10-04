@@ -164,6 +164,10 @@ def optimize(objective, poses, *, iterations, callback=None, label="fast",
     relative cost decrease ``converged_decrease``. Correction stages whose
     own rows are a small part of the total cost pass a smaller one.
     """
+    from .runtime_options import OPTIONS
+    if OPTIONS.windowed_priority and getattr(objective, 'priority_clearance', None) is not None:
+        from .window_driver import optimize_windowed_priority
+        return optimize_windowed_priority(objective, poses, iterations, callback, label, converged_decrease)
     started = objective.start_workers()
     try:
         return _optimize(objective, poses, iterations, callback, label, converged_decrease)
@@ -172,26 +176,51 @@ def optimize(objective, poses, *, iterations, callback=None, label="fast",
             objective.stop_workers()
 
 
-def _conic_proposal(objective, poses, system, gradient, diagonal, damping, guards):
+def _conic_proposal(objective, poses, system, gradient, diagonal, damping, guards, *, model=None):
     """Constrained fallback direction, backtracked or restored; None if unsolved.
 
     The candidate is None when neither a fraction nor the restored step passes
     the guards; the direction itself is still returned for ``_shorten_conic``.
     """
     from .shape_step import bounded_shape_step, restore_shape_step
+    from .runtime_options import OPTIONS
 
+    if model is not None:
+        from .qp_assembly import solve_model
+        from .globalization import globalize
+        solution = solve_model(model, damping)
+        if solution is None:
+            return None
+        solution, projected, fraction = globalize(
+            objective, model, solution, damping, guards,
+            soc=OPTIONS.objective_soc, frame_lengths=OPTIONS.frame_step_lengths)
+        if fraction < .25:
+            restored = restore_shape_step(objective, poses, solution.step)
+            if restored is not None and all(guard.accepts(restored) for guard in guards):
+                projected, fraction = restored, 1.
+        return solution.step, projected, fraction
     bounded = bounded_shape_step(objective, poses, system, gradient, diagonal, damping)
     if bounded is None:
         return None
-    projected, fraction = backtrack(objective, poses, bounded, guards)
-    if fraction < .25:
-        restored = restore_shape_step(objective, poses, bounded)
+    locally_restored = False
+    if OPTIONS.local_conic_restoration:
+        from .local_restoration import backtrack_with_restoration
+        projected, fraction, locally_restored = backtrack_with_restoration(
+            objective, poses, bounded, guards)
+    else:
+        projected, fraction = backtrack(objective, poses, bounded, guards)
+    if fraction < .25 and not locally_restored:
+        from .proposal_curvature import CONTACT_CURVATURE, restore_curvature
+        restored = (restore_curvature(objective, poses, bounded, guards,
+                                     (system, diagonal, damping)) if CONTACT_CURVATURE else None)
+        if restored is None:
+            restored = restore_shape_step(objective, poses, bounded)
         if restored is not None and all(guard.accepts(restored) for guard in guards):
             projected, fraction = restored, 1.
     return bounded, projected, fraction
 
 
-def _shorten_conic(objective, poses, step, alpha, acc, temporal_j, gradient, cost):
+def _shorten_conic(objective, poses, step, alpha, acc, temporal_j, gradient, cost, *, metric=None):
     """Shorter fraction of a conic step whose objective decreases, or None.
 
     The conic fallback solves the damped model under every guard's
@@ -204,14 +233,18 @@ def _shorten_conic(objective, poses, step, alpha, acc, temporal_j, gradient, cos
     from .shape_step import restore_shape_step
     from .shortening import FractionRestorations
     from .runtime_options import OPTIONS
+    from .proposal_curvature import CONTACT_CURVATURE, restore_curvature
 
+    if not CONTACT_CURVATURE:
+        from .window_restoration_parallel import fraction_class
+        FractionRestorations = fraction_class(objective, FractionRestorations)
     coords = objective.coords
     guards = guards_of(objective)[1]
     step = np.asarray(step).reshape(objective.frames, objective.width)
     restorations = 0
     with FractionRestorations(restore_shape_step, objective, poses, step, alpha,
                               CONIC_FRACTIONS, MAX_CONIC_RESTORATIONS, guards,
-                              enabled=OPTIONS.parallel_shortening) as pending:
+                              enabled=OPTIONS.parallel_shortening and not CONTACT_CURVATURE) as pending:
         for fraction in CONIC_FRACTIONS:
             scaled = alpha * fraction
             candidate = objective.project(coords.integrate(poses, step, scaled))
@@ -223,7 +256,10 @@ def _shorten_conic(objective, poses, step, alpha, acc, temporal_j, gradient, cos
                 if restorations == MAX_CONIC_RESTORATIONS:
                     return None
                 restorations += 1
-                candidate = pending.restore(fraction)
+                candidate = (restore_curvature(objective, poses, step * scaled, guards, metric)
+                             if CONTACT_CURVATURE else None)
+                if candidate is None:
+                    candidate = pending.restore(fraction)
                 if candidate is None or not all(guard.accepts(candidate) for guard in guards):
                     continue
             actual = coords.difference(poses, candidate).ravel()
@@ -236,7 +272,16 @@ def _shorten_conic(objective, poses, step, alpha, acc, temporal_j, gradient, cos
 
 
 def _optimize(objective, poses, iterations, callback, label, converged_decrease):
+    if getattr(objective, '_soft_bulk', False):
+        from .soft_bulk import optimize_bulk
+        return optimize_bulk(objective, poses, iterations, callback, label, converged_decrease)
     from .runtime_options import OPTIONS
+    if OPTIONS.windowed_priority and getattr(objective, 'priority_clearance', None) is not None:
+        from .window_driver import optimize_windowed_priority
+        return optimize_windowed_priority(objective, poses, iterations, callback, label, converged_decrease)
+    if getattr(objective, 'priority_clearance', None) is not None:
+        from .prioritized_solver import optimize_priority
+        return optimize_priority(objective, poses, iterations, callback, label, converged_decrease)
     coords = objective.coords
     frames, width = objective.frames, objective.width
     # Source fitting stays byte-identical. This experiment starts only after
@@ -282,13 +327,25 @@ def _optimize(objective, poses, iterations, callback, label, converged_decrease)
         shape, _ = guards_of(objective)
         conic_possible = shape is not None and all(
             hasattr(g, 'constraints') for g in objective.candidate_guards)
+        model = None
+        if conic_possible and (OPTIONS.direct_acquisition_qp or OPTIONS.objective_soc
+                               or OPTIONS.frame_step_lengths):
+            from .qp_assembly import prepare_model
+            from .qp_guard_rows import UnsupportedRows
+            try:
+                model = prepare_model(objective, poses, system, gradient, diagonal)
+            except UnsupportedRows:
+                # Unknown external guard: preserve its original constraints.
+                # Priority mode never takes this fallback or drops a soft row.
+                pass
         # Every rejection below grows the damping the same way.
         dampings, value, factor = [], damping, growth
         for _ in range(MAX_REJECTIONS):
             dampings.append(value)
             value, factor = min(value * factor, MAX_DAMPING), factor * 2
+        kwargs = {} if model is None else {'model': model}
         attempts = Attempts(objective, poses, system, gradient, diagonal, held, radial, rhs,
-                            dampings, band_step, _conic_proposal)
+                            dampings, band_step, _conic_proposal, **kwargs)
         for attempt in range(MAX_REJECTIONS):
             if attempt == 1:
                 # The first attempt was rejected: compute the rest at once.
@@ -329,7 +386,8 @@ def _optimize(objective, poses, iterations, callback, label, converged_decrease)
                 decreased = bool(np.isfinite(trial[0].cost) and trial[0].cost < cost and ratio > 0)
             if conic and not decreased:
                 shortened = _shorten_conic(objective, poses, step, 1. if candidate is None else alpha,
-                                           acc, temporal_j, gradient, cost)
+                                           acc, temporal_j, gradient, cost,
+                                           metric=(system, diagonal, trial_damping))
                 if shortened is not None:
                     candidate, alpha, trial, ratio = shortened
                     decreased = True

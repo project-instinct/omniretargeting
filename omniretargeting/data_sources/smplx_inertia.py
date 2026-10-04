@@ -1,10 +1,8 @@
 """Expose an explicit SMPL-X geometric inertia approximation to source dynamics."""
 
 import numpy as np
-from scipy.spatial.transform import Rotation
 
-from ..centroidal_demand import estimate_centroidal_demand
-from ..mesh_inertia import segment_inertias
+from ..source_inertia import mesh_source_inertia
 
 
 def skin_face_regions(model, joint_count):
@@ -30,33 +28,13 @@ def source_inertia(
     not an anthropometric measurement. Callers must retain its assumptions and
     derivative disagreement when interpreting contact feasibility.
     """
-    properties = segment_inertias(
-        full_body["reference_vertices"], full_body["faces"], face_regions
-    )
-    ids = properties["regions"].astype(int)
-    reference_joints = np.asarray(full_body["reference_joint_positions"])[ids]
-    orientations = np.asarray(orientations)
-    rotation = Rotation.from_quat(
-        orientations[:, ids].reshape(-1, 4), scalar_first=True
-    ).as_matrix()
-    rotation = (
-        rotation.reshape(len(orientations), len(ids), 3, 3)
-        @ np.asarray(reference_rotation).T
-    )
-    centers = np.asarray(positions)[:, ids] + np.einsum(
-        "tbij,bj->tbi", rotation, properties["centers"] - reference_joints
-    )
-    demand = estimate_centroidal_demand(
-        centers,
-        rotation,
-        properties["masses"],
-        properties["inertias"],
+    result = mesh_source_inertia(
+        full_body,
+        positions,
+        orientations,
+        face_regions,
+        reference_rotation=reference_rotation,
         framerate=framerate,
     )
-    demand["inertia_source"] = "capped_smplx_segments_uniform_density"
-    return {
-        "centers": centers,
-        "rotations": rotation,
-        "properties": properties,
-        "demand": demand,
-    }
+    result["demand"]["inertia_source"] = "capped_smplx_segments_uniform_density"
+    return result

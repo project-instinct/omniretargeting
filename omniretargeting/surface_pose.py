@@ -291,12 +291,14 @@ def build_surface_pose_tasks(
         else None
     )
     if reason:
-        return None, {"status": "disabled", "reason": reason}
+        return None, {"status": "unresolved" if cfg["enabled"] else "disabled",
+                      "enabled": cfg["enabled"], "reason": reason}
     motion = surface_motion or SurfaceMotion(
         model, source, reference_qpos, cfg.get("correspondence"), mapping
     )
     if not motion.binding_valid.any():
-        return None, {"status": "disabled", "reason": "no_valid_correspondences"}
+        return None, {"status": "unresolved", "enabled": True,
+                      "reason": "no_valid_correspondences"}
     task = SurfacePoseTasks(
         motion, root_positions, reference_root, config=cfg, **kwargs
     )

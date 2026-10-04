@@ -1,10 +1,12 @@
 """Prepare one surface correspondence shared by all whole-body objectives."""
 
+import numpy as np
+
 from ..local_collision_repair import diagnostics_json
 from ..surface_motion import SurfaceMotion
 
 
-def _prepare_source_support(owner, source, positions, scene, config):
+def _prepare_source_support(owner, source, positions, scene, config, *, map_function=None):
     """Derive source net-wrench support evidence once, unless supplied.
 
     It tells contacts the source dynamics need (support) from ones that only
@@ -32,15 +34,48 @@ def _prepare_source_support(owner, source, positions, scene, config):
         scene_objects=getattr(owner, "_scene_objects", ()),
         scene_enclosed_free_space=config.get("scene_enclosed_free_space", False),
         table=getattr(owner, "last_source_contact_table", None),
+        inertia_model=getattr(owner, "_source_inertia_model", None),
+        map_function=map_function,
     )
     owner._source_support_evidence = evidence
     if table is not None:
         owner.last_source_contact_table = table
     owner.last_source_support_diagnostics = report
     print("source_support: " + diagnostics_json(
-        {k: report.get(k) for k in ("status", "reason", "explained_frames", "frames",
+        {k: report.get(k) for k in ("status", "reason", "inertia_source", "inertia_assumptions", "explained_frames", "frames",
                                     "support_region_frames", "moving_object_candidates_excluded", "fixed_object_frames",
-                                    "skin_sample_spacing_m", "support_patch_frames", "support_patch_demoted_candidates")}))
+                                    "skin_sample_spacing_m", "support_patch_frames", "support_patch_demoted_candidates",
+                                    "support_patch_restored_candidates", "support_demotion_window_frames")}))
+
+
+def _prepare_object_support(owner, scene, config, *, map_function=None):
+    """Ask each moving object, once, which skin contacts carry it.
+
+    Uses the same source contact table as the human evidence; the result only
+    promotes contacts to support in the role table (``object_support_evidence``).
+    """
+    from ..contact_phase import contact_phase_config
+    from ..object_support_evidence import build_object_support_evidence
+    from ..surface_contact import surface_contact_config
+
+    if getattr(owner, "_object_support_built", False):
+        return
+    owner._object_support_built = True
+    owner._object_support_evidence = None
+    objects = list(getattr(owner, "_scene_objects", None) or ())
+    if not objects or not contact_phase_config(config.get("contact_phase_priority"))["enabled"]:
+        return
+    evidence, report = build_object_support_evidence(
+        getattr(owner, "last_source_contact_table", None), scene, objects,
+        surface_contact_config(config.get("surface_contact")),
+        framerate=getattr(owner, "_source_framerate", 30.0),
+        scene_enclosed_free_space=config.get("scene_enclosed_free_space", False),
+        map_function=map_function,
+    )
+    owner._object_support_evidence = evidence
+    owner.last_object_support_diagnostics = report
+    print("object_support: " + diagnostics_json(
+        {k: report.get(k) for k in ("status", "reason", "support_region_frames")}))
 
 
 def prepare_surface_tasks(
@@ -109,7 +144,11 @@ def prepare_surface_tasks(
         )
     scene_built = False
     if apply_scene_contacts and not getattr(owner, "_surface_contacts_built", False):
-        _prepare_source_support(owner, source, positions, scene, config)
+        from ..support_parallel import SupportPool
+
+        with SupportPool() as pool:
+            _prepare_source_support(owner, source, positions, scene, config, map_function=pool.map)
+            _prepare_object_support(owner, scene, config, map_function=pool.map)
         owner.last_surface_contact_tasks, owner.last_surface_contact_diagnostics = (
             build_surface_contact_tasks(
                 owner.robot_model,
@@ -196,6 +235,7 @@ def prepare_surface_tasks(
     if apply_scene_contacts:
         from ..contact_phase import attach_contact_phase, contact_phase_config
         from ..contact_phase_observation import observe_effector_clearances
+        from ..object_support_evidence import combine_support_roles
 
         phase_cfg = contact_phase_config(config.get("contact_phase_priority"))
         if (
@@ -241,8 +281,12 @@ def prepare_surface_tasks(
             phase_cfg,
             model=owner.robot_model,
             source_clearances=getattr(owner, "_contact_phase_clearances", None),
-            support_evidence=getattr(owner, "_source_support_evidence", None),
+            support_evidence=combine_support_roles(
+                getattr(owner, "_source_support_evidence", None),
+                getattr(owner, "_object_support_evidence", None),
+            ),
             control_evidence=getattr(owner, "_source_control_evidence", None),
+            unresolved_support_frames=_unresolved_support_frames(owner, len(positions)),
         )
     retargeter.contact_phase = (
         getattr(owner, "last_contact_phase", None) if apply_scene_contacts else None
@@ -261,3 +305,16 @@ def prepare_surface_tasks(
     ):
         if task is not None and len(task.targets) != len(positions):
             raise ValueError("Surface tasks must follow the original motion timeline")
+
+
+def _unresolved_support_frames(owner, frames):
+    """Keep observed contacts protected where source mechanics is unknown."""
+    report = getattr(owner, "last_source_support_diagnostics", {})
+    if report.get("status") == "unresolved":
+        return np.ones(frames, bool)
+    evidence = getattr(owner, "_source_support_evidence", None)
+    if evidence is None:
+        return None
+    unresolved = np.zeros(frames, bool)
+    unresolved[evidence.diagnostics.get("unexplained_frames", [])] = True
+    return unresolved

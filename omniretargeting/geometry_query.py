@@ -1,6 +1,6 @@
 """Rigid collision-geometry queries, independent of the optimization model.
 
-Algorithm reference: UMR 8c4db7db (see docs/umr_scene_interaction.md).
+Algorithm reference: UMR (github.com/hanyang9/UMR) at commit 8c4db7db.
 Independently implemented; no UMR code or assets are distributed here.
 The query model has nq=nv=0. Robot geoms follow original FK through mocap
 bodies; scene bodies have no joints or mocap. Jacobians belong to the original

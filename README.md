@@ -300,7 +300,6 @@ model collision filters, and checks the paths between saved poses. Visual-only
 geoms are ignored. Set `retargeting.self_collision_enabled` to `false` to opt
 out; an old saved profile that explicitly sets it to `false` keeps that choice.
 The output diagnostics report self-collision separately from scene penetration.
-See [self-collision implementation and validation](docs/self_collision.md).
 
 Palm and sole tracking/contact offsets are inferred from the robot's mesh and
 collision geometry when omitted. Profiles only need explicit offsets when the
@@ -465,22 +464,13 @@ OmniRetargeting adapts the interaction mesh retargeting approach from the holoso
 
 ### Contact-priority hand/foot retargeting
 
-For whole-body scene interaction, raw SMPL-X sources also provide persistent
-skin samples. `retargeting.surface_contact.enabled` defaults to true and learns
-indexed human/robot reference-surface correspondence, following UMR's contact-map
-formulation. Active forearm, torso, pelvis and other surface contacts share the
-framewise solver, refinement and final validation; existing hand/foot contacts
-retain priority. Source motion, robot size and scene scale remain unchanged.
-See [whole-body surface contact](docs/whole_body_surface_contact.md) for configuration,
-exported `surface_contact_*` arrays, correspondence diagnostics and limitations.
-
-`retargeting.whole_body_correction.enabled` also defaults to true. The final
-coupled correction lets pelvis/waist/leg joints participate alongside hand/foot
-compensation, with a fixed floating base and fixed endpoint error budgets.
-Prescribed moving-object geometry contributes collision constraints at frames
-and between frames; open mesh components remain explicitly unknown. See
-[constrained whole-body correction](docs/constrained_whole_body_correction.md)
-for the UMR method mapping, configuration and validation coverage.
+Whole-body interaction is not limited to hands and feet. Surface correspondence,
+self-contact, surface posture, and coupled whole-body correction are enabled by
+the `retargeting.*` defaults. They preserve source motion and metric scale while
+letting the torso, pelvis, legs, and surface patches participate in contact and
+collision tasks. Current semantics and diagnostics are summarized in
+[retargeting invariants](docs/retargeting_invariants.md); module entry points
+are listed in the [code layout guide](docs/code_layout.md).
 
 Robot profiles can enable `retargeting.end_effector_priority`. For raw SMPL-X
 motions, the loader samples stable hand and foot surface vertices, detects

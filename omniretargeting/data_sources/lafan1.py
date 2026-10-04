@@ -9,7 +9,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 from omniretargeting.data_sources.base import DataSource, MotionData
+from omniretargeting.data_sources.lafan1_reference import lafan1_reference
 from omniretargeting.data_sources.registry import register_data_source
+from omniretargeting.data_sources.skeleton_inertia import skeleton_segment_model
+from omniretargeting.data_sources.skeleton_soles import skeleton_sole_markers
 from omniretargeting.utils import estimate_body_height
 
 
@@ -278,10 +281,14 @@ class Lafan1DataSource(DataSource):
         # Forward kinematics to global quats and positions (still in BVH coords, cm)
         global_quats, global_positions = _quat_fk(quats, positions, parents)
 
-        num_frames = global_positions.shape[0]
-
         # Apply coordinate transform and cm to m conversion
         transformed_positions = global_positions @ _ROTATION_MATRIX.T / 100.0
+        # Rotate world joint frames by the same rigid transform as positions.
+        # Positions alone cannot observe a terminal joint's axial/palm twist.
+        transformed_quats = _quat_mul(_ROTATION_QUAT, global_quats)
+        transformed_quats /= np.linalg.norm(
+            transformed_quats, axis=-1, keepdims=True
+        )
 
         # Root orientations are estimated from joint positions by the retargeting pipeline
 
@@ -311,6 +318,11 @@ class Lafan1DataSource(DataSource):
             )
 
         framerate = 1.0 / frametime if frametime > 0 else 30.0
+        markers = {} if foot_joint_names is None else skeleton_sole_markers(
+            transformed_positions, names, parents,
+            {"left_foot": foot_joint_names[0], "right_foot": foot_joint_names[1]},
+            source_height, framerate,
+        )
 
         self._motion_data = MotionData(
             positions=transformed_positions,
@@ -324,6 +336,21 @@ class Lafan1DataSource(DataSource):
                 "source_type": "lafan1",
                 "bone_names": list(names),
                 "bone_parents": parents.tolist(),
+                "joint_orientations": transformed_quats,
+                "source_inertia_model": self.metadata.get(
+                    "source_inertia_model",
+                    skeleton_segment_model(names, parents, bvh["offsets"] / 100.0),
+                ),
+                "end_effector_markers": self.metadata.get("end_effector_markers", markers),
+                "source_material_assumptions": self.metadata.get(
+                    "source_material_assumptions", {
+                        "geometry": "skeleton_sole_approximation",
+                        "ankle_height_per_source_height": 0.039,
+                        "subject_measurement": False,
+                        "whole_body_skin_available": False,
+                    },
+                ),
+                **lafan1_reference(names, parents, bvh["offsets"], bvh["quats"]),
             },
         )
         return self._motion_data

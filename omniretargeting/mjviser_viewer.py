@@ -27,6 +27,7 @@ from omniretargeting._viewer_motion import (
     _resolve_motion_file as _resolve_motion_file,
     _resolve_object_mesh as _resolve_object_mesh,
     _resolve_path as _resolve_path,
+    source_body_parents as source_body_parents,
 )
 from omniretargeting._viewer_scene import (
     _run_viewer as _run_viewer,
@@ -101,6 +102,14 @@ def run(args: argparse.Namespace) -> None:
             if source_type == "parc_ms":
                 source_parents = PARC_MS_BODY_PARENTS
                 source_label = "PARC-MS"
+            elif source_joints is not None and "source_joint_names" in payload:
+                named_parents = source_body_parents(payload["source_joint_names"])
+                if named_parents is not None:
+                    source_parents = named_parents
+                    source_label = source_type.upper() or "source"
+                elif source_joints.shape[1] == len(SMPLX_BODY_PARENTS):
+                    source_parents = SMPLX_BODY_PARENTS
+                    source_label = "SMPL-X"
             elif source_joints is not None and source_joints.shape[1] == len(
                 SMPLX_BODY_PARENTS
             ):

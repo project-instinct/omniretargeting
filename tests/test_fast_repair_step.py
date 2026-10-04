@@ -17,7 +17,7 @@ def _solve(jac, phi, *, cap=None, projection=None, keys=None, shift=0.):
                    "depths": {key: max(0., -min(p for k, p in zip(keys, phi, strict=True) if k == key))
                               for key in keys}}
 
-    def constraints(_):
+    def constraints(_, *, projection=None):
         result = LinearBounds(width)
         result.add(sparse.eye(width), -.1, .1)
         if cap is not None:

@@ -9,7 +9,7 @@ import numpy as np
 import trimesh
 from scipy.spatial.transform import Rotation
 
-from omniretargeting._viewer_motion import SMPLX_BODY_PARENTS
+from omniretargeting._viewer_motion import SMPLX_BODY_PARENTS, source_body_parents
 
 
 def add_mesh(spec, body, name, mesh, opacity):
@@ -29,8 +29,8 @@ def add_mesh(spec, body, name, mesh, opacity):
     )
 
 
-def draw_source(scene, joints):
-    for child, parent in enumerate(SMPLX_BODY_PARENTS):
+def draw_source(scene, joints, parents=SMPLX_BODY_PARENTS):
+    for child, parent in enumerate(parents):
         if parent < 0 or child >= len(joints) or scene.ngeom >= scene.maxgeom:
             continue
         geom = scene.geoms[scene.ngeom]
@@ -56,6 +56,14 @@ def render(args):
     inputs = np.load(args.prepared, allow_pickle=True).item()
     payload = np.load(args.motion)
     poses, source = payload["qpos"], payload["source_joints_w"]
+    named_parents = (
+        source_body_parents(payload["source_joint_names"])
+        if "source_joint_names" in payload
+        else None
+    )
+    if named_parents is None:
+        named_parents = SMPLX_BODY_PARENTS[: source.shape[1]]
+    source_parents = named_parents
     objects = np.load(args.prepared.parent / "objects.npy", allow_pickle=True).tolist()
     spec = mujoco.MjSpec.from_file(inputs["model_path"])
     mesh = trimesh.load_mesh(args.prepared.parent / "static_scene.obj", process=False)
@@ -105,7 +113,7 @@ def render(args):
             for azimuth in (-50, 40):
                 camera.azimuth = azimuth
                 renderer.update_scene(data, camera=camera)
-                draw_source(renderer.scene, source[frame])
+                draw_source(renderer.scene, source[frame], source_parents)
                 pixels = renderer.render().copy()
                 if writer is None or frame in (0, len(poses) // 2, len(poses) - 1):
                     path = args.output / f"frame_{frame:04d}_{azimuth}.png"

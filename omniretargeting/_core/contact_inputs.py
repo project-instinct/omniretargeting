@@ -135,7 +135,9 @@ def unified_contact_inputs(owner, source, positions, scene, objects, markers, fp
         known_clear = np.isfinite(clearances.get(name, np.full(len(positions), np.nan)))
         known_clear &= clearances.get(name, np.zeros(len(positions))) > cfg["distance"]
         world = ~known_clear
-        world_tracking = source_name in set(full.get("world_target_joints", ()))
+        world_tracking = source_name in set(full.get("world_target_joints", ())) or bool(
+            supplied.get("world_target", False)
+        )
         if world_tracking:
             world[:] = True
         if "preserve_world_target" in spec:
