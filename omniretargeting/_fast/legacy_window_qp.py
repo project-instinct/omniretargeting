@@ -5,6 +5,7 @@ of the original trajectory. No objective, guard, reference or budget is rebuilt.
 """
 
 from contextlib import contextmanager
+from collections import OrderedDict
 from dataclasses import replace
 import time
 
@@ -48,6 +49,7 @@ class WindowGuard:
     def __init__(self, window, guard):
         self.window, self.guard = window, guard
         self.rejections = 0
+        self._bounds_cache = OrderedDict()
 
     def __getattr__(self, name):
         return getattr(self.guard, name)
@@ -62,7 +64,20 @@ class WindowGuard:
         return bad[self.window.span]
 
     def qp_bounds(self, poses, *, frames=None):
-        return self.guard.qp_bounds(self.window.embed(poses), frames=self.window.variable_frames)
+        if not getattr(self.window, '_cache_guard_bounds', False):
+            return self.guard.qp_bounds(self.window.embed(poses), frames=self.window.variable_frames)
+        poses = np.asarray(poses)
+        key = poses.shape, poses.dtype.str, poses.tobytes()
+        if key not in self._bounds_cache:
+            self._bounds_cache[key] = self.guard.qp_bounds(
+                self.window.embed(poses), frames=self.window.variable_frames)
+        self._bounds_cache.move_to_end(key)
+        while len(self._bounds_cache) > 2:
+            self._bounds_cache.popitem(last=False)
+        # A damping retry has the same pose and frozen guards. Return owned
+        # sparse/array buffers so canonicalization cannot mutate this cache.
+        return tuple([tuple(value.copy() for value in row) for row in family]
+                     for family in self._bounds_cache[key])
 
     def constraints(self, poses, flat, box=None):
         # Keep complete vector cones, including stencils crossing either end.
@@ -88,6 +103,9 @@ class WindowObjective:
     """Local-variable facade consumed by solver._optimize unchanged."""
     def __init__(self, objective, poses, frames):
         self.global_objective = objective
+        budget = getattr(objective, '_window_cpu_budget', None)
+        if budget is not None:
+            self._window_cpu_budget = budget
         permits = getattr(objective, '_window_restoration_permits', None)
         if permits is not None:
             self._window_restoration_permits = permits
@@ -109,6 +127,12 @@ class WindowObjective:
         self.source_shape = (None if objective.source_shape is None else
                              WindowGuard(self, objective.source_shape))
         self.candidate_guards = [WindowGuard(self, guard) for guard in objective.candidate_guards]
+        parent_trace = getattr(objective, "performance_trace", None)
+        if parent_trace is not None and parent_trace.enabled:
+            from .performance_trace import PerformanceTrace
+            self.performance_trace = PerformanceTrace(
+                True, stage=parent_trace.current_stage,
+                frames=(self.span.start, self.span.stop))
 
     def _slice_bound(self, value):
         value = np.asarray(value)
@@ -183,6 +207,9 @@ def solve_local(objective, poses, frames, iterations, convergence):
     from .solver import _optimize
     started = time.monotonic()
     local = WindowObjective(objective, poses, frames)
+    # Bounds, references and contact groups stay frozen during this solve.
+    # Other users of the facade can still edit a guard between evaluations.
+    local._cache_guard_bounds = True
     from .window_qoco import RESTORATION_DIAGNOSTICS
     RESTORATION_DIAGNOSTICS.clear()
     progress = dict(converged=False)

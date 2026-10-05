@@ -103,6 +103,13 @@ def serial_scene(scene):
         backend = cache.get((id(vertices), id(faces)))
         if backend is None:
             raise RuntimeError("Unprepared winding geometry in a forked query")
+        component = scope.get("component")
+        if component is not None:
+            v, f, bounds, _ = scene._component_query_data[component]
+            if vertices is v and faces is f:
+                original_points = scope["points"]
+                inside = np.all((original_points >= bounds[0]) & (original_points <= bounds[1]), axis=1)
+                return scope["winding"][inside]
         hints = scope.get("hints")
         if hints is None or len(scene.components) != 1 or not scene.components[0][2]:
             return backend(points)
@@ -140,6 +147,15 @@ def serial_scene(scene):
         finally:
             scope.clear()
     result.query_with_sign_hints = query_with_sign_hints
+    def query_with_winding(points, component, values):
+        # Values are the original native fast-winding answers, not inferred
+        # signs. The original query still resolves ambiguity with exact winding.
+        scope.update(points=points, component=component, winding=values)
+        try:
+            return result.query(points, component_ids=[component])
+        finally:
+            scope.clear()
+    result.query_with_winding = query_with_winding
     return result
 
 

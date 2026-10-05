@@ -37,6 +37,11 @@ def prepare_window_evaluation(objective):
             bulk_library()
         except NativeUnavailable:
             pass
+        from .window_query_native import prepare
+        try:
+            prepare(objective)
+        except NativeUnavailable:
+            pass
     if objective.self_collision is not None and objective.evaluation_backend != 'legacy':
         try:
             objective._window_collision_template = acquisition_self_collision(objective.self_collision, workers=1, window=True)
@@ -126,7 +131,6 @@ def _views(objective, frames):
     local._deepest_samples = geometry.deepest
     if collision is not None:
         local._self_batch = collision
-        collision.workers = 1
     span = slice(context.start, context.stop)
     for name in ('cfg', 'correction_temporal_scale', 'angular_cols'):
         if hasattr(objective, name):
@@ -157,13 +161,46 @@ def evaluate_window(objective, poses, with_jacobian, frames):
     if len(poses) != objective.frames:
         raise ValueError('window evaluation requires the current full poses')
     local, temporal, context = _views(objective, frames)
-    kin = objective.window_kinematics(poses, context, with_jacobian)
+    local._window_cpu_budget = getattr(objective, '_window_cpu_budget', None)
+    # FrameKinematicsCache caches individual frames, but assembles new arrays
+    # on every call. Keep the last exact window assemblies as well: collision
+    # witnesses are keyed by their immutable geom-array identities. Geometry
+    # does not depend on whether body Jacobians were requested.
+    assemblies = getattr(local, '_window_assemblies', None)
+    if assemblies is None:
+        local._window_assemblies = assemblies = OrderedDict()
+    context_poses = np.asarray(poses)[context.start:context.stop]
+    pose_key = (objective.coords.cols.tobytes(), context_poses.shape,
+                context_poses.dtype.str, context_poses.tobytes())
+    previous = assemblies.get(pose_key)
+    if previous is not None and (not with_jacobian or previous.with_jacobian):
+        kin = previous
+    else:
+        kin = objective.window_kinematics(poses, context, with_jacobian)
+        if previous is not None:
+            kin._window_slices = getattr(previous, '_window_slices', {}).copy()
+            for name in ('xpos', 'xmat', 'geom_xpos', 'geom_xmat'):
+                old, new = getattr(previous, name), getattr(kin, name)
+                if old.tobytes() == new.tobytes():
+                    setattr(kin, name, old)
+        assemblies[pose_key] = kin
+    assemblies.move_to_end(pose_key)
+    while len(assemblies) > 4:
+        assemblies.popitem(last=False)
     relative = slice(frames.start - context.start, frames.stop - context.start)
     local.kin = copy.copy(kin)
     local.kin.cache = OrderedDict()
     names = ['xpos', 'xmat', 'geom_xpos', 'geom_xmat'] + (['jacp', 'jacr'] if with_jacobian else [])
+    # Retain the slice objects too, including across value -> Jacobian upgrades.
+    slices = getattr(kin, '_window_slices', None)
+    if slices is None:
+        kin._window_slices = slices = {}
     for name in names:
-        setattr(local.kin, name, getattr(kin, name)[relative])
+        array = getattr(kin, name)
+        cached = slices.get(name)
+        if cached is None or cached[0] is not array:
+            slices[name] = array, array[relative]
+        setattr(local.kin, name, slices[name][1])
     part = np.asarray(poses)[frames.start:frames.stop]
     key = (local.kin.columns.tobytes(), part.shape, part.dtype.str, part.tobytes())
     local.kin.cache[key] = {name: getattr(local.kin, name) for name in names}
@@ -196,6 +233,11 @@ def evaluate_window(objective, poses, with_jacobian, frames):
                 local._self_batch = acquisition_self_collision(local.self_collision, workers=1, window=True)
             except NativeUnavailable:
                 local._self_batch = None
+    collision = getattr(local, '_self_batch', None)
+    if collision is not None:
+        from .window_cpu_budget import native_workers
+        collision.cpu_budget = getattr(objective, '_window_cpu_budget', None)
+        collision.workers = native_workers() if collision.cpu_budget is not None else 1
     service = getattr(objective, '_window_eval_client', None)
     weight = objective.envelope_weight[frames.start:frames.stop]
     measured = (local.evaluate_frames(part, with_jacobian, weight) if service is None else

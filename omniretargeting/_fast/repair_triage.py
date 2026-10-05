@@ -21,6 +21,9 @@ def progress_bound(limits, poses, geometry, measurement, depth):
     Include the QP's box tolerance and outward arithmetic padding. Non-selector
     projections, incomplete evidence and nonfinite data cannot certify a skip.
     """
+    if OPTIONS.abl_repair_ratchet:
+        # The dual certificate below assumes the legacy per-key feasible set.
+        return None
     from .mesh_repair import _joint_projection
     projection = restrict(_joint_projection(limits, geometry.model, measurement), limits.frame_mask)
     if not projection.shape[1]:

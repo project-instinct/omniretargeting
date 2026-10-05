@@ -52,7 +52,7 @@ class TrumansDataSource(DataSource):
                    for obj in objects]
         return indices[clip], scene, objects
 
-    def _parameters(self, indices):
+    def _parameters(self, indices, *, model=None):
         """Recorded parameters with the world rotation applied to the root.
 
         SMPL-X rotates the body about its rest pelvis ``j0`` before adding the
@@ -63,7 +63,8 @@ class TrumansDataSource(DataSource):
 
         arrays = {name: np.asarray(np.load(self.data_root / f"{name}.npy", mmap_mode="r")[indices], dtype=np.float64)
                   for name in ("human_orient", "human_pose", "human_transl", "left_hand_pose", "right_hand_pose")}
-        model = smplx.create(str(self.model_directory), "smplx", gender="male", use_pca=False)
+        if model is None:
+            model = smplx.create(str(self.model_directory), "smplx", gender="male", use_pca=False)
         with torch.no_grad():
             j0 = model(betas=torch.zeros((1, 10))).joints[0, 0].cpu().numpy().astype(np.float64)
         world = Rotation.from_matrix(WORLD_ROTATION)
@@ -81,11 +82,37 @@ class TrumansDataSource(DataSource):
             return self._motion_data
         from .smplx import SmplxDataSource
 
-        indices, scene, objects = self._clip()
-        adapter = SmplxDataSource(self.data_root / "seg_name.npy", model_directory=self.model_directory,
-                                  gender="male", use_smplx_base_pose=True, frame_id_semantics="provenance")
-        positions, orientations, root_orient, _, _, body = adapter._load_raw_npz(
-            self._parameters(indices), self.framerate)
+        from .._core.preprocessing_parallel import can_parallelize
+        from concurrent.futures import ThreadPoolExecutor
+        pool = None
+        pending = None
+        if can_parallelize():
+            rows = np.flatnonzero(np.load(self.data_root / 'seg_name.npy') == self.segment)
+            indices = rows[slice(self.frame_start,self.frame_stop)]
+            if len(indices):
+                pool = ThreadPoolExecutor(max_workers=1)
+                pending = pool.submit(self._clip)
+        if pending is None:
+            indices, scene, objects = self._clip()
+        try:
+            adapter = SmplxDataSource(self.data_root / "seg_name.npy", model_directory=self.model_directory,
+                                      gender="male", use_smplx_base_pose=True, frame_id_semantics="provenance")
+            model = None
+            if pending is not None:
+                import smplx
+                model = smplx.create(str(self.model_directory),'smplx',gender='male',use_pca=False)
+            parameters = self._parameters(indices,model=model)
+            kwargs = {} if model is None else {'body_model':model}
+            positions, orientations, root_orient, _, _, body = adapter._load_raw_npz(
+                parameters,self.framerate,**kwargs)
+            if pending is not None:
+                indices, scene, objects = pending.result()
+        except BaseException:
+            if pending is not None:
+                pending.result()  # Scene validation retains precedence.
+            raise
+        finally:
+            if pool is not None:pool.shutdown(wait=True)
         body.update(adapter._foot_sole_metadata(orientations))
         recorded = np.asarray(np.load(self.data_root / "human_joints.npy", mmap_mode="r")[indices, :22],
                               dtype=np.float64) @ WORLD_ROTATION.T

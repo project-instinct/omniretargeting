@@ -84,7 +84,9 @@ def evaluate(prepared, motion, choices, *, start=0):
                 if not _is_surface_only_contact_mode(task.contact_modes[f]):
                     values[name]["sticking"].append(np.linalg.norm(delta))
         surface = inputs["surface"]
-        for k in np.flatnonzero(surface["surface_contact_mask"][f]):
+        # A clip without surface contacts exports an empty plan.
+        for k in (np.flatnonzero(surface["surface_contact_mask"][f])
+                  if surface_points.shape[1] else ()):
             gid = int(surface["surface_contact_robot_geoms"][k])
             point = (
                 data.geom_xpos[gid]

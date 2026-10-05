@@ -233,6 +233,41 @@ format such as BVH, add one adapter name, for example
 `--source-type lafan1`; source JSON remains available only for real per-source
 overrides.
 
+### Batch scheduling
+
+Use `scripts/batch_retarget.py` to run independent clips concurrently:
+
+```json
+[
+  {"name": "clip_a", "args": ["--source-motion", "/path/to/a.pkl", "--output", "/path/to/a.npz"], "memory_gb": 9},
+  {"name": "clip_b", "command": ["/path/to/command", "--flag"], "memory_gb": 4, "env": {"MUJOCO_GL": "egl"}}
+]
+```
+
+```bash
+.venv/bin/python scripts/batch_retarget.py clips.json \
+  --log-dir runs/batch-logs --max-jobs 4 --cpus-per-job 6
+```
+
+Each job is launched as `.venv/bin/python -m omniretargeting.main` with its
+`args` (or with the exact `command` list), and receives
+`OPENBLAS_NUM_THREADS=1`, `OMP_NUM_THREADS=1`, and
+`OMNIRETARGETING_CPUS=<--cpus-per-job>`. The CPU value only shrinks geometry
+and evaluation worker pools; scheduling changes job start times, not solver
+arguments or results. On the 24-core machine, 3–4 concurrent jobs with 6 CPUs
+per job are the recommended starting point.
+
+Before starting a job, the runner keeps both the sum of running `memory_gb`
+reservations at or below `--memory-budget-gb` (default 46 GiB) and
+`/proc/meminfo` MemAvailable, after those reservations, at or above
+`--reserve-gb` (default 10 GiB). Jobs missing `memory_gb` use
+`--default-memory-gb` (default 10 GiB). Unless `--no-systemd` is set, each job
+is placed in a user systemd scope with `MemoryMax=1.5×memory_gb` and
+`MemorySwapMax=0`. Logs and `/usr/bin/time -v` peak RSS are written under
+`--log-dir`; the final summary records wall time, queue time, exit codes,
+makespan, and failed jobs without retrying them. Use `--largest-first` when
+large clips should claim memory before short jobs.
+
 Profile fields can include:
 - `joint_mapping`
 - `urdf_path`
@@ -493,6 +528,100 @@ declared priority up to the configured numerical tolerances. The generated
 `contact_confidence`, `contact_targets_w`, and `end_effector_reference_w` for
 downstream robot policy training or evaluation.
 
+### Fast solver performance trace
+
+Set `OMNIRETARGETING_FAST_ENABLE=performance_trace` with `--solver fast` to add
+a `performance` section to the saved diagnostics. It contains one exclusive
+timing row for each of `source_pose`, `grid_setup`, `contact_acquisition`,
+`reweight`, `free_bodies`, `original_mesh_repair`, and `final_audit`, followed
+by counters for banded solves, constraint proposals, recoveries, objective and
+Jacobian evaluations, guard checks/rejections, accepted step sizes, failed
+candidate time, and the binding frame/contact/joint evidence. Tracing is
+diagnostic only and does not alter the accepted trajectory or thresholds.
+
+Proposal phase timings are mutually exclusive: `constraint_row_construction`
+(rows and expressions), `canonicalization`, `solver_setup`, `numerical_solve`,
+`backtracking`, and `restoration`. Nested phase time is subtracted from its
+parent, so restoration excludes its construction and numerical solves. The
+legacy `constraint_proposals` and `recoveries` timers are inclusive summaries;
+`counter_semantics` marks them as non-additive with the phase timers.
+`objective_jacobian_evaluations` is a subset of `objective_evaluations`: a
+Jacobian evaluation contributes the **same call and seconds to both**. Never
+sum those two counters.
+
+Each outer iteration has an `iteration_performance` record, also retained in
+`performance.iterations` and phase/window reports. It records all attempted
+`banded_feasible_alpha` values (`null` for an unsolved direction), the actual
+`accepted_step_backend` (`null` for a rejected iteration), fallback reasons,
+actual proposal/restoration call counts by function, and multiple binding rows.
+The existing `step_backend` history field is preserved; the diagnostic field
+identifies the accepted attempt even after a rejected conic fallback. Binding
+diagnostics inspect later guards without re-running their acceptance predicates.
+Tracing disables speculative attempt forks and parallel shortening to count the
+calls actually consumed by the solver; execution without tracing is unchanged.
+
+### Original geometry on open scans
+
+A scan made only of open sheets has no signed side, so its shell samples are
+unknown. Original-mesh repair then queries the actual triangles with each
+collision geom (capsule, sphere, solid cylinder): crossing a sheet is
+penetration with an exact exit, a geom wholly behind a sheet is not detected.
+Other components or geom types, tied exits and uncertified witnesses keep the
+stage `unknown_query`. The repair report lists `query_coverage` per category
+and `query_failure_examples` with frame, geom, body and backend.
+`scripts/review_scene_metrics.py` audits such scenes with the same exact query.
+
+### Banded temporal direction (opt-in)
+
+`OMNIRETARGETING_FAST_ENABLE=banded_temporal_direction` tries a cheaper step
+before the full conic fallback: the same damped LM model, trust and joint
+boxes and fixed root, constrained by the frozen mechanical rows (URDF joint
+velocity plus the active contact/layout/root rows), solved by the banded
+primal-dual KKT of `_fast/constrained_ip.py`. Every candidate guard and the
+descent test still accept the step; any failure runs the unchanged conic
+fallback. `banded_guard_direction` solves the same banded problem with the
+frozen rows of every guard. The old all-order reference-derivative rows are
+available only through the explicit `reference_derivative_budget` regression
+switch.
+
+### Repair working set (default) and whole-trajectory QOCO (opt-in)
+
+Original-mesh repair solves each QP and restoration by exact constraint
+generation (`_fast/working_set.py`, default since 2026-10-05;
+`OMNIRETARGETING_FAST_DISABLE=repair_working_set` restores the complete solves).
+These programs carry 10^5 rows and up to 4·10^4 contact cones, of which under one
+percent bind. Each solve starts from the rows and cones near their bound at the
+zero step (restorations also drop constraints that cannot reach their bound
+inside the trust ball), adds every omitted constraint whose slack at the solved
+point falls below 1e-6, and stops when none does: that point is the optimum of
+the complete strictly convex program. A certified infeasible working set proves
+the complete program infeasible; every other outcome solves the complete
+program as before. Acceptance, guards and original-geometry checks are
+unchanged; only interior-point roundoff differs, which can move a
+path-sensitive clip. `OMNIRETARGETING_WORKING_SET_STATS=1` prints outcome counts.
+
+`OMNIRETARGETING_FAST_ENABLE=whole_qoco_proposals` gives whole-trajectory
+bounded proposals the window path's QOCO solve (1e-4 tolerances,
+`_fast/window_qoco.py`), falling back to Clarabel on any other status. It
+changes the proposal arithmetic and therefore the path.
+
+Other default speed switches (each can be turned off with
+`OMNIRETARGETING_FAST_DISABLE=<name>`): `whole_canonical` assembles
+whole-trajectory proposals and restorations for clips under 600 frames
+directly in Clarabel standard form instead of through CVXPY (bit-identical
+final poses on nine clips); `repair_geometry_reduction` skips exact original
+mesh queries only where conservative distance bounds prove the result cannot
+reach any consumer (bit-identical); `stationary_window` ends a pass of short
+unguarded steps once the three-step cost window stops decreasing, as guarded
+passes already did. The last one removes the idle tail of `free_bodies`
+(relative decreases of 1e-6 to 1e-10 for up to 15 iterations) and changes the
+path slightly: on ten validation clips every penetration change stayed below
+1 mm, in both directions. `repair_main_cache` caches repair limit/contact rows
+and witnesses per pose and group; window acquisition borrows idle cores for the
+native self-collision and deepest-point queries of busy windows; preprocessing
+runs support evidence in parallel and computes the source pose while the scene
+loads. All three keep final poses bit-identical.
+
 Fixed per-frame joint velocity, acceleration, and jerk caps have been removed
 so deliberate fast source motion can pass through. Neither the framewise
 optimization nor its output applies these caps; old configuration keys cannot
@@ -501,12 +630,17 @@ Mechanical joint ranges, scene/contact constraints, and the per-iteration
 optimization trust region remain active. Source-relative base-motion bounds
 and soft smoothing are configured separately.
 
-Whole-trajectory refinement in the main pipeline uses the same immutable
-framewise reference and budgets as final acceptance. Its CLARABEL subproblem
-bounds cumulative joint corrections, added correction velocity/acceleration,
-end-effector displacement, contact residuals, and reliable scene penetration.
-Each retained update also passes real FK and dense/interframe geometry checks.
-These bounds constrain **added corrections**, not the speed of the source motion.
+The fast backend uses the same immutable framewise reference for final
+continuity acceptance: source-relative high-frequency chatter plus URDF velocity
+limits, rather than a reference acceleration/jerk cap. Contact acquisition does
+not roll back an otherwise useful sweep for a window-assembly chatter flag;
+the final audit still reports and gates chatter. Local repair still has a
+small per-step joint locality box and protects supported endpoints against
+world slip. Whole-trajectory refinement bounds cumulative correction locality,
+end-effector displacement, contact residuals, and reliable scene penetration;
+each retained update also passes real FK and dense/interframe geometry checks.
+These bounds constrain **locality and contact regression**, not deliberate
+source speed.
 `track_swing: false` disables only free-effector position rows; contact, arm
 posture, and orientation rows remain active. Optional smoothing that violates
 these budgets leaves the validated refinement intact. Legacy ground-lock/XYZ

@@ -68,13 +68,15 @@ def test_runtime_switch_preserves_reference(monkeypatch):
     assert restorations_type() is DeferredFractionRestorations
 
 
-def test_complete_lm_history_with_consumed_restorations(monkeypatch):
+def test_complete_lm_history_survives_relaxed_layout_without_restorations(monkeypatch):
     from dataclasses import replace
-    from omniretargeting._fast import runtime_options, shortening
+    from omniretargeting._fast import repair_limits, runtime_options, shortening
     from tests.test_fast_proposals import _solve
 
     monkeypatch.setattr(runtime_options, 'OPTIONS',
-                        replace(runtime_options.OPTIONS, parallel_shortening=True))
+                        replace(runtime_options.OPTIONS, parallel_shortening=True,
+                                reference_derivative_budget=True))
+    monkeypatch.setattr(repair_limits, 'OPTIONS', runtime_options.OPTIONS)
     reference = _solve(monkeypatch, False)
     calls = []
     original = DeferredFractionRestorations.restore
@@ -84,7 +86,7 @@ def test_complete_lm_history_with_consumed_restorations(monkeypatch):
     monkeypatch.setattr(DeferredFractionRestorations, 'restore', counted)
     monkeypatch.setattr(shortening, 'FractionRestorations', DeferredFractionRestorations)
     fast = _solve(monkeypatch, False)
-    assert calls, 'must consume restored fractions'
+    assert calls == []
     assert fast[0].tobytes() == reference[0].tobytes()
     assert fast[1] == reference[1]
     assert fast[2] == reference[2]

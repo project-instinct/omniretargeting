@@ -1,4 +1,4 @@
-"""The opt-in fast experiment bounds corrections; defaults keep legacy semantics."""
+"""Compare explicit legacy derivative rows with production chatter acceptance."""
 from types import SimpleNamespace
 
 import pytest
@@ -124,7 +124,7 @@ def test_fixed_reference_is_not_aliased_and_rotation_reweight_is_separate():
     relative = np.zeros((len(candidate), 3)); relative[12, 2] = .05
     candidate[:, 3:7] = (Rotation.from_rotvec(relative) * rotations).as_quat(scalar_first=True)
     report, chatter, _ = verify_budgets(objective.model, coords, original, candidate)
-    assert chatter[12] and report['root_rotation_order_3']['added_chatter_violations']
+    assert chatter[12] and report['root_rotation_order_3']['legacy_derivative_budget_violations']
     weighted = reweight_temporal_signals(objective, original, candidate, 10.)
     assert weighted['root_rotation_reweighted']
     assert not weighted['joint_columns'] and not weighted['root_translation_frames']

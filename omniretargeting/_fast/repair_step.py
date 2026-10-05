@@ -21,6 +21,9 @@ def solve_step(limits, poses, geometry, measurement, baseline, projection, *,
     constraints = limits.constraints(poses, projection=projection)
     collision, phi = geometry.linear_rows(measurement)
     budgets = np.array([baseline["depths"].get(key, 0.) for key, _ in measurement["rows"]])
+    if OPTIONS.abl_repair_ratchet:
+        from .repair_ablation import collision_budgets
+        budgets = collision_budgets(limits.objective, measurement, baseline)
     # Keep the nonlinear guard's tiny tolerance in reserve. Spending it in
     # the linear subproblem leaves no room for curvature and roundoff.
     # Accepted roundoff on a different fixed chain must leave zero feasible.
@@ -123,8 +126,18 @@ def solve_step(limits, poses, geometry, measurement, baseline, projection, *,
                                   dims=SimpleNamespace(zero=0, nonneg=nonneg, soc=soc_sizes)))
         if x is not None:
             return (projection @ (x[:joint_variables] * scale[:joint_variables])).reshape(limits.frames, limits.width), "QOCO_SOLVED"
-    solution = clarabel.DefaultSolver(quadratic, gradient * scale, matrix, rhs, cones, settings()).solve()
+    solution = None
+    if OPTIONS.repair_working_set:
+        # Same optimum on the few rows that can bind (``working_set``).
+        from .working_set import solve as solve_working_set
+        solution = solve_working_set(quadratic, gradient * scale, matrix, rhs, cones, settings)
+    if solution is None and OPTIONS.gpu_conic:
+        from .gpu_conic import dimensions, solve as solve_gpu
+        solution = solve_gpu(quadratic, gradient * scale, matrix, rhs,
+                             dimensions(cones), context='repair_full')
+    if solution is None:
+        solution = clarabel.DefaultSolver(quadratic, gradient * scale, matrix, rhs, cones, settings()).solve()
     status = str(solution.status)
-    if status not in accepted or not np.isfinite(solution.x).all():
+    if status not in accepted or solution.x is None or not np.isfinite(solution.x).all():
         return None, status
     return (projection @ (np.asarray(solution.x[:joint_variables]) * scale[:joint_variables])).reshape(limits.frames, limits.width), status

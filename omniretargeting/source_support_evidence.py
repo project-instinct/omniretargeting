@@ -21,12 +21,14 @@ or one riding a moving support, is being controlled; those contacts keep
 their object-control or following roles.
 """
 
+from dataclasses import replace
+
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from .contact_mechanics import explain_contacts
 from .contact_support import SourceSupportEvidence
-from .source_contacts import build_source_contacts
+from .source_contacts import SourceContactTable, build_source_contacts
 from .support_patches import source_skin_spacing
 from .support_sensitivity import combine_support_scenarios
 from .support_parallel import SupportPool
@@ -270,9 +272,13 @@ def _explain_and_combine(candidate_sets, regions, demand, skin_spacing=0.0, map_
     results = list(map_function(_explain, tasks))
     scenarios = [SourceSupportEvidence(results[s * frames:(s + 1) * frames], regions, candidates=sets)
                  for s, sets in enumerate(candidate_sets)]
+    from ._core.preprocess_cache import CertificateMap
+    from .support_sensitivity import _certify
+
+    certificates = CertificateMap(map_function, _certify)
     return combine_support_scenarios(
         scenarios, demand["wrench"], origin=demand["origin"],
-        uncertainty=demand["derivative_disagreement"], map_function=map_function,
+        uncertainty=demand["derivative_disagreement"], map_function=certificates,
         skin_spacing=skin_spacing,
         min_demotion_frames=int(demand.get("derivative_window") or 0))
 
@@ -346,15 +352,25 @@ def build_source_support_evidence(
     spacing = source_skin_spacing(table.points, table.valid)
     first_object = 1 if scene_mesh is not None and len(scene_mesh.faces) else 0
     candidate_sets, regions, excluded = [], {}, 0
+    geometric_candidates = None
     for friction in FRICTION_SCENARIOS:
-        per_frame, names_map = table.candidates(
-            friction=friction,
-            reconstruction_bound_m=config["distance"],
-            normal_speed_m_s=config["normal_speed"],
-            touch_distance_m=config["touch_distance"],
-            normal_opposition=config["normal_opposition"],
-            sticking_speed_m_s=config["sticking_speed"],
-        )
+        if geometric_candidates is None or type(table) is not SourceContactTable:
+            per_frame, names_map = table.candidates(
+                friction=friction,
+                reconstruction_bound_m=config["distance"],
+                normal_speed_m_s=config["normal_speed"],
+                touch_distance_m=config["touch_distance"],
+                normal_opposition=config["normal_opposition"],
+                sticking_speed_m_s=config["sticking_speed"],
+            )
+            geometric_candidates = per_frame
+        else:
+            if not np.isfinite(friction) or friction < 0:
+                raise ValueError("Mechanical candidate assumptions must be finite and nonnegative")
+            # Friction changes wrench rays, never the geometric observations
+            # or slip grouping. Each scenario retains its own ray cache.
+            per_frame = tuple(tuple(replace(c, friction=friction) for c in row)
+                              for row in geometric_candidates)
         admissible = []
         for frame, candidates in enumerate(per_frame):
             kept = []

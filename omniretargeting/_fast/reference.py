@@ -69,11 +69,12 @@ def register_height(objective, poses):
 class ReferenceShape:
     """Fixed-reference posture preference on normalized landmark relations.
 
-    Relation components clear in the reference may not flip (the layout,
-    ``pose_relations``); no angle limits how far the whole body or one landmark
-    changes. Relation angles to the fixed reference and to the immutable
-    source, and the per-bone source directions of the seed, are reported so a
-    distorted initialization or result is judged against the original motion.
+    Source-clear layout may cross zero briefly, but a sustained clear opposite
+    side is collapse (``pose_relations``); no angle limits how far the whole
+    body or one landmark changes. Relation angles to the fixed reference and to
+    the immutable source, and the per-bone source directions of the seed, are
+    reported so a distorted initialization or result is judged against the
+    original motion.
     """
 
     def __init__(self, objective, seed):
@@ -158,7 +159,7 @@ class ReferenceShape:
         """Root translation balls and linearized layout rows for a conic step.
 
         ``box`` bounds the step per coordinate; layout components it cannot
-        flip are omitted (``RelationEnvelope.linear_bounds``).
+        flip's allowed deadband are omitted (``RelationEnvelope.linear_bounds``).
         """
         self.kin.evaluate(poses)
         coords = self.coords
@@ -204,6 +205,7 @@ class ReferenceShape:
         bad = np.zeros(len(poses), bool)
         for envelope in self.envelopes:
             bad |= envelope.violations(self.kin)
+        source_bad = self.envelopes[0].source_flips(self.kin) > self.envelopes[0].SLACK
         relative = self.kin.xmat[:, self.bodies] @ self.rotations.transpose(0, 1, 3, 2)
         rotation = Rotation.from_matrix(relative.reshape(-1, 3, 3)).magnitude()
         source_angles = source_relation_angles(self.envelopes[0], self.kin, self.source)
@@ -225,7 +227,9 @@ class ReferenceShape:
             'seed_source_bone_angle_edge': ([self.tasks.names[i] for i in self.pose.edges[seed_bone]]
                                             if self.seed_source_errors.size else None),
             'source_bone_angle_max_rad': float(bones.max(initial=0)),
-            'layout_preserved': not bool(bad.any()),
-            'layout_flip_frames': np.flatnonzero(bad).tolist(),
+            'fixed_reference_layout_preserved': not bool(bad.any()),
+            'source_layout_preserved': not bool(source_bad.any()),
+            'layout_preserved': not bool((bad | source_bad).any()),
+            'layout_flip_frames': np.flatnonzero(bad | source_bad).tolist(),
             'rejected_candidates': self.rejections,
         }

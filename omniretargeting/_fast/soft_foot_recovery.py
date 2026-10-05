@@ -111,7 +111,8 @@ def restore_clearance(objective, trial, clearance, held, diagonal, diagnostics, 
 def recover(objective, poses, *, iterations=4, include_contacts=True,
             protect_clearance=False, preserve_contacts=True, all_joints=False,
             hold_failed_regions=False, weights=None, clearance_ceiling=False,
-            hold_binding_frames=False, contact_tangent_sigma=None, root_last=False, root_damping=10.):
+            hold_binding_frames=False, contact_tangent_sigma=None, root_last=False, root_damping=10.,
+            private_callback=None):
     tick=time.monotonic()
     report=dict(mode='joint_first_world_tracking_recovery', evaluations=0,evaluation_seconds=0.,
                 factorizations=0,band_solves=0,history=[],root_path='held',conic_calls=0)
@@ -223,6 +224,7 @@ def recover(objective, poses, *, iterations=4, include_contacts=True,
                             poses=trial;quality=following;evaluation=physical.evaluate(poses);accepted=True
                             if measured is not None:clearance_rows.commit(measured)
                 report['history'].append(rec)
+                if private_callback is not None:private_callback(trial.copy(),rec)
                 if accepted:break
             if not accepted:
                 if hold_binding_frames and rec.get('clearance_nonregressing') is False:

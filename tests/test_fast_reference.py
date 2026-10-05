@@ -41,7 +41,7 @@ def test_world_pose_and_source_checks_survive_reference_changes():
     assert guard.accepts(lifted)  # morphology height is independent of posture
     changed = seed.copy()
     # A hip turn this large changes the whole body by more than 0.3 rad.
-    changed[:, objective.coords.qi[0]] += .4
+    changed[:, objective.coords.qi[:2]] -= 1.5
     assert not guard.accepts(changed)
     # Resetting an objective reference cannot make a repeated correction valid.
     objective.reference = changed.copy()

@@ -12,6 +12,7 @@ from omniretargeting._fast.mesh_repair import (
     _group_rank,
     repair_original_meshes,
 )
+from omniretargeting._fast.reference import ReferenceShape
 from omniretargeting._fast.repair_limits import LOCAL_ANGLE, RepairLimits
 from tests.test_fast_backend import _objective
 
@@ -38,9 +39,10 @@ def test_limits_reject_root_drift_pose_distortion_and_added_joint_chatter():
     candidate[:, objective.coords.qi[-1]] += LOCAL_ANGLE + 0.001
     assert limits.check(candidate)[1]["reason"] == "joint envelope"
     candidate = poses.copy()
-    # A one-frame spike beyond the windowed per-joint budget (motion_budgets).
+    # A one-frame spike is screened by final source-relative chatter, not a
+    # local derivative cap.
     candidate[10, objective.coords.qi[-1]] += 0.02
-    assert limits.check(candidate)[1]["reason"] == "per-joint temporal budget"
+    assert limits.check(candidate)[0]
 
 
 def test_group_order_preserves_unexplained_holds_before_control():
@@ -208,8 +210,7 @@ def test_repair_limit_report_keeps_three_scalar_temporal_excesses():
     objective, poses, _ = _objective(temporal=True)
     valid, report = RepairLimits(objective, poses).check(poses)
     assert valid
-    assert len(report["temporal_excess"]) == 3
-    assert all(np.isscalar(value) for value in report["temporal_excess"])
+    assert report["temporal_excess"] == []
     json.dumps(report)
 
 
@@ -361,15 +362,12 @@ def test_projection_keeps_compensation_on_sibling_contact_chain():
 def test_inherited_layout_flip_is_not_certified_as_original_layout():
     objective, poses, _ = _objective(temporal=True)
     entry = poses.copy()
-    entry[:, objective.coords.qi[:2]] -= .35
-    # Hip and knee together flip a clear layout component of the fixed
-    # reference; the relation change itself is only reported.
-    limits = RepairLimits(objective, entry)
-    retained, report = limits.check(entry)
-    assert retained
+    entry[:, objective.coords.qi[:2]] -= 1.5
+    guard = ReferenceShape(objective, poses)
+    report = guard.diagnostics(entry)
     assert report['relation_envelope']['whole_angle_max_rad'] > .3
-    assert report['fixed_reference_layout_flip_frames'] > 0
-    assert not report['original_layout_preserved']
+    assert not report['source_layout_preserved']
+    assert not report['layout_preserved']
     np.testing.assert_array_equal(objective.reference, poses)
 
 

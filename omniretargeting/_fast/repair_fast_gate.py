@@ -33,6 +33,11 @@ def _predict(limits, poses, geometry, measurement, protected, depth):
     from .mesh_repair import _joint_projection, COLLISION_SIGMA, LIMB_COLLISION_SIGMA, LOCAL_ANGLE
     from .limb_scope import scope_for_body
     started = time.monotonic()
+    if OPTIONS.abl_repair_ratchet or OPTIONS.abl_repair_restore_layout or OPTIONS.abl_contact_regression:
+        # Reduced frame views do not carry the experimental global history
+        # or directional evidence. Retain the full proposal rather than gate it.
+        return None
+    local_angle = getattr(limits, 'local_angle', LOCAL_ANGLE)
     if (measurement.get('failures') or not measurement.get('complete', True)
             or OPTIONS.repair_aggregate):
         return None
@@ -82,7 +87,7 @@ def _predict(limits, poses, geometry, measurement, protected, depth):
                                              objective=SimpleNamespace(frames=1)))
         selector = sparse.eye(limits.width,format='csc')[:, np.flatnonzero(selected[frame])]
         step, status = solve_step(local, poses[frame:frame+1], facade, measured, baseline, selector,
-                                  collision_sigma=sigma, local_angle=LOCAL_ANGLE)
+                                  collision_sigma=sigma, local_angle=local_angle)
         if (step is None or not np.isfinite(step).all()
                 or status not in ('Solved','AlmostSolved','QOCO_SOLVED')):
             return None
@@ -96,7 +101,7 @@ def _predict(limits, poses, geometry, measurement, protected, depth):
     if not should_skip({'predicted_decrease_m': float(depth)-predicted}):
         from .repair_gate_windows import predict as window_prediction
         windows = window_prediction(limits, poses, geometry, measurement, protected, depth,
-                                    selected, low, high, frames, sigma, LOCAL_ANGLE, WITNESSES_PER_KEY)
+                                    selected, low, high, frames, sigma, local_angle, WITNESSES_PER_KEY)
         if windows is not None:
             predicted = max(p['predicted_depth_m'] for p in windows)
     return dict(model='reduced_frame_qp', entry_depth_m=float(depth),

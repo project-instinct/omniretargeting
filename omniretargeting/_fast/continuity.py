@@ -9,7 +9,8 @@ from .._refinement.math import _difference_operator
 from .kinematics import skew
 from .runtime_options import OPTIONS
 
-from ..motion_budgets import CHATTER_RMS_FRACTION, CHATTER_WINDOW, windowed_budget
+from ..motion_budgets import CHATTER_RMS_FRACTION, CHATTER_WINDOW, chatter_excess, windowed_budget
+from ..motion_budgets import CHATTER_EXCESS_TOLERANCE
 
 ROUND_OFF = 2e-7
 
@@ -32,6 +33,40 @@ def derivatives(coords, poses):
         for name, (values, initial) in signals.items() for order in (1, 2, 3)
         if len(poses) > order
     }
+
+
+def temporal_signals(coords, poses):
+    """Raw per-frame signals on which source-relative chatter is measured."""
+    q = coords.root_q
+    poses = np.asarray(poses)
+    result = {"joints": poses[:, coords.qi]}
+    if q is not None:
+        result["root_translation"] = poses[:, q:q + 3]
+        rotation = Rotation.from_quat(poses[:, q + 3:q + 7], scalar_first=True)
+        result["root_rotation"] = (rotation[1:] * rotation[:-1].inv()).as_rotvec()
+    return result
+
+
+def chatter_reports(coords, fixed, motion):
+    """High-frequency excess over the source-shaped reference, per coordinate."""
+    before, after = temporal_signals(coords, fixed), temporal_signals(coords, motion)
+    reports, bad = {}, np.zeros(len(motion), bool)
+    for name, reference in before.items():
+        excess = chatter_excess(reference, after[name])
+        violations = excess > CHATTER_EXCESS_TOLERANCE
+        reports[name] = {
+            "excess": excess,
+            "violations": violations,
+            "rms_per_coordinate": np.sqrt(np.mean(excess**2, axis=0)).tolist(),
+            "peak_per_coordinate": excess.max(axis=0).tolist(),
+        }
+        if name == "root_rotation":
+            frame_bad = np.zeros(len(motion), bool)
+            frame_bad[1:] = violations.any(axis=1)
+            bad |= frame_bad
+        else:
+            bad |= violations.any(axis=1)
+    return reports, bad
 
 
 def correction_signals(coords, fixed, motion):
@@ -58,15 +93,15 @@ def correction_derivatives(coords, fixed, motion):
 
 
 def audit_continuity(coords, fixed, motion, *, correction=None):
-    """Report strict and relaxed checks separately, per coordinate and stencil."""
+    """Report source-relative chatter and legacy derivative diagnostics."""
     use_correction = OPTIONS.correction_budget if correction is None else correction
     before, after = derivatives(coords, fixed), derivatives(coords, motion)
     correction = correction_derivatives(coords, fixed, motion)
     budget_values = correction if use_correction else after
     strict_frames = np.zeros(len(motion), bool)
-    chatter_frames = np.zeros(len(motion), bool)
     budget_frames = np.zeros(len(motion), bool)
     channels = {}
+    chatter, chatter_frames = chatter_reports(coords, fixed, motion)
     for name, original in before.items():
         current = after[name]
         order = int(name[-1])
@@ -74,12 +109,12 @@ def audit_continuity(coords, fixed, motion, *, correction=None):
         strict = new > old + ROUND_OFF
         local = maximum_filter1d(old, CHATTER_WINDOW, axis=0, mode="nearest")
         rms = np.sqrt(np.mean(old**2, axis=0))
-        chatter = np.abs(budget_values[name]) > local + CHATTER_RMS_FRACTION * rms + ROUND_OFF
+        derivative_screen = np.abs(budget_values[name]) > local + CHATTER_RMS_FRACTION * rms + ROUND_OFF
         # The enforced per-joint budget: every order, windowed (motion_budgets).
         over = np.abs(budget_values[name]) > windowed_budget(old) + ROUND_OFF
         for start in np.flatnonzero(over.any(axis=1)):
             budget_frames[start:start + order + 1] = True
-        for mask, frames in ((strict, strict_frames), (chatter if order > 1 else np.zeros_like(chatter), chatter_frames)):
+        for mask, frames in ((strict, strict_frames),):
             for start in np.flatnonzero(mask.any(axis=1)):
                 frames[start:start + order + 1] = True
         channels[name] = {
@@ -88,7 +123,7 @@ def audit_continuity(coords, fixed, motion, *, correction=None):
             "strict_violations": int(strict.sum()),
             "strict_per_coordinate": strict.sum(axis=0).tolist(),
             "violating_stencil_starts": np.flatnonzero(strict.any(axis=1)).tolist(),
-            "added_chatter_violations": int(chatter.sum()),
+            "derivative_screen_violations": int(derivative_screen.sum()),
             "windowed_budget_violations": int(over.sum()),
             "rms_before_per_coordinate": rms.tolist(),
             "rms_after_per_coordinate": np.sqrt(np.mean(new**2, axis=0)).tolist(),
@@ -101,6 +136,15 @@ def audit_continuity(coords, fixed, motion, *, correction=None):
                           else "absolute executed derivatives"),
         "round_off_slack": ROUND_OFF,
         "channels": channels,
+        "source_relative_chatter": {
+            name: {
+                "violations": int(row["violations"].sum()),
+                "violation_frames": np.flatnonzero(row["violations"].any(axis=1)).tolist(),
+                "rms_excess_per_coordinate": row["rms_per_coordinate"],
+                "peak_excess_per_coordinate": row["peak_per_coordinate"],
+            }
+            for name, row in chatter.items()
+        },
         "strict_accepted": not bool(strict_frames.any()),
         "relaxed_chatter_accepted": not bool(chatter_frames.any()),
         "windowed_budget_accepted": not bool(budget_frames.any()),
@@ -111,22 +155,29 @@ def audit_continuity(coords, fixed, motion, *, correction=None):
 
 
 class CorrectionContinuity:
-    """Preserve absolute derivatives; correction semantics require an explicit opt-in."""
+    """Reject added source-relative chatter, not smooth low-frequency change."""
 
-    def __init__(self, coords, acquired, *, root_norm=False, correction=None):
+    def __init__(self, coords, acquired, *, root_norm=False, correction=None, chatter=None,
+                 enforce_chatter=True):
         self.coords = coords
         self.correction = OPTIONS.correction_budget if correction is None else correction
+        # Standalone guards retain the legacy explicit envelope for regression
+        # tooling; the production fast pipeline opts into chatter semantics.
+        self.chatter = False if chatter is None else bool(chatter)
+        self.enforce_chatter = bool(enforce_chatter)
         self.fixed = np.array(acquired, copy=True)
         self.fixed.setflags(write=False)
-        # Windowed per-coordinate budgets of the reference (motion_budgets).
-        self.bounds = {k: windowed_budget(v) for k, v in derivatives(coords, acquired).items()}
+        # Production uses high-frequency chatter. The old derivative envelope
+        # stays available only through the explicit regression switch.
+        self.bounds = ({} if self.chatter else
+                       {k: windowed_budget(v) for k, v in derivatives(coords, acquired).items()})
         self.rejections = 0
         self._operators = {}
         self._linear_cache = None
         # The independent final audit measures root acceleration and
         # jerk as 3D norms. Coordinate bounds alone do not imply these balls.
         self.norm_bounds = {}
-        if root_norm and coords.root_q is not None:
+        if root_norm and not self.chatter and coords.root_q is not None:
             for name, value in derivatives(coords, acquired).items():
                 if name in ('root_translation_order_2', 'root_translation_order_3'):
                     self.norm_bounds[name] = windowed_budget(np.linalg.norm(value, axis=1))
@@ -153,6 +204,13 @@ class CorrectionContinuity:
             return good
         values = (correction_derivatives(self.coords, self.fixed, poses) if self.correction
                   else derivatives(self.coords, poses))
+        if self.chatter:
+            good = np.isfinite(poses).all()
+            if self.enforce_chatter:
+                _, bad = chatter_reports(self.coords, self.fixed, poses)
+                good = good and not bad.any()
+            self.rejections += not good
+            return bool(good)
         good = all(np.isfinite(values[k]).all() and np.all(np.abs(values[k]) <= v + ROUND_OFF)
                    for k, v in self.bounds.items())
         good = good and all(np.all(np.linalg.norm(values[k], axis=1) <= v + ROUND_OFF)
@@ -165,6 +223,13 @@ class CorrectionContinuity:
             from .window_guards import guard_violation_frames
             return guard_violation_frames(self, poses, frames=frames)
         """Frames of every difference stencil ``accepts`` rejects."""
+        if self.chatter:
+            if not np.isfinite(poses).all():
+                return np.ones(len(poses), bool)
+            if not self.enforce_chatter:
+                return np.zeros(len(poses), bool)
+            _, bad = chatter_reports(self.coords, self.fixed, poses)
+            return bad
         values = (correction_derivatives(self.coords, self.fixed, poses) if self.correction
                   else derivatives(self.coords, poses))
         bad = np.zeros(len(poses), bool)
@@ -250,6 +315,8 @@ class CorrectionContinuity:
         linear, norms = [], []
         rows = self.linearizations(poses)
         for name, (values, jacobian) in rows.items():
+            if name not in self.bounds:
+                continue
             fixed = self.bounds[name].ravel()
             bound = np.minimum(np.maximum(fixed + ROUND_OFF / 2, np.abs(values.ravel())),
                                fixed + ROUND_OFF)
@@ -269,6 +336,8 @@ class CorrectionContinuity:
         constraints = []
         rows = self.linearizations(poses)
         for name, (values, jacobian) in rows.items():
+            if name not in self.bounds:
+                continue
             if merge_rows is not None:
                 bound = self.bounds[name].ravel() + ROUND_OFF / 2
                 merge_rows.append((jacobian, -bound - values.ravel(), bound - values.ravel()))

@@ -3,46 +3,36 @@
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
-from ..motion_budgets import windowed_budget
+from ..motion_budgets import chatter_excess
 from .runtime_options import OPTIONS
-from .continuity import ROUND_OFF, derivatives, correction_derivatives
+from .continuity import temporal_signals
+from ..motion_budgets import CHATTER_EXCESS_TOLERANCE
 
 
 def offending_frames(coords, fixed, motion):
     """Same selected joint/root signals as the independent final audit."""
-    signal = motion - fixed if OPTIONS.correction_budget else motion
     frames = len(motion)
     joint = np.zeros((frames, len(coords.qi)), bool)
     root = np.zeros(frames, bool)
-    for order in (2, 3):
-        if frames <= order:
-            continue
-        before = np.diff(fixed[:, coords.qi], n=order, axis=0)
-        after = np.diff(signal[:, coords.qi], n=order, axis=0)
-        bad = np.abs(after) > windowed_budget(before) + ROUND_OFF
-        for start, column in zip(*np.nonzero(bad)):
-            joint[start:start + order + 1, column] = True
-        if coords.root_q is not None:
-            q = coords.root_q
-            old = np.linalg.norm(np.diff(fixed[:, q:q + 3], n=order, axis=0), axis=1)
-            new = np.linalg.norm(np.diff(signal[:, q:q + 3], n=order, axis=0), axis=1)
-            for start in np.flatnonzero(new > windowed_budget(old) + ROUND_OFF):
-                root[start:start + order + 1] = True
+    joint[:] = chatter_excess(fixed[:, coords.qi], motion[:, coords.qi]) > CHATTER_EXCESS_TOLERANCE
+    if coords.root_q is not None:
+        q = coords.root_q
+        root[:] = np.any(
+            chatter_excess(fixed[:, q:q + 3], motion[:, q:q + 3]) > CHATTER_EXCESS_TOLERANCE,
+            axis=1,
+        )
     return joint, root
 
 
 def reweight_temporal_signals(objective, fixed, motion, factor):
     joint, root = offending_frames(objective.coords, fixed, motion)
     rotation = np.zeros(len(motion), bool)
-    before = derivatives(objective.coords, fixed)
-    delta = correction_derivatives(objective.coords, fixed, motion)
-    for order in (2, 3):
-        name = f'root_rotation_order_{order}'
-        if not OPTIONS.correction_budget or name not in before:
-            continue
-        bad = np.abs(delta[name]) > windowed_budget(before[name]) + ROUND_OFF
-        for start in np.flatnonzero(bad.any(axis=1)):
-            rotation[start:start + order + 1] = True
+    before, after = temporal_signals(objective.coords, fixed), temporal_signals(objective.coords, motion)
+    if "root_rotation" in before:
+        rotation[1:] = np.any(
+            chatter_excess(before["root_rotation"], after["root_rotation"]) > CHATTER_EXCESS_TOLERANCE,
+            axis=1,
+        )
     for index in range(len(objective.temporal_weight)):
         order = index + 1
         if len(motion) <= order:

@@ -11,6 +11,10 @@ import os
 from functools import lru_cache
 from types import SimpleNamespace
 
+from .gpu_conic_runtime import prepare as _prepare_gpu_runtime
+
+_prepare_gpu_runtime()
+
 import cvxpy as cp
 import numpy as np
 from scipy import sparse
@@ -65,6 +69,13 @@ def solve_conic(problem: cp.Problem, *, cpu_only: bool = False, **cpu_options) -
     backend = os.environ.get("OMNIRETARGETING_CONIC_BACKEND", "clarabel").lower()
     if backend not in {"clarabel", "qoco_cuda", "qoco_cuda_strict"}:
         raise ValueError(f"Unknown conic backend: {backend}")
+    from ._fast.runtime_options import OPTIONS
+    if OPTIONS.gpu_conic:
+        if not cpu_only and not {'max_iter', 'time_limit'} & cpu_options.keys():
+            from ._fast.gpu_conic import solve_problem
+            if solve_problem(problem):
+                return problem.value
+        return _solve_cpu(problem, cpu_options)
     if backend == "clarabel" or cpu_only or problem.size_metrics.num_scalar_variables < GPU_MIN_VARIABLES:
         return _solve_cpu(problem, cpu_options)
 
@@ -180,8 +191,15 @@ def solve_conic_working_set(problem: cp.Problem, **cpu_options) -> float | None:
         kinds = ([clarabel.ZeroConeT(zero)] if zero else []) + (
             [clarabel.NonnegativeConeT(int(keep_linear.sum()))] if keep_linear.any() else [])
         kinds += [_soc_descriptor(int(sizes[c])) for c in cones]
-        solution = clarabel.DefaultSolver(quadratic, linear, matrix[rows].tocsc(), offset[rows],
-                                          kinds, settings).solve()
+        from ._fast.gpu_conic import dimensions, solve as solve_gpu
+        reduced_matrix = matrix[rows].tocsc()
+        from ._fast.runtime_options import OPTIONS
+        solution = (solve_gpu(quadratic, linear, reduced_matrix, offset[rows],
+                              dimensions(kinds), context='restoration_working_set')
+                    if OPTIONS.gpu_conic else None)
+        if solution is None:
+            solution = clarabel.DefaultSolver(quadratic, linear, reduced_matrix, offset[rows],
+                                              kinds, settings).solve()
         iterations += solution.iterations
         seconds += solution.solve_time
         if str(solution.status) != "Solved":

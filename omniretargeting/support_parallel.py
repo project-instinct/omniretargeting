@@ -14,8 +14,8 @@ class SupportPool:
     the context terminates the pool rather than leaving workers behind.
     """
 
-    def __init__(self):
-        self.workers = min(8, available_cpus())
+    def __init__(self, workers=None):
+        self.workers = min(8 if workers is None else max(1, int(workers)), available_cpus())
         self.pool = None
 
     def __enter__(self):

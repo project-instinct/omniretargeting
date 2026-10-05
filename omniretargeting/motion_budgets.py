@@ -4,19 +4,65 @@
 # reference, measured on landmark relations (``pose_relations``) and reported
 # against the original motion.
 
-# Per-joint temporal budgets on executed motion (velocity, acceleration, jerk per
-# frame): at every stencil, the largest magnitude of the fixed reference's own
-# derivative within CHATTER_WINDOW stencils around it, plus CHATTER_RMS_FRACTION
-# of that coordinate's RMS derivative. The same relaxed envelope screens added
-# chatter; a stencil-exact budget left no room where the reference is smooth.
+# Source-relative chatter is measured on the high-frequency content of a
+# signal, not on the magnitude of its derivative. A slowly varying clearance
+# correction is therefore allowed even where the source-shaped reference is
+# nearly stationary.
 CHATTER_WINDOW = 7
-CHATTER_RMS_FRACTION = 0.1
 # Chatter is the content of a signal below this Gaussian scale (frames).
 CHATTER_SCALE_FRAMES = 2.0
+CHATTER_RMS_FRACTION = 0.1
+CHATTER_RMS_ALLOWANCE = 0.5
+CHATTER_ABS_AMPLITUDE = 2e-3
+CHATTER_EXCESS_TOLERANCE = 1e-3
+
+
+def high_frequency(signal):
+    """High-frequency content of a per-frame scalar/vector signal."""
+    import numpy as np
+    from scipy.ndimage import gaussian_filter1d
+
+    signal = np.asarray(signal, dtype=float)
+    if not signal.shape[0]:
+        return np.zeros_like(signal)
+    return signal - gaussian_filter1d(
+        signal, CHATTER_SCALE_FRAMES, axis=0, mode="nearest"
+    )
+
+
+def chatter_budget(reference):
+    """Per-coordinate high-frequency amplitude allowed by the source signal.
+
+    The allowance follows the source locally and also receives a fraction of
+    its whole-clip RMS plus a small absolute numerical/motion floor. Thus a
+    fast source remains fast, while a smooth low-frequency robot correction is
+    not mistaken for chatter.
+    """
+    import numpy as np
+    from scipy.ndimage import maximum_filter1d
+
+    content = np.abs(high_frequency(reference))
+    if not content.shape[0]:
+        return content
+    local = maximum_filter1d(content, CHATTER_WINDOW, axis=0, mode="nearest")
+    rms = np.sqrt(np.mean(content**2, axis=0))
+    return local + CHATTER_RMS_ALLOWANCE * rms + CHATTER_ABS_AMPLITUDE
+
+
+def chatter_excess(reference, candidate):
+    """Positive excess high-frequency amplitude of ``candidate`` over source."""
+    import numpy as np
+
+    reference, candidate = np.asarray(reference, float), np.asarray(candidate, float)
+    if reference.shape != candidate.shape:
+        raise ValueError("Chatter reference and candidate must have the same shape")
+    if not reference.shape[0]:
+        return np.zeros(reference.shape[:-1] if reference.ndim > 1 else reference.shape)
+    return np.abs(high_frequency(candidate - reference)) - chatter_budget(reference)
 
 
 def windowed_budget(magnitudes):
-    """Budget of derivative magnitudes (stencils, ...) of one reference signal."""
+    """Legacy derivative-magnitude budget for explicit regression experiments."""
     import numpy as np
     from scipy.ndimage import maximum_filter1d
 

@@ -13,7 +13,9 @@ def test_default_enables_only_validated_options(monkeypatch):
     assert enabled == {
         'parallel_shortening', 'parallel_repair_restore', 'repair_support_continuity',
         'fast_self_collision', 'bulk_cpu_geometry', 'repair_triage',
-        'repair_fast_gate', 'repair_parallel_groups',
+        'repair_fast_gate', 'repair_parallel_groups', 'whole_canonical',
+        'repair_working_set', 'repair_geometry_reduction', 'stationary_window',
+        'repair_main_cache',
     }
 
 
@@ -24,6 +26,20 @@ def test_independent_switches(monkeypatch):
         assert flags[name] is False
         defaults = RuntimeOptions().describe()
         assert all(value == defaults[key] for key, value in flags.items() if key != name)
+
+
+def test_repair_main_cache_uses_runtime_switch(monkeypatch):
+    from omniretargeting._fast import runtime_options
+    from omniretargeting._fast.repair_frame_norm import enabled
+    monkeypatch.delenv('OMNIRETARGETING_FAST_ENABLE', raising=False)
+    monkeypatch.delenv('OMNIRETARGETING_FAST_DISABLE', raising=False)
+    monkeypatch.setenv('OMNIRETARGETING_REPAIR_MAIN', '0')
+    monkeypatch.setattr(runtime_options, 'OPTIONS', RuntimeOptions.from_environment())
+    assert enabled()
+    monkeypatch.setenv('OMNIRETARGETING_FAST_DISABLE', 'repair_main_cache')
+    monkeypatch.setenv('OMNIRETARGETING_REPAIR_MAIN', '1')
+    monkeypatch.setattr(runtime_options, 'OPTIONS', RuntimeOptions.from_environment())
+    assert not enabled()
 
 
 def test_unknown_switch_is_error(monkeypatch):

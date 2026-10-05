@@ -82,6 +82,7 @@ class SequenceTasks:
         contact_offset_choice=None,
         extra_tasks=(),
         orientation_targets=(),
+        source_graph_cache=None,
     ):
         self.model, self.coords = model, coordinates
         self.data = mujoco.MjData(model)
@@ -120,10 +121,11 @@ class SequenceTasks:
             raise ValueError(
                 "environment_points must be finite (frames, points, 3) or (points, 3)"
             )
-        self.operators = [
-            graph_operator(np.vstack([self.human[f], env[f]]), len(self.names))
-            for f in range(self.frames)
-        ]
+        self.operators = (
+            [graph_operator(np.vstack([self.human[f], env[f]]), len(self.names))
+             for f in range(self.frames)]
+            if source_graph_cache is None else source_graph_cache.get(self.human, env, graph_operator)
+        )
         self.axes = []
         raw_axes = list(config.get("pose_axes", []))
         for edge in priority.get("pose_direction", {}).get("edges", []):

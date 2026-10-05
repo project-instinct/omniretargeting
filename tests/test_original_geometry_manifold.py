@@ -16,8 +16,10 @@ from tests.test_original_geometry_batches import (
 @pytest.mark.parametrize('kind', ['closed', 'evidence', 'mixed'])
 def test_manifold_depths_unknowns_and_witnesses_survive_batching_and_cache(kind):
     objective, poses = _problem()
-    reference = OriginalGeometry(objective, [], _scene(kind)).measure(poses)
-    fresh = OriginalGeometry(objective, [], _scene(kind), manifold=True)
+    # One query semantics for all three: the recording wrapper is not the
+    # repository SceneQuery, so none of them takes the open-scan rigid fallback.
+    reference = OriginalGeometry(objective, [], _RecordingQuery(_scene(kind))).measure(poses)
+    fresh = OriginalGeometry(objective, [], _RecordingQuery(_scene(kind)), manifold=True)
     expected = fresh.measure(poses, jacobians=True)
     query = _RecordingQuery(_scene(kind))
     split = OriginalGeometry(objective, [], query, manifold=True)

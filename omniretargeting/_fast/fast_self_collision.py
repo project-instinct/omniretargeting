@@ -49,7 +49,7 @@ class FastSelfCollision:
         if not np.isfinite(activation_distance) or activation_distance < 0:
             raise ValueError('activation_distance must be finite and nonnegative')
         self.activation_distance = float(activation_distance)
-        self.workers = 1
+        self.workers = max(1, int(workers))
         self.seed_provider = None
         self.first, self.second = query.pairs.T.copy()
         # Never alter the robot model's CCD flags, tolerances or geometry.
@@ -235,6 +235,9 @@ class FastSelfCollision:
             from .fast_self_planes import BandMeshHinges
             if self.positive_hinges is None:
                 self.positive_hinges = BandMeshHinges(self.query)
+            if self.positive_hinges.batch is not None:
+                self.positive_hinges.batch.workers = self.workers
+                self.positive_hinges.batch.cpu_budget = getattr(self, 'cpu_budget', None)
             tick = time.perf_counter()
             hinges, failures, count = self.positive_hinges.rows(
                 poses, kin, per_frame, with_jacobian, target, cutoff)

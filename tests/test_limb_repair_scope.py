@@ -154,7 +154,7 @@ def test_bounded_ik_reduces_foot_penetration_and_keeps_impossible_residual(depth
     np.testing.assert_array_equal(result[:, fixed], poses[:, fixed])
     assert np.abs(result - poses).max() <= LOCAL_ANGLE + 1e-8
     assert report["limits"]["root_unchanged"]
-    assert max(report["limits"]["temporal_excess"]) <= 2e-7
+    assert report["limits"]["temporal_excess"] == []
     assert all(record["limb_only"] for record in report["history"])
     if depth > 0.1:
         assert after > 0.05

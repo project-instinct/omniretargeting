@@ -15,13 +15,24 @@ hard line, and update this file with it.
   every later check. Its quality is therefore judged directly against the source (relation
   angles, per-bone source directions of the seed). Building a better reference is one of the
   most leveraged improvements available.
-- Jitter budgets are per joint and per stencil (velocity, acceleration, jerk), from
-  `motion_budgets.windowed_budget`: the largest magnitude of the reference's own derivative
-  within `CHATTER_WINDOW = 7` stencils, plus `CHATTER_RMS_FRACTION = 0.1` of that joint's RMS
-  derivative. The RMS term exists because a stencil-exact budget left no room to correct where
-  the reference is smooth. Budgets cover root translation, root orientation and joints, and
-  are not pooled across joints: aggregate smoothness hid ankle or wrist chatter behind a
-  smoother arm.
+- Continuity follows `AGENTS.md`: added high-frequency content is chatter, while a smooth
+  low-frequency clearance correction is not. `motion_budgets.chatter_excess` high-passes each
+  signal with Gaussian scale `CHATTER_SCALE_FRAMES = 2`, and allows the source-shaped
+  reference's local high-frequency amplitude (`CHATTER_WINDOW = 7`), half its RMS, and a
+  `2e-3` numerical/motion floor, with a separate `1e-3` excess tolerance for isolated
+  sub-threshold samples. Signals cover scalar joints, root translation and root angular
+  increments; budgets are not pooled across joints.
+- Acquisition candidate guards do not cap acceleration or jerk by the reference derivative and
+  do not reject a sweep merely because assembling windows creates a flagged frame: that would
+  roll back useful clearance. They retain hard URDF velocity rows when the owner supplies its
+  URDF, while final audit reports and gates sustained added chatter.
+  `OMNIRETARGETING_FAST_ENABLE=reference_derivative_budget` restores the old per-stencil
+  derivative envelope only as an explicit regression experiment. Support-endpoint
+  world continuity remains protected during local repair because its purpose is preventing
+  support slip, not general smoothness.
+- `scripts/review_joint_smoothness.py` audits the same source-relative chatter, URDF velocity
+  limits, and a contact-free inverse-dynamics effort screen. The effort screen reports
+  candidates for a contact-force split; it is not yet a final torque certificate.
 
 ## Posture
 
@@ -31,9 +42,12 @@ hard line, and update this file with it.
 - The posture term pulls softly toward the fixed reference, scaled by the robot's own
   morphology angle to the source (clip median, at least `POSTURE_SCALE_RAD`). The scale weights
   posture; it does not limit it.
-- Layout (the hard line in `AGENTS.md`) reads limbs from the landmark tree, not from names, and
-  compares relation components in the reference heading frame. The fast backend checks it on
-  every candidate and backtracks a flipping proposal.
+- Layout reads limbs from the landmark tree, not from names. Source landmarks determine the
+  legal side wherever both the source and source-shaped reference are clear and agree; pairs
+  involving an unobserved effector tip stay soft posture terms. A collapse requires the clear
+  opposite side (`LAYOUT_FLIP_MARGIN`) for `LAYOUT_FLIP_WINDOW_FRAMES = 7` consecutive frames.
+  Near-zero and brief crossings get a deadband in the linearized rows; a sustained clear flip
+  is restored and rejected by exact final acceptance.
 - Secondary corrections stay local to the motion they receive (`_fast/repair_limits.LOCAL_ANGLE`,
   `max_joint_correction`). This bounds correction locality, not posture against the source.
 - Distal segments that no other task observes (hands) follow their calibrated source
@@ -116,8 +130,15 @@ contacts to support.
   object's recorded vertices, or beyond the evidence's reach where the generalized winding
   number is decisively zero, is outside that object (not applied to terrain or enclosed rooms,
   which continue beyond their vertices).
-- A residual deeper than 1 cm usually traces to a joint limit, a layout or continuity budget, or
-  correction locality. Penetration held in place only by lower-priority terms means the
+- Unsigned scenes (`_fast/original_rigid_fallback.py`): when every component is an open sheet
+  without evidence (or a closed convex part), original-mesh repair replaces the unknown shell
+  samples with exact geom/finite-triangle queries (capsule, sphere and solid cylinder,
+  `triangle_cylinder.py`). Such a sheet has no solid side: crossing it is penetration, a geom
+  wholly behind it is not detected. Any other component, geom type, tied exit or uncertified
+  witness stays `unknown_query`, counted by category; it is never zero depth.
+- A residual deeper than 1 cm usually traces to a joint limit, a sustained layout collapse,
+  chatter/velocity limit, or correction locality. Penetration held in place only by
+  lower-priority terms means the
   penetration weight is too low.
 - InstinctLab has no terrain-aware spawn penetration detection: its reset height offset is an
   unconditional vertical lift that cannot fix lateral intersections, and physics separation is
@@ -126,11 +147,14 @@ contacts to support.
 
 ## Solver Backends
 
-- `--solver fast` checks the reference layout on every candidate, verifies per-joint continuity
-  after solving, and reports `budgets` (including `relation_*`, `layout_flip_*`) and
-  `skipped_tasks`.
+- `--solver fast` checks sustained source layout on candidates, verifies source-relative
+  chatter and URDF velocity limits after solving, and reports `budgets` (including
+  `relation_*`, `layout_flip_*`, `source_relative_chatter`) and `skipped_tasks`.
 - `--solver sequence` bounds only root/slide translation and fits source directions first,
   without angular slack.
+- Open problem: no backend has a wall-clock budget yet. The 957-frame TRUMANS clip has taken
+  1664–3236 s (`out/speedup_20261001/runs/*957*/timing.json`), above the 1 s/frame target in
+  `AGENTS.md`. A budget should return the best accepted result so far and report the rest.
 
 ## Useful Diagnostics
 

@@ -18,6 +18,7 @@ def solve_core_sequence(
     object_points,
     reference_trajectory=None,
     source_joint_orientations=None,
+    *, source_only=False,
 ):
     model = owner.robot_model
     frames = len(positions)
@@ -160,6 +161,14 @@ def solve_core_sequence(
         "root_orientation_targets": orientation_reference,
         "body_orientation_targets": body_orientation_targets,
     }
+    if source_only:
+        config.pop("backend",None)
+        from .._fast.pipeline import prepare_fast_source
+        return prepare_fast_source(
+            owner, model, initial, positions, owner.smplx_joint_names, mapping,
+            positions[:, root_index], tasks or {}, priority, config, common, (),
+
+        )
     initialization_report = None
     extra_tasks = (
         getattr(owner, "last_body_relation_tasks", None),

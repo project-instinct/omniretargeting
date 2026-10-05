@@ -61,6 +61,8 @@ class ContactGuard:
     """
 
     def __init__(self, objective, acquired, *, preserve_positions=False):
+        from .runtime_options import OPTIONS
+        self.ablate_contacts = OPTIONS.abl_contact_regression
         poses = np.asarray(acquired, dtype=float)
         self.shape = (objective.frames, objective.model.nq)
         if poses.shape != self.shape or not np.isfinite(poses).all():
@@ -175,13 +177,22 @@ class ContactGuard:
             if held.any():
                 scalar = _block_rows(normal_jac, self.coords.width)[held.ravel()]
                 base = group.acquired[..., 1][held] + group.tolerance + group.yielded[held]
+                if self.ablate_contacts:
+                    base = base + CONTACT_DRIFT
                 allowance = np.minimum(np.maximum(base + NUMERICAL_SLACK / 2, np.abs(along[held])),
                                        base + NUMERICAL_SLACK)
-                linear.append((scalar, -allowance - along[held], allowance - along[held]))
+                lower = -allowance - along[held]
+                if self.ablate_contacts:
+                    acquired_along = np.sum((group.positions-group.targets)*normal, axis=-1)
+                    floor = np.minimum(acquired_along[held], 0.)
+                    lower = np.maximum(lower, floor - NUMERICAL_SLACK / 2 - along[held])
+                linear.append((scalar, lower, allowance - along[held]))
 
             def add_norm(rows, residual, bound, mask):
                 selected = np.repeat(mask.ravel(), 3)
                 base = np.broadcast_to(bound, mask.shape)[mask]
+                if self.ablate_contacts:
+                    base = base + CONTACT_DRIFT
                 allowed = np.minimum(np.maximum(base + NUMERICAL_SLACK / 2,
                                                 np.linalg.norm(residual[mask], axis=1)),
                                      base + NUMERICAL_SLACK)
@@ -207,6 +218,9 @@ class ContactGuard:
             return self.repair_bounds(poses)
         if self.priority is not None:
             return [], []  # Coordinator owns these soft rows and funded acceptance.
+        if self.ablate_contacts:
+            from .repair_contact_rows import _slice
+            return _slice(self, slice(frames.start, frames.stop)).repair_bounds(poses[frames.start:frames.stop])
         from .priority_contacts import PriorityContacts
         from .priority_window_contacts import frozen_bounds
         return frozen_bounds(PriorityContacts(self, type(self).__name__), poses, frames)
@@ -216,12 +230,58 @@ class ContactGuard:
             return not self.violation_frames(candidate, frames=frames).any()
         if self.priority is not None:
             return self.priority.accepts(candidate)
+        from .repair_frame_norm import enabled
+        if enabled() and type(self) is ContactGuard:
+            from inspect import unwrap
+            diagnostic = unwrap(self.diagnostics)
+            if (diagnostic.__module__ == __name__
+                    and diagnostic.__qualname__ == 'ContactGuard.diagnostics'):
+                return self._accepts_without_report(candidate)
         return self.diagnostics(candidate)["accepted"]
+
+    def _accepts_without_report(self, candidate):
+        """The diagnostics rejection expressions, without reporting reductions."""
+        poses = np.asarray(candidate, dtype=float)
+        if poses.shape != self.shape or not np.isfinite(poses).all():
+            return False
+        self.kin.evaluate(poses, with_jacobian=False)
+        for group in self.groups:
+            points = self._points(group)
+            errors = self._errors(group, points)
+            checked = np.stack((group.active, group.established, group.established), axis=-1)
+            regression = np.where(checked, errors - group.acquired, 0.)
+            allowance = group.tolerance + group.yielded[..., None]
+            if self.ablate_contacts:
+                allowance = allowance + CONTACT_DRIFT
+            invalid = checked & (~np.isfinite(errors) | (regression - allowance > NUMERICAL_SLACK))
+            if invalid.any():
+                return False
+            if self.ablate_contacts:
+                along = np.sum((points-group.targets)*group.normals, axis=-1)
+                acquired_along = np.sum((group.positions-group.targets)*group.normals, axis=-1)
+                inward = np.minimum(acquired_along, 0.) - along
+                if np.any(group.established & (~np.isfinite(inward) | (inward > NUMERICAL_SLACK))):
+                    return False
+            if self.preserve_positions and group.established.any():
+                drift = np.linalg.norm(points - group.positions, axis=-1)
+                budget = group.tolerance + group.yielded
+                if self.ablate_contacts:
+                    budget = budget + CONTACT_DRIFT
+                if np.any(group.established & (~np.isfinite(drift) | (drift > budget + NUMERICAL_SLACK))):
+                    return False
+        return True
 
     def violation_frames(self, candidate, *, frames=None):
         if frames is not None:
             if self.priority is not None:
                 return self.priority.violation_frames(candidate, frames=frames)
+            if self.ablate_contacts:
+                from .repair_contact_rows import _slice
+                local = _slice(self, slice(frames.start, frames.stop))
+                local.shape = len(frames), self.shape[1]
+                bad = np.zeros(self.shape[0], bool)
+                bad[frames.start:frames.stop] = local.violation_frames(candidate[frames.start:frames.stop])
+                return bad
             from .priority_contacts import PriorityContacts
             from .priority_window_contacts import frozen_violations
             return frozen_violations(PriorityContacts(self, type(self).__name__), candidate, frames)
@@ -260,13 +320,26 @@ class ContactGuard:
             checked = np.stack((group.active, group.established, group.established), axis=-1)
             regression = np.where(checked, regression, 0.)
             allowance = group.tolerance + group.yielded[..., None]
+            if self.ablate_contacts:
+                allowance = allowance + CONTACT_DRIFT
+                report['ablation_regression_slack_m'] = CONTACT_DRIFT
             excess = regression - allowance
             invalid = checked & (~np.isfinite(errors) | (excess > NUMERICAL_SLACK))
             frames = np.any(invalid, axis=(1, 2))
+            if self.ablate_contacts:
+                along = np.sum((points-group.targets)*group.normals, axis=-1)
+                acquired_along = np.sum((group.positions-group.targets)*group.normals, axis=-1)
+                inward = np.minimum(acquired_along, 0.) - along
+                frames |= np.any(group.established & (~np.isfinite(inward) | (inward > NUMERICAL_SLACK)), axis=1)
+                max_inward = float(np.max(np.where(group.established, inward, 0.), initial=0.))
+                report['max_inward_regression_m'] = max(report.get('max_inward_regression_m', 0.), max_inward)
             drift = np.linalg.norm(points - group.positions, axis=-1)
             if self.preserve_positions:
+                position_budget = group.tolerance + group.yielded
+                if self.ablate_contacts:
+                    position_budget = position_budget + CONTACT_DRIFT
                 frames |= np.any(group.established & (~np.isfinite(drift)
-                                                      | (drift > group.tolerance + group.yielded + NUMERICAL_SLACK)), axis=1)
+                                                      | (drift > position_budget + NUMERICAL_SLACK)), axis=1)
             violated |= frames
             max_regression = float(np.max(np.where(group.active[..., None], regression, 0.), initial=0))
             max_excess = float(np.max(np.where(group.active[..., None], excess, 0.), initial=0))
@@ -276,6 +349,8 @@ class ContactGuard:
             if not np.isfinite(drift[group.established]).all():
                 max_drift = float("inf")
             position_excess = max(0., max_drift - group.tolerance)
+            if self.ablate_contacts:
+                position_excess = max(0., max_drift - group.tolerance - CONTACT_DRIFT)
             if self.preserve_positions:
                 max_excess = max(max_excess, position_excess)
             report["max_regression_m"] = max(report["max_regression_m"], max_regression)

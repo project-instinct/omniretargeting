@@ -34,6 +34,14 @@ HINGE_MARGIN_M = float(os.environ.get('OMNIRETARGETING_FAST_HINGE_MARGIN', '0'))
 
 
 class AcquisitionNormalGuard:
+    @property
+    def numerical_slack(self):
+        """Only this guard family's numerical reserve; larger opt-in wins."""
+        from .runtime_options import OPTIONS
+        if OPTIONS.abl_normal_slack_1e5:
+            return 1e-5
+        return 1e-6 if OPTIONS.abl_normal_slack else 1e-7
+
     def __init__(self, objective, reference):
         self.objective = objective
         self.priority = getattr(objective, 'priority_clearance', None)
@@ -94,6 +102,8 @@ class AcquisitionNormalGuard:
             return self.repair_bounds(poses)
         if self.priority is not None:
             return [], []  # Coordinator owns these soft rows and funded acceptance.
+        if self.numerical_slack != 1e-7:
+            return self._window_ablation_bounds(poses, frames)
         from .priority_contacts import PriorityContacts
         from .priority_window_contacts import frozen_bounds
         return frozen_bounds(PriorityContacts(self, type(self).__name__), poses, frames)
@@ -109,6 +119,13 @@ class AcquisitionNormalGuard:
         if frames is not None:
             if self.priority is not None:
                 return self.priority.violation_frames(poses, frames=frames)
+            if self.numerical_slack != 1e-7:
+                bad = np.zeros(len(poses), bool)
+                for block in self._window_ablation_rows(poses, frames, jacobian=False):
+                    values = block.values
+                    violated = ~np.isfinite(values) | (values > block.bound + block.own + self.numerical_slack)
+                    bad[block.frames[violated]] = True
+                return bad
             from .priority_contacts import PriorityContacts
             from .priority_window_contacts import frozen_violations
             return frozen_violations(PriorityContacts(self, type(self).__name__), poses, frames)
@@ -122,7 +139,7 @@ class AcquisitionNormalGuard:
             along = np.sum(offset * normal, axis=-1)
             gap = np.where(established, np.maximum(along - bound - yielded, -along - bound),
                            np.linalg.norm(offset, axis=-1) - bound - yielded)
-            bad |= np.any(active & ~(gap <= 1e-7), axis=1)
+            bad |= np.any(active & ~(gap <= self.numerical_slack), axis=1)
         return bad
 
     def diagnostics(self, poses):
@@ -145,7 +162,7 @@ class AcquisitionNormalGuard:
                 worst = dict(group=self.names[group_index], frame=int(frame), sample=int(sample),
                              excess_m=maximum, frozen_penetration_yield_m=float(yielded[frame, sample]))
             excess = max(excess, maximum)
-        return dict(accepted=bool(np.isfinite(excess) and excess <= 1e-7),
+        return dict(accepted=bool(np.isfinite(excess) and excess <= self.numerical_slack),
                     max_excess_m=excess, worst_constraint=worst,
                     fixed_pre_acquisition_reference=not hasattr(self, '_regression_reference'),
                     bound_reference=getattr(self, '_regression_reference', 'fixed_pre_acquisition'),
@@ -153,6 +170,24 @@ class AcquisitionNormalGuard:
                     on_surface_frame_points=sum(int(g[6].sum()) for g in self.groups),
                     penetration_yield_max_m=float(max((g[8][g[5]].max(initial=0) for g in self.groups),
                                                       default=0.)))
+
+    def _window_ablation_rows(self, poses, frames, *, jacobian=True):
+        from .priority_contacts import PriorityContacts
+        return PriorityContacts(self, type(self).__name__).evaluate(
+            poses, frames=frames, jacobian=jacobian)
+
+    def _window_ablation_bounds(self, poses, frames):
+        # Keep the generic frozen-window kernels (and ContactGuard) unchanged.
+        linear, cones = [], []
+        slack = self.numerical_slack
+        for block in self._window_ablation_rows(poses, frames):
+            base = block.bound + block.own
+            allowed = np.minimum(np.maximum(base + slack / 2, block.values), base + slack)
+            if block.scalar:
+                linear.append((block.matrix, np.full(len(base), -np.inf), allowed - block.residual))
+            else:
+                cones.append((block.matrix, block.residual, allowed))
+        return linear, cones
 
     def hinge_rows(self, kin, frames, weight, sigma, with_jacobian, *, inner_margin=None):
         """Stiff one-sided rows of the same bounds on another trajectory's
@@ -199,6 +234,7 @@ class AcquisitionNormalGuard:
         self.kin.evaluate(poses)
         linear, norms = [], []
         width = self.objective.width
+        slack = self.numerical_slack
         for kind, indices, local, target, normal, active, established, bound, yielded in self.groups:
             points = self._points(kind, indices, local)
             bodies = self.objective.model.geom_bodyid[indices] if kind == 'surface' else indices
@@ -209,17 +245,17 @@ class AcquisitionNormalGuard:
                 matrix = _block_rows(rows, width)[held.ravel()]
                 residual = np.sum((points - target) * normal, axis=-1)[held]
                 # Preserve zero feasibility when an accepted pose has spent
-                # numerical roundoff; the immutable 1e-7 nonlinear cap is unchanged.
-                inward = np.minimum(np.maximum(bound[held] + 5e-8, -residual), bound[held] + 1e-7)
+                # numerical roundoff; reserve half this family's nonlinear cap.
+                inward = np.minimum(np.maximum(bound[held] + slack / 2, -residual), bound[held] + slack)
                 outward = bound[held] + yielded[held]
-                outward = np.minimum(np.maximum(outward + 5e-8, residual), outward + 1e-7)
+                outward = np.minimum(np.maximum(outward + slack / 2, residual), outward + slack)
                 linear.append((matrix, -inward - residual, outward - residual))
             reaching = active & ~established
             if reaching.any():
                 residual = (points - target)[reaching]
                 limit = bound[reaching] + yielded[reaching]
-                allowance = np.minimum(np.maximum(limit + 5e-8, np.linalg.norm(residual, axis=1)),
-                                       limit + 1e-7)
+                allowance = np.minimum(np.maximum(limit + slack / 2, np.linalg.norm(residual, axis=1)),
+                                       limit + slack)
                 matrix = _block_rows(jac.reshape(len(poses), -1, width), width)[np.repeat(reaching.ravel(), 3)]
                 norms.append((matrix, residual, allowance))
         return linear, norms

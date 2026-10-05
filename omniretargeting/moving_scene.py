@@ -256,7 +256,13 @@ class MovingSceneQuery:
                     points.append(local[ids])
             if not points:
                 continue
-            signed = obj["query"].query(np.vstack(points), component_ids=[cid])
+            reduction = obj.get("repair_reduction")
+            if reduction is None:
+                signed = obj["query"].query(np.vstack(points), component_ids=[cid])
+            else:
+                ends = np.r_[0, np.cumsum([len(part) for part in points])]
+                signed = reduction.query(np.vstack(points), list(zip(ends[:-1], ends[1:])),
+                                         cid, band / scale)
             start = 0
             for gid, ids in groups:
                 stop = start + len(ids)

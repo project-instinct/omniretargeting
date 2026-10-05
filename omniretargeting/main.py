@@ -119,10 +119,10 @@ def main():
     parser.add_argument("--output", required=True, help="Path to save output motion (.npz)")
     parser.add_argument("--solver", choices=["framewise", "sequence", "mink", "fast"], default=None,
                         help="Retargeting solver; sequence jointly optimizes all input frames, "
-                             "mink solves the same objective as one small QP per frame (UMR-style), "
-                             "fast solves the sequence objective by banded Gauss-Newton with exact "
-                             "joint limits, root translation bound, reference layout and "
-                             "verified, re-weighted continuity")
+                            "mink solves the same objective as one small QP per frame (UMR-style), "
+                            "fast solves the sequence objective by banded Gauss-Newton with exact "
+                            "joint limits, root translation bound, sustained source layout and "
+                            "verified, re-weighted source-relative chatter")
     parser.add_argument("--terrain", help="Path to terrain mesh file (optional, defaults to flat ground)")
     parser.add_argument(
         "--output-scaled-terrain",

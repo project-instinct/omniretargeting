@@ -35,7 +35,7 @@ def test_source_shape_rows_preserve_both_frozen_references():
     assert violation(shape.repair_bounds(poses), step) <= 1e-10
     # Hip and knee together flip a clear layout component.
     candidate = poses.copy()
-    candidate[:, objective.coords.qi[:2]] -= 0.35
+    candidate[:, objective.coords.qi[:2]] -= 0.8
     step = objective.coords.difference(poses, candidate).ravel()
     assert not shape.accepts(candidate)
     assert violation(shape.repair_bounds(poses), step) > 0.01
@@ -46,11 +46,9 @@ def test_invalid_candidate_cannot_expand_its_temporal_linearization_allowance():
     objective, poses, _ = _objective(temporal=True)
     limits = RepairLimits(objective, poses)
     candidate = poses.copy()
-    candidate[10, objective.coords.qi[-1]] += 0.03  # beyond the windowed budget
-    bounds = limits.constraints(candidate)
-    _, lo, hi = bounds.packed()
-    assert max(lo.max(), (-hi).max()) > 1e-3
-    assert not limits.check(candidate)[0]
+    candidate[10, objective.coords.qi[-1]] += 0.03  # smooth local correction
+    assert limits.check(candidate)[0]
+    assert limits.check(candidate)[1]['temporal_excess'] == []
 
 
 def test_restoration_fixes_small_nonlinear_overshoot_without_undoing_leg_progress():

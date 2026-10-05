@@ -1,11 +1,9 @@
 """Preserve acquired temporal accuracy while optimizing secondary geometry.
 
 Bounds come from the immutable acquired trajectory, not body labels or clip
-timings. Root derivatives concern the correction to the unmodified source.
-Joint velocity, acceleration and jerk concern each executed scalar joint,
-individually. An explicit fast experiment can opt into correction derivatives
-relative to its immutable reference; both backends default to legacy semantics. No filtering or
-transfer of jitter budgets between joints occurs.
+timings. Production acceptance measures source-relative high-frequency chatter;
+the old derivative envelopes remain available for explicit regression
+experiments. No chatter budget is transferred between joints.
 """
 
 import numpy as np
@@ -15,7 +13,7 @@ from scipy import sparse
 from scipy.spatial.transform import Rotation
 
 from ..conic_constraints import LocalNormBounds
-from ..motion_budgets import windowed_budget
+from ..motion_budgets import CHATTER_EXCESS_TOLERANCE, windowed_budget
 
 LINEARIZATION_SLACK = 1e-7
 ACCEPTANCE_SLACK = 2e-7
@@ -33,15 +31,19 @@ def _difference_span(frames, count, order):
 
 
 class SequenceContinuityGuard:
-    def __init__(self, tasks, reference, root_rotations, windowed=False, *, correction=False):
-        """``windowed`` uses the relaxed windowed budgets of
-        ``motion_budgets.windowed_budget`` instead of stencil-exact ones.
+    def __init__(self, tasks, reference, root_rotations, windowed=False, *, correction=False,
+                 chatter=False, velocity_limits=None, enforce_chatter=True):
+        """``windowed`` selects the legacy local derivative envelope.
 
         The optional fast experiment requests ``correction``: keep the same numeric envelopes,
         but constrain deltas from the immutable reference. The sequence
-        backend retains its original executed-signal semantics by default.
+        backend uses source-relative chatter plus velocity limits when ``chatter`` is set.
         """
         self.tasks = tasks
+        self.chatter = bool(chatter)
+        self.enforce_chatter = bool(enforce_chatter)
+        self.reference_pose = np.array(reference, copy=True)
+        self.reference_pose.setflags(write=False)
         self.correction = False
         self.rotations = root_rotations
         self._signals_cache = OrderedDict()
@@ -58,7 +60,17 @@ class SequenceContinuityGuard:
             for order in orders:
                 differences = np.diff(values, n=order, axis=0)
                 size = _change_size(name, differences)
-                self.bounds[name, order] = windowed_budget(size) if windowed else size
+                if not self.chatter:
+                    self.bounds[name, order] = windowed_budget(size) if windowed else size
+        if self.chatter and velocity_limits is not None:
+            velocity_limits = np.asarray(velocity_limits, dtype=float)
+            if velocity_limits.shape != (len(self.reference["joints"][0][1]),):
+                raise ValueError("Velocity limits must match the scalar joints")
+            if np.any(~np.isfinite(velocity_limits) | (velocity_limits <= 0)):
+                raise ValueError("Velocity limits must be finite and positive")
+            # Chatter has no derivative cap, but a real URDF velocity limit is
+            # still a hard first-order mechanical constraint.
+            self.bounds["joints", 1] = velocity_limits
 
         self.correction = correction
         self.fixed_rotations = (None if tasks.coords.root_q is None else
@@ -248,6 +260,18 @@ class SequenceContinuityGuard:
             good = guard_accepts(self, poses, frames=frames)
             return good
         """Nonlinear check; ``frames`` limits it to differences a window moved."""
+        if self.chatter:
+            poses = np.asarray(poses)
+            if poses.shape != self.reference_pose.shape or not np.isfinite(poses).all():
+                return False
+            if self.enforce_chatter:
+                from .._fast.continuity import chatter_reports
+                _, bad = chatter_reports(self.tasks.coords, self.reference_pose, poses)
+                if bad.any():
+                    return False
+            velocity = np.abs(np.diff(poses[:, self.tasks.coords.qi], axis=0))
+            bound = self.bounds.get(("joints", 1))
+            return bound is None or np.all(velocity <= bound[None, :] + ACCEPTANCE_SLACK)
         window = range(len(poses)) if frames is None else frames
         first = max(0, window.start - 3)
         signals = self.signals(poses, (first, min(len(poses), window.stop + 3)))
@@ -266,6 +290,26 @@ class SequenceContinuityGuard:
             from .._fast.window_guards import guard_violation_frames
             return guard_violation_frames(self, poses, frames=frames)
         """Frames of every difference stencil ``accepts`` rejects."""
+        if self.chatter:
+            poses = np.asarray(poses)
+            if poses.shape != self.reference_pose.shape or not np.isfinite(poses).all():
+                return np.ones(len(poses), bool)
+            bad = np.zeros(len(poses), bool)
+            if self.enforce_chatter:
+                from .._fast.continuity import chatter_reports
+                bad = chatter_reports(self.tasks.coords, self.reference_pose, poses)[1]
+                if bad.any():
+                    return bad
+            bound = self.bounds.get(("joints", 1))
+            if bound is None:
+                return bad
+            rows = np.any(
+                np.abs(np.diff(poses[:, self.tasks.coords.qi], axis=0))
+                > bound[None, :] + ACCEPTANCE_SLACK, axis=1
+            )
+            for offset in range(2):
+                bad[offset:offset + len(rows)] |= rows
+            return bad
         signals = self.signals(poses)
         bad = np.zeros(len(poses), bool)
         for (name, order), bound in self.bounds.items():

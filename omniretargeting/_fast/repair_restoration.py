@@ -189,6 +189,32 @@ def _solve_cvxpy_restoration(bounds, projection, movement, radius):
     return np.asarray(delta.value), problem.status
 
 
+def _solve_working_set_restoration(bounds, projection, movement, radius):
+    """The same projection by exact constraint generation, else the established solve.
+
+    The direct program has only the delta variables. A selector projection
+    bounds ``||delta||`` by ``radius + ||movement||`` through the trust cone,
+    which lets ``working_set`` drop rows that cannot bind inside that ball.
+    """
+    import clarabel
+    from .working_set import solve as solve_working_set
+
+    def settings():
+        value = clarabel.DefaultSettings()
+        value.verbose = False
+        value.direct_solve_method = "qdldl"
+        return value
+
+    program = _restoration_program(bounds, projection, movement, radius)
+    ball = radius + float(np.linalg.norm(movement)) if _selected_rows(projection) is not None else None
+    solution = solve_working_set(*program, settings, radius=ball)
+    if solution is None:
+        return _solve_cvxpy_restoration(bounds, projection, movement, radius)
+    if solution.x is None:
+        return None, CLARABEL.STATUS_MAP[solution.status]
+    return np.asarray(solution.x), CLARABEL.STATUS_MAP[solution.status]
+
+
 def restore_repair(
     limits, origin, candidate, geometry, measurement, baseline, projection
 ):
@@ -210,6 +236,9 @@ def restore_repair(
     budgets = np.array(
         [baseline["depths"].get(key, 0.0) for key, _ in measurement["rows"]]
     )
+    if OPTIONS.abl_repair_ratchet:
+        from .repair_ablation import collision_budgets
+        budgets = collision_budgets(limits.objective, measurement, baseline)
     for iteration in range(RESTORATION_ITERATIONS):
         if limits.check(candidate)[0]:
             return candidate, {"status": "restored", "iterations": iteration}
@@ -230,6 +259,8 @@ def restore_repair(
                 status = cp.OPTIMAL
             if delta is None:
                 delta, status = _solve_restoration(program)
+        elif OPTIONS.repair_working_set:
+            delta, status = _solve_working_set_restoration(bounds, projection, movement, radius)
         else:
             delta, status = _solve_cvxpy_restoration(bounds, projection, movement, radius)
         if delta is None:

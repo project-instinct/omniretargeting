@@ -1,127 +1,132 @@
 # OmniRetargeting Agent Instructions
 
-Canonical instructions for all coding agents; `CLAUDE.md` imports this file. Definitions,
-constants and the current implementation: [retargeting invariants](docs/retargeting_invariants.md).
-Documentation policy and index: [docs](docs/README.md).
+本文件是所有编码代理的项目指令，`CLAUDE.md` 引用了它。当前实现的机制、常量和代码位置见
+[重定向设计](docs/retargeting_invariants.md)，文档索引见 [docs](docs/README.md)。
 
-## Goal
+用中文回复用户；代码、命令、路径、标识符和原始错误文本保持原文。
 
-Turn SMPL-X human motion, with its scene and objects, into robot motion that is recognizably
-the same action, touches what the human touches, and passes through nothing. The output
-trains RL tracking policies in InstinctLab, so it must be physically trackable: penetration,
-foot sliding and jitter are what a policy cannot follow or learns as artifacts. Penetration
-means the robot's collision geoms (`contype`/`conaffinity` set, `collision_geom_ids`), which is
-what the simulator sees; visual meshes do not count.
+## 目标
 
-The job is to improve these metrics; measure them before and after any change that affects
-motion output:
+把 SMPL-X 人体动作（连同场景和物体）转成机器人动作：动作认得出是同一个，触碰人所触碰
+的东西，不穿过任何东西。输出用来在 InstinctLab/InstinctMJ 里训练 RL 跟踪策略，所以必须
+物理上跟得上：穿透、脚滑和抖动会让策略跟不上，或者被学成伪影。
 
-| Metric | Good | Audit |
+方法不限。下面的规则描述目标和边界，不规定实现；`docs/` 里的机制都是当前做法，指标证明
+更好时可以整段替换求解阶段。如果你认为本文件的某条规则挡住了更好的结果，带着数据告诉
+用户。
+
+## 指标
+
+改动会影响动作输出时，在相同的 clip 上测量改动前后：
+
+| 指标 | 好的标准 | 审计 |
 | - | - | - |
-| Penetration of robot collision geoms (scene, moving objects, self) | zero; deeper than 1 cm is a defect | `scripts/review_scene_metrics.py` |
-| Pose similarity to the source | small limb/relation angles, action recognizable | `scripts/review_source_pose.py` |
-| Contacts | at the source's scene locations, no foot sliding | `scripts/review_contact_metrics.py` |
-| Jitter | no chatter added beyond the source's own motion | `scripts/review_joint_smoothness.py` |
+| 穿透（机器人碰撞 geom 对场景、移动物体、自身） | 以零为目标；只放行经验证的微小残余（≤ 5 mm）；深于 1 cm 为缺陷；reset 状态单独验收 | `scripts/review_scene_metrics.py` |
+| 姿态相似度 | 动作可识别，关系角度小 | `scripts/review_source_pose.py` |
+| 接触 | 在源动作接触的场景位置，无脚滑 | `scripts/review_contact_metrics.py` |
+| 抖动与可执行性 | 不新增源动作没有的高频抖振；关节速度和力矩在机器人限值内 | `scripts/review_joint_smoothness.py` |
+| 耗时 | 每帧 ≤ 1 s（本机 24 核 + RTX 3090；954 帧约 16 min） | 每个 clip 的 `timing.json` |
 
-Compare across clips with `scripts/trumans_crossclip_review.py` and
-`scripts/review_crossclip_summary.py`. Better methods are welcome, including replacing solver
-stages, when these metrics show the gain.
+穿透只算碰撞 geom（`contype`/`conaffinity` 非零的 `collision_geom_ids`），这是仿真器实际
+看到的；可视网格不算。跨 clip 比较用 `scripts/trumans_crossclip_review.py` 和
+`scripts/review_crossclip_summary.py`。
 
-## Project
+## 红线
 
-- Interpreter: `.venv/bin/python`. Robot profiles: `robot_models/`; module map:
-  [code layout](docs/code_layout.md).
-- Contact-aware changes: `.venv/bin/python -m pytest -q tests/test_contact_priority.py` (~2 s).
-- Full suite: `.venv/bin/python -m pytest -q tests` (~2 min).
-- CLI: `.venv/bin/python -m omniretargeting.main --solver {framewise,sequence,mink,fast} ...`
-  (arguments in `README.md`).
+以下几条无论指标收益多大都保持，其余都是可以权衡的目标：
 
-## Hard Lines
+- SMPL-X 动作、场景配准和物体运动是 ground truth，保持原样（不改写、缩放、抬升或变形）；
+  机器人和场景保持 `scale=1.0`，除非用户要求。SMPL-X 表面穿入场景或物体是拟合误差，真实
+  的人不会穿模：把穿入当作接触证据，机器人不跟着穿。
+- 关节限位始终满足。
+- 检查通过要靠方法改进。如果认为某个测试、阈值、角度上限、profile 权重或身体白名单本身
+  定错了，先告诉用户并附理由和前后数据，用户批准后再改；否则指标就失去了意义。
 
-Never cross these, whatever a metric gains:
+## 取舍
 
-- The SMPL-X motion, scene registration and object motion are ground truth: never rewrite,
-  rescale, lift or deform them. Robot and scene stay at `scale=1.0` unless the user asks.
-- Joint limits hold.
-- Layout: between different limbs, or a limb and the trunk, a relation component clear in the
-  reference heading frame (front/back, left/right, up/down) may approach zero but never flips.
-  Bends within one limb are not layout.
-- Never pass a check by loosening a test or threshold, or with angle caps, per-robot/per-body
-  weights in profile JSON or body-part whitelists.
+每一项在可接受范围内就算满足。超出范围的冲突按下面的顺序，以最小偏差解决：
 
-If a metric cannot improve without crossing a hard line, stop and report the binding
-constraint (rule, body, frames, magnitude).
+1. 时间连续性：不新增源动作没有的高频抖振（来回反向、高频能量），关节速度和力矩在 URDF
+   `<limit velocity effort>` 之内，根节点和支撑切换同样适用。铺开到相邻帧的平滑修正不算
+   抖振。原因：策略学不会抖振，超限的动作机器人做不出来。
+2. 非穿透：以零为目标，包括接触中的身体。放行的残余要 ≤ 5 mm 且经过验证：几何上可确认
+   （不是 `unknown_query`），位于接触身体与其支撑面之间且沿法向，而不是侧向穿进家具或物体；
+   物理回放中没有异常接触力或弹开（回放工具就绪前，几何验证通过即放行，标注“未物理验证”）。
+   残余进入这个范围就停手，超出时先修最深、持续最久的。
+   reset 单独验收：InstinctMJ 可以从轨迹任意时刻开始 episode，每一帧都可能是初始状态，那时
+   没有接触平衡，穿透会被一下弹开。所以不允许侧向穿入和自碰撞，支撑面残余不超过仿真静止
+   接触的平衡深度。
+3. 接触：先支撑，再有证据的物体控制，最后其他触碰。
+4. 源根节点路径与时机。
+5. 姿态相似度：自由手目标、源朝向和姿态关系，作为同一层软目标用权重平衡。布局（不同肢体
+   之间、肢体与躯干之间的前后/左右/上下关系）以源动作为准：持续、明显的翻转算动作崩溃；
+   接近零、短暂，或为避让穿透而小幅越过零，不算翻转。同一肢体内的弯曲不属于布局。
 
-## Trade-offs
+较高优先级明确改善时，较低优先级的小幅退化可以接受，同时报告两个数值。较低优先级崩溃
+（认不出动作、布局明显翻转、失去支撑）的结果不采用，换方法。
 
-When goals conflict, the higher item wins, by the smallest deviation that resolves the
-conflict:
+## 领域知识
 
-1. Temporal continuity: no jitter beyond each joint's windowed velocity/acceleration/jerk
-   budget, including root and support hand-offs; one joint's budget never pays for another's.
-2. Non-penetration, for every body including bodies in contact: no contact, target or posture
-   term may hold a body inside a surface.
-3. Contacts: supports, then evidenced object control, then other touches.
-4. Source root path and timing.
-5. Pose similarity: free-hand targets, source orientations and posture relations, one soft
-   level balanced by weights.
+这些来自踩过的坑，理解原因比照搬做法更重要：
 
-A small loss in a lower item is acceptable when a higher one clearly improves; state both
-numbers. If a lower item collapses (the action becomes unrecognizable or a support is lost),
-the result is rejected even if other metrics improve: look for a better method, and report
-only if none works.
+- 接触目标留在世界坐标下的场景位置（脚也一样），因为要碰到的是真实物体；自由手用身体
+  相对、按形态缩放的目标。
+- 碰撞修正前，先从源动作形态构建机器人参考，同一次运行内保持固定：反复重设到最新候选解
+  会让机器人越修越扭。改进参考的构建方式是杠杆最大的方向之一。
+- 接触由几何检测（源表面接触或穿入场景、物体表面；穿入越深越确定是接触，目标取自由侧
+  表面上的投影），力学只负责排序：最小可行支撑集里的是支撑（例如托住箱底的双手），物体
+  控制要有物体运动的证据（`object_control_evidence.py`）。身体部位、距离和持续时间都不是
+  证据；力学解释不了的接触继续保护。
+- 接触把身体拉到表面上，而不是拉进去：超出容差的接触身体按深度让位并报告间隙。为脱离源
+  穿模而偏离源姿态是正确的偏差。
+- 源动作中新旧支撑同时存在时，先合后离：先够到新支撑再放开旧支撑，先调姿态再动根节点。
+  例：腿比人短的机器人坐着时，先沿座椅前移到双脚着地再起身，而不是把骨盆压进座椅。
+- 整体平移或抬升根节点很容易变成作弊（脚悬空、根节点漂移）。优先用关节修正；需要动根节点
+  时分散到相邻帧，并报告偏移量。
+- 只平滑求解器引入的抖振：保留源动作里刻意的快速动作和接触时机，不引入滞后、脚滑或末端
+  漂移。
+- 姿态用形态归一化的 landmark 关系度量（`pose_relations.py`），对照源动作判断。
+- InstinctLab 的 reset 抬高和 physics separation 不算修复：前者只检查 link 原点是否低于
+  z=0，看不到家具；后者是下游兜底。
 
-## Domain Rules
+## 运行与卡住时
 
-- Contact targets stay at their world-frame scene locations, never scaled or root-relative.
-  Free hands use body-relative, morphology-scaled targets; feet keep world targets.
-- Build a source-shaped robot reference before clearance optimization. Within a run, keep it
-  and its jitter budgets fixed; never rebase them to the latest candidate, or repeated passes
-  progressively twist the robot. Improving how the reference is built is fine.
-- Contacts: geometry detects (source body surface touching a scene or object surface);
-  mechanics only ranks, with one test for the human and every moving object. A contact in a
-  minimal feasible support set is a support (e.g. hands under a carried box); object control
-  needs evidence from object motion (`object_control_evidence.py`). Body part, proximity and
-  duration are not evidence; contacts mechanics cannot explain stay protected.
-- Contacts pull onto a surface, never into it: a contact body that penetrates yields by its
-  depth, and a yielded contact reports its gap.
-- Hand off make-before-break: reach the incoming support before releasing the outgoing one,
-  yielding posture first, then the smallest root shift. Example: a seated robot with shorter
-  legs than the source slides forward on the seat until its feet reach the floor, then rises;
-  sinking the pelvis into the seat is wrong.
-- Shifting or lifting the whole root is the usual cheat for penetration and contacts; it shows
-  up as floating feet or root drift. Use it only when joint corrections cannot resolve the
-  problem, spread corrections over neighbouring frames instead of snapping, and report any
-  root shift.
-- Smooth only solver chatter: keep deliberate fast motion and contact timing, with no lag,
-  foot sliding or endpoint drift.
-- Measure posture as morphology-normalized landmark relations (`pose_relations.py`), judged
-  against the source rather than fixed angle limits.
-- InstinctLab's reset height offset and physics separation do not count as repairs.
+- 求解器在耗时预算内收敛：到预算时返回当前最好的已接受结果，把没做完的部分写进缺陷清单，
+  不继续迭代。
+- 验收（几何、物理回放、reset）在求解完成后每个 clip 跑一次，不放进求解循环；不通过就记入
+  缺陷清单，不自动重解。reset 不合格的帧可以标为不可作为起点。
+- 某个 clip 修不好时，记入缺陷清单（指标、身体、帧、幅度、卡住它的约束），继续处理其他
+  clip。同一瓶颈出现在多数 clip 上，或者只有越过红线才能解决时，停下来问用户。
+- 审计判断不了的数据（例如 `unknown_query`）单独计数报告，不算通过，也不阻塞。
 
-## Reporting
+## 汇报
 
-For changes that affect motion output, report each metric before/after on the clips you ran,
-with the worst body, joint and frame rather than only averages; separate source fast motion
-from added chatter; name every trade-off and every remaining defect with its binding
-constraint. With `--solver fast`, include `budgets` (with `relation_*`, `layout_flip_*`) and
-`skipped_tasks`. Code-only changes need the tests above.
+影响动作输出的改动：报告每个 clip 每个指标的前后值和最差身体、关节、帧（不只平均值），
+以及耗时；区分源动作本身的快速运动和新增抖振；列出取舍和缺陷清单。使用 `--solver fast`
+时附上 `budgets`（含 `relation_*`、`layout_flip_*`）和 `skipped_tasks`。
 
-## Working Rules
+## 项目
 
-- Preserve unrelated user changes; use small patches and reuse existing utilities.
-- Keep Python files at or below 1000 lines, split by responsibility
-  (`tests/test_module_size.py`).
-- Keep generic solver contracts source-agnostic; SMPL-X extraction belongs in loaders/adapters
-  and contact-marker preparation.
-- WebViser/WebVisualizer previews use only port `8183`: check `http://127.0.0.1:8183/`, give
-  the user `http://10.19.126.196:8183/<page>/`.
-- Do not push to a remote without explicit user approval.
+- 解释器 `.venv/bin/python`；机器人 profile 在 `robot_models/`；模块结构见
+  [代码布局](docs/code_layout.md)。
+- CLI：`.venv/bin/python -m omniretargeting.main --solver {framewise,sequence,mink,fast} ...`
+  （参数见 `README.md`）。
+- 测试：接触相关改动跑 `.venv/bin/python -m pytest -q tests/test_contact_priority.py`
+  （约 2 s）；完整套件 `.venv/bin/python -m pytest -q tests`（约 2 min）。只改代码也要跑。
+- Python 文件不超过 1000 行，按职责拆分（`tests/test_module_size.py`）。
+- 通用求解器契约与数据源无关；SMPL-X 提取放在 loaders/adapters 和接触标记准备阶段。
+- 补丁小而聚焦，复用现有工具，保留无关的用户改动。
+- WebViser/WebVisualizer 预览只用端口 `8183`：本机检查 `http://127.0.0.1:8183/`，给用户
+  `http://10.19.126.196:8183/<page>/`。
+- 推送到远端前先征得用户同意。
 
-## Sub-agents (paseo)
+## 子代理（paseo）
 
-- Review and analysis: `codex-glm/glm-5.3` (codex is expensive); `codex/gpt-6-astra` only
-  for design problems the GLM models cannot handle.
-- Writing code: `codex/gpt-6.1-sol`.
-- Simple implementation: `codex-glm/glm-5.3`.
-- Running and monitoring jobs: `codex-glm/glm-5.3-flash`.
+- 启动 `codex-glm` 子代理时，通过对应的 Paseo full-access profile：GLM 5.3 用
+  `glm-full-access`，Flash 用 `glm-flash-full-access`。profile 具体化为
+  `settings: {modeId: "full-access", ...}`；Codex 的 mode ID 里没有 `plan`。
+- 审查与分析：`codex-glm/glm-5.3`（codex 较贵）；只有 GLM 处理不了的设计问题才用
+  `codex/gpt-6-astra`。
+- 编写代码：`codex/gpt-6.1-sol`。
+- 简单实现：`codex-glm/glm-5.3`。
+- 运行和监控任务：`codex-glm/glm-5.3-flash`。

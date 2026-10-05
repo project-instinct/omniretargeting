@@ -127,7 +127,9 @@ def _serve(objective, connection, inherited):
                 break
             try:
                 permits = getattr(objective, '_window_restoration_permits', None)
-                with permits if permits is not None else nullcontext():
+                budget = getattr(objective, '_window_cpu_budget', None)
+                lease = budget.window() if budget is not None else permits
+                with lease if lease is not None else nullcontext():
                     result = solve_local(objective, *task)
                 connection.send(('ok', result))
             except BaseException:
@@ -224,8 +226,14 @@ def _workers(objective, count):
     service, evaluation_service, workers = None, None, None
     try:
         from .window_restoration_parallel import WINDOW_PARALLEL_RESTORATIONS
-        if WINDOW_PARALLEL_RESTORATIONS and count and not WINDOW_GPU_EVALUATION and not WINDOW_GPU_SHELL:
-            objective._window_restoration_permits = multiprocessing.get_context('fork').BoundedSemaphore(count)
+        from .window_cpu_budget import WindowCpuBudget, native_workers
+        if count and not WINDOW_GPU_EVALUATION and not WINDOW_GPU_SHELL:
+            if native_workers() > 1:
+                objective._window_cpu_budget = WindowCpuBudget(count)
+            if WINDOW_PARALLEL_RESTORATIONS:
+                budget = getattr(objective, '_window_cpu_budget', None)
+                objective._window_restoration_permits = (budget.permits if budget is not None else
+                    multiprocessing.get_context('fork').BoundedSemaphore(count))
         if WINDOW_GPU_EVALUATION:
             evaluation_service = WindowEvalService(objective)
             objective._window_eval_client = evaluation_service.client()
@@ -242,6 +250,7 @@ def _workers(objective, count):
         if workers is not None:
             workers.close()
         objective.__dict__.pop('_window_restoration_permits', None)
+        objective.__dict__.pop('_window_cpu_budget', None)
         if service is not None:
             objective.__dict__.pop('_window_shell_client').close()
             for local, _, _ in getattr(objective, '_window_views', {}).values():
@@ -434,6 +443,8 @@ def _history_row(task, result, details, *, label, index, sweep, color, count, se
         window_evaluation_seconds=result.get('evaluation_seconds'),
         window_evaluation_calls=result.get('evaluation_calls'),
         window_evaluation_jacobian_calls=result.get('evaluation_jacobian_calls'),
+        window_performance=(
+            result['history'][-1].get('solver_performance') if result['history'] else None),
         qoco_restoration=result.get('qoco_restoration', {}),
         parallel_restoration=result.get('parallel_restoration', {}),
         **({'iteration_quota': task.iteration_quota} if task.iteration_quota is not None else {}),
@@ -619,6 +630,9 @@ def optimize_legacy_windows(objective, poses, *, iterations, callback=None,
                 break
             if callback is not None and len(history) > first_record:
                 callback(current.copy(), dict(history[-1]))
+        budget = getattr(objective, '_window_cpu_budget', None)
+        if budget is not None:
+            summary['native_cpu_budget'] = budget.report()
     if history:
         summary['extra_seconds'] = 0. if extra_started is None else time.monotonic() - extra_started
         history[-1].update(seconds=time.monotonic() - started, continuation=report_value(summary))

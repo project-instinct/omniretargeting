@@ -47,7 +47,10 @@ def test_strict_velocity_increase_is_separate_from_relaxed_chatter():
     assert not report['strict_accepted']
     assert report['relaxed_chatter_accepted']
     assert report['channels']['joints_order_1']['strict_per_coordinate'][0] == len(candidate) - 1
-    assert not CorrectionContinuity(coords, fixed).accepts(candidate)
+    assert CorrectionContinuity(coords, fixed, chatter=True).accepts(candidate)
+    noisy = fixed.copy()
+    noisy[::2, coords.qi[0]] += .015
+    assert not CorrectionContinuity(coords, fixed, chatter=True).accepts(noisy)
 
 
 def test_secondary_solver_keeps_root_and_each_acquired_temporal_bound():

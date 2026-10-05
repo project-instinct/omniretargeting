@@ -62,6 +62,8 @@ def _serve(geometry, frames, cores, connection, stop):
             break
         if isinstance(message[0], str):
             command, poses = message
+            if command == 'prefetch_self' and poses is None:
+                poses = geometry._repair_pose_view
             from ..geometry_query import GeometryQueryError
             try:
                 if command == "reference_observations":
@@ -85,6 +87,10 @@ def _serve(geometry, frames, cores, connection, stop):
                 connection.send(("error", error, 0))
             continue
         poses, jacobians, protected, order, static_updates, *moving = message
+        if poses is None:
+            poses = geometry._repair_pose_view
+        from .repair_transport import decode_protected
+        protected = decode_protected(geometry, protected)
         visit = frames if order is None else [frame for frame in order if frame in own]
         try:
             if moving and moving[0] is not None:
@@ -106,6 +112,8 @@ def _serve(geometry, frames, cores, connection, stop):
             if static_updates is not None:
                 part["_static_updates"] = [(u[0], geometry._static_cache[u[0]]) for u in static_updates]
                 part["_static_seconds"] = geometry.gpu_exact_seconds
+            part["_static_query_coverage"] = dict(getattr(geometry, "static_query_coverage", {}))
+            part["_static_query_examples"] = list(getattr(geometry, "static_query_examples", ()))
             count = 0 if geometry.moving is None else geometry.moving.query_count
             reply = ("ok", part, count)
         except Exception as error:  # re-raised by the parent
@@ -127,6 +135,10 @@ class ParallelMeasure:
         if count < 2 or not hasattr(os, "fork"):
             return
         context = multiprocessing.get_context("fork")
+        from .repair_frame_norm import enabled
+        if enabled():
+            from .repair_transport import prepare
+            prepare(geometry, context, self.frames)
         # First rejected frame found by any worker; -1 while none is known.
         self.stop = context.RawValue("i", -1)
         available = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
@@ -165,8 +177,13 @@ class ParallelMeasure:
 
     def prefetch_self(self, poses):
         """Overlap exact self-pair cache filling with parent GPU scene screening."""
+        from .repair_frame_norm import enabled
+        value = np.asarray(poses)
+        if enabled() and not self.prefetched:
+            from .repair_transport import pose_message
+            value = pose_message(self.geometry, value)
         for _, connection in self.workers:
-            connection.send(("prefetch_self", np.asarray(poses)))
+            connection.send(("prefetch_self", value))
         self.prefetched = True
 
     def prefetch_static(self, updates):
@@ -230,8 +247,19 @@ class ParallelMeasure:
             for update in moving_updates:
                 moving[update[0] % count].append(update)
 
+        from .repair_frame_norm import enabled
+        pose_payload, protected_payload = poses, protected_depths
+        if enabled() and hasattr(self.geometry, '_repair_pose_view'):
+            from .repair_transport import pose_message, protected_message
+            # Streaming may deliberately retain an unfinished self prefetch.
+            # Its shared snapshot must survive until the acknowledgements are
+            # drained below; this exceptional request uses ordinary pickle.
+            if not self.prefetched:
+                pose_payload = pose_message(self.geometry, poses)
+            protected_payload = protected_message(self.geometry, protected_depths)
+
         def message(index):
-            value = (poses, jacobians, protected_depths, order, None if updates is None else updates[index])
+            value = (pose_payload, jacobians, protected_payload, order, None if updates is None else updates[index])
             return value if moving is None else (*value, moving[index])
         launch = list(range(count))
         if stream is not None and order is not None:
@@ -266,6 +294,13 @@ class ParallelMeasure:
             else:
                 self.geometry._static_cache.update(value.pop("_static_updates", ()))
                 static_seconds.append(value.pop("_static_seconds", 0.))
+                coverage = value.pop("_static_query_coverage", {})
+                for name, count_value in coverage.items():
+                    current = self.geometry.static_query_coverage
+                    current[name] = current.get(name, 0) + count_value
+                from .original_rigid_fallback import record_example
+                for example in value.pop("_static_query_examples", []):
+                    record_example(self.geometry, example)
                 parts.append(value)
                 self.counts[index] = count
         if error is not None:

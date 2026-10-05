@@ -91,6 +91,23 @@ class OmomoDataSource(DataSource):
         if len(vertices) <= self.n_object_samples:
             return vertices
 
+        from .._core.preprocessing_parallel import can_parallelize
+        if can_parallelize():
+            # Each pairwise distance uses the same three-coordinate norm.
+            # Retain the original set iteration and tie-breaking order.
+            sampled_indices = [0]
+            remaining = set(range(len(vertices)))
+            remaining.remove(0)
+            nearest = np.full(len(vertices),np.inf)
+            for _ in range(self.n_object_samples-1):
+                ids = list(remaining)
+                distance = np.linalg.norm(vertices[ids]-vertices[sampled_indices[-1]],axis=1)
+                nearest[ids] = np.minimum(nearest[ids],distance)
+                farthest_idx = ids[np.argmax(nearest[ids])]
+                sampled_indices.append(farthest_idx)
+                remaining.remove(farthest_idx)
+            return vertices[sampled_indices]
+
         sampled_indices = [0]
         remaining = set(range(len(vertices)))
         remaining.remove(0)

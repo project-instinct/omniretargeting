@@ -33,6 +33,40 @@ def report_depths(depths, model, start):
     }
 
 
+def open_surface_depths(model, poses, ids, query):
+    """Exact geom / finite-triangle crossing depths of a scene of open scans.
+
+    A scene with unsigned-only components has no sampled side anywhere. Its
+    collision geoms are tested against the actual triangles (capsule, sphere
+    and solid cylinder). An open scan has no solid side: a geom wholly behind
+    one is not a crossing. Unsupported geoms or signed components raise.
+    """
+    from omniretargeting._fast.original_rigid_fallback import uncovered_components
+    from omniretargeting.geometry_query import OPEN_SURFACE_GEOMS, RigidGeometryQuery
+
+    backend = RigidGeometryQuery(model, ids, query)
+    unsupported = [int(g) for g in ids if model.geom_type[g] not in OPEN_SURFACE_GEOMS]
+    uncovered = uncovered_components(query, backend)
+    if unsupported or uncovered:
+        raise RuntimeError(f"open-scan audit cannot certify geoms {unsupported} / components {uncovered}")
+    data = mujoco.MjData(model)
+    depths = np.zeros((len(poses), model.ngeom))
+    uncertain, worst_exit, worst_depth = 0, np.zeros(3), 0.0
+    for frame, pose in enumerate(poses):
+        data.qpos[:] = pose
+        mujoco.mj_forward(model, data)
+        for row in backend.query(data, 0.0):
+            uncertain += bool(row["uncertain"])
+            depth = max(-float(row["clearance"]), 0.0)
+            gid = int(row["geom_ids"])
+            depths[frame, gid] = max(depths[frame, gid], depth)
+            if depth > worst_depth:
+                worst_depth, worst_exit = depth, depth * np.asarray(row["directions"])
+    if backend.failures:
+        raise RuntimeError(f"open-scan audit query failures: {backend.failures[:3]}")
+    return depths, uncertain, worst_exit, backend.describe()
+
+
 def audit(args):
     inputs = np.load(args.prepared, allow_pickle=True).item()
     payload = np.load(args.motion)
@@ -58,7 +92,10 @@ def audit(args):
     depths = np.zeros((len(poses), model.ngeom))
     unknown = 0
     worst_exit, worst_depth = np.zeros(3), 0.0
-    for begin in range(0, len(poses), args.batch):
+    open_scan = query.has_unsigned_only_components
+    if open_scan:
+        depths, unknown, worst_exit, backend = open_surface_depths(model, poses, ids, query)
+    for begin in range(0, len(poses) if not open_scan else 0, args.batch):
         chunk = poses[begin : begin + args.batch]
         points = []
         for pose in chunk:
@@ -98,9 +135,14 @@ def audit(args):
         spacing_m=args.spacing,
         worst_exit_xy_m=float(np.linalg.norm(worst_exit[:2])),
         worst_exit_z_m=float(worst_exit[2]),
-        method="original triangles; winding containment",
+        method=("original triangles; exact geom/finite-triangle crossing (open scans, no solid side)"
+                if open_scan else "original triangles; winding containment"),
         collision_free_certificate=False,
     )
+    if open_scan:
+        static.update(open_scan_backend={key: backend[key] for key in (
+            "open_surface_test", "pair_queries", "cylinder_surface_faces",
+            "ambiguous_surface_intersections", "uncertified_cylinder_witnesses")})
     saved = {"static_depths": depths}
     result = {
         "motion": str(args.motion),

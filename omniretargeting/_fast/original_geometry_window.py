@@ -27,12 +27,16 @@ def _pose_key(geometry, pose):
 
 def copy_rows(rows):
     """Own mutable witness values without recursively copying immutable keys."""
+    from .repair_frame_norm import enabled
+    fast = enabled()
     return [(key, {name: (value.copy() if isinstance(value, np.ndarray)
+                         else value.copy() if fast and isinstance(value, list)
+                         and all(type(v) in (int, float, bool, str, bytes, type(None)) for v in value)
                          else deepcopy(value) if isinstance(value, (dict, list, set)) else value)
                    for name, value in row.items()}) for key, row in rows]
 
 
-def remember_frames(geometry, poses, parts):
+def remember_frames(geometry, poses, parts, *, owned=False):
     """Keep completed per-frame results, never early-stop partial diagnostics."""
     from .repair_linearize import remember
     remember(geometry, poses, parts)
@@ -51,7 +55,8 @@ def remember_frames(geometry, poses, parts):
                 if collision[1] == "moving":
                     witness["jacobian"] = np.empty(0, dtype=np.float64)
                 witnesses.append((collision, witness))
-            cache[key] = (frame, copy_rows(witnesses), dict(depths), list(failures))
+            cache[key] = (frame, witnesses if owned else copy_rows(witnesses),
+                          dict(depths), list(failures))
             cache.move_to_end(key)
             while len(cache) > POSES_PER_FRAME:
                 cache.popitem(last=False)
@@ -210,7 +215,10 @@ def _query_missing(geometry, poses, missing, protected_depths):
                                  moving_updates=moving, frames=missing)
         if geometry.moving is not None:
             geometry.moving.query_count = parallel.query_count
-    remember_frames(geometry, poses, parts)
+    from .repair_frame_norm import enabled
+    # These private query results never escape. The public window result is
+    # still copied below, including lists/dicts and every mutable array.
+    remember_frames(geometry, poses, parts, owned=enabled())
     return parts
 
 

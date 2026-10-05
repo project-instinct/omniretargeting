@@ -34,6 +34,8 @@ def test_violation_frames_are_the_per_frame_form_of_accepts(seed):
             assert bad.shape == (len(poses),)
             assert bool(bad.any()) == (not guard.accepts(candidate)), type(guard).__name__
             moved = np.flatnonzero(np.abs(step).sum(axis=1) > 0)
-            if bad.any():
+            # Chatter is a whole-trajectory high-frequency certificate, so a
+            # flagged frame can depend on samples outside a three-frame stencil.
+            if bad.any() and not getattr(guard, "chatter", False):
                 # A rejected frame moved or lies in a moved frame's stencil.
                 assert np.min(np.abs(np.flatnonzero(bad)[:, None] - moved[None]), axis=1).max() <= 3

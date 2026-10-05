@@ -6,7 +6,7 @@ import numpy as np
 from scipy import sparse
 
 from .kinematics import TrajectoryKinematics
-from .repair_contact_rows import CHUNK_FRAMES, _shift
+from .repair_contact_rows import CHUNK_FRAMES, _shift, selector_key, shift_project
 from .reference import ReferenceShape
 
 _REPAIR_BOUNDS = ReferenceShape.repair_bounds
@@ -22,7 +22,7 @@ def _identity(envelope, part):
                              for a in values))
 
 
-def layout_bounds(guard, poses, *, restore=False):
+def layout_bounds(guard, poses, *, restore=False, selector=None):
     """Full-coordinate ReferenceShape rows with the established family order."""
     if (type(guard) is not ReferenceShape
             or getattr(guard.repair_bounds, "__func__", None) is not _REPAIR_BOUNDS):
@@ -31,12 +31,16 @@ def layout_bounds(guard, poses, *, restore=False):
     if state is None or state[0] != guard.coords.cols.tobytes():
         state = guard._repair_layout_cache = guard.coords.cols.tobytes(), {}
     caches = state[1]
+    from .repair_frame_norm import enabled
+    fast = enabled()
     collected = [[] for _ in guard.envelopes]
     guard.kin.evaluate(poses)
     for start in range(0, len(poses), CHUNK_FRAMES):
         part = slice(start, min(start + CHUNK_FRAMES, len(poses)))
         key = (poses.dtype.str, poses[part].tobytes(), restore,
                tuple(_identity(e, part) for e in guard.envelopes))
+        if fast:
+            key += (len(poses), selector_key(selector))
         cache = caches.setdefault(start, OrderedDict())
         value = cache.get(key)
         if value is None:
@@ -48,13 +52,17 @@ def layout_bounds(guard, poses, *, restore=False):
             kin.with_jacobian = True
             value = [e.for_frames(part).linear_bounds(kin, guard.coords.width, restore=restore)
                      for e in guard.envelopes]
+            if fast:
+                value = [[(shift_project(matrix, start * guard.coords.width,
+                                        len(poses) * guard.coords.width, selector), low, high)
+                          for matrix, low, high in rows] for rows in value]
             cache[key] = value
         cache.move_to_end(key)
         while len(cache) > 3:
             cache.popitem(last=False)
         for output, rows in zip(collected, value):
             for matrix, low, high in rows:
-                output.append((_shift(matrix, start * guard.coords.width,
+                output.append((matrix if fast else _shift(matrix, start * guard.coords.width,
                                       len(poses) * guard.coords.width), low, high))
     linear = []
     for chunks in collected:

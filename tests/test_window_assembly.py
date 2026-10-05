@@ -24,8 +24,10 @@ def make_objective():
     objective, poses, (tasks, _, _) = _objective(temporal=True)
     objective.priority_clearance = EmptyPriority()
     objective.source_shape = ReferenceShape(objective, poses)
-    objective.candidate_guards = [CorrectionContinuity(objective.coords, poses, root_norm=True),
-                                  SequenceContinuityGuard(tasks, poses, objective.root_rotations)]
+    objective.candidate_guards = [
+        CorrectionContinuity(objective.coords, poses, root_norm=True, chatter=False),
+        SequenceContinuityGuard(tasks, poses, objective.root_rotations, chatter=False),
+    ]
     return objective, poses
 
 

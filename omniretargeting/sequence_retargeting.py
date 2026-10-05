@@ -150,6 +150,7 @@ def prepare_sequence(
     extra_tasks=(),
     root_orientation_targets=None,
     body_orientation_targets=(),
+    source_graph_cache=None,
 ):
     """Coordinates, limits and per-frame task rows shared by both backends."""
     coords = Coordinates(
@@ -212,6 +213,7 @@ def prepare_sequence(
         contact_offset_choice=contact_offset_choice,
         extra_tasks=extra_tasks,
         orientation_targets=orientation_targets,
+        source_graph_cache=source_graph_cache,
     )
     return coords, q, task_set, root_rotations
 

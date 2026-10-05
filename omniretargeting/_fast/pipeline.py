@@ -11,25 +11,28 @@ No new user configuration: constants below are internal numerical choices.
 
 import time
 from contextlib import ExitStack, nullcontext
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import numpy as np
-from scipy.ndimage import gaussian_filter1d, maximum_filter1d
+from scipy.ndimage import maximum_filter1d
 from scipy.spatial.transform import Rotation
 
 from .._sequence.orientation_seed import source_orientation_seed
 from .._sequence.continuity_guard import SequenceContinuityGuard
 from .._sequence.proximity import SurfaceProximityTasks
-from ..motion_budgets import (
-    CHATTER_RMS_FRACTION, CHATTER_SCALE_FRAMES, CHATTER_WINDOW, windowed_budget,
-)
+from ..motion_budgets import CHATTER_RMS_FRACTION, CHATTER_WINDOW, windowed_budget
 from ..sequence_retargeting import prepare_sequence, sequence_config
 from ..surface_contact import SurfaceContactTasks
 from .runtime_options import OPTIONS
 from .contact_guard import ContactGuard
 from .acquisition_guard import AcquisitionNormalGuard
-from .continuity import CorrectionContinuity, audit_continuity, correction_derivatives, derivatives
+from .continuity import (
+    CorrectionContinuity, audit_continuity, chatter_reports, correction_derivatives, derivatives,
+)
 from .mesh_repair import repair_original_meshes
 from .objective import FastObjective
+from .performance_trace import PerformanceTrace, explain_guard
 from .reference import ReferenceShape, kinematic_tracking_tasks, register_height
 from .sdf import object_sdf, static_scene_sdf
 from .solver import optimize, threadpool_limits
@@ -48,11 +51,11 @@ ROUND_OFF_SLACK = 2e-7
 CHATTER_WINDOW_FRAMES = CHATTER_WINDOW
 REWEIGHT_ROUNDS = 1
 REWEIGHT_FACTOR = 10.0
+REWEIGHT_DECREASE = 1e-2
 # The free-body stage is a small correction whose rows are a small part of the
 # total cost: it stops on a much smaller relative decrease, within a budget.
 FREE_STAGE_ITERATIONS = 15
 FREE_STAGE_DECREASE = 1e-4
-CORRECTION_TOLERANCE = 0.02
 # Contact/scene joint corrections are measured against the fixed reference and
 # must not add chatter, so their temporal rows start this much stiffer than the
 # source-pose rows (root rows keep following the source path); verification
@@ -72,6 +75,34 @@ def _continuity_layers(initialization, final, correction, acquisition_accepted):
                 acquisition_guard_accepted=bool(acquisition_accepted),
                 acquisition_pass_is_not_full_acceptance=True,
                 missing_initialization_audit_is_not_a_pass=True)
+
+
+def _velocity_limits(owner, model, coords, framerate):
+    """Per optimized scalar joint: URDF velocity / clips per second."""
+    path = getattr(owner, "robot_urdf_path", None)
+    if path is None or Path(path).suffix.lower() not in {".urdf", ".xml"}:
+        return None
+    try:
+        root = ET.parse(path).getroot()
+    except (OSError, ET.ParseError):
+        return None
+    declared = {
+        joint.get("name"): float(joint.find("limit").get("velocity"))
+        for joint in root.findall(".//joint")
+        if joint.get("name") is not None and joint.find("limit") is not None
+        and joint.find("limit").get("velocity") is not None
+    }
+    result = np.full(len(coords.qi), np.inf)
+    found = False
+    for column, address in enumerate(coords.qi):
+        candidates = np.flatnonzero(model.jnt_qposadr == int(address))
+        if len(candidates) != 1:
+            continue
+        limit = declared.get(model.joint(int(candidates[0])).name)
+        if limit is not None:
+            result[column] = float(limit) / framerate
+            found = True
+    return result if found else None
 
 
 def _surface_tasks(extra_tasks):
@@ -133,7 +164,8 @@ def verify_budgets(model, coords, fixed, motion, bodies=None, shape=None):
     only; posture has no angular bound.
     """
     qi = coords.qi
-    result, chatter_frames = {}, np.zeros(len(motion), bool)
+    chatter, chatter_frames = chatter_reports(coords, fixed, motion)
+    result = {}
     for order in (1, 2, 3):
         before = np.abs(np.diff(fixed[:, qi], n=order, axis=0))
         after = np.abs(np.diff(motion[:, qi], n=order, axis=0))
@@ -141,23 +173,23 @@ def verify_budgets(model, coords, fixed, motion, bodies=None, shape=None):
         strict = after > before + ROUND_OFF_SLACK
         local = maximum_filter1d(before, CHATTER_WINDOW_FRAMES, axis=0, mode="nearest")
         joint_rms = np.sqrt(np.mean(before**2, axis=0))
-        chatter = (correction if OPTIONS.correction_budget else after) > local + CHATTER_RMS_FRACTION * joint_rms + ROUND_OFF_SLACK
-        # A smooth correction legitimately changes velocity; chatter shows in
-        # acceleration and jerk, so only those orders trigger re-weighting.
-        for start in np.flatnonzero(chatter.any(axis=1)) if order > 1 else ():
-            chatter_frames[start : start + order + 1] = True
+        derivative_screen = (
+            (correction if OPTIONS.correction_budget else after)
+            > local + CHATTER_RMS_FRACTION * joint_rms + ROUND_OFF_SLACK
+        )
         result[f"order_{order}"] = {
             "correction_rms": float(np.sqrt(np.mean(correction**2))),
             "correction_peak": float(correction.max(initial=0)),
             "strict_violations": int(strict.sum()),
-            "added_chatter_violations": int(chatter.sum()),
+            "derivative_screen_violations": int(derivative_screen.sum()),
             "rms_before": float(np.sqrt(np.mean(before**2))),
             "rms_after": float(np.sqrt(np.mean(after**2))),
             "peak_before": float(before.max(initial=0)),
             "peak_after": float(after.max(initial=0)),
         }
     if coords.root_q is not None:
-        # Root position chatter, on the same added-chatter criterion.
+        # Root derivative statistics remain diagnostic; position chatter is
+        # the high-frequency report above, not a derivative-size comparison.
         root = slice(coords.root_q, coords.root_q + 3)
         for order in (2, 3):
             before = np.linalg.norm(np.diff(fixed[:, root], n=order, axis=0), axis=1)
@@ -165,12 +197,13 @@ def verify_budgets(model, coords, fixed, motion, bodies=None, shape=None):
             correction = np.linalg.norm(np.diff(motion[:, root] - fixed[:, root], n=order, axis=0), axis=1)
             local = maximum_filter1d(before, CHATTER_WINDOW_FRAMES, mode="nearest")
             rms = np.sqrt(np.mean(before**2))
-            chatter = (correction if OPTIONS.correction_budget else after) > local + CHATTER_RMS_FRACTION * rms + ROUND_OFF_SLACK
-            for start in np.flatnonzero(chatter):
-                chatter_frames[start : start + order + 1] = True
+            derivative_screen = (
+                (correction if OPTIONS.correction_budget else after)
+                > local + CHATTER_RMS_FRACTION * rms + ROUND_OFF_SLACK
+            )
             result[f"root_order_{order}"] = {
                 "correction_rms": float(np.sqrt(np.mean(correction**2))),
-                "added_chatter_violations": int(chatter.sum()),
+                "derivative_screen_violations": int(derivative_screen.sum()),
                 "rms_before": float(np.sqrt(np.mean(before**2))),
                 "rms_after": float(np.sqrt(np.mean(after**2))),
             }
@@ -184,9 +217,7 @@ def verify_budgets(model, coords, fixed, motion, bodies=None, shape=None):
                 continue
             before, after, delta = original[name], executed[name], corrections[name]
             bad = np.abs(delta) > windowed_budget(before) + ROUND_OFF_SLACK
-            for start in np.flatnonzero(bad.any(axis=1)) if order > 1 else ():
-                chatter_frames[start:start + order + 1] = True
-            result[name] = dict(added_chatter_violations=int(bad.sum()),
+            result[name] = dict(legacy_derivative_budget_violations=int(bad.sum()),
                 rms_before_per_coordinate=np.sqrt(np.mean(before**2, axis=0)).tolist(),
                 rms_after_per_coordinate=np.sqrt(np.mean(after**2, axis=0)).tolist(),
                 correction_rms_per_coordinate=np.sqrt(np.mean(delta**2, axis=0)).tolist())
@@ -220,8 +251,16 @@ def verify_budgets(model, coords, fixed, motion, bodies=None, shape=None):
             layout_flip_max=max(flips),
         )
     result.update(
-        budget_signal=("correction relative to immutable reference" if OPTIONS.correction_budget
-                       else "absolute executed derivatives"),
+        budget_signal="source-relative high-frequency content of joints and root translation",
+        source_relative_chatter={
+            name: {
+                "violations": int(row["violations"].sum()),
+                "violation_frames": np.flatnonzero(row["violations"].any(axis=1)).tolist(),
+                "rms_excess_per_coordinate": row["rms_per_coordinate"],
+                "peak_excess_per_coordinate": row["peak_per_coordinate"],
+            }
+            for name, row in chatter.items()
+        },
         max_joint_change_rad=float(change.max(initial=0)),
         max_body_rotation_change_rad=float(guarded.max(initial=0)),
         max_any_body_rotation_change_rad=float(rotation.max(initial=0)),
@@ -232,31 +271,11 @@ def verify_budgets(model, coords, fixed, motion, bodies=None, shape=None):
 
 
 def smooth_correction(coords, entry, candidate, entry_budgets, candidate_budgets):
-    """Independent temporal/layout acceptance, using the selected budget semantics."""
+    """Independent source-chatter and sustained-layout acceptance."""
     reasons = []
-    if OPTIONS.correction_budget:
-        if not CorrectionContinuity(coords, entry, root_norm=True).accepts(candidate):
-            reasons.append("correction derivatives exceed reference window budgets")
-    else:
-        signals = [("joint", entry[:, coords.qi], candidate[:, coords.qi])]
-        if coords.root_q is not None:
-            root = slice(coords.root_q, coords.root_q + 3)
-            signals.append(("root", entry[:, root], candidate[:, root]))
-        for name, before, after in signals:
-            rough = after - before
-            rough = rough - gaussian_filter1d(rough, CHATTER_SCALE_FRAMES, axis=0, mode="nearest")
-            for order in (2, 3):
-                old, new, jitter = (np.diff(x, n=order, axis=0) for x in (before, after, rough))
-                if name == "root":
-                    old, new, jitter = (np.linalg.norm(x, axis=1, keepdims=True) for x in (old, new, jitter))
-                rms = np.sqrt(np.mean(old**2, axis=0))
-                allowed = rms * (1 + CORRECTION_TOLERANCE) + ROUND_OFF_SLACK
-                if np.any(np.sqrt(np.mean(new**2, axis=0)) > allowed):
-                    reasons.append(f"{name} order {order} RMS")
-                if np.any(np.abs(new).max(0) > np.abs(old).max(0) * (1 + CORRECTION_TOLERANCE) + ROUND_OFF_SLACK):
-                    reasons.append(f"{name} order {order} peak")
-                if np.any(np.sqrt(np.mean(jitter**2, axis=0)) > CORRECTION_TOLERANCE * rms + ROUND_OFF_SLACK):
-                    reasons.append(f"{name} order {order} added high-frequency")
+    reports, bad = chatter_reports(coords, entry, candidate)
+    if bad.any():
+        reasons.append("source-relative high-frequency chatter")
     if "layout_flip_max" in candidate_budgets:
         limit = max(entry_budgets.get("layout_flip_max", 0.0), 0.0) + 1e-7
         if candidate_budgets["layout_flip_max"] > limit:
@@ -270,12 +289,12 @@ def _improves(budgets, chatter, posture, checked, *, strict):
     after, after_chatter, after_posture = checked
     if not strict:
         return np.sum(after_chatter | after_posture) <= np.sum(chatter | posture)
-    added = [f"order_{order}" for order in (2, 3)]
+    added = ["source_relative_chatter"]
     return (
         np.sum(after_chatter) <= np.sum(chatter)
         and np.sum(after_posture) <= np.sum(posture)
         and all(
-            after[key]["added_chatter_violations"] <= budgets[key]["added_chatter_violations"]
+            after[key]["violations"] <= budgets[key]["violations"]
             for key in added
         )
     )
@@ -298,15 +317,27 @@ def solve_fast_sequence(
         )
 
 
+def prepare_fast_source(*args):
+    """Internal source-only entry, independent of full-pipeline capture hooks."""
+    context = nullcontext() if threadpool_limits is None else threadpool_limits(1,user_api='blas')
+    with context, ExitStack() as resources:
+        return _solve_fast_sequence(*args,resources=resources,_source_only=True)
+
+
 def _solve_fast_sequence(
     owner, model, initial, positions, names, mapping, roots, tasks, priority,
-    config, common, extra_tasks, reference_trajectory=None, callback=None, *, resources=None,
+    config, common, extra_tasks, reference_trajectory=None, callback=None, *, resources=None, _source_only=False,
 ):
     from .runtime_options import OPTIONS
     started = time.monotonic()
     report = {"backend": "fast", "stages": {}, "runtime_options": OPTIONS.describe()}
+    from .gpu_conic import reset_report, report as gpu_report
+    reset_report()
+    trace = PerformanceTrace(OPTIONS.performance_trace)
+    from .._core.preprocess_cache import SourceGraphCache
     orientation_targets = common["body_orientation_targets"]
     shared = {
+        "source_graph_cache": SourceGraphCache(),
         "environment_points": common["environment_points"],
         "root_orientation_targets": common["root_orientation_targets"],
         "body_orientation_targets": orientation_targets,
@@ -322,6 +353,14 @@ def _solve_fast_sequence(
             enabled=True, reference_rebased=False, audits=seed_audits,
             status='pending' if reference_trajectory is None else 'unknown_reused_reference_seed_unavailable')
 
+    from .._core.source_pose_prefetch import source_key
+    prefetch = None if _source_only else getattr(owner,'_source_pose_prefetch',None)
+    source_signature = (source_key(initial,positions,names,mapping,roots,tasks,priority,config,common)
+                        if _source_only or prefetch is not None else None)
+    callbacks = []
+    if _source_only:
+        callback = lambda pose, record: callbacks.append((np.array(pose,copy=True),dict(record)))
+    ready = None if prefetch is None else prefetch.consume(source_signature,callback)
     # A: fit the source action and its permanent world/body-relative tracking
     # semantics before object contacts or clearance can choose the reference.
     tick = time.monotonic()
@@ -331,7 +370,14 @@ def _solve_fast_sequence(
              contact_normal_sigma_m=SOURCE_POSE_CONTACT_SIGMA,
              contact_tangent_sigma_m=SOURCE_POSE_CONTACT_SIGMA)
     )
-    if reference_trajectory is None:
+    if ready is not None:
+        source_pose, shape, coords = ready['pose'],ready['shape'],ready['coords']
+        initialization_continuity = ready['continuity']
+        shared['source_graph_cache'] = ready['graph']
+        registration = ready['registration']
+        report['stages']['source_pose'] = ready['stage']
+        trace.add_stage_seconds('source_pose',ready['stage']['seconds'])
+    elif reference_trajectory is None:
         orientation_seed = source_orientation_seed(model, initial, roots, priority, orientation_targets, config)
         # Preserve the unnormalized seed before prepare_sequence can clip it.
         seed_reference = orientation_seed.copy() if OPTIONS.seed_continuity else orientation_seed
@@ -349,11 +395,13 @@ def _solve_fast_sequence(
             task_set, pose_config, reference=q, temporal_reference=None,
             root_rotations=rotations, framerate=framerate,
         )
+        restore_pose_trace = trace.install(pose_objective)
         if seed_envelope is not None:
             seed_envelope.attach_source_objective(pose_objective)
-        source_pose, history = optimize(
-            pose_objective, q, iterations=loose["iterations"], callback=callback, label="source_pose",
-        )
+        with trace.stage("source_pose"):
+            source_pose, history = optimize(
+                pose_objective, q, iterations=loose["iterations"], callback=callback, label="source_pose",
+            )
         if seed_envelope is not None:
             seed_audits['fit_vs_seed'] = seed_envelope.check_normalized(source_pose, stage='fit_vs_seed')
         # Finish morphology registration against the same source tracking
@@ -369,10 +417,13 @@ def _solve_fast_sequence(
             task_set, loose, reference=q, temporal_reference=None,
             root_rotations=rotations, framerate=framerate,
         )
+        restore_registration_trace = trace.install(registration)
         if seed_envelope is None:
-            source_pose, height_shift = register_height(registration, q)
+            with trace.stage("source_pose"):
+                source_pose, height_shift = register_height(registration, q)
         else:
-            source_pose, height_shift, height_report = seed_envelope.bounded_height_registration(registration, q)
+            with trace.stage("source_pose"):
+                source_pose, height_shift, height_report = seed_envelope.bounded_height_registration(registration, q)
             report['initialization_seed_envelope']['height_registration'] = height_report
             seed_audits['postheight_vs_seed'] = seed_envelope.check_normalized(source_pose, stage='postheight_vs_seed')
         initialization_continuity = (audit_continuity(coords, seed_reference, source_pose)
@@ -396,8 +447,22 @@ def _solve_fast_sequence(
             )[0],
             "continuity_vs_kinematic_seed": initialization_continuity,
         }
+        trace.add_stage_seconds(
+            "source_pose",
+            max(0.0, time.monotonic() - tick - trace.stage_seconds["source_pose"]),
+        )
+        restore_pose_trace()
+        restore_registration_trace()
     else:
         source_pose = np.asarray(reference_trajectory, dtype=float).copy()
+
+    if _source_only:
+        from .._core.source_pose_prefetch import compact_source_transport, source_registration_view
+        compact_source_transport(shape,registration)
+        return dict(key=source_signature, pose=source_pose, shape=shape, coords=coords,
+                    continuity=initialization_continuity, graph=shared['source_graph_cache'],
+                    stage=report['stages']['source_pose'],callbacks=callbacks,
+                    registration=source_registration_view(registration,shape))
 
     # B: contacts, whole-body surfaces and scene grids from the fixed reference.
     tick = time.monotonic()
@@ -421,6 +486,8 @@ def _solve_fast_sequence(
         objects=objects, surface_tasks=surfaces, proximity_tasks=proximity,
         role_policy=task_set.contact_phase,
     )
+    restore_objective_trace = trace.install(objective)
+    trace.current_stage = "grid_setup"
     # Supports (penetration.py stage 1): a floating base sitting inside an
     # upward support at several collision points (a seat) cannot leave it by
     # any joint, and acquisition keeps the root within its translation ball
@@ -472,8 +539,15 @@ def _solve_fast_sequence(
     acquisition_guard = AcquisitionNormalGuard(objective, fixed)
     frozen_acquisition_guard = acquisition_guard
     acquisition_continuity = SequenceContinuityGuard(task_set, fixed, rotations, windowed=True,
-                                                     correction=OPTIONS.correction_budget)
-    fixed_continuity = CorrectionContinuity(coords, fixed, root_norm=OPTIONS.batch2)
+                                                     correction=OPTIONS.correction_budget,
+                                                     chatter=not OPTIONS.reference_derivative_budget,
+                                                     enforce_chatter=False,
+                                                     velocity_limits=_velocity_limits(
+                                                         owner, model, coords, framerate
+                                                     ))
+    fixed_continuity = CorrectionContinuity(coords, fixed, root_norm=OPTIONS.batch2,
+                                            chatter=not OPTIONS.reference_derivative_budget,
+                                            enforce_chatter=False)
     objective.candidate_guards = [acquisition_guard, acquisition_continuity,
                                   fixed_continuity]
     if coordinator is not None:
@@ -498,11 +572,18 @@ def _solve_fast_sequence(
         prepare(objective)
     elif not OPTIONS.windowed_priority:
         objective.start_workers()
+    trace.add_stage_seconds("grid_setup", time.monotonic() - tick)
+    trace.add_stage_detail("grid_setup", "sdf_grid_seconds", grid_seconds)
+    trace.add_stage_detail(
+        "grid_setup", "prepare_objective_and_worker_seconds",
+        max(0.0, trace.stage_seconds["grid_setup"] - grid_seconds))
     try:
         from .legacy_window import MIN_WINDOW_FRAMES, optimize_legacy_windows, unsupported_reason
         # Parallel time windows for long clips; short clips and unsupported
         # combinations (priority coordinator, experimental proposal paths,
         # infeasible entry) keep the whole-trajectory optimizer and record why.
+        acquisition_tick = time.monotonic()
+        trace.current_stage = "contact_acquisition"
         window_status = unsupported_reason(objective, q, min_frames=MIN_WINDOW_FRAMES) or "used"
         if OPTIONS.coarse_acquisition:
             from .coarse_acquisition import optimize_coarse_acquisition
@@ -532,11 +613,18 @@ def _solve_fast_sequence(
             motion, history = optimize(objective, q, iterations=cfg["iterations"],
                                        callback=callback, label="contact_scene")
         verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
+        trace.add_stage_seconds("contact_acquisition", time.monotonic() - acquisition_tick)
+        if window_status == "used":
+            trace.absorb_history(history)
+        trace.current_stage = None
         for round_index in range(REWEIGHT_ROUNDS if coordinator is None else 0):
             budgets, chatter, posture = verified
             rounds.append(budgets)
             if not chatter.any() and not posture.any():
                 break
+            reweight_tick = time.monotonic()
+            candidate_tick = time.monotonic()
+            trace.current_stage = "reweight"
             from .reweight import reweight_temporal_signals
 
             if OPTIONS.batch2:
@@ -555,21 +643,33 @@ def _solve_fast_sequence(
                     objective, motion, iterations=cfg["iterations"], callback=callback,
                     label=label, focus=chatter | posture)
             else:
+                # ``loose_reweight``: the re-weighted pass makes >90% of its cost
+                # decrease in its first four steps; end its tail at a 1% step.
                 candidate, more = optimize(objective, motion, iterations=cfg["iterations"],
-                                           callback=callback, label=label)
+                                           callback=callback, label=label,
+                                           **({"converged_decrease": REWEIGHT_DECREASE}
+                                              if OPTIONS.loose_reweight else {}))
             history += more
             checked = verify_budgets(model, coords, fixed, candidate, objective.envelope_bodies, shape)
+            trace.add_stage_seconds("reweight", time.monotonic() - reweight_tick)
+            if window_status == "used":
+                trace.absorb_history(more)
+            trace.current_stage = None
             if not _improves(budgets, chatter, posture, checked, strict=False):
                 rounds[-1]["rejected"] = label
                 rounds[-1]["rejected_budgets"] = checked[0]
+                trace.add_failed(time.monotonic() - candidate_tick, "reweight_rejected")
                 continue
             motion, verified = candidate, checked
+            trace.add_alpha(1.0)
         # Free-body penetration: every contact held, a small correction of the
         # accepted motion, kept only if it adds no chatter or layout flip
         # (jitter and layout precede clearance). See penetration.py.
         # The acquisition workers still hold the same immutable fields and
         # shells: they measure the deepest samples below, before the free
         # stage changes what the objective evaluates.
+        free_tick = time.monotonic()
+        trace.current_stage = "free_bodies"
         if coordinator is not None:
             from .acquisition_clearance import complete_priority_clearance
             motion, more, completion = complete_priority_clearance(objective, motion, optimize, callback)
@@ -578,7 +678,10 @@ def _solve_fast_sequence(
             verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
             acquired = motion.copy()
             contact_guard = ContactGuard(objective, acquired)
-            continuity_guard = CorrectionContinuity(coords, acquired)
+            continuity_guard = CorrectionContinuity(
+                coords, acquired, chatter=not OPTIONS.reference_derivative_budget,
+                enforce_chatter=False,
+            )
         else:
             from .acquisition_clearance import complete_original_clearance
             if OPTIONS.original_clearance:
@@ -589,13 +692,17 @@ def _solve_fast_sequence(
             acquired = motion.copy()
             contact_guard = ContactGuard(objective, acquired)
             anchored_contacts = ContactGuard(objective, acquired, preserve_positions=True)
-            continuity_guard = CorrectionContinuity(coords, acquired)
+            continuity_guard = CorrectionContinuity(
+                coords, acquired, chatter=not OPTIONS.reference_derivative_budget,
+                enforce_chatter=False,
+            )
             objective.candidate_guards = [anchored_contacts, continuity_guard,
                                           acquisition_guard, acquisition_continuity] + (
                                           [fixed_continuity] if OPTIONS.correction_budget or soft_v4_used else [])
             if coords.root_q is not None:
                 objective.fixed_root = acquired[:, coords.root_q:coords.root_q + 7].copy()
             record = {"stage": "free_bodies", "before": objective.penetration_summary(motion)}
+            candidate_tick = time.monotonic()
             objective.prepare_free_stage(motion)
             objective.envelope_weight = np.maximum(objective.envelope_weight, REWEIGHT_FACTOR)
             objective.stop_workers()
@@ -610,16 +717,26 @@ def _solve_fast_sequence(
             accepted, reasons = smooth_correction(coords, motion, candidate, verified[0], checked[0])
             for name, guard in (("acquired contact positions and precision", anchored_contacts),
                                 ("acquired per-coordinate temporal bounds", continuity_guard)):
-                if not guard.accepts(candidate):
+                guard_tick = time.monotonic()
+                guard_accepted = guard.accepts(candidate)
+                explanation = (None if guard_accepted else
+                               explain_guard(objective, guard, candidate))
+                trace.add_guard(guard, guard_accepted,
+                                time.monotonic() - guard_tick, explanation)
+                if not guard_accepted:
                     accepted = False
                     reasons.append(name)
             record["accepted"] = bool(accepted)
             if accepted:
                 motion, verified = candidate, checked
+                trace.add_alpha(1.0)
             else:
                 record["rejected"] = reasons
                 record["rejected_budgets"] = checked[0]
+                trace.add_failed(time.monotonic() - candidate_tick, "free_stage_rejected")
             penetration.append(record)
+        trace.add_stage_seconds("free_bodies", time.monotonic() - free_tick)
+        trace.current_stage = None
     finally:
         objective.stop_workers()
     # The selected repair group may approach its original target; all other
@@ -635,11 +752,18 @@ def _solve_fast_sequence(
     # object, a floor-only scene, or self-collision needs the same bounded
     # correction and audit; grid coverage says nothing about those overlaps.
     if common.get("scene_query") is not None or objects or config.get("self_collision_enabled", True):
+        repair_tick = time.monotonic()
+        trace.current_stage = "original_mesh_repair"
         motion, mesh_repair = repair_original_meshes(
             objective, motion, getattr(owner, "_scene_objects", ()), common.get("scene_query"),
         )
         verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
+        trace.absorb_repair(mesh_repair)
+        trace.add_stage_seconds("original_mesh_repair", time.monotonic() - repair_tick)
+        trace.current_stage = None
     # Final statistics; worker chunks give the same values as a serial pass.
+    audit_tick = time.monotonic()
+    trace.current_stage = "final_audit"
     started_workers = objective.start_workers()
     try:
         objective.evaluate(motion, with_jacobian=False)
@@ -695,12 +819,13 @@ def _solve_fast_sequence(
         report["stages"]["contact_scene"]["priority_clearance"] = priority_report
         report.update({name: priority_report[name] for name in
                        ('accepted_update_count', 'solver_outcome', 'convergence_certified')})
+    total_seconds = time.monotonic() - started
     report.update(
         status="solved", frames=len(motion), framerate=float(framerate),
         model_nq=model.nq, model_nv=model.nv, scalar_joint_count=len(coords.qi),
         history=history, final_residuals=objective.stats,
         contact_offset_choice={k: np.asarray(v).tolist() for k, v in task_set.choices.items()},
-        seconds=time.monotonic() - started,
+        seconds=total_seconds,
     )
     if shape is not None:
         report["source_shape"] = shape.diagnostics(motion)
@@ -711,17 +836,35 @@ def _solve_fast_sequence(
         report["strict_continuity_accepted"] = bool(
             final_continuity["strict_accepted"] and initialization_continuity is not None
             and initialization_continuity["strict_accepted"])
+        # The orientation seed is not the source action. Keep its audit for
+        # diagnosis, but final continuity is measured against the frozen
+        # source-shaped reference used by every clearance stage.
         report["layout_and_relaxed_chatter_accepted"] = bool(
             layout_ok and final_continuity["relaxed_chatter_accepted"]
-            and initialization_continuity is not None
-            and initialization_continuity["relaxed_chatter_accepted"])
+        )
         # The enforced per-joint budgets are windowed (motion_budgets); the
         # stencil-exact comparison above stays an informational report.
         report["windowed_continuity_accepted"] = bool(
             final_continuity["windowed_budget_accepted"] and initialization_continuity is not None
             and initialization_continuity["windowed_budget_accepted"])
-        report["layout_continuity_accepted"] = bool(layout_ok and report["windowed_continuity_accepted"])
-        if not report["layout_continuity_accepted"]:
-            report["acceptance_status"] = "unresolved_layout_or_continuity"
+        # The enforced production criterion is source-relative chatter. The
+        # old derivative budget stays visible as a legacy diagnostic layer.
+        report["source_chatter_continuity_accepted"] = report[
+            "layout_and_relaxed_chatter_accepted"
+        ]
+        report["layout_continuity_accepted"] = bool(
+            layout_ok and report["source_chatter_continuity_accepted"]
+        )
+        report["acceptance_status"] = (
+            "passed" if report["layout_continuity_accepted"]
+            else "unresolved_layout_or_continuity"
+        )
+    total_seconds = time.monotonic() - started
+    report["seconds"] = total_seconds
+    trace.add_stage_seconds("final_audit", time.monotonic() - audit_tick)
+    trace.current_stage = None
+    restore_objective_trace()
+    report["performance"] = trace.report(total_seconds=total_seconds)
+    report["gpu_conic"] = gpu_report()
     owner.last_fast_source_pose = source_pose
     return motion, report

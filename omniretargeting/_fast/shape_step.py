@@ -96,6 +96,10 @@ def restore_shape_step(objective, origin, step):
     if _canonical_window(objective):
         from .window_canonical import restore_step
         return restore_step(objective, origin, step)
+    from .whole_canonical import supported
+    if supported(objective):
+        from .whole_canonical import restore_step
+        return restore_step(objective, origin, step)
     coords = objective.coords
     candidate = objective.project(coords.integrate(origin, step.reshape(len(origin), -1), 1.))
     lower, upper = coords.bounds(origin, objective.cfg["angular_step_rad"],
@@ -104,6 +108,31 @@ def restore_shape_step(objective, origin, step):
                                  lower, upper, {}, working_set=WORKING_SET_RESTORATION)
     # The accepted state must be what the next step's projection keeps.
     return None if restored is None else objective.project(restored)
+
+
+def _qoco_proposal(problem, flat):
+    """Whole-trajectory proposal by the window path's QOCO solve, or None.
+
+    Same program, same canonical data and the same 1e-4 QOCO tolerances as
+    ``window_qoco`` (default for windows since 2026-10-03). Every nonlinear
+    guard and the objective decrease still decide acceptance; any status
+    other than solved returns None and the caller keeps Clarabel.
+    """
+    from .window_qoco import solve_proposal
+    data, _, inverse = problem.get_problem_data(cp.CLARABEL)
+    offsets = [d.var_offsets for d in inverse if hasattr(d, "var_offsets")]
+    if not offsets or offsets[-1].get(flat.id) != 0:
+        return None
+    data = dict(data)
+    for key in ("P", "A"):
+        # QOCO's CSC binding takes 32-bit indices; CVXPY may emit 64-bit ones.
+        matrix = sparse.csc_matrix(data[key])
+        matrix.indices, matrix.indptr = matrix.indices.astype(np.int32), matrix.indptr.astype(np.int32)
+        data[key] = matrix
+    try:
+        return solve_proposal(data, flat.size)
+    except (ImportError, RuntimeError, ValueError, TypeError, ArithmeticError):
+        return None
 
 
 def bounded_shape_step(objective, poses, system, gradient, diagonal, damping):
@@ -132,6 +161,13 @@ def bounded_shape_step(objective, poses, system, gradient, diagonal, damping):
             if step is not None:
                 return step
         return solve_data(data, count)
+    from .whole_canonical import supported
+    if supported(objective) and not OPTIONS.whole_qoco_proposals:
+        from .whole_canonical import canonical_data
+        from .window_canonical import solve_data
+        data = canonical_data(objective, poses, lo, hi, matrix * (2 * (1 / scale)),
+                              (2 * gradient) * (1 / scale))
+        return solve_data(data, count)
     flat = cp.Variable(count)
     constraints = [flat >= lo.ravel(), flat <= hi.ravel()]
     # Both frozen reference layouts (seed and acquired reference) apply;
@@ -144,6 +180,10 @@ def bounded_shape_step(objective, poses, system, gradient, diagonal, damping):
     if OPTIONS.window_qp and len(poses) >= 2 * WINDOW_FRAMES:
         # Temporal block-coordinate step: every linearized bound stays exact.
         step = solve_windows(problem, flat, len(poses), coords.width)
+        if step is not None:
+            return step
+    if OPTIONS.whole_qoco_proposals:
+        step = _qoco_proposal(problem, flat)
         if step is not None:
             return step
     try:

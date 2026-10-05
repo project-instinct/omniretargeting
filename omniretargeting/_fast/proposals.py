@@ -29,11 +29,11 @@ def guards_of(objective):
     return shape, guards
 
 
-def backtrack(objective, poses, direction, guards):
+def backtrack(objective, poses, direction, guards, alphas=ALPHAS):
     """Largest listed fraction of ``direction`` whose projection every guard accepts."""
     coords = objective.coords
     frames, width = objective.frames, objective.width
-    for alpha in ((1.,) if not guards else ALPHAS):
+    for alpha in ((1.,) if not guards else alphas):
         trial = objective.project(coords.integrate(poses, direction.reshape(frames, width), alpha))
         from .priority_merit import check_trial
         if check_trial(objective, trial, guards):

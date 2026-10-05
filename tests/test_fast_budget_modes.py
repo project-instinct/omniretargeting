@@ -6,7 +6,8 @@ from omniretargeting._fast import runtime_options
 
 def select_budget_mode(monkeypatch, enabled):
     from omniretargeting._fast import continuity, pipeline, repair_limits, repair_temporal, reweight
-    options = replace(runtime_options.OPTIONS, correction_budget=enabled)
+    options = replace(runtime_options.OPTIONS, correction_budget=enabled,
+                      reference_derivative_budget=enabled)
     for module in (runtime_options, continuity, pipeline, repair_limits, repair_temporal, reweight):
         monkeypatch.setattr(module, 'OPTIONS', options)
 
@@ -36,14 +37,15 @@ def test_audit_rows_and_repair_switch_together(monkeypatch, enabled):
     reference[:, coords.qi[0]] += .01 * np.sin(np.arange(len(reference)) * .2)
     candidate = reference.copy()
     candidate[:, coords.qi[0]] += .005 * np.sin(np.arange(len(reference)) * .2)
-    direct = CorrectionContinuity(coords, reference)
+    direct = CorrectionContinuity(coords, reference, chatter=True)
     assert direct.correction == enabled
-    assert direct.accepts(candidate) == enabled
+    assert direct.chatter
+    assert direct.accepts(candidate)
     step = cp.Variable(len(candidate) * coords.width); step.value = np.zeros(step.shape)
-    assert all(np.max(c.violation()) < 1e-10 for c in direct.constraints(candidate, step)) == enabled
+    assert direct.constraints(candidate, step) == []
     assert audit_continuity(coords, reference, candidate)['windowed_budget_accepted'] == enabled
-    assert (not verify_budgets(objective.model, coords, reference, candidate)[1].any()) == enabled
-    assert (not any(x.any() for x in offending_frames(coords, reference, candidate))) == enabled
+    assert not verify_budgets(objective.model, coords, reference, candidate)[1].any()
+    assert not any(x.any() for x in offending_frames(coords, reference, candidate))
     limits = RepairLimits(objective, reference)
-    assert limits.check(candidate)[0] == enabled
+    assert limits.check(candidate)[0]
     assert direct.accepts(reference)

@@ -31,12 +31,34 @@ def _kind(guard):
 
 def guard_dependencies(guard, frames, count):
     frames = frame_range(frames, count)
-    halo = 0 if _kind(guard) == 'shape' else 3
+    kind = _kind(guard)
+    halo = 0 if kind == 'shape' else 3
+    if kind == 'shape' and _layout_deadband_enabled(count):
+        from ..pose_relations import LAYOUT_FLIP_WINDOW_FRAMES
+        halo = LAYOUT_FLIP_WINDOW_FRAMES - 1
     return range(max(0, frames.start - halo), min(count, frames.stop + halo))
+
+
+def _layout_deadband_enabled(count):
+    from .runtime_options import OPTIONS
+    return count >= 600 and OPTIONS.abl_window_layout_deadband
 
 
 def _span(frames, count, order):
     return max(0, frames.start - order), min(count - order, frames.stop)
+
+
+def _operator_cache(guard, key, build):
+    """Only constant stencil matrices survive a pose/weight change."""
+    cache = getattr(guard, '_window_operators', None)
+    if cache is None:
+        guard._window_operators = cache = OrderedDict()
+    if key not in cache:
+        cache[key] = build()
+    cache.move_to_end(key)
+    while len(cache) > 64:
+        cache.popitem(last=False)
+    return cache[key]
 
 
 def _correction(guard, poses, frames, jacobian):
@@ -46,7 +68,11 @@ def _correction(guard, poses, frames, jacobian):
     if jacobian:
         local = copy.copy(guard)
         local.fixed = guard.fixed[context.start:context.stop]
-        local._linear_cache, local._operators = None, {}
+        # linearizations caches its pose-dependent values separately from
+        # immutable difference operators. Reuse only the latter across poses.
+        key = ('correction', guard.correction, len(context), guard.coords.cols.tobytes())
+        local._linear_cache = None
+        local._operators = _operator_cache(guard, key, dict)
         values = local.linearizations(part)
     else:
         fixed = guard.fixed[context.start:context.stop]
@@ -109,10 +135,16 @@ def _sequence(guard, poses, frames, jacobian):
         matrix = None
         if jacobian:
             coefficients = {1: [-1, 1], 2: [1, -2, 1], 3: [-1, 3, -3, 1]}[order]
-            difference = sparse.diags(coefficients, np.arange(order + 1),
-                shape=(len(context) - order, len(context)), format='csr', dtype=float)[chosen]
+            key = ('sequence', len(context), chosen.start, chosen.stop,
+                   order, values.shape[1], guard.tasks.coords.cols.tobytes())
+            def build():
+                difference = sparse.diags(coefficients, np.arange(order + 1),
+                    shape=(len(context) - order, len(context)), format='csr', dtype=float)[chosen]
+                return difference, sparse.kron(difference, guard.tasks.coords.selector, format='csr') if name == 'joints' else None
+            # Include signal kind: a joint pack can also have 3 or 4 columns.
+            difference, joints = _operator_cache(guard, (*key, name), build)
             if name == 'joints':
-                matrix = sparse.kron(difference, guard.tasks.coords.selector, format='csr')
+                matrix = joints
             else:
                 matrix = sparse.kron(difference, sparse.eye(values.shape[1]), format='csr') @ _block_rows(jac, guard.tasks.coords.width)
             matrix = matrix[:, (frames.start - context.start) * guard.tasks.coords.width:
@@ -135,6 +167,8 @@ def guard_violation_frames(guard, poses, *, frames):
     bad = np.zeros(len(poses), bool)
     kind = _kind(guard)
     if kind == 'shape':
+        if _layout_deadband_enabled(len(poses)):
+            return _shape_history_violations(guard, poses, frames)
         part = np.asarray(poses)[frames.start:frames.stop]
         finite = np.isfinite(part).all(axis=1)
         bad[frames.start:frames.stop] = ~finite
@@ -165,8 +199,27 @@ def guard_accepts(guard, poses, *, frames):
     return not guard_violation_frames(guard, poses, frames=frames).any()
 
 
+def _shape_history_violations(guard, poses, frames):
+    """Read the preceding streak; edits can change the following six verdicts."""
+    context = guard_dependencies(guard, frames, len(poses))
+    affected = slice(frames.start, context.stop)
+    chosen = slice(frames.start - context.start, len(context))
+    bad = np.zeros(len(poses), bool)
+    if not np.isfinite(np.asarray(poses)[context.start:context.stop]).all():
+        # Do not forward an invalid quaternion from the historical context.
+        bad[affected] = True
+        return bad
+    kin = _shape_kin(guard, poses, context, False)
+    for envelope in guard.envelopes:
+        local = envelope.for_frames(slice(context.start, context.stop))
+        bad[affected] |= local.violations(kin)[chosen]
+    return bad
+
+
 def _shape_bounds(guard, poses, frames, box, jacobian):
-    kin = _shape_kin(guard, poses, frames, jacobian or box is not None)
+    deadband = _layout_deadband_enabled(len(poses))
+    context = guard_dependencies(guard, frames, len(poses)) if deadband else frames
+    kin = _shape_kin(guard, poses, context, jacobian or box is not None)
     linear, cones = [], []
     coords, span = guard.coords, slice(frames.start, frames.stop)
     if coords.root_q is not None:
@@ -181,21 +234,31 @@ def _shape_bounds(guard, poses, frames, box, jacobian):
             cones.append((matrix, poses[span, q:q + 3] - reference[span, q:q + 3],
                           np.full(len(frames), guard.xy)))
     for envelope in guard.envelopes:
-        envelope = envelope.for_frames(span)
+        envelope = envelope.for_frames(slice(context.start, context.stop))
         _, _, (change, pairs) = envelope.measure(kin, with_jacobian=jacobian or box is not None)
         value, derivative = envelope.layout(change, pairs)
         if value is None:
             continue
         keep = envelope.layout_sign != 0
+        if deadband:
+            from ..pose_relations import LAYOUT_FLIP_MARGIN, LAYOUT_FLIP_WINDOW_FRAMES, _sustained
+            floor = np.where(_sustained(value < -LAYOUT_FLIP_MARGIN,
+                                       LAYOUT_FLIP_WINDOW_FRAMES), 0., -LAYOUT_FLIP_MARGIN)
+            chosen = slice(frames.start - context.start, frames.stop - context.start)
+            value, keep, floor = value[chosen], keep[chosen], floor[chosen]
+            if derivative is not None:
+                derivative = derivative[chosen]
         if box is not None:
-            keep &= np.einsum('fpaw,fw->fpa', np.abs(derivative), box) >= value
+            reach = np.einsum('fpaw,fw->fpa', np.abs(derivative), box)
+            keep &= reach >= (value - floor if deadband else value)
         keep = keep.ravel()
         if keep.any():
             matrix = (_block_rows(derivative.reshape(len(frames), -1, coords.width), coords.width)[keep]
                       if jacobian else None)
             # Signed nonlinear remainder (SOC), including existing flips.
             kept = value.ravel()[keep]
-            lower = -(np.maximum(kept, 0.) if jacobian else kept) - envelope.SLACK / 2
+            lower = (floor.ravel()[keep] - kept - envelope.SLACK / 2 if deadband else
+                     -(np.maximum(kept, 0.) if jacobian else kept) - envelope.SLACK / 2)
             linear.append((matrix, lower, np.full(len(lower), np.inf)))
     return linear, cones
 

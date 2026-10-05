@@ -79,8 +79,7 @@ class ContactSurface:
             raise ValueError(
                 "Contact surface geometry and rigid poses must be finite and share the source timeline"
             )
-        self.tree = igl.AABB()
-        self.tree.init(self.vertices, self.faces)
+        self._tree = None
         for value in (
             self.vertices,
             self.faces,
@@ -90,6 +89,15 @@ class ContactSurface:
             self.scales,
         ):
             value.setflags(write=False)
+
+    @property
+    def tree(self):
+        """Pose-only consumers need validation, but no spatial query tree."""
+        if self._tree is None:
+            tree = igl.AABB()
+            tree.init(self.vertices, self.faces)
+            self._tree = tree
+        return self._tree
 
     def observe(self, points, framerate, *, return_clearance_side=False):
         local = np.einsum(

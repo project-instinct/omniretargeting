@@ -315,10 +315,10 @@ def test_grid_sdf_interpolates_and_marks_unknown(tmp_path, monkeypatch):
 def test_budget_verification_flags_chatter_and_only_reports_joint_change():
     model, _, coords, poses, _, _ = _problem()
     motion = poses.copy()
-    motion[18, coords.qi[0]] += 0.05
+    motion[12:24, coords.qi[0]] += 0.1 * (-1.0) ** np.arange(12)
     motion[30, coords.qi[1]] += 0.65
     result, chatter, posture = verify_budgets(model, coords, poses, motion)
-    assert chatter[18] and not chatter[:10].any()
+    assert chatter[12:24].any() and not chatter[:10].any()
     # Joint change has no angular bound; it is reported, not flagged.
     assert not posture.any() and result["layout_flip_frames"] == 0
     assert result["max_joint_change_rad"] == pytest.approx(0.65)
@@ -423,7 +423,7 @@ def test_smooth_corrections_pass_and_added_jitter_is_rejected():
     ramp = entry.copy()
     ramp[:, coords.qi[0]] += 0.02 * (1 - np.cos(np.linspace(0, np.pi, len(entry)))) / 2
     jitter = entry.copy()
-    jitter[:, coords.qi[0]] += 0.002 * (-1.0) ** np.arange(len(entry))
+    jitter[:, coords.qi[0]] += 0.1 * (-1.0) ** np.arange(len(entry))
     base = verify_budgets(model, coords, poses, entry)[0]
     accepted, _ = smooth_correction(coords, entry, ramp, base, verify_budgets(model, coords, poses, ramp)[0])
     rejected, reasons = smooth_correction(coords, entry, jitter, base, verify_budgets(model, coords, poses, jitter)[0])

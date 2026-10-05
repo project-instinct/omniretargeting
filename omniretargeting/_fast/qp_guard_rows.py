@@ -140,6 +140,8 @@ def _correction(guard, poses):
     rows = guard.linearizations(poses)
     families, blocks = [], []
     for name, (values, jacobian) in rows.items():
+        if name not in guard.bounds:
+            continue
         bound = guard.bounds[name].ravel() + ROUND_OFF / 2
         def value(p, name=name, bound=bound):
             residual = guard.linearizations(p)[name][0].ravel()

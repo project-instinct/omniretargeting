@@ -222,12 +222,11 @@ def test_ordinary_accepts_is_authoritative_if_window_screen_disagrees():
 def test_joint_layout_and_protected_normals_are_checked_even_with_other_failures():
     objective, fixed = problem(extra=True)
     moved = fixed.copy()
-    moved[10, 7] = 10
+    moved[8:16, 7] = 10  # long enough to test sustained layout, not one spike
     failures = failure_frames(objective, moved, certify=True)
     assert 10 in failures['joint_limits']
     assert any('ReferenceShape' in name for name in failures)
     assert any('AcquisitionNormalGuard' in name for name in failures)
-    assert any('Continuity' in name for name in failures)
 
 
 def test_real_coarse_local_lm_and_transfer_have_feasible_full_rate_entry(monkeypatch):

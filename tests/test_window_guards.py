@@ -42,8 +42,8 @@ def _expected_mask(guard, poses, frames, correction):
 @pytest.mark.parametrize('frames', [range(0, 1), range(0, 32), range(4, 36), range(14, 18), range(35, 36)])
 def test_window_continuity_masks_equal_full_stencil_restriction(kind, correction, frames):
     obj, poses, _ = _objective(temporal=True)
-    guard = (CorrectionContinuity(obj.coords, poses, root_norm=True, correction=correction) if kind == 'correction'
-             else SequenceContinuityGuard(obj.tasks, poses, obj.root_rotations, windowed=True, correction=correction))
+    guard = (CorrectionContinuity(obj.coords, poses, root_norm=True, correction=correction, chatter=False) if kind == 'correction'
+             else SequenceContinuityGuard(obj.tasks, poses, obj.root_rotations, windowed=True, correction=correction, chatter=False))
     changed = obj.coords.integrate(poses, np.random.default_rng(11).normal(scale=.02, size=(len(poses), obj.width)), 1.)
     changed[::2, 3:7] *= -1
     expected = _expected_mask(guard, changed, frames, kind == 'correction')
@@ -56,8 +56,8 @@ def test_window_continuity_masks_equal_full_stencil_restriction(kind, correction
 @pytest.mark.parametrize('kind', ['correction', 'sequence'])
 def test_window_qp_rows_equal_full_rows_with_fixed_columns_removed(kind, correction):
     obj, poses, _ = _objective(temporal=True)
-    guard = (CorrectionContinuity(obj.coords, poses, root_norm=True, correction=correction) if kind == 'correction'
-             else SequenceContinuityGuard(obj.tasks, poses, obj.root_rotations, windowed=True, correction=correction))
+    guard = (CorrectionContinuity(obj.coords, poses, root_norm=True, correction=correction, chatter=False) if kind == 'correction'
+             else SequenceContinuityGuard(obj.tasks, poses, obj.root_rotations, windowed=True, correction=correction, chatter=False))
     changed = obj.coords.integrate(poses, np.random.default_rng(14).normal(scale=.002, size=(len(poses), obj.width)), 1.)
     frames = range(7, 21)
     linear, cones = guard_qp_bounds(guard, changed, frames=frames)
@@ -124,7 +124,7 @@ def test_window_layout_decisions_and_unscreened_rows_are_full_restrictions(frame
 
 def test_window_threshold_ties_and_unrelated_outside_failures():
     obj, poses, _ = _objective(temporal=True)
-    guard = CorrectionContinuity(obj.coords, poses)
+    guard = CorrectionContinuity(obj.coords, poses, chatter=False)
     # Set immutable test bounds to the current exact derivative magnitudes:
     # equality at the existing acceptance reserve must still pass.
     for name, (value, _) in guard.linearizations(poses).items():
@@ -134,3 +134,14 @@ def test_window_threshold_ties_and_unrelated_outside_failures():
     outside[0, 7] += .1
     assert not guard.accepts(outside)
     assert guard_accepts(guard, outside, frames=range(10, 20))
+
+
+def test_default_chatter_guard_has_no_local_derivative_rows():
+    obj, poses, _ = _objective(temporal=True)
+    direct = CorrectionContinuity(obj.coords, poses, chatter=True)
+    sequence = SequenceContinuityGuard(obj.tasks, poses, obj.root_rotations, windowed=True,
+                                       chatter=True)
+    assert direct.bounds == {}
+    assert sequence.bounds == {}
+    assert direct.constraints(poses, np.zeros(1)) == []
+    assert sequence.constraints(poses, np.zeros(1)) == []

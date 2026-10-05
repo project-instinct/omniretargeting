@@ -19,6 +19,10 @@ from ..contact_phase import CONTACT_ROLES
 from ..geometry_query import GeometryQueryError
 from ..moving_scene import MovingSceneQuery
 from ..self_collision import SelfCollisionQuery
+from .original_rigid_fallback import (
+    WITNESS_CLEARANCE, enabled as rigid_fallback_enabled,
+    query_summary, record_example, resolve_unknown_static, rigid_robot_data,
+)
 from .collision_manifold import select_collision_manifold
 from .repair_limits import LOCAL_ANGLE, RepairLimits
 from .limb_scope import scope_for_body
@@ -30,14 +34,13 @@ from .repair_frames import group_frames, halo_frames, restrict
 from .repair_witnesses import RepairWitnesses
 from ..moving_outside import certified_outside
 from .runtime_options import OPTIONS
+from .repair_ablation import measure_candidate
 
 ITERATIONS = 12
 # Small progress ends shallow groups. Deep groups defer until relevant joints
 # change or an acceptance query discovers a new constraint at the current pose.
 MIN_GROUP_PROGRESS_M = 1e-4
 DEEP_RESIDUAL_M = .01
-# Static samples at or beyond this clearance yield no witness row.
-WITNESS_CLEARANCE = 0.008
 # Rounding allowance of the rigid displacement bound (metres).
 BOUND_SLACK = 1e-9
 COLLISION_SIGMA = 0.01
@@ -124,6 +127,13 @@ class OriginalGeometry:
         # Per-frame exact pair results of the last query (see ``query``'s reuse).
         self._self_reuse = {}
         self._window_frame_cache = {}
+        self._rigid_static_backend = None
+        self._rigid_static_cache = {}
+        self.static_query_coverage = {
+            "sample_unknown": 0, "rigid_resolved": 0, "rigid_unknown": 0,
+            "rigid_rows": 0,
+        }
+        self.static_query_examples = []
         self._query_owner = os.getpid()
         self.scene = scene_query
         self.data = mujoco.MjData(self.model)
@@ -284,6 +294,10 @@ class OriginalGeometry:
                 cached = self._static_cache.get((frame, geom))
                 if cached is not None and cached[0] == signature:
                     summary = cached[1]
+                    if summary["unknown"]:
+                        updates.append(((frame, geom), signature, summary,
+                                        data.geom_xpos[geom].copy(), data.geom_xmat[geom].copy(),
+                                        rigid_robot_data(data)))
                 elif cached is not None and self._static_bound_reuse and self._clear_after_motion(cached, geom):
                     # The cache keeps the exactly queried transform and bound.
                     summary = cached[1]
@@ -298,7 +312,8 @@ class OriginalGeometry:
                         selected = (np.empty(0, int) if far_geom(self, geom, summary) else
                                     screened_static_samples(self, geom, selected, cached, summary))
                     updates.append(((frame, geom), signature, summary,
-                                    data.geom_xpos[geom].copy(), data.geom_xmat[geom].copy()))
+                                    data.geom_xpos[geom].copy(), data.geom_xmat[geom].copy(),
+                                        rigid_robot_data(data)))
                     first = 0
                     while first < len(selected):
                         indices = selected[first:first + limit - count]
@@ -321,7 +336,10 @@ class OriginalGeometry:
         if pending:
             self._query_static_batch(pending)
         # Never commit a partially queried summary if SceneQuery raises.
-        for key, signature, summary, position, rotation in updates:
+        for key, signature, summary, position, rotation, robot_data in updates:
+            if summary["unknown"] and rigid_fallback_enabled(self.scene):
+                resolve_unknown_static(self, key[0], key[1], summary, signature,
+                                       robot_data, WITNESS_CLEARANCE)
             if summary.pop("_screen_sort", False):
                 order = np.argsort(summary["_screen_ids"], kind="stable")
                 summary["_screen_ids"] = summary["_screen_ids"][order]
@@ -576,6 +594,8 @@ class OriginalGeometry:
                 for geom, summary in summaries:
                     if summary["unknown"]:
                         failures.append(f"unknown static frame {frame} geom {geom}")
+                        failures.extend(f"rigid backend frame {frame} geom {geom}: {value}"
+                                        for value in summary.get("query_failures", ()))
                     witnesses = summary["rows"] if self.manifold else ([] if summary["row"] is None else [summary["row"]])
                     for witness in witnesses:
                         row = {"clearance": witness["clearance"], "direction": witness["direction"].copy(),
@@ -623,6 +643,8 @@ class OriginalGeometry:
         from .repair_diagnostics import deep_residuals
         result["residuals_over_1cm"] = deep_residuals(self.model, measurement)
         result["query_failures"] = len(measurement["failures"])
+        if self.scene is not None:
+            result.update(query_summary(self))
         result["unknown_object_components"] = 0 if self.moving is None else self.moving.unknown_components
         result["collision_free_certificate"] = False
         if self.moving is not None:
@@ -722,7 +744,7 @@ def _qp_step(limits, poses, geometry, measurement, baseline):
                                getattr(limits, "frame_mask", None)),
                       collision_sigma=(LIMB_COLLISION_SIGMA if scope_for_body(limits, limits.movable_body)
                                        is not None else COLLISION_SIGMA),
-                      local_angle=LOCAL_ANGLE)
+                      local_angle=getattr(limits, 'local_angle', LOCAL_ANGLE))
 
 
 def _repair_groups(objective, measurement, activation=None):
@@ -752,8 +774,9 @@ def repair_original_meshes(objective, poses, scene_objects=(), scene_query=None)
     limits = RepairLimits(objective, entry)
     geometry = OriginalGeometry(objective, scene_objects, scene_query, manifold=True)
     if getattr(OPTIONS, "repair_triage", False):
-        from .repair_geometry_setup import prepare_static_bounds
+        from .repair_geometry_setup import prepare_static_bounds, prepare_moving_reduction
         prepare_static_bounds(geometry, entry)
+        prepare_moving_reduction(geometry, entry)
     # Frame-parallel measurement returns the serial rows; see parallel_geometry.
     geometry.start_workers(len(entry))
     try:
@@ -774,7 +797,7 @@ def _repair(objective, entry, limits, geometry, started):
     groups = ordered or [None]
     report = {"before": geometry.summary(baseline), "history": [],
               "entry_limits": limits.check(entry)[1],
-              "local_angle_budget_rad": LOCAL_ANGLE, "root_fixed": True,
+              "local_angle_budget_rad": getattr(limits, 'local_angle', LOCAL_ANGLE), "root_fixed": True,
               "limb_scopes": [{"fixed_anchor": model.body(scope.anchor).name,
                                "movable_joints": [model.joint(int(model.dof_jntid[limits.coords.di[c]])).name
                                                   for c in sorted(scope.columns)]}
@@ -885,17 +908,20 @@ def _repair(objective, entry, limits, geometry, started):
                 if first_geometry_candidate is None:
                     first_geometry_candidate = candidate.copy()
                 # Unmoved frames reuse their exact per-pose cache entries.
-                checked = geometry.measure(candidate, protected_depths=protected["depths"],
-                                           frames=None if frame_mask is None else range(len(candidate)))
-                regressions = [key for key, value in checked["depths"].items()
-                               if _regressed(value, protected["depths"].get(key, 0.))]
-                after = sum(value**2 for value in checked["depths"].values())
-                if not checked.get("complete", True) or checked["failures"] or regressions or after >= before - 1e-10:
+                checked, regressions, after, descent = measure_candidate(
+                    objective, geometry, candidate, measured, protected, group, before,
+                    frames=None if frame_mask is None else range(len(candidate)))
+                if not checked.get("complete", True) or checked["failures"] or regressions or not descent:
                     if not checked.get("complete", True):
                         record["rejected_geometry_prefix_frame"] = checked.get("rejection_frame")
                     record["query_failures"] = checked["failures"][:3]
                     record["collision_regressions"] = len(regressions)
-                    record["regression_examples"] = [{"key": list(key), "increase": checked["depths"][key] - protected["depths"].get(key, 0.)} for key in regressions[:3]]
+                    record["regression_examples"] = [{
+                        "key": list(key),
+                        "limit_m": protected["depths"].get(key, 0.),
+                        "actual_m": checked["depths"][key],
+                        "increase": checked["depths"][key] - protected["depths"].get(key, 0.),
+                    } for key in regressions[:3]]
                     continue
                 new_witnesses += witnesses.observe(measured, checked)
                 if prediction is not None:

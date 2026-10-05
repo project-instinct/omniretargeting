@@ -418,6 +418,7 @@ class SmplxDataSource(DataSource):
         self,
         motion: np.lib.npyio.NpzFile,
         framerate: float | None,
+        *, body_model=None,
     ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, float | None, dict]:
         import smplx
         import torch
@@ -425,12 +426,13 @@ class SmplxDataSource(DataSource):
         trans, root_orient, pose_body, pose_hand, timeline_metadata = self._prepare_raw_timeline(
             motion, framerate
         )
-        body_model = smplx.create(
-            self.model_directory,
-            "smplx",
-            gender=self._model_gender(motion),
-            use_pca=False,
-        )
+        if body_model is None:
+            body_model = smplx.create(
+                self.model_directory,
+                "smplx",
+                gender=self._model_gender(motion),
+                use_pca=False,
+            )
 
         if self.betas is None:
             betas_tensor = torch.tensor(motion["betas"]).float().view(1, -1)

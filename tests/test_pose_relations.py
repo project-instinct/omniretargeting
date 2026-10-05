@@ -97,20 +97,48 @@ def test_layout_component_may_approach_zero_but_not_flip():
 
     # pelvis, chest, a hand clearly in front of the chest (x forward) and a
     # second hand, so the chest is a branch point of the trunk.
-    reference = np.array([[[0, 0, 1.0], [0, 0, 1.5], [.3, 0, 1.4], [0, -.3, 1.2]]])
+    one = np.array([[0, 0, 1.0], [0, 0, 1.5], [.3, 0, 1.4], [0, -.3, 1.2]])
+    reference = np.repeat(one[None], 8, axis=0)
     envelope = RelationEnvelope([0, 1, 2, 3], np.zeros((4, 3)), [-1, 0, 1, 1], reference,
                                 axes=heading_axes(np.eye(3)[None]))
     assert envelope.accepts(_Positions(reference))
     far = reference.copy()
-    far[0, 2] = [.9, 0, 1.45]  # a large change that keeps every clear side
+    far[:, 2] = [.9, 0, 1.45]  # a large change that keeps every clear side
     assert envelope.accepts(_Positions(far))
     closer = reference.copy()
-    closer[0, 2, 0] = .01  # still in front
+    closer[:, 2, 0] = .01  # crosses the numerical zero, but stays ambiguous
     assert envelope.accepts(_Positions(closer))
     behind = reference.copy()
-    behind[0, 2, 0] = -.05  # small move, but the hand is now behind the chest
+    behind[:, 2, 0] = -.4  # clearly behind the chest for the whole interval
     assert not envelope.accepts(_Positions(behind))
-    assert envelope.summary(_Positions(behind))["layout_flip_frames"] == [0]
+    assert envelope.summary(_Positions(behind))["layout_flip_frames"] == list(range(6, 8))
+
+
+def test_brief_clear_layout_crossing_is_not_collapse():
+    from omniretargeting.pose_relations import RelationEnvelope, heading_axes
+
+    one = np.array([[0, 0, 1.0], [0, 0, 1.5], [.3, 0, 1.4], [0, -.3, 1.2]])
+    reference = np.repeat(one[None], 8, axis=0)
+    envelope = RelationEnvelope([0, 1, 2, 3], np.zeros((4, 3)), [-1, 0, 1, 1], reference,
+                                axes=heading_axes(np.repeat(np.eye(3)[None], 8, axis=0)))
+    brief = reference.copy()
+    brief[3, 2, 0] = -.4
+    assert envelope.accepts(_Positions(brief))
+
+
+def test_source_disagreement_is_not_a_hard_reference_layout_row():
+    from omniretargeting.pose_relations import RelationEnvelope, heading_axes
+
+    robot = np.array([[[0, 0, 1.0], [0, 0, 1.5], [.4, 0, 1.4], [0, -.3, 1.2]]])
+    source = robot.copy()
+    source[0, 2, 0] = -.4
+    axes = heading_axes(np.eye(3)[None])
+    envelope = RelationEnvelope([0, 1, 2, 3], np.zeros((4, 3)), [-1, 0, 1, 1],
+                                robot, axes=axes, source_positions=source)
+    reference_only = RelationEnvelope([0, 1, 2, 3], np.zeros((4, 3)), [-1, 0, 1, 1],
+                                      robot, axes=axes)
+    assert np.count_nonzero(envelope.layout_sign) < np.count_nonzero(reference_only.layout_sign)
+    assert envelope.accepts(_Positions(robot))
 
 
 def test_bends_within_one_limb_are_not_layout_flips():

@@ -44,7 +44,7 @@ def test_combined_root_chatter_is_rejected_even_when_each_coordinate_passes():
     assert guard.accepts(fixed)
     assert not guard.accepts(candidate)
     report, _, _ = verify_budgets(objective.model, coords, fixed, candidate)
-    assert report['root_order_2']['added_chatter_violations'] > 0
+    assert report['root_order_2']['derivative_screen_violations'] > 0
     for order in (2, 3):
         original = np.linalg.norm(np.diff(fixed[:, :3], n=order, axis=0), axis=1)
         independent = maximum_filter1d(original, 7, mode='nearest') + .1 * np.sqrt(np.mean(original**2))
@@ -76,6 +76,10 @@ def test_root_norm_is_present_in_conic_and_repair_rows_with_roundoff_reserve():
 
 def test_reweight_root_only_preserves_joint_rotation_and_world_path_weights():
     objective, fixed, candidate = _norm_counterexample()
+    candidate = fixed.copy()
+    candidate[:, objective.coords.root_q:objective.coords.root_q + 3] += .02 * (
+        -1.0
+    ) ** np.arange(len(fixed))[:, None]
     report = reweight_temporal_signals(objective, fixed, candidate, 10.)
     assert not report['joint_columns'] and report['root_translation_frames']
     for weights in (objective.temporal_weight, objective.joint_temporal_weight, objective.root_rotation_weight):
@@ -92,7 +96,7 @@ def test_reweight_root_only_preserves_joint_rotation_and_world_path_weights():
 def test_reweight_one_joint_does_not_change_other_joint_or_root_channels():
     objective, fixed, _ = _objective(temporal=True)
     candidate = fixed.copy()
-    candidate[15, objective.coords.qi[1]] += .02
+    candidate[15, objective.coords.qi[1]] += .2
     report = reweight_temporal_signals(objective, fixed, candidate, 10.)
     assert report['joint_columns'] == [1]
     for weights in objective.joint_temporal_weight:

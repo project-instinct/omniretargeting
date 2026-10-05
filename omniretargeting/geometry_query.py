@@ -110,6 +110,11 @@ def relative_point_jacobian(
     return np.asarray(direction) @ jac
 
 
+# Robot geom types with an exact open-surface (finite triangle) query.
+OPEN_SURFACE_GEOMS = (mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_SPHERE,
+                      mujoco.mjtGeom.mjGEOM_CYLINDER)
+
+
 class RigidGeometryQuery:
     """Exact convex-component supplement to the original triangle query.
 
@@ -137,6 +142,8 @@ class RigidGeometryQuery:
         }
         self.surface_intersection_queries = 0
         self.ambiguous_surface_intersections = 0
+        self.cylinder_surface_faces = 0
+        self.uncertified_cylinder_witnesses = 0
         spec = mujoco.MjSpec()
         spec.compiler.fusestatic = False
         spec.option.ccd_tolerance = 1e-9
@@ -292,15 +299,15 @@ class RigidGeometryQuery:
             "distance_retries": self.distance_retries,
             "analytic_cylinder_box_face_queries": self.analytic_face_queries,
             "failures": self.failures,
-            "open_surface_test": "exact capsule-axis / finite triangle distance",
+            "open_surface_test": "exact capsule-axis / solid-cylinder / finite triangle distance",
             "open_surface_supported_geoms": [
                 gid for gid in self.mapping
-                if self.robot.geom_type[gid] in (
-                    mujoco.mjtGeom.mjGEOM_CAPSULE, mujoco.mjtGeom.mjGEOM_SPHERE
-                )
+                if self.robot.geom_type[gid] in OPEN_SURFACE_GEOMS
             ],
             "surface_intersection_queries": self.surface_intersection_queries,
             "ambiguous_surface_intersections": self.ambiguous_surface_intersections,
+            "cylinder_surface_faces": self.cylinder_surface_faces,
+            "uncertified_cylinder_witnesses": self.uncertified_cylinder_witnesses,
             "open_surface_solid_side_inferred": False,
         }
 
@@ -425,6 +432,64 @@ class RigidGeometryQuery:
                         }
                     )
         rows.extend(self._open_surface_rows(robot_data, activation_distance, active))
+        rows.extend(self._open_cylinder_rows(robot_data, activation_distance, active))
+        return rows
+
+    def _open_cylinder_rows(self, data, activation_distance, active=None):
+        """Exact solid-cylinder / finite-triangle rows (see ``triangle_cylinder``).
+
+        Every face in the box of the enclosing capsule plus the activation
+        band is measured; capsule nearest-face pruning would not bound a
+        cylinder. Tied intersecting exits and uncertified separated witnesses
+        stay uncertain without a gradient.
+        """
+        from .triangle_cylinder import CERTIFIED_GAP_M, cylinder_triangle_rows, witness_pair
+
+        rows = []
+        for gid in self.mapping:
+            if active is not None and gid not in active:
+                continue
+            if self.robot.geom_type[gid] != mujoco.mjtGeom.mjGEOM_CYLINDER:
+                continue
+            radius, half = map(float, self.robot.geom_size[gid, :2])
+            axis = data.geom_xmat[gid].reshape(3, 3)[:, 2]
+            center = np.asarray(data.geom_xpos[gid], dtype=float)
+            band = radius + activation_distance
+            lower = np.minimum(center - half * axis, center + half * axis) - band
+            upper = np.maximum(center - half * axis, center + half * axis) + band
+            for cid, _part, faces in self.open_parts:
+                candidates = self.triangle_candidates[cid]
+                if np.any(upper < candidates.bounds[0]) or np.any(lower > candidates.bounds[1]):
+                    continue
+                ids = np.asarray(sorted(candidates.tree.intersection(np.r_[lower, upper])), int)
+                if not len(ids):
+                    continue
+                self.pair_queries += 1
+                self.surface_intersection_queries += 1
+                self.cylinder_surface_faces += len(ids)
+                measured = cylinder_triangle_rows(center, axis, radius, half,
+                                                  candidates.triangles[ids], with_witnesses=False)
+                k = int(np.argmin(measured["clearance"]))
+                clearance = float(measured["clearance"][k])
+                if clearance >= activation_distance:
+                    continue
+                point, surface, gap = witness_pair(
+                    center, axis, radius, half, candidates.triangles[ids[k]],
+                    measured["exit"][k], measured["support"][k])
+                ambiguous = bool(measured["ambiguous"][k])
+                uncertified = clearance >= 0. and gap > CERTIFIED_GAP_M
+                self.ambiguous_surface_intersections += ambiguous
+                self.uncertified_cylinder_witnesses += uncertified
+                uncertain = ambiguous or uncertified
+                rows.append({
+                    "clearance": clearance,
+                    "directions": np.zeros(3) if uncertain else measured["direction"][k].copy(),
+                    "points": point, "surface_points": surface, "geom_ids": gid,
+                    "body_ids": int(self.robot.geom_bodyid[gid]), "obstacle_ids": cid,
+                    "surface_ids": int(faces[ids[k]]), "confidence": 0.0 if uncertain else 1.0,
+                    "uncertain": uncertain, "unsigned_distance": abs(clearance),
+                    "witness_gap": gap,
+                })
         return rows
 
     def _open_surface_rows(self, data, activation_distance, active=None):

@@ -28,10 +28,12 @@ def project_joints(objective, bulk, *, report):
         for k in (1, 2, 3) if frames > k}
     for guard in objective.candidate_guards:
         if isinstance(guard, CorrectionContinuity):
-            limits = {k: guard.bounds[f'joints_order_{k}'] for k in operators}
+            limits = {k: guard.bounds[f'joints_order_{k}']
+                      for k in operators if f'joints_order_{k}' in guard.bounds}
             fixed, tolerance = guard.fixed[:, coords.qi], ROUND_OFF
         elif isinstance(guard, SequenceContinuityGuard):
-            limits = {k: guard.bounds['joints', k] for k in operators}
+            limits = {k: guard.bounds['joints', k]
+                      for k in operators if ('joints', k) in guard.bounds}
             fixed, tolerance = guard.reference['joints'][0], ACCEPTANCE_SLACK
         else:
             continue

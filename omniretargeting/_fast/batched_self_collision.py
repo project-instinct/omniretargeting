@@ -15,6 +15,7 @@ used to certify a different pose's reference-algorithm decision.
 
 from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
+from contextlib import nullcontext
 import ctypes
 from functools import lru_cache
 import hashlib
@@ -248,17 +249,22 @@ class BatchedSelfCollision:
         # ctypes releases the GIL; no model, MuJoCo data or Qhull state is
         # shared by the native worker calls. BLAS stays at one thread.
         count = min(self.workers, max(1, len(position) // 8))
-        if multiprocessing.current_process().daemon:
+        budget = getattr(self, 'cpu_budget', None)
+        if multiprocessing.current_process().daemon and budget is None:
             count = 1
-        edges = np.linspace(0, len(position), count + 1).astype(int)
         started = time.perf_counter()
-        if count == 1:
-            run(0, len(position))
-        else:
-            with ThreadPoolExecutor(max_workers=count) as executor:
-                list(executor.map(lambda bounds: run(*bounds), zip(edges[:-1], edges[1:])))
+        with budget.borrow(count) if budget is not None else nullcontext(count) as count:
+            edges = np.linspace(0, len(position), count + 1).astype(int)
+            if count == 1:
+                run(0, len(position))
+            else:
+                # This pool is gone (all native calls joined) before the next
+                # restoration can fork. No executor survives in query state.
+                with ThreadPoolExecutor(max_workers=count) as executor:
+                    list(executor.map(lambda bounds: run(*bounds), zip(edges[:-1], edges[1:])))
         self.diagnostics.update(native_cpu_seconds=sum(work_cpu),
-                                native_wall_seconds=time.perf_counter() - started)
+                                native_wall_seconds=time.perf_counter() - started,
+                                native_workers=count)
         result = clearance, points, directions, status
         self.previous = position.copy(), rotation.copy(), gap, result
         self.previous_threshold = threshold

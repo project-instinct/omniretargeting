@@ -64,6 +64,11 @@ class BulkGeometry:
         self.groups, self.grids, self.local = {}, {}, {}
         self.diagnostics = {}
         self.vertices = {}
+        # Only window evaluators opt into this directional certificate. Whole
+        # acquisition keeps its existing batching and original support path.
+        self.window_support_reuse = False
+        self.support_previous = {}
+        self.window_queries = None
         # Parent preparation shares immutable hulls with every fork worker.
         for prox in getattr(objective, 'proximities', ()):
             for geom in np.unique(prox['geoms']):
@@ -111,16 +116,52 @@ class BulkGeometry:
         vertices = self.vertices[geom]
         normalized = np.array(directions, dtype=float, order='C', copy=True)
         normalized /= np.maximum(np.linalg.norm(normalized, axis=1, keepdims=True), 1e-12)
-        choices, margins = np.empty(len(normalized), np.int64), np.empty(len(normalized))
-        self.library.bulk_support(len(normalized), len(vertices),
-            *(_pointer(a) for a in (normalized, vertices, choices, margins)))
         slack = 64*np.finfo(float).eps*(np.abs(vertices).max()+1)
+        choices, margins = np.empty(len(normalized), np.int64), np.empty(len(normalized))
+        if not self.window_support_reuse:
+            self.library.bulk_support(len(normalized), len(vertices),
+                *(_pointer(a) for a in (normalized, vertices, choices, margins)))
+        else:
+            self._window_support(geom, vertices, normalized, choices, margins, slack)
         # One nonzero component has a single multiplication in every BLAS
         # reduction. Exact ties and zero directions preserve the first index.
         ambiguous = (margins <= slack) & (np.count_nonzero(normalized, axis=1) > 1)
         self.diagnostics['support_queries'] = self.diagnostics.get('support_queries', 0)+len(normalized)
         self.diagnostics['support_fallbacks'] = self.diagnostics.get('support_fallbacks', 0)+int(ambiguous.sum())
         return vertices[choices], ambiguous
+
+    def _window_support(self, geom, vertices, normalized, choices, margins, slack):
+        reused = np.zeros(len(normalized), bool)
+        previous = self.support_previous.get(geom)
+        if previous is not None and previous[0].shape == normalized.shape:
+            old_direction, old_choice, old_margin, radius = previous
+            # Each vertex dot product moves by at most |v| |d'-d|. Subtract
+            # twice this bound from the old winner/runner-up gap. Additional
+            # slack covers both native reductions and reference BLAS rounding.
+            displacement = 2*radius*np.linalg.norm(normalized-old_direction, axis=1)
+            remaining = old_margin-displacement
+            reused = remaining > 4*slack
+            choices[reused], margins[reused] = old_choice[reused], remaining[reused]
+        pending = np.flatnonzero(~reused)
+        if len(pending):
+            directions = np.ascontiguousarray(normalized[pending])
+            selected, gap = np.empty(len(pending), np.int64), np.empty(len(pending))
+            if self.window_queries is None:
+                self.library.bulk_support(len(pending), len(vertices),
+                    *(_pointer(a) for a in (directions, vertices, selected, gap)))
+            else:
+                self.window_queries.support(geom, vertices, directions, selected, gap, slack)
+            choices[pending], margins[pending] = selected, gap
+        radius = previous[3] if previous is not None else np.linalg.norm(vertices, axis=1).max(initial=0.)
+        anchor_margin = margins.copy()
+        anchor_direction = normalized.copy()
+        if reused.any():
+            # Keep the original certificate anchor; repeated subtractions
+            # would accumulate rounding across a long sequence of tiny trials.
+            anchor_direction[reused] = old_direction[reused]
+            anchor_margin[reused] = old_margin[reused]
+        self.support_previous[geom] = anchor_direction, choices.copy(), anchor_margin, radius
+        self.diagnostics['support_reused'] = self.diagnostics.get('support_reused', 0)+int(reused.sum())
 
     def grid(self, sdf):
         key = id(sdf)
@@ -143,6 +184,13 @@ class BulkGeometry:
         return value
 
     def deepest(self, sdf, rotation, translation, scales=None):
+        if self.window_queries is None or getattr(self.objective, '_window_cpu_budget', None) is None:
+            return self._deepest(sdf, rotation, translation, scales)
+        from .window_native_parallel import shell_workers
+        with shell_workers(self):
+            return self._deepest(sdf, rotation, translation, scales)
+
+    def _deepest(self, sdf, rotation, translation, scales=None):
         obj = self.objective
         if type(sdf) is not GridSDF or (scales is not None and np.asarray(scales).dtype != np.dtype(float)):
             # Grid float32 * scale float32 rounds before first-min selection.
@@ -181,9 +229,12 @@ class BulkGeometry:
             value, choice = np.empty(len(pairs)), np.empty(len(pairs), np.int64)
             arrays = (frames, self.local[int(geom)], position, orientations,
                       field_r, field_t, field_s, grid, shape, lower)
-            self.library.bulk_shell(len(pairs), len(samples), int(geoms[geom]), obj.model.ngeom,
-                *(None if a is None else _pointer(a) for a in arrays), sdf.spacing,
-                _pointer(value), _pointer(choice))
+            if self.window_queries is None:
+                self.library.bulk_shell(len(pairs), len(samples), int(geoms[geom]), obj.model.ngeom,
+                    *(None if a is None else _pointer(a) for a in arrays), sdf.spacing,
+                    _pointer(value), _pointer(choice))
+            else:
+                self.window_queries.shell(sdf, int(geom), frames, arrays, sdf.spacing, value, choice)
             # Selected-point reconstruction keeps the original NumPy path.
             points = kin.geom_xpos[frames, geoms[geom]][:, None]+np.einsum(
                 'nij,nsj->nsi', kin.geom_xmat[frames, geoms[geom]], obj.shell_local[samples[choice]][:, None])

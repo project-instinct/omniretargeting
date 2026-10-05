@@ -101,6 +101,8 @@ class RepairLimits:
     def __init__(self, objective, entry):
         self.objective, self.coords = objective, objective.coords
         self.entry = np.array(entry, copy=True)
+        self.local_angle = .10 if OPTIONS.abl_repair_local_angle else LOCAL_ANGLE
+        self.ablate_contacts = OPTIONS.abl_contact_regression
         self.frames, self.width = len(entry), len(self.coords.qi)
         self.kin = TrajectoryKinematics(objective.model, self.coords.di)
         self.kin.evaluate(entry)
@@ -119,6 +121,9 @@ class RepairLimits:
         self.targets = [e["contact"][:, None] for e in objective.effectors] + [s["targets"] for s in objective.surfaces]
         self.contact_tolerances = ([min(CONTACT_DRIFT, objective.cfg["endpoint_regression_m"])] * len(objective.effectors)
                                    + [min(CONTACT_DRIFT, s["task"].cfg["regression"]) for s in objective.surfaces])
+        if self.ablate_contacts:
+            from .repair_contact_ablation import prepare
+            self.contact_planes = prepare(self)
         self.target_budgets = [np.linalg.norm(point - target, axis=-1) + tolerance
                                for point, target, tolerance in zip(self.anchors, self.targets, self.contact_tolerances)]
         # A free endpoint is allowed to approach its source-derived target.
@@ -127,17 +132,19 @@ class RepairLimits:
                                  for error, _, _ in self.tracking_rows(False)]
         slide = objective.model.jnt_type[objective.model.dof_jntid[self.coords.di]] == 2
         self.slide = slide
-        local = np.where(slide, FREE_DRIFT, LOCAL_ANGLE)
+        local = np.where(slide, FREE_DRIFT, self.local_angle)
         self.lower = np.maximum(objective.lower, entry[:, self.coords.qi] - local)
         self.upper = np.minimum(objective.upper, entry[:, self.coords.qi] + local)
         self.differences = []
-        for order in (1, 2, 3):
-            if self.frames <= order:
-                continue
-            op = sparse.kron(_difference_operator(self.frames, order), sparse.eye(self.width), format="csr")
-            before = op @ entry[:, self.coords.qi].ravel()
-            # Windowed per-joint budgets of the acquired motion (motion_budgets).
-            self.differences.append((op, windowed_budget(before.reshape(-1, self.width)).ravel()))
+        if OPTIONS.reference_derivative_budget:
+            for order in (1, 2, 3):
+                if self.frames <= order:
+                    continue
+                op = sparse.kron(_difference_operator(self.frames, order), sparse.eye(self.width), format="csr")
+                before = op @ entry[:, self.coords.qi].ravel()
+                # Legacy regression envelope; production checks source chatter
+                # after repair and does not forbid smooth low-frequency change.
+                self.differences.append((op, windowed_budget(before.reshape(-1, self.width)).ravel()))
         self.aggregate_temporal = RepairTemporal(entry[:, self.coords.qi], self.differences, self.width)
         self.support_continuity = SupportContinuity(
             objective, self.kin, slack=NUMERICAL_SLACK, enabled=OPTIONS.repair_support_continuity)
@@ -179,6 +186,9 @@ class RepairLimits:
         """
         weld = self.objective.model.body_weldid[bodies]
         yielded = np.where(budget == CONTACT_DRIFT, self.penetration_yield[:, weld], 0.)
+        if self.ablate_contacts:
+            extra = np.where(budget == CONTACT_DRIFT, CONTACT_DRIFT, 0.)
+            return budget + yielded + extra, self.target_budgets[index] + yielded + extra
         return budget + yielded, self.target_budgets[index] + yielded
 
     def backtrack_branches(self, poses, step):
@@ -200,40 +210,50 @@ class RepairLimits:
         relative = self.kin.xmat[:, self.bodies] @ target.transpose(0, 1, 3, 2)
         return Rotation.from_matrix(relative.reshape(-1, 3, 3)).magnitude().reshape(self.frames, -1)
 
-    def point_groups(self):
+    def point_groups(self, *, include_surfaces=True):
         groups = []
-        for eff in self.objective.effectors:
+        from .repair_frame_norm import enabled
+        from .repair_points import points as cached_points
+        fast = enabled()
+        for index, eff in enumerate(self.objective.effectors):
             body = eff["body"]
-            point = self.kin.xpos[:, body] + np.einsum("fij,fj->fi", self.kin.xmat[:, body], eff["offset"])
-            point = point[:, None]
+            if fast:
+                point = cached_points(self, ('endpoint', index), 'endpoint', np.array([body]), eff['offset'])
+            else:
+                point = self.kin.xpos[:, body] + np.einsum("fij,fj->fi", self.kin.xmat[:, body], eff["offset"])
+                point = point[:, None]
             active = eff["active"] | eff["managed"]
             budget = np.where(active, CONTACT_DRIFT, np.inf)[:, None]
             # Surface-managed contacts use their actual material samples;
             # the legacy endpoint target is inactive in the acquiring solve.
             budget = np.where(eff["managed"][:, None], np.inf, budget)
             groups.append((point, np.array([eff["body"]]), budget))
-        for surf in self.objective.surfaces:
-            point = self.kin.geom_points(surf["geoms"], surf["local"])
+        for index, surf in enumerate(self.objective.surfaces if include_surfaces else ()):
+            point = (cached_points(self, ('surface', index), 'surface', surf['geoms'], surf['local'])
+                     if fast else self.kin.geom_points(surf["geoms"], surf["local"]))
             budget = np.where(surf["active"], CONTACT_DRIFT, np.inf)
             groups.append((point, surf["bodies"], budget))
         return groups
 
-    def tracking_rows(self, with_jacobian):
+    def tracking_rows(self, with_jacobian, bounds=None):
         """Unchanged world/body-relative tracking semantics from acquisition."""
         tasks, kin = self.objective.tasks, self.kin
         roots = np.asarray(tasks.roots)
         root = roots if tasks.root_body is None else kin.xpos[:, tasks.root_body]
-        for eff, (point, bodies, _) in zip(self.objective.effectors, self.point_groups()):
+        from .repair_frame_norm import enabled, point_jacobians, root_relative
+        for eff, (point, bodies, _) in zip(self.objective.effectors,
+                                         self.point_groups(include_surfaces=not enabled())):
             target = np.where(eff["world"][:, None], eff["tracking"],
                               root + eff["scale"] * (eff["tracking"] - roots))
             target += eff["share"][:, None] * (eff["approach"] - target)
             free = ~(eff["active"] | eff["managed"])
             jac = None
             if with_jacobian:
-                jac = kin.point_jacobians(bodies, point)
+                jac = (kin.point_jacobians(bodies, point) if bounds is None else
+                       point_jacobians(self, bounds, bodies, point))
                 if tasks.root_body is not None:
                     share = np.where(eff["world"], 0., 1. - eff["share"])
-                    jac -= share[:, None, None, None] * kin.jacp[:, tasks.root_body, None]
+                    jac = root_relative(jac, share, kin, tasks.root_body)
             yield point - target[:, None], jac, free[:, None]
 
     def correction_mask(self, bodies, budget):
@@ -244,7 +264,8 @@ class RepairLimits:
         return (weld[None] == self.movable_body) & (budget == CONTACT_DRIFT)
 
     def constraints(self, poses, *, restore_layout=False, projection=None):
-        if OPTIONS.repair_defect_windows and not getattr(self, '_repair_frame_view', False):
+        if (OPTIONS.repair_defect_windows and not OPTIONS.abl_repair_restore_layout
+                and not getattr(self, '_repair_frame_view', False)):
             from .repair_sparse_frames import constraints
             compact = constraints(self, poses, restore_layout=restore_layout, projection=projection)
             if compact is not None:
@@ -269,27 +290,29 @@ class RepairLimits:
         if OPTIONS.repair_aggregate:
             self.aggregate_temporal.add(bounds, poses[:, self.coords.qi])
         self.support_continuity.add(bounds, self.kin)
+        from .repair_frame_norm import point_jacobians, masked_norm
         for index, (anchor, (points, bodies, budget)) in enumerate(zip(self.anchors, self.point_groups())):
-            jac = self.kin.point_jacobians(bodies, points)
+            jac = (self.kin.point_jacobians(bodies, points) if self.ablate_contacts else
+                   point_jacobians(self, bounds, bodies, points))
+            if self.ablate_contacts:
+                from .repair_contact_ablation import add
+                add(self, index, points, jac, bounds)
             correcting = self.correction_mask(bodies, budget)
             budget, target_budget = self.contact_budgets(index, bodies, budget)
             if correcting.any():
                 target_budget = np.where(correcting, target_budget, 1.)
-                error = np.where(correcting[..., None], points - self.targets[index], 0.)
-                target_jac = np.where(correcting[..., None, None], jac, 0.)
-                bounds.norm(target_jac, error, np.maximum(target_budget, 1e-8))
+                masked_norm(bounds, jac, points - self.targets[index],
+                            np.maximum(target_budget, 1e-8), correcting)
             budget = np.where(correcting, np.inf, budget)
             delta = points - anchor
             valid = np.isfinite(budget)
-            bounds.norm(np.where(valid[..., None, None], jac, 0.),
-                        np.where(valid[..., None], delta, 0.), np.where(valid, budget, 1.))
-        for (error, jac, free), budget in zip(self.tracking_rows(True), self.tracking_budgets):
-            bounds.norm(np.where(free[..., None, None], jac, 0.),
-                        np.where(free[..., None], error, 0.), np.where(free, budget, 1.))
+            masked_norm(bounds, jac, delta, budget, valid)
+        for (error, jac, free), budget in zip(self.tracking_rows(True, bounds), self.tracking_budgets):
+            masked_norm(bounds, jac, error, budget, free)
         if not OPTIONS.body_rotation_report_only:
             # Vector norm cones prevent tangent steps on an already saturated
             # local sphere from repeatedly failing the nonlinear check.
-            for target, allowed in ((self.entry_rotations, LOCAL_ANGLE),):
+            for target, allowed in ((self.entry_rotations, self.local_angle),):
                 relative = self.kin.xmat[:, self.bodies] @ target.transpose(0, 1, 3, 2)
                 vector = Rotation.from_matrix(relative.reshape(-1, 3, 3)).as_rotvec().reshape(self.frames, -1, 3)
                 length = np.linalg.norm(vector, axis=-1)
@@ -304,7 +327,16 @@ class RepairLimits:
         # Secondary proposals must see the original acquisition/continuity
         # bounds, not merely fail them after solving an incompatible QP.
         # Only scalar joints are variables here; root tangent columns stay zero.
-        selector = sparse.kron(sparse.eye(self.frames), self.coords.selector.T, format="csr")
+        from .repair_frame_norm import enabled
+        from .repair_contact_rows import selector_key
+        selector_state = getattr(self, '_repair_selector', None)
+        selector_identity = self.frames, selector_key(self.coords.selector)
+        if enabled() and selector_state is not None and selector_state[0] == selector_identity:
+            selector = selector_state[1]
+        else:
+            selector = sparse.kron(sparse.eye(self.frames), self.coords.selector.T, format="csr")
+            if enabled():
+                self._repair_selector = selector_identity, selector
         guards = list(getattr(self.objective, "candidate_guards", ()))
         shape = getattr(self.objective, "source_shape", None)
         if shape is not None:
@@ -314,16 +346,24 @@ class RepairLimits:
                 continue
             from .repair_contact_rows import contact_bounds
             from .repair_layout_rows import layout_bounds
-            cached = None if projection is None else contact_bounds(guard, poses)
-            if cached is None and projection is not None:
-                cached = layout_bounds(guard, poses, restore=restore_layout and guard is shape)
+            restore = restore_layout and guard is shape
+            align_layout = restore and OPTIONS.abl_repair_restore_layout
+            # Full rows keep the preceding six frames of sustained-flip
+            # history; the legacy chunk cache is unchanged when disabled.
+            early_selector = selector if enabled() else None
+            cached = (None if projection is None else
+                      contact_bounds(guard, poses, selector=early_selector))
+            if cached is None and projection is not None and not align_layout:
+                cached = layout_bounds(guard, poses, restore=restore, selector=early_selector)
             linear, norms = (cached if cached is not None else
                              guard.repair_bounds(poses, restore=True)
-                             if restore_layout and guard is shape else guard.repair_bounds(poses))
+                             if restore and not align_layout else guard.repair_bounds(poses))
             for matrix, lower, upper in linear:
-                bounds.add(matrix @ selector, lower, upper)
+                bounds.add(matrix if cached is not None and early_selector is not None
+                           else matrix @ selector, lower, upper)
             for matrix, residual, allowed in norms:
-                bounds.norms.append((matrix @ selector, residual, allowed))
+                bounds.norms.append((matrix if cached is not None and early_selector is not None
+                                    else matrix @ selector, residual, allowed))
         return bounds
 
     def check(self, poses):
@@ -333,7 +373,8 @@ class RepairLimits:
         if shape is not None and not shape.accepts(poses):
             return False, {"reason": "immutable source shape"}
         for guard in getattr(self.objective, "candidate_guards", ()):
-            if not guard.accepts(poses):
+            from .repair_guard_cache import accepts
+            if not accepts(guard, poses):
                 from .repair_diagnostics import guard_failure
                 return False, guard_failure(guard, poses)
         qi = self.coords.qi
@@ -355,11 +396,11 @@ class RepairLimits:
         if not support_valid:
             return False, support_report
         local = self.angles(self.entry_rotations)
-        if not OPTIONS.body_rotation_report_only and local.max(initial=0) > LOCAL_ANGLE + 1e-7:
+        if not OPTIONS.body_rotation_report_only and local.max(initial=0) > self.local_angle + 1e-7:
             frame, body = np.unravel_index(np.argmax(local), local.shape)
             return False, {"reason": "body posture", "frame": int(frame),
                            "body": self.objective.model.body(int(self.bodies[body])).name,
-                           "excess": float(local.max() - LOCAL_ANGLE)}
+                           "excess": float(local.max() - self.local_angle)}
         tracking_excess = 0.
         for (error, _, free), budget in zip(self.tracking_rows(False), self.tracking_budgets):
             tracking_delta = np.linalg.norm(error, axis=-1) - budget
@@ -371,6 +412,11 @@ class RepairLimits:
         repaired_drift = 0.
         total_drift = 0.
         for index, (anchor, (points, bodies, budget)) in enumerate(zip(self.anchors, self.point_groups())):
+            if self.ablate_contacts:
+                from .repair_contact_ablation import check
+                inward = check(self, index, points)
+                if inward is not None:
+                    return False, inward
             distance = np.linalg.norm(points - anchor, axis=-1)
             original_drift = np.linalg.norm(points - self.original_anchors[index], axis=-1)
             total_drift = max(total_drift, float(original_drift[budget == CONTACT_DRIFT].max(initial=0)))
@@ -400,6 +446,7 @@ class RepairLimits:
                       "max_contact_drift_m": drift, "temporal_excess": excess,
                       "repaired_contact_displacement_m": repaired_drift,
                       "max_contact_point_displacement_m": total_drift,
+                      "source_chatter_checked_by_final_audit": not OPTIONS.reference_derivative_budget,
                       "max_free_endpoint_displacement_m": free_drift,
                       "free_tracking_error_increase_m": tracking_excess,
                       "relation_envelope": relation,

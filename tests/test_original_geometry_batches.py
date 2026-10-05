@@ -8,6 +8,7 @@ import pytest
 import trimesh
 
 from omniretargeting._fast.mesh_repair import OriginalGeometry
+import omniretargeting._fast.original_rigid_fallback as original_rigid_fallback
 from omniretargeting.scene_geometry import SceneQuery
 
 
@@ -122,7 +123,76 @@ def test_batches_keep_original_geometry_samples_results_and_frame_jacobians(kind
     for key, row in actual["rows"]:
         if key[1] == "static":
             assert row["point"].base is None
-            assert row["direction"].base is None
+        assert row["direction"].base is None
+
+
+def test_unsigned_static_samples_use_exact_rigid_fallback_without_zero_depth():
+    objective, poses = _problem()
+    geometry = OriginalGeometry(objective, [], _scene("mixed"))
+    measured = geometry.measure(poses, jacobians=False)
+    assert not measured["failures"]
+    coverage = geometry.summary(measured)["query_coverage"]
+    assert coverage["sample_unknown"] > 0
+    assert coverage["rigid_resolved"] == coverage["sample_unknown"]
+    assert coverage["rigid_unknown"] == 0
+
+
+def test_uncertain_rigid_fallback_remains_unknown(monkeypatch):
+    objective, poses = _problem()
+    geometry = OriginalGeometry(objective, [], _scene("mixed"))
+
+    def uncertain(*args, **kwargs):
+        return [{
+            "clearance": -0.01, "directions": np.zeros(3), "points": np.zeros(3),
+            "surface_points": np.zeros(3), "geom_ids": 0, "body_ids": 0,
+            "obstacle_ids": 0, "surface_ids": 0, "uncertain": True,
+            "unsigned_distance": np.nan,
+        }]
+
+    monkeypatch.setattr(original_rigid_fallback, "_backend", lambda _geometry: SimpleNamespace(
+        open_parts=[object()], failures=[], query=uncertain))
+    monkeypatch.setattr(original_rigid_fallback, "uncovered_components", lambda *_: [])
+    measured = geometry.measure(poses[:1], jacobians=False)
+    assert measured["failures"]
+    assert any("rigid backend" in failure and "rigid_ambiguous_exit" in failure
+               for failure in measured["failures"])
+    summary = geometry.summary(measured)
+    assert summary["query_coverage"]["rigid_unknown"] > 0
+    assert summary["query_coverage"]["rigid_ambiguous_exit"] == summary["query_coverage"]["rigid_unknown"]
+    assert {row["category"] for row in summary["query_failure_examples"]} >= {
+        "shell_sample_unknown_side", "rigid_ambiguous_exit"}
+
+
+def test_signed_component_beside_open_scan_is_never_resolved_by_crossing_test():
+    objective, poses = _problem()
+    sheet = trimesh.Trimesh([[2, -.3, .2], [2, .3, .2], [2, .3, .8]], [[0, 1, 2]], process=False)
+    # A closed, non-convex L block: its winding side is not a MuJoCo convex pair.
+    block = trimesh.creation.box(extents=[.3, .1, .1]).union(
+        trimesh.creation.box(extents=[.1, .3, .1], transform=trimesh.transformations.translation_matrix([.1, .1, 0])))
+    block.apply_translation([3, 0, 0])
+    geometry = OriginalGeometry(objective, [], SceneQuery(trimesh.util.concatenate([block, sheet])))
+    measured = geometry.measure(poses[:1], jacobians=False)
+    coverage = geometry.summary(measured)["query_coverage"]
+    assert measured["failures"]
+    assert coverage["rigid_resolved"] == 0
+    assert coverage["rigid_uncovered_scene_components"] == coverage["sample_unknown"]
+
+
+def test_unsupported_geom_type_on_open_scan_stays_unknown():
+    model = mujoco.MjModel.from_xml_string('''<mujoco><worldbody>
+      <body name="base" pos="0 0 .5"><freejoint/><geom type="box" size=".04 .04 .04"/></body>
+      </worldbody></mujoco>''')
+    poses = model.qpos0[None].copy()
+    objective = SimpleNamespace(
+        model=model, frames=1, coords=SimpleNamespace(qi=np.array([], int), di=np.array([], int)),
+        shell_geoms=np.arange(1), shell_sample_geom=np.zeros(6, int),
+        shell_local=np.concatenate([np.eye(3), -np.eye(3)]) * .04)
+    sheet = trimesh.Trimesh([[-1, -1, .45], [1, -1, .45], [0, 1, .45]], [[0, 1, 2]], process=False)
+    geometry = OriginalGeometry(objective, [], SceneQuery(sheet))
+    measured = geometry.measure(poses, jacobians=False)
+    coverage = geometry.summary(measured)["query_coverage"]
+    assert measured["failures"]
+    assert coverage["rigid_unsupported_geom_type"] == 1
 
 
 def test_single_dense_frame_still_respects_query_point_bound():

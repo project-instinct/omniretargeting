@@ -33,6 +33,59 @@ def prepare_moving(geometry):
         for obj in geometry.moving.objects]
 
 
+def prepare_moving_reduction(geometry, poses):
+    """Build repair-only cones for objects reachable from its entry poses.
+
+    The inexpensive sphere/box test only decides whether to prepare an
+    acceleration structure. Objects without one still execute full queries,
+    even if a later candidate approaches them.
+    """
+    import subprocess
+    import mujoco
+    import numpy as np
+    from ..moving_scene import interpolate_object
+    from .repair_static_query import _QUERY
+    from .runtime_options import OPTIONS
+    moving = geometry.moving
+    if not OPTIONS.repair_geometry_reduction or moving is None:
+        return
+    from .original_geometry_reduction import ClosedComponentReduction
+    eligible = {i for i, obj in enumerate(moving.objects)
+                if getattr(obj['query'], '_r4_serial', False) and obj.get('closed')
+                and getattr(getattr(obj['query'].query, '__func__', None), '__code__', None)
+                is _QUERY.__code__}
+    if not eligible:
+        return
+    geoms = [shell['geom_id'] for shell in moving.shells]
+    radii = np.array([shell['radius'] for shell in moving.shells])
+    reachable = set()
+    band = moving.cfg['activation_distance']
+    for frame, pose in enumerate(poses):
+        moving.data.qpos[:] = pose
+        mujoco.mj_forward(moving.model, moving.data)
+        for oid in eligible - reachable:
+            obj = moving.objects[oid]
+            translation, rotation, scale = interpolate_object(obj['surface'], frame)
+            local = (moving.data.geom_xpos[geoms] - translation) @ rotation / scale
+            for cid in obj['closed']:
+                bounds = obj['query']._component_query_data[cid][2]
+                gap = np.maximum(np.maximum(bounds[0] - local, local - bounds[1]), 0.)
+                if np.any(np.linalg.norm(gap, axis=1) <= (radii + band) / scale):
+                    reachable.add(oid)
+                    break
+        if reachable == eligible:
+            break
+    for oid in reachable:
+        obj = moving.objects[oid]
+        scene = obj['query']
+        if obj.get('repair_reduction') is not None:
+            continue
+        try:
+            obj['repair_reduction'] = ClosedComponentReduction(scene, band)
+        except (OSError, RuntimeError, subprocess.CalledProcessError):
+            pass  # Optional screening never replaces the exact fallback.
+
+
 def prepare_static_bounds(geometry, poses):
     """Prepare the existing exact distance cones before a cold CPU audit.
 

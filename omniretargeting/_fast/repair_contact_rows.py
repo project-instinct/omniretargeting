@@ -64,7 +64,7 @@ def _shift(matrix, start, width):
     return sparse.csr_matrix((value.data, value.indices, value.indptr), shape=(value.shape[0], width))
 
 
-def contact_bounds(guard, poses):
+def contact_bounds(guard, poses, *, selector=None):
     """Full-coordinate, byte-equal guard rows, or None for an unknown guard."""
     from .acquisition_guard import AcquisitionNormalGuard
     from .contact_guard import ContactGuard
@@ -75,7 +75,12 @@ def contact_bounds(guard, poses):
     # Both supported guard constructors own readonly arrays in immutable
     # groups. Retain those objects, so recycled IDs cannot certify new state.
     identity = tuple(guard.groups)
-    config = (getattr(guard, "preserve_positions", None), guard.kin.columns.tobytes(), CHUNK_FRAMES)
+    config = (getattr(guard, "preserve_positions", None), guard.kin.columns.tobytes(), CHUNK_FRAMES,
+              getattr(guard, 'ablate_contacts', False))
+    from .repair_frame_norm import enabled
+    fast = enabled()
+    if fast:
+        config += (len(poses), getattr(guard, 'numerical_slack', None), selector_key(selector))
     state = getattr(guard, "_repair_contact_cache", None)
     if (state is None or state[1] != config or len(state[0]) != len(identity)
             or any(a is not b for a, b in zip(state[0], identity))):
@@ -92,6 +97,9 @@ def contact_bounds(guard, poses):
         if value is None:
             local = _slice(guard, part)
             result = local.repair_bounds(poses[part])
+            if fast:
+                result = [[(shift_project(matrix, start * width, len(poses) * width, selector),
+                            first, second) for matrix, first, second in rows] for rows in result]
             value = [(names, rows) for names, rows in zip(_families(local), result)]
             cache[key] = value
         cache.move_to_end(key)
@@ -100,7 +108,8 @@ def contact_bounds(guard, poses):
         for output, (names, rows) in zip(collected, value):
             assert len(names) == len(rows), "Contact row families changed"
             for family, (matrix, first, second) in zip(names, rows):
-                output[family].append((_shift(matrix, start * width, len(poses) * width), first, second))
+                output[family].append((matrix if fast else _shift(matrix, start * width, len(poses) * width),
+                                       first, second))
     result = []
     for output in collected:
         rows = []
@@ -110,3 +119,15 @@ def contact_bounds(guard, poses):
                          np.concatenate(first), np.concatenate(second)))
         result.append(rows)
     return tuple(result)
+
+
+def selector_key(selector):
+    if selector is None:
+        return None
+    return (selector.shape, selector.dtype.str, selector.data.tobytes(),
+            selector.indices.tobytes(), selector.indptr.tobytes())
+
+
+def shift_project(matrix, start, width, selector):
+    matrix = _shift(matrix, start, width)
+    return matrix if selector is None else matrix @ selector

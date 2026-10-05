@@ -34,6 +34,39 @@ class FramewiseMotionMixin(SourceRootReferenceMixin):
         apply_surface_contacts: bool = True,
         object_points: np.ndarray | None = None,
     ) -> np.ndarray:
+        """Overlap independent evidence with construction of the retargeter."""
+        if reference_trajectory is not None and len(reference_trajectory)!=len(processed_trajectory):
+            raise ValueError("reference_trajectory must have the same number of frames as processed_trajectory.")
+        from .preprocessing_parallel import EvidencePrefetch
+        sequence = self.retargeting_config.get('sequence_solver', {})
+        with EvidencePrefetch(
+            self,getattr(self,'_body_surface_samples',None),processed_trajectory,
+            scaled_terrain,self.retargeting_config,
+            apply_surface_contacts and sequence.get('enabled',False)
+            and sequence.get('backend') == 'fast',
+        ):
+            return self._perform_retargeting_prepared(
+                processed_trajectory,scaled_terrain,base_orientations,base_translations,
+                source_joint_orientations,source_reference_joint_orientations,
+                source_reference_joint_positions,end_effector_tasks,reference_trajectory,
+                overlay_contact_names,apply_surface_contacts,object_points,
+            )
+
+    def _perform_retargeting_prepared(
+        self,
+        processed_trajectory: np.ndarray,
+        scaled_terrain: trimesh.Trimesh,
+        base_orientations: np.ndarray | None = None,
+        base_translations: np.ndarray | None = None,
+        source_joint_orientations: np.ndarray | None = None,
+        source_reference_joint_orientations: np.ndarray | None = None,
+        source_reference_joint_positions: np.ndarray | None = None,
+        end_effector_tasks: Optional[Dict[str, SceneContactTask]] = None,
+        reference_trajectory: np.ndarray | None = None,
+        overlay_contact_names: Optional[set[str]] = None,
+        apply_surface_contacts: bool = True,
+        object_points: np.ndarray | None = None,
+    ) -> np.ndarray:
         """Perform the actual motion retargeting using generic interaction mesh retargeting."""
         from ..retargeting import GenericInteractionRetargeter
 
@@ -204,24 +237,31 @@ class FramewiseMotionMixin(SourceRootReferenceMixin):
                 print("Body relations: " + diagnostics_json(report))
             retargeter.body_relation_tasks = self.last_body_relation_tasks
 
-        from .surfaces import prepare_surface_tasks
-        prepare_surface_tasks(
-            self, retargeter, processed_trajectory, scaled_terrain,
-            source_reference_joint_positions, apply_scene_contacts=apply_surface_contacts,
-            robot_seed_trajectory=reference_trajectory,
-        )
-        if apply_surface_contacts and getattr(retargeter, "contact_phase", None) is not None:
-            end_effector_tasks = {
-                name: self.last_end_effector_tasks[name] for name in (end_effector_tasks or {})
-            }
-
-        if self.retargeting_config.get("sequence_solver", {}).get("enabled", False):
-            from .sequence import solve_core_sequence
-            return solve_core_sequence(
-                self, retargeter, processed_trajectory, end_effector_tasks,
-                base_orientations, object_points, reference_trajectory,
-                source_joint_orientations=source_joint_orientations,
+        from .source_pose_prefetch import SourcePosePrefetch
+        sequence = self.retargeting_config.get('sequence_solver', {})
+        with SourcePosePrefetch(
+            self, retargeter, processed_trajectory, end_effector_tasks or {}, base_orientations,
+            object_points, reference_trajectory, source_joint_orientations,
+            sequence.get('enabled',False) and sequence.get('backend') == 'fast',
+        ):
+            from .surfaces import prepare_surface_tasks
+            prepare_surface_tasks(
+                self, retargeter, processed_trajectory, scaled_terrain,
+                source_reference_joint_positions, apply_scene_contacts=apply_surface_contacts,
+                robot_seed_trajectory=reference_trajectory,
             )
+            if apply_surface_contacts and getattr(retargeter, "contact_phase", None) is not None:
+                end_effector_tasks = {
+                    name: self.last_end_effector_tasks[name] for name in (end_effector_tasks or {})
+                }
+
+            if self.retargeting_config.get("sequence_solver", {}).get("enabled", False):
+                from .sequence import solve_core_sequence
+                return solve_core_sequence(
+                    self, retargeter, processed_trajectory, end_effector_tasks,
+                    base_orientations, object_points, reference_trajectory,
+                    source_joint_orientations=source_joint_orientations,
+                )
 
         # Retarget each frame
         framewise_max_iterations = self.retargeting_config.get("framewise_max_iterations")

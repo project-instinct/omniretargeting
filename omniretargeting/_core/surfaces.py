@@ -88,6 +88,27 @@ def prepare_surface_tasks(
     apply_scene_contacts=True,
     robot_seed_trajectory=None,
 ):
+    from .preprocessing_parallel import EvidencePrefetch
+    sequence = owner.retargeting_config.get('sequence_solver', {})
+    prefetch = getattr(owner,'_preprocess_evidence_prefetch',None) or EvidencePrefetch(
+        owner, getattr(owner, '_body_surface_samples', None), positions, scene,
+        owner.retargeting_config,
+        apply_scene_contacts and sequence.get('enabled', False) and sequence.get('backend') == 'fast',
+    )
+    try:
+        return _prepare_surface_tasks(
+            owner, retargeter, positions, scene, reference_positions,
+            apply_scene_contacts=apply_scene_contacts, robot_seed_trajectory=robot_seed_trajectory,
+            prefetch=prefetch,
+        )
+    finally:
+        prefetch.close()
+
+
+def _prepare_surface_tasks(
+    owner, retargeter, positions, scene, reference_positions, *,
+    apply_scene_contacts=True, robot_seed_trajectory=None, prefetch,
+):
     from ..self_contact import build_self_contact_tasks
     from ..surface_contact import build_surface_contact_tasks
     from ..surface_pose import build_surface_pose_tasks
@@ -147,8 +168,10 @@ def prepare_surface_tasks(
         from ..support_parallel import SupportPool
 
         with SupportPool() as pool:
-            _prepare_source_support(owner, source, positions, scene, config, map_function=pool.map)
-            _prepare_object_support(owner, scene, config, map_function=pool.map)
+            if not prefetch.consume('source'):
+                _prepare_source_support(owner, source, positions, scene, config, map_function=pool.map)
+            if not prefetch.consume('object'):
+                _prepare_object_support(owner, scene, config, map_function=pool.map)
         owner.last_surface_contact_tasks, owner.last_surface_contact_diagnostics = (
             build_surface_contact_tasks(
                 owner.robot_model,

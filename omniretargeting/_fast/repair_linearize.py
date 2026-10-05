@@ -16,6 +16,19 @@ def _content(value):
     return value
 
 
+def _signature(geometry, key, witness, fast):
+    if fast:
+        if key[1] != 'self':
+            # These are every witness field read by the MuJoCo Jacobian below.
+            return key, ('point', witness['geom_id'], _content(witness['point']),
+                         _content(witness['direction']))
+        from ..self_collision import SelfCollisionQuery
+        if getattr(geometry.self_query.jacobian, '__func__', None) is SelfCollisionQuery.jacobian:
+            return key, ('self', _content(witness['body_ids']), _content(witness['points']),
+                         _content(witness['direction']))
+    return key, _content(witness)
+
+
 def _frame_cache(geometry, frame, pose):
     cache = getattr(geometry, "_repair_jacobian_cache", None)
     if cache is None:
@@ -32,6 +45,8 @@ def _frame_cache(geometry, frame, pose):
 
 
 def remember(geometry, poses, parts):
+    from .repair_frame_norm import enabled
+    fast = enabled()
     for part in parts:
         for frame, rows, _, _ in part["frames"]:
             if frame == part["rejection"]:
@@ -43,17 +58,19 @@ def remember(geometry, poses, parts):
                     continue
                 if cache is None:
                     cache = _frame_cache(geometry, frame, poses[frame])
-                cache[(key, _content(row))] = np.array(jac, copy=True)
+                cache[_signature(geometry, key, row, fast)] = np.array(jac, copy=True)
 
 
 def linearize(geometry, poses, measurement):
+    from .repair_frame_norm import enabled
+    fast = enabled()
     rows, frame, ready = [], None, False
     reused = computed = 0
     for key, witness in measurement["rows"]:
         if key[0] != frame:
             frame, ready = key[0], False
             cache = _frame_cache(geometry, frame, poses[frame])
-        signature = key, _content(witness)
+        signature = _signature(geometry, key, witness, fast)
         jacobian = cache.get(signature)
         if jacobian is None:
             if not ready:
