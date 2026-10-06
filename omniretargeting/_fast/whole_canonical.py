@@ -25,6 +25,10 @@ from .runtime_options import OPTIONS
 
 def supported(objective):
     """Only contracts whose numerical constraint construction is known here."""
+    # Joint elastic variables/curvature cones use the expression assembler;
+    # the unchanged packed program remains exact for all existing workloads.
+    if getattr(objective, 'joint_witness', None) is not None:
+        return False
     if not OPTIONS.whole_canonical or gpu_enabled() or OPTIONS.window_qp:
         return False
     if type(getattr(objective, 'source_shape', None)) is not ReferenceShape:

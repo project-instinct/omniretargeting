@@ -23,6 +23,8 @@ class RuntimeOptions:
     body_rotation_report_only: bool = False
     frozen_depth: bool = False
     original_clearance: bool = False
+    joint_witness: bool = False
+    joint_skip_free: bool = False
     repair_aggregate: bool = False
     off_surface_approach_only: bool = False
     submillimeter_repair: bool = False
@@ -51,6 +53,13 @@ class RuntimeOptions:
     window_geometry_generation: bool = False
     seed_continuity: bool = False
     coarse_acquisition: bool = False
+    spline_correction: bool = False
+    spline_adaptive: bool = False
+    spline_shared_loop: bool = False
+    # Skip nearly-closed winding for samples outside a moving object's convex
+    # hull. Identical on all measured clips; differs only where a cone cap
+    # encloses hull-outside samples, so it stays opt-in.
+    moving_hull_exit: bool = False
     fast_self_collision: bool = True
     bulk_cpu_geometry: bool = True
     barrier_acquisition: bool = False
@@ -92,7 +101,19 @@ class RuntimeOptions:
         unknown = (disabled | enabled) - cls.__dataclass_fields__.keys()
         if unknown:
             raise ValueError(f'Unknown fast ablation switches: {sorted(unknown)}')
-        return cls(**{**{name: False for name in disabled}, **{name: True for name in enabled}})
+        result = cls(**{**{name: False for name in disabled}, **{name: True for name in enabled}})
+        if result.joint_skip_free and not result.joint_witness:
+            raise ValueError('joint_skip_free requires joint_witness')
+        if (result.spline_adaptive or result.spline_shared_loop) and not result.spline_correction:
+            raise ValueError('Spline refinement requires spline_correction')
+        if result.spline_shared_loop and not result.spline_adaptive:
+            raise ValueError('spline_shared_loop requires spline_adaptive')
+        if result.spline_correction and any(getattr(result, name) for name in (
+                'coarse_acquisition', 'soft_acquisition', 'soft_acquisition_v4',
+                'soft_acquisition_v5', 'priority_clearance', 'windowed_priority',
+                'gpu_conic', 'whole_qoco_proposals')):
+            raise ValueError('Spline corrections require an independent CPU acquisition path')
+        return result
 
     def describe(self):
         return asdict(self)

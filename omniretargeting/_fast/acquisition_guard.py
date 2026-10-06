@@ -69,6 +69,9 @@ class AcquisitionNormalGuard:
         return self.kin.points(np.broadcast_to(indices, local.shape[:2]), local)
 
     def _add(self, kind, indices, local, target, normal, active, slack, name=None):
+        joint = getattr(self.objective, 'joint_witness', None)
+        if joint is not None:
+            active = joint.support.extract(kind, indices, local, target, normal, active, slack, name)
         length = np.linalg.norm(normal, axis=-1)
         active = np.asarray(active, bool) & np.isfinite(length) & (length > 1e-12)
         if not active.any():

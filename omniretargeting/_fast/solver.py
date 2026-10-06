@@ -155,7 +155,9 @@ def _model_decrease(acc, temporal_j, step, gradient):
     curvature = float(np.einsum("fw,fwv,fv->", blocks, acc.hessian, blocks))
     temporal = temporal_j @ step
     curvature += float(temporal @ temporal)
-    return -2.0 * float(gradient @ step) - curvature
+    decrease = -2.0 * float(gradient @ step) - curvature
+    model = getattr(acc, 'joint_model', None)
+    return decrease if model is None else decrease + model.correction(step)
 
 
 def optimize(objective, poses, *, iterations, callback=None, label="fast",
@@ -240,6 +242,9 @@ def _conic_proposal(objective, poses, system, gradient, diagonal, damping, guard
     bounded = bounded_shape_step(objective, poses, system, gradient, diagonal, damping)
     if bounded is None:
         return None
+    if getattr(objective, 'joint_witness', None) is not None:
+        from .joint_proposal import globalize
+        return globalize(objective, poses, bounded, guards)
     locally_restored = False
     if OPTIONS.local_conic_restoration:
         from .local_restoration import backtrack_with_restoration
@@ -282,6 +287,9 @@ def _shorten_conic(objective, poses, step, alpha, acc, temporal_j, gradient, cos
     from .runtime_options import OPTIONS
     from .proposal_curvature import CONTACT_CURVATURE, restore_curvature
 
+    if getattr(objective, 'joint_witness', None) is not None:
+        from .joint_proposal import shorten
+        return shorten(objective, poses, step, alpha, acc, temporal_j, gradient, cost)
     if not CONTACT_CURVATURE:
         from .window_restoration_parallel import fraction_class
         FractionRestorations = fraction_class(objective, FractionRestorations)
@@ -448,6 +456,7 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
         from .prioritized_solver import optimize_priority
         return optimize_priority(objective, poses, iterations, callback, label, converged_decrease)
     coords = objective.coords
+    joint = getattr(objective, 'joint_witness', None)
     trace = getattr(objective, "performance_trace", None)
     frames, width = objective.frames, objective.width
     # Source fitting stays byte-identical. This experiment starts only after
@@ -479,6 +488,8 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
     cost = acc.cost
     costs = [cost]
     for iteration in range(iterations):
+        if joint is not None:
+            joint.begin(poses, iteration)
         if trace is not None and trace.enabled:
             trace.begin_iteration(label, iteration)
         gradient = acc.gradient.ravel() + temporal_j.T @ temporal_r
@@ -524,7 +535,7 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
         for attempt in range(MAX_REJECTIONS):
             if attempt == 1:
                 # The first attempt was rejected: compute the rest at once.
-                if trace is None:
+                if trace is None and joint is None:
                     attempts.speculate(1, shape_solves, MAX_SHAPE_SOLVES, conic_possible)
             # Nonlinear source-shape checks supplement the scalar boxes. A
             # rejected proposal backtracks inside the same immutable envelope.
@@ -545,7 +556,7 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
             conic = False
             trial_damping = damping
             decreased = False
-            checked_short = OPTIONS.accept_short_banded and candidate is not None and alpha < .25
+            checked_short = (OPTIONS.accept_short_banded or joint is not None) and candidate is not None and alpha < .25
             if checked_short:
                 actual_step = coords.difference(poses, candidate).ravel()
                 predicted = _model_decrease(acc, temporal_j, actual_step, gradient)
@@ -602,6 +613,8 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
                 reason = ("conic_shortening_failed" if conic else "objective_no_decrease")
                 trace.add_failed(time.monotonic() - candidate_tick, reason)
             damping, growth = min(damping * growth, MAX_DAMPING), growth * 2
+        if joint is not None:
+            joint.finish_iteration(accepted)
         if not accepted:
             history.append(dict(phase=label, iteration=iteration, cost=cost, after=cost,
                                 alpha=0.0, damping=damping, seconds=time.monotonic() - start, **stats))

@@ -169,14 +169,22 @@ def bounded_shape_step(objective, poses, system, gradient, diagonal, damping):
                               (2 * gradient) * (1 / scale))
         return solve_data(data, count)
     flat = cp.Variable(count)
-    constraints = [flat >= lo.ravel(), flat <= hi.ravel()]
-    # Both frozen reference layouts (seed and acquired reference) apply;
-    # components no step inside this box can flip are omitted.
-    box = np.maximum(np.abs(lo), np.abs(hi))
-    constraints += shape.constraints(poses, flat, np.where(np.isfinite(box), box, 1e3))
-    constraints += _guard_constraints(objective.candidate_guards, poses, flat)
-    problem = cp.Problem(cp.Minimize((cp.quad_form(flat, cp.psd_wrap(matrix)) + 2 * gradient @ flat) / scale),
-                         constraints)
+    joint = getattr(objective, 'joint_witness', None)
+    if joint is not None:
+        from .joint_canonical import constraints as joint_constraints
+        constraints = joint_constraints(objective, poses, lo, hi, flat)
+    else:
+        constraints = [flat >= lo.ravel(), flat <= hi.ravel()]
+        # Both frozen reference layouts apply; impossible flips are omitted.
+        box = np.maximum(np.abs(lo), np.abs(hi))
+        constraints += shape.constraints(poses, flat, np.where(np.isfinite(box), box, 1e3))
+        constraints += _guard_constraints(objective.candidate_guards, poses, flat)
+    if joint is None:
+        value = (cp.quad_form(flat, cp.psd_wrap(matrix)) + 2 * gradient @ flat) / scale
+    else:
+        value, elastic_rows = joint.proposal(flat, matrix, gradient, scale)
+        constraints += elastic_rows
+    problem = cp.Problem(cp.Minimize(value), constraints)
     if OPTIONS.window_qp and len(poses) >= 2 * WINDOW_FRAMES:
         # Temporal block-coordinate step: every linearized bound stays exact.
         step = solve_windows(problem, flat, len(poses), coords.width)

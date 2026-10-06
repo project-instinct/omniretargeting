@@ -536,6 +536,11 @@ def _solve_fast_sequence(
         from .priority_geometry import acquisition_coordinator
         coordinator = acquisition_coordinator(objective, fixed, getattr(owner, '_scene_objects', ()),
                                               common.get('scene_query'), resources)
+    joint = None
+    if OPTIONS.joint_witness and len(q) < 600:
+        from .joint_witness import JointWitness
+        joint = objective.joint_witness = JointWitness(
+            objective, fixed, getattr(owner, '_scene_objects', ()), common.get('scene_query'))
     acquisition_guard = AcquisitionNormalGuard(objective, fixed)
     frozen_acquisition_guard = acquisition_guard
     acquisition_continuity = SequenceContinuityGuard(task_set, fixed, rotations, windowed=True,
@@ -552,11 +557,24 @@ def _solve_fast_sequence(
                                   fixed_continuity]
     if coordinator is not None:
         objective.candidate_guards = [acquisition_continuity, fixed_continuity, coordinator]
+    if joint is not None:
+        objective.candidate_guards.append(joint)
     # The acquisition guard also enters the objective as stiff one-sided rows,
     # so plain steps rarely need the costly constrained fallback.
     objective.hinge_guards = [acquisition_guard] if coordinator is None else []
 
     objective.correction_temporal_scale = CORRECTION_TEMPORAL_WEIGHT
+    if OPTIONS.spline_correction:
+        from .spline_pipeline import run_spline_pipeline
+        trace.add_stage_seconds('grid_setup', time.monotonic() - tick)
+        return run_spline_pipeline(
+            owner, objective, q, getattr(owner, '_scene_objects', ()), common.get('scene_query'),
+            resources, started=started, report=report, trace=trace, source_pose=source_pose,
+            initialization_continuity=initialization_continuity,
+            acquisition_guard=acquisition_guard, acquisition_continuity=acquisition_continuity,
+            fixed_continuity=fixed_continuity, callback=callback, extra_tasks=extra_tasks,
+            surfaces=surfaces, proximity=proximity, grid_seconds=grid_seconds,
+            restore_trace=restore_objective_trace, report_lift=float(lift.max(initial=0.)))
     rounds, penetration = [], []
     # Height registration and the support lift have finished. No collision
     # pass may move this reference to gain a new angular or translation allowance.
@@ -612,6 +630,15 @@ def _solve_fast_sequence(
         else:
             motion, history = optimize(objective, q, iterations=cfg["iterations"],
                                        callback=callback, label="contact_scene")
+        if joint is not None:
+            report['joint_witness'] = joint.diagnostics(motion)
+            joint.close()
+            objective.joint_witness = None
+            # Downstream passes retain the original acquisition guard/hinges.
+            acquisition_guard = AcquisitionNormalGuard(objective, fixed)
+            frozen_acquisition_guard = acquisition_guard
+            objective.candidate_guards = [acquisition_guard, acquisition_continuity, fixed_continuity]
+            objective.hinge_guards = [acquisition_guard]
         verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
         trace.add_stage_seconds("contact_acquisition", time.monotonic() - acquisition_tick)
         if window_status == "used":
@@ -702,43 +729,49 @@ def _solve_fast_sequence(
             if coords.root_q is not None:
                 objective.fixed_root = acquired[:, coords.root_q:coords.root_q + 7].copy()
             record = {"stage": "free_bodies", "before": objective.penetration_summary(motion)}
-            candidate_tick = time.monotonic()
-            objective.prepare_free_stage(motion)
-            objective.envelope_weight = np.maximum(objective.envelope_weight, REWEIGHT_FACTOR)
-            objective.stop_workers()
-            objective.start_workers()
-            candidate, more = optimize(
-                objective, motion, iterations=min(cfg["iterations"], FREE_STAGE_ITERATIONS),
-                callback=callback, label="free_bodies", converged_decrease=FREE_STAGE_DECREASE,
-            )
-            history += more
-            checked = verify_budgets(model, coords, fixed, candidate, objective.envelope_bodies, shape)
-            record["candidate"] = objective.penetration_summary(candidate)
-            accepted, reasons = smooth_correction(coords, motion, candidate, verified[0], checked[0])
-            for name, guard in (("acquired contact positions and precision", anchored_contacts),
-                                ("acquired per-coordinate temporal bounds", continuity_guard)):
-                guard_tick = time.monotonic()
-                guard_accepted = guard.accepts(candidate)
-                explanation = (None if guard_accepted else
-                               explain_guard(objective, guard, candidate))
-                trace.add_guard(guard, guard_accepted,
-                                time.monotonic() - guard_tick, explanation)
-                if not guard_accepted:
-                    accepted = False
-                    reasons.append(name)
-            record["accepted"] = bool(accepted)
-            if accepted:
-                motion, verified = candidate, checked
-                trace.add_alpha(1.0)
+            if OPTIONS.joint_skip_free and joint is not None:
+                record.update(skipped=True, reason='joint_skip_free', iterations=0,
+                              accepted=False, after=record['before'])
             else:
-                record["rejected"] = reasons
-                record["rejected_budgets"] = checked[0]
-                trace.add_failed(time.monotonic() - candidate_tick, "free_stage_rejected")
+                candidate_tick = time.monotonic()
+                objective.prepare_free_stage(motion)
+                objective.envelope_weight = np.maximum(objective.envelope_weight, REWEIGHT_FACTOR)
+                objective.stop_workers()
+                objective.start_workers()
+                candidate, more = optimize(
+                    objective, motion, iterations=min(cfg["iterations"], FREE_STAGE_ITERATIONS),
+                    callback=callback, label="free_bodies", converged_decrease=FREE_STAGE_DECREASE,
+                )
+                history += more
+                checked = verify_budgets(model, coords, fixed, candidate, objective.envelope_bodies, shape)
+                record["candidate"] = objective.penetration_summary(candidate)
+                accepted, reasons = smooth_correction(coords, motion, candidate, verified[0], checked[0])
+                for name, guard in (("acquired contact positions and precision", anchored_contacts),
+                                    ("acquired per-coordinate temporal bounds", continuity_guard)):
+                    guard_tick = time.monotonic()
+                    guard_accepted = guard.accepts(candidate)
+                    explanation = (None if guard_accepted else
+                                   explain_guard(objective, guard, candidate))
+                    trace.add_guard(guard, guard_accepted,
+                                    time.monotonic() - guard_tick, explanation)
+                    if not guard_accepted:
+                        accepted = False
+                        reasons.append(name)
+                record["accepted"] = bool(accepted)
+                if accepted:
+                    motion, verified = candidate, checked
+                    trace.add_alpha(1.0)
+                else:
+                    record["rejected"] = reasons
+                    record["rejected_budgets"] = checked[0]
+                    trace.add_failed(time.monotonic() - candidate_tick, "free_stage_rejected")
             penetration.append(record)
         trace.add_stage_seconds("free_bodies", time.monotonic() - free_tick)
         trace.current_stage = None
     finally:
         objective.stop_workers()
+        if joint is not None:
+            joint.close()
     # The selected repair group may approach its original target; all other
     # groups remain anchored by RepairLimits. Precision still uses acquisition.
     objective.candidate_guards = [contact_guard, continuity_guard,
@@ -802,6 +835,9 @@ def _solve_fast_sequence(
         "self_collision": ("bounded original-mesh repair; see original_mesh_repair" if mesh_repair is not None
                            else "not optimized in the fast backend; audited separately"),
     }
+    if joint is not None:
+        from .postprocess_workload import workload
+        report['postprocess_workload'] = workload(report)
     if coarse_report is not None:
         report["stages"]["contact_scene"]["coarse_acquisition"] = coarse_report
     if soft_report is not None:

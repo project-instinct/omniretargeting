@@ -80,7 +80,13 @@ class Attempts:
         except LinAlgError:
             result = None
         else:
-            result = (step, *backtrack(self.objective, self.poses, step, guards))
+            joint = getattr(self.objective, 'joint_witness', None)
+            if joint is None:
+                candidate, alpha = backtrack(self.objective, self.poses, step, guards)
+            else:
+                from .joint_proposal import banded_candidate
+                candidate, alpha = banded_candidate(joint, self.poses, step, guards)
+            result = (step, candidate, alpha)
         return result, [a - b for a, b in zip(_counters(guards), before)]
 
     def _conic(self, attempt):

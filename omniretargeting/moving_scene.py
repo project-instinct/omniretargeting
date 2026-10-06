@@ -328,13 +328,6 @@ class MovingSceneQuery:
         # that the head penetrates the lamp. Keep such samples unknown.
         # The search bound only prunes; samples beyond it are out of scope.
         query = obj["query"]
-        in_scope = np.zeros(len(local), bool)
-        if query.evidence_tree is not None:
-            scope = obj.get("scope")
-            if scope is None:
-                scope = obj["scope"] = EvidenceScope(
-                    query.evidence_tree, query.evidence_points, query.evidence_radius)
-            in_scope = scope(local)
         # Outside the object's hull a sample is known outside at any distance.
         # Beyond the activation band it needs no query: its distance to the
         # object is at least its hull margin, so it has no row either.
@@ -348,6 +341,17 @@ class MovingSceneQuery:
             near = np.flatnonzero(~far)
             classified = query.hull_classification(local[near], HULL_TOLERANCE, band)
             outside[near], far[near] = classified.T
+        # Hull-outside/far samples do not need their evidence scope: the hull
+        # already puts them in scope, and far samples are discarded below.
+        in_scope = np.zeros(len(local), bool)
+        if query.evidence_tree is not None:
+            scope = obj.get("scope")
+            if scope is None:
+                scope = obj["scope"] = EvidenceScope(
+                    query.evidence_tree, query.evidence_points, query.evidence_radius)
+            unresolved = np.flatnonzero(~outside & ~far)
+            if len(unresolved):
+                in_scope[unresolved] = scope(local[unresolved])
         in_scope = (in_scope | outside) & ~far
         # Nearest triangles are per point; out-of-scope samples never use one.
         components = np.full(len(local), -1)
@@ -375,6 +379,8 @@ class MovingSceneQuery:
         # units) that its winding number decides inside penetrates it. Being
         # outside it says nothing about the nearer, unknown surface.
         unknown = np.flatnonzero(~known)
+        from ._fast.runtime_options import OPTIONS
+        hull_exit = OPTIONS.moving_hull_exit
         for cid, bounds in zip(obj["nearly_closed"], obj["nearly_bounds"]):
             if not len(unknown):
                 break
@@ -382,6 +388,14 @@ class MovingSceneQuery:
                                         & (local[unknown] <= bounds[1] + band), axis=1)]
             gap = np.maximum(np.maximum(bounds[0] - local[candidates], local[candidates] - bounds[1]), 0)
             selected = candidates[(components[candidates] != cid) & (np.linalg.norm(gap, axis=1) <= band)]
+            if hull_exit:
+                # A sample outside the object's convex hull is outside the
+                # object (the convention ``in_scope`` already uses above), so it
+                # cannot be a material penetration. Cone caps only close the
+                # chain for the inside/outside test; their bounding-box apexes
+                # may leave the hull, and only such cap-enclosed hull-outside
+                # samples were reported here without this switch.
+                selected = selected[~outside[selected]]
             if not len(selected):
                 continue
             signed = obj["query"].winding_side(local[selected], cid)

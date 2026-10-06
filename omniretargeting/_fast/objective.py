@@ -792,6 +792,9 @@ class FastObjective(FrameTerms, PenetrationStages):
                 # Frame counts add up over chunks; every other statistic is a maximum.
                 stats[key] = (stats.get(key, 0) + value if key.endswith("_frames")
                               else max(stats.get(key, 0.0), value))
+        joint = getattr(self, 'joint_witness', None)
+        if joint is not None:
+            joint.add_cost(poses, acc, stats)
         root_point = collect("root_point")
         root_jac = collect("root_jacobian") if with_jacobian else None
         paths = (collect("effector_point"), collect("effector_jacobian") if with_jacobian else None)

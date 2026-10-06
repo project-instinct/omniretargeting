@@ -18,7 +18,7 @@ pipeline file. `tests/test_module_size.py` enforces the limit.
 | Scene and collision | `scene_geometry.py`, `moving_scene.py`, `geometry_query.py`, `triangle_*.py`, `self_collision*.py` | Query original static/moving geometry and robot collision geoms, including open-surface uncertainty and self-collision. |
 | Correction and refinement | `trajectory_refinement.py`, `_refinement/`, `local_collision_repair.py`, `whole_body_correction.py`, `staged_contact_repair.py` | Improve an existing trajectory while preserving contacts, posture locality, continuity, and collision acceptance. |
 | Motion budgets and quality | `motion_budgets.py`, `motion_quality.py`, `trajectory_validation.py`, `trajectory_fidelity.py` | Define source-relative chatter, the legacy derivative ablation, and validation/reporting fields used across stages. |
-| Review tools | `scripts/review_*.py`, `scripts/trumans_*review*.py` | Measure the four AGENTS metrics and compare clips without changing motion. |
+| Review tools | `scripts/review_*.py`, `scripts/trumans_*review*.py`, `scene_metrics_parallel.py`, `training_collision_parallel.py` | Measure the four AGENTS metrics and compare clips without changing motion; the parallel helpers split audits by frame and keep serial aggregation. |
 
 Entry-point compatibility matters more than this table. When moving code, keep
 the public call signature or update callers and tests in the same change.
