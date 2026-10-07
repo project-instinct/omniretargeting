@@ -18,23 +18,21 @@ from scipy import sparse
 from ..contact_phase import CONTACT_ROLES
 from ..geometry_query import GeometryQueryError
 from ..moving_scene import MovingSceneQuery
-from ..self_collision import SelfCollisionQuery
 from .original_rigid_fallback import (
     WITNESS_CLEARANCE, enabled as rigid_fallback_enabled,
-    query_summary, record_example, resolve_unknown_static, rigid_robot_data,
+    query_summary, resolve_unknown_static, rigid_robot_data,
 )
 from .collision_manifold import select_collision_manifold
 from .repair_limits import LOCAL_ANGLE, RepairLimits
 from .limb_scope import scope_for_body
 from .repair_step import solve_step
-from .repair_restoration import restore_repair
 from .repair_schedule import RepairSchedule
-from .repair_candidates import candidate_steps
-from .repair_frames import group_frames, halo_frames, restrict
-from .repair_witnesses import RepairWitnesses
-from ..moving_outside import certified_outside
-from .runtime_options import OPTIONS
-from .repair_ablation import measure_candidate
+from .repair_frames import halo_frames, restrict
+from .repair_restoration import restore_repair as restore_repair
+from .repair_candidates import candidate_steps as candidate_steps
+from .repair_frames import group_frames as group_frames
+from .original_rigid_fallback import record_example as record_example
+from .repair_acceptance import measure_candidate
 
 ITERATIONS = 12
 # Small progress ends shallow groups. Deep groups defer until relevant joints
@@ -51,12 +49,15 @@ REGRESSION = 1e-6
 # lowering the group's worst depth is not rejected. Keys without penetration
 # keep ``REGRESSION``: no new penetration beyond it.
 PENETRATING_REGRESSION_M = 5e-5
+# Witnesses kept per collision key when ``OriginalGeometry.witness_band`` is
+# set (local repair): every reliable sample within the band of the deepest.
+WITNESS_BAND_CAP = 48
 
 
 def _activation_depth():
     # A sub-millimetre geom can exceed the external 0.5 mm regression gate.
     # This changes group eligibility, not geometry evidence or guard slack.
-    return .0005 if OPTIONS.submillimeter_repair else .001
+    return .001
 
 
 def _regressed(value, protected):
@@ -110,20 +111,16 @@ class OriginalGeometry:
         self.qi, self.di = objective.coords.qi, self.columns
         self.width = len(self.columns)
         self._moving_source = tuple(id(spec) for spec in scene_objects)
-        provider = getattr(objective, "frozen_original_depth", None)
+        provider = None
         reusable = getattr(provider, "geometry", None)
-        reuse = (OPTIONS.reuse_original_geometry and reusable is not None and reusable.model is self.model
-                 and reusable.frames == self.frames and reusable._moving_source == self._moving_source)
+        reuse = False
         if reuse:
             self.moving = None if reusable.moving is None else reusable.moving.fresh_state()
             self.self_query = reusable.self_query.fresh_state()
         else:
             self.moving = MovingSceneQuery(self.model, scene_objects, objective.frames) if scene_objects else None
-            if getattr(OPTIONS, "repair_triage", False):
-                from .repair_geometry_setup import self_query
-                self.self_query = self_query(objective)
-            else:
-                self.self_query = SelfCollisionQuery(self.model)
+            from .repair_geometry_setup import self_query
+            self.self_query = self_query(objective)
         # Per-frame exact pair results of the last query (see ``query``'s reuse).
         self._self_reuse = {}
         self._window_frame_cache = {}
@@ -165,24 +162,20 @@ class OriginalGeometry:
         if self.scene is not None:
             from .repair_static_query import prepare
             prepare(self)
-        if getattr(OPTIONS, "repair_triage", False):
-            from .repair_geometry_setup import prepare_moving
-            if reuse:
-                # Prepare the immutable provider, then share its object list.
-                # The provider's original dictionaries are never mutated.
-                prepare_moving(reusable)
-                self.moving = None if reusable.moving is None else reusable.moving.fresh_state()
-            else:
-                prepare_moving(self)
+        from .repair_geometry_setup import prepare_moving
+        if reuse:
+            # Prepare the immutable provider, then share its object list.
+            # The provider's original dictionaries are never mutated.
+            prepare_moving(reusable)
+            self.moving = None if reusable.moving is None else reusable.moving.fresh_state()
+        else:
+            prepare_moving(self)
         self.static_reused = 0
-        self._window_parent_mode = bool(OPTIONS.windowed_priority)
+        self._window_parent_mode = bool(False)
         # CUDA belongs to a spawned service; neither the solver process nor
         # its forked measurement workers initialise a CUDA context.
         self._gpu_owner = os.getpid()
-        self._gpu_allowed = self._window_parent_mode or os.environ.get("OMNIRETARGETING_GPU_GEOMETRY", "1") != "0"
-        if self._window_parent_mode:
-            from .original_geometry_cpu import warm_scene_queries
-            warm_scene_queries(self)
+        self._gpu_allowed = True
         if self._gpu_allowed:
             try:
                 from .gpu_geometry import initialize_static
@@ -259,24 +252,10 @@ class OriginalGeometry:
             return None
 
     def _prepare_gpu_moving(self, poses, *, frames=None):
-        if (not self._gpu_allowed or os.getpid() != self._gpu_owner
-                or os.environ.get("OMNIRETARGETING_GPU_GEOMETRY_MOVING", "0") == "0"):
-            return None
-        try:
-            from .gpu_geometry import prepare_moving
-            return prepare_moving(self, poses, frames=frames)
-        except GeometryQueryError:
-            raise
-        except (ImportError, RuntimeError, ValueError, OSError, EOFError) as error:
-            self.gpu_moving_unavailable = str(error)
-            return None
+        return None
 
     def _static_frames(self, poses, frames=None, *, _gpu_ready=False):
         """Batch changed geoms; reuse exact-transform witnesses, never Jacobians."""
-        if not _gpu_ready and getattr(self, "_gpu_pending_static", None) is not None:
-            from .gpu_geometry import lazy_static_frames
-            yield from lazy_static_frames(self, poses, frames)
-            return
         objective, data = self.objective, self.data
         ids = objective.shell_sample_geom
         groups = [(int(geom), np.flatnonzero(ids == geom)) for geom in objective.shell_geoms]
@@ -420,6 +399,14 @@ class OriginalGeometry:
                 v = np.r_[[r["clearance"] for r in old], value[eligible]]
                 samples = np.r_[[r["sample_id"] for r in old], ids[eligible]].astype(int)
                 selected = select_collision_manifold(p, v, d, origin=summary["origin"])
+                band = getattr(self, "witness_band", None)
+                if band is not None and len(v):
+                    # Local repair models every sample that a small step can
+                    # make the deepest, not only the support probes.
+                    near = np.flatnonzero(v <= v.min() + band)
+                    near = near[np.argsort(v[near], kind="stable")[:WITNESS_BAND_CAP]]
+                    selected = np.union1d(selected, near)
+                    selected = selected[np.unique(samples[selected], return_index=True)[1]]
                 summary["rows"] = [{"point": p[k].copy(), "direction": d[k].copy(),
                                     "sample_id": int(samples[k]), "clearance": float(v[k])} for k in selected]
             first = last
@@ -482,11 +469,6 @@ class OriginalGeometry:
 
         if os.getpid() != self._query_owner:
             raise RuntimeError("Use fork_private_client before querying inherited geometry")
-        if (self._window_parent_mode and frames is None and activation_distance is None
-                and not getattr(self, "_fork_cpu_only", False)
-                and not getattr(self, "_parent_full_query", False)):
-            from .original_geometry_cpu import measure_parent
-            return measure_parent(self, poses, jacobians, protected_depths)
         if frames is not None or activation_distance is not None:
             return measure_window(self, poses, frames, jacobians, protected_depths,
                                   activation_distance)
@@ -496,11 +478,6 @@ class OriginalGeometry:
                 and self._gpu_allowed and protected_depths is None):
             parallel.prefetch_self(poses)
         static_updates = self._prepare_gpu_static(poses)
-        if (parallel is not None and len(poses) == parallel.frames
-                and isinstance(static_updates, list)
-                and os.environ.get("OMNIRETARGETING_GPU_GEOMETRY_MOVING", "0") != "0"
-                and os.environ.get("OMNIRETARGETING_GPU_GEOMETRY_OVERLAP", "0") != "0"):
-            parallel.prefetch_static(static_updates)
         moving_updates = self._prepare_gpu_moving(poses)
         if parallel is not None and len(poses) == parallel.frames:
             parts = parallel.measure(poses, jacobians, protected_depths,
@@ -544,7 +521,7 @@ class OriginalGeometry:
                     required = self._moving_evidence_baseline.setdefault(
                         frame, frozenset(measured.get("open_penetrating_samples", ())))
                 missing = required.difference(measured.get("open_known_samples", ()))
-                outside = certified_outside(self.moving, pose, frame, missing) if OPTIONS.outside_proof else set()
+                outside = set()
                 if not missing.issubset(outside):
                     failures.append(f"lost original source-side observation at frame {frame}")
                 for row in measured["rows"]:
@@ -764,19 +741,15 @@ def _repair_groups(objective, measurement, activation=None):
 
 def repair_original_meshes(objective, poses, scene_objects=(), scene_query=None):
     """Retain only small corrections satisfying immutable nonlinear limits."""
-    if getattr(objective, 'priority_clearance', None) is not None:
-        from .acquisition_clearance import repair_priority_clearance
-        return repair_priority_clearance(objective, poses)
     started = time.monotonic()
     entry = np.array(poses, copy=True)
     if not len(objective.coords.qi):
         return entry, {"status": "no_joint_dofs", "seconds": time.monotonic() - started}
     limits = RepairLimits(objective, entry)
     geometry = OriginalGeometry(objective, scene_objects, scene_query, manifold=True)
-    if getattr(OPTIONS, "repair_triage", False):
-        from .repair_geometry_setup import prepare_static_bounds, prepare_moving_reduction
-        prepare_static_bounds(geometry, entry)
-        prepare_moving_reduction(geometry, entry)
+    from .repair_geometry_setup import prepare_static_bounds, prepare_moving_reduction
+    prepare_static_bounds(geometry, entry)
+    prepare_moving_reduction(geometry, entry)
     # Frame-parallel measurement returns the serial rows; see parallel_geometry.
     geometry.start_workers(len(entry))
     try:
@@ -814,30 +787,17 @@ def _repair(objective, entry, limits, geometry, started):
     total_limit = ITERATIONS * original_group_count
     report['total_attempt_budget'] = total_limit
     report['activation_depth_m'] = _activation_depth()
-    schedule = RepairSchedule(groups, ITERATIONS, defer_enabled=OPTIONS.deferred_retry,
-                              total_limit=total_limit)
-    if OPTIONS.repair_defect_windows:
-        from .repair_defects import halo as defect_halo
-        limits._repair_defect_masks = {group: group_frames(
-            baseline, model, group, limits.frames, defect_halo(objective.framerate)) for group in groups}
-        report['frame_window_policy'] = dict(scene_activation_m=.005,
-            self_activation_m=_activation_depth(), retain_entry_activated_windows=True,
-            temporal_halo_frames=defect_halo(objective.framerate),
-            acceptance='unchanged full geometry, contact, layout and temporal checks')
-        report['skipped_defect_groups'] = []
-    witnesses = RepairWitnesses(enabled=OPTIONS.witness_memory)
+    schedule = RepairSchedule(groups, ITERATIONS, total_limit=total_limit)
     from .repair_proposals import RepairProposals, transition_group
-    if OPTIONS.repair_parallel_groups:
-        from .repair_parallel_groups import ParallelGroups as RepairProposals
+    from .repair_parallel_groups import ParallelGroups as RepairProposals
     proposals = geometry._repair_proposals = RepairProposals(limits, geometry)
     iteration = -1
     while (scheduled := schedule.next()) is not None:
         group, group_iteration = scheduled
         iteration += 1
-        if not OPTIONS.deferred_retry:
-            # Preserve baseline history numbering, including unused attempts
-            # after an earlier group stopped. Scheduling changes are opt-in.
-            iteration = groups.index(group) * ITERATIONS + group_iteration
+        # Preserve baseline history numbering, including unused attempts
+        # after an earlier group stopped. Scheduling changes are opt-in.
+        iteration = groups.index(group) * ITERATIONS + group_iteration
         transition_group(limits, current, group)
         columns = limits.coords.qi[np.unique(_joint_projection(limits, model, measured).nonzero()[0] % limits.width)]
         scope = scope_for_body(limits, group)
@@ -850,20 +810,14 @@ def _repair(objective, entry, limits, geometry, started):
                 if group is None or any(model.body_weldid[model.geom_bodyid[g]] == group for g in geoms):
                     yield value
         entry_depth = max(group_depths(), default=0.)
-        if entry_depth <= _activation_depth() or (schedule.was_wakeup and entry_depth <= DEEP_RESIDUAL_M):
+        if entry_depth <= _activation_depth():
             continue
-        if OPTIONS.repair_defect_windows:
-            from .repair_defects import has_defect
-            if not has_defect(measured, model, group):
-                report['skipped_defect_groups'].append(dict(body=model.body(group).name,
-                    depth_m=entry_depth, reason='below_remaining_defect_work_band'))
-                continue
         tick = time.monotonic()
         # Only the group's penetrating frames and their halo move.
         from .repair_defects import frames as attempt_frames
         frame_mask = limits.frame_mask = attempt_frames(limits, measured, model, group,
                                                         padding=halo_frames(objective.framerate))
-        subproblem = witnesses.augment(geometry, current, measured)
+        subproblem = measured
         proposals.prefetch(schedule, current, measured, protected)
         proposal = proposals.take(current, subproblem, protected,
                                   fixed_q if scope is not None else None, entry_depth)
@@ -880,14 +834,12 @@ def _repair(objective, entry, limits, geometry, started):
         if not proposal.has_direction:
             proposal.close()
             proposals.note_outcome(False)
-            schedule.defer(group, current, columns, "no_direction")
             continue
         if proposal.stationary:
             proposal.close()
             proposals.note_outcome(False)
             record["stationary"] = True
             record["stop_reason"] = "stationary_proposal"
-            schedule.defer(group, current, columns, "stationary_proposal")
             continue
         from .repair_prediction import should_gate
         if should_gate(prediction, MIN_GROUP_PROGRESS_M):
@@ -895,14 +847,12 @@ def _repair(objective, entry, limits, geometry, started):
             proposals.note_outcome(False)
             record["model_progress"]["realized_decrease_m"] = 0.
             record["stop_reason"] = "predicted_small_progress"
-            schedule.defer(group, current, columns, "predicted_small_progress")
             continue
         # A pair and its contact compensators form one coupled proposal.
         # Backtracking branches independently can destroy that compensation.
         before = sum(value**2 for value in measured["depths"].values())
         first_geometry_candidate = None
         new_witnesses = 0
-        retry_witnesses = 0
         with closing(proposal.candidates(record)) as candidates:
             for alpha, candidate in candidates:
                 if first_geometry_candidate is None:
@@ -923,7 +873,6 @@ def _repair(objective, entry, limits, geometry, started):
                         "increase": checked["depths"][key] - protected["depths"].get(key, 0.),
                     } for key in regressions[:3]]
                     continue
-                new_witnesses += witnesses.observe(measured, checked)
                 if prediction is not None:
                     from .repair_prediction import linear_prediction
                     candidate_prediction = linear_prediction(
@@ -932,7 +881,6 @@ def _repair(objective, entry, limits, geometry, started):
                     if candidate_prediction is not None:
                         record["model_progress"]["predicted_candidate_decrease_m"] = candidate_prediction["predicted_decrease_m"]
                 current = candidate
-                schedule.changed(current)
                 measured = geometry.linearize(current, checked)
                 for key in protected["depths"].keys() | measured["depths"].keys():
                     protected["depths"][key] = min(protected["depths"].get(key, 0.), measured["depths"].get(key, 0.))
@@ -942,24 +890,11 @@ def _repair(objective, entry, limits, geometry, started):
         if prediction is not None:
             record["model_progress"]["realized_decrease_m"] = entry_depth - max(group_depths(), default=0.)
             record["model_progress"]["accepted_alpha"] = record["alpha"]
-        if record["alpha"]:
-            schedule.note_progress(group, entry_depth, max(group_depths(), default=0.))
         small = (MIN_GROUP_PROGRESS_M > 0
                  and entry_depth - max(group_depths(), default=0.) < MIN_GROUP_PROGRESS_M)
         if not record["alpha"] or small:
             reason = "no_admissible_descent" if not record["alpha"] else "small_progress"
-            # Deterministic complete discovery, once for the first geometric
-            # proposal. Partial parallel rejection prefixes are diagnostics,
-            # never the source of numerical-path-dependent working sets.
-            deep = max(group_depths(), default=0.) > DEEP_RESIDUAL_M
-            if OPTIONS.witness_memory and first_geometry_candidate is not None:
-                discovered = geometry.measure(first_geometry_candidate)
-                retry_witnesses = witnesses.observe(measured, discovered)
-                new_witnesses += retry_witnesses
             record["stop_reason"] = reason
-            if deep:
-                if not (retry_witnesses and schedule.witness_retry(group)):
-                    schedule.defer(group, current, columns, reason)
         else:
             schedule.retry(group)
         record["new_witnesses"] = new_witnesses
@@ -971,27 +906,23 @@ def _repair(objective, entry, limits, geometry, started):
                                      jacobians=getattr(geometry, "linearization_totals", {}))
     if getattr(geometry, '_repair_static_bounds', False):
         report['geometry_cache']['static_bounds'] = geometry.static_bounds_stats
-    report["deferred_groups"] = [{"body": model.body(g).name if g is not None else None,
-                                   "reason": state[2], "attempts": schedule.attempts[g]}
-                                  for g, state in schedule.deferred.items()]
-    report["remembered_witnesses"] = len(witnesses.required)
+    report["deferred_groups"] = []
+    report["remembered_witnesses"] = 0
     # Wall time of each proposal: until the next one (or the end) started.
     ends = [r["started"] for r in report["history"][1:]] + [time.monotonic()]
     for record, end in zip(report["history"], ends):
         record["seconds"] = end - record.pop("started")
     report["iteration_limited_groups"] = [r["contact_group"] for r in report["history"]
                                            if r.get("stop_reason") == "iteration_limit"]
-    if getattr(OPTIONS, "repair_triage", False):
-        certified = [r for r in report["history"]
-                     if r.get("model_progress", {}).get("model") == "pre_qp_upper_bound"]
-        report["triage"] = {"enabled": True, "pre_qp_skips": len(certified),
-                            "groups": [{"body": r["contact_group"],
-                                        "certificate": r["model_progress"]} for r in certified]}
-    if getattr(OPTIONS, "repair_fast_gate", False):
-        gated = [r for r in report["history"]
-                 if r["solver_status"] == "reduced_predicted_small_progress"]
-        report["fast_gate"] = {"enabled": True, "pre_qp_skips": len(gated),
-                               "iterations": [r["iteration"] for r in gated]}
+    certified = [r for r in report["history"]
+                 if r.get("model_progress", {}).get("model") == "pre_qp_upper_bound"]
+    report["triage"] = {"enabled": True, "pre_qp_skips": len(certified),
+                        "groups": [{"body": r["contact_group"],
+                                    "certificate": r["model_progress"]} for r in certified]}
+    gated = [r for r in report["history"]
+             if r["solver_status"] == "reduced_predicted_small_progress"]
+    report["fast_gate"] = {"enabled": True, "pre_qp_skips": len(gated),
+                           "iterations": [r["iteration"] for r in gated]}
     report.update(status="corrected" if np.any(current != entry) else "retained",
                   after=geometry.summary(measured), limits=limits.check(current)[1],
                   seconds=time.monotonic() - started)

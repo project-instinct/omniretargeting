@@ -50,8 +50,7 @@ def _progress_converged(costs, cost, slow, alpha, guarded, threshold, shortened=
     existing three-step cost window, which includes the preceding useful
     step and cannot mistake two curvature corrections for convergence.
     """
-    from .runtime_options import OPTIONS
-    if not OPTIONS.batch2 and shortened:
+    if shortened:
         alpha = 1.
     decrease = (costs[-1] - cost) / max(costs[-1], 1e-12)
     slow = slow + 1 if decrease < threshold and alpha == 1. else 0
@@ -60,7 +59,7 @@ def _progress_converged(costs, cost, slow, alpha, guarded, threshold, shortened=
     # ``stationary_window``: the same window also ends passes of short
     # unguarded (banded) steps whose cost has stopped moving.
     done = slow >= CONVERGED_STEPS or (
-        (guarded or OPTIONS.stationary_window) and len(costs) > window
+        len(costs) > window
         and costs[-1 - window] - cost < window * threshold * costs[-1 - window])
     return slow, done
 
@@ -156,8 +155,7 @@ def _model_decrease(acc, temporal_j, step, gradient):
     temporal = temporal_j @ step
     curvature += float(temporal @ temporal)
     decrease = -2.0 * float(gradient @ step) - curvature
-    model = getattr(acc, 'joint_model', None)
-    return decrease if model is None else decrease + model.correction(step)
+    return decrease
 
 
 def optimize(objective, poses, *, iterations, callback=None, label="fast",
@@ -168,10 +166,6 @@ def optimize(objective, poses, *, iterations, callback=None, label="fast",
     relative cost decrease ``converged_decrease``. Correction stages whose
     own rows are a small part of the total cost pass a smaller one.
     """
-    from .runtime_options import OPTIONS
-    if OPTIONS.windowed_priority and getattr(objective, 'priority_clearance', None) is not None:
-        from .window_driver import optimize_windowed_priority
-        return optimize_windowed_priority(objective, poses, iterations, callback, label, converged_decrease)
     started = objective.start_workers()
     try:
         return _optimize(objective, poses, iterations, callback, label, converged_decrease)
@@ -180,85 +174,23 @@ def optimize(objective, poses, *, iterations, callback=None, label="fast",
             objective.stop_workers()
 
 
-def _conic_proposal(objective, poses, system, gradient, diagonal, damping, guards, *, model=None):
+def _conic_proposal(objective, poses, system, gradient, diagonal, damping, guards):
     """Constrained fallback direction, backtracked or restored; None if unsolved.
 
     The candidate is None when neither a fraction nor the restored step passes
     the guards; the direction itself is still returned for ``_shorten_conic``.
     """
     from .shape_step import bounded_shape_step, restore_shape_step
-    from .runtime_options import OPTIONS
 
     trace = getattr(objective, "performance_trace", None)
-    if model is not None:
-        if trace is not None:
-            trace.record_call("proposal", "model_qp")
-        from .qp_assembly import solve_model
-        from .globalization import globalize
-        solution = solve_model(model, damping)
-        if solution is None:
-            return None
-        solution, projected, fraction = globalize(
-            objective, model, solution, damping, guards,
-            soc=OPTIONS.objective_soc, frame_lengths=OPTIONS.frame_step_lengths)
-        if fraction < .25:
-            restoration_tick = time.monotonic()
-            restored = restore_shape_step(objective, poses, solution.step)
-            if trace is not None:
-                trace.add_operation("recoveries", time.monotonic() - restoration_tick)
-                if restored is None:
-                    trace.add_failed(time.monotonic() - restoration_tick,
-                                     "model_restoration_unsolved")
-            if restored is not None and all(guard.accepts(restored) for guard in guards):
-                projected, fraction = restored, 1.
-        return solution.step, projected, fraction
-    # Opt-in schedule: after one failed cheap direction on this objective (one
-    # LM solve or window), its binding guards are not temporal; go straight to
-    # the conic fallback for the rest of that solve.
-    skip = OPTIONS.adaptive_banded_direction and getattr(objective, "_banded_direction_failed", False)
-    if (OPTIONS.banded_temporal_direction or OPTIONS.banded_guard_direction) and not skip:
-        from .temporal_direction import temporal_budget_direction
-        temporal_tick = time.monotonic()
-        temporal_diagnostics = {}
-        if trace is not None:
-            trace.record_call("proposal", "banded_guard" if OPTIONS.banded_guard_direction
-                              else "banded_temporal")
-        cheap = temporal_budget_direction(
-            objective, poses, system, gradient, diagonal, damping,
-            diagnostics=temporal_diagnostics, every_guard=OPTIONS.banded_guard_direction)
-        if trace is not None:
-            seconds = time.monotonic() - temporal_tick
-            trace.add_operation("banded_temporal_directions", seconds)
-            trace.temporal_direction(temporal_diagnostics, seconds, accepted=cheap is not None)
-        if cheap is not None:
-            return cheap
-        objective._banded_direction_failed = True
-        if trace is not None:
-            reason = temporal_diagnostics.get("fallback_reason", "temporal_direction_unsolved")
-            trace.add_failed(time.monotonic() - temporal_tick, reason)
-            trace.fallback(reason)
     if trace is not None:
         trace.record_call("proposal", "shape_conic")
     bounded = bounded_shape_step(objective, poses, system, gradient, diagonal, damping)
     if bounded is None:
         return None
-    if getattr(objective, 'joint_witness', None) is not None:
-        from .joint_proposal import globalize
-        return globalize(objective, poses, bounded, guards)
-    locally_restored = False
-    if OPTIONS.local_conic_restoration:
-        from .local_restoration import backtrack_with_restoration
-        restoration_tick = time.monotonic()
-        projected, fraction, locally_restored = backtrack_with_restoration(
-            objective, poses, bounded, guards)
-        if trace is not None:
-            trace.add_operation("recoveries", time.monotonic() - restoration_tick)
-    else:
-        projected, fraction = backtrack(objective, poses, bounded, guards)
-    if fraction < .25 and not locally_restored:
-        from .proposal_curvature import CONTACT_CURVATURE, restore_curvature
-        restored = (restore_curvature(objective, poses, bounded, guards,
-                                     (system, diagonal, damping)) if CONTACT_CURVATURE else None)
+    projected, fraction = backtrack(objective, poses, bounded, guards)
+    if fraction < .25:
+        restored = None
         if restored is None:
             restoration_tick = time.monotonic()
             restored = restore_shape_step(objective, poses, bounded)
@@ -284,15 +216,9 @@ def _shorten_conic(objective, poses, step, alpha, acc, temporal_j, gradient, cos
     """
     from .shape_step import restore_shape_step
     from .shortening import FractionRestorations
-    from .runtime_options import OPTIONS
-    from .proposal_curvature import CONTACT_CURVATURE, restore_curvature
-
-    if getattr(objective, 'joint_witness', None) is not None:
-        from .joint_proposal import shorten
-        return shorten(objective, poses, step, alpha, acc, temporal_j, gradient, cost)
-    if not CONTACT_CURVATURE:
-        from .window_restoration_parallel import fraction_class
-        FractionRestorations = fraction_class(objective, FractionRestorations)
+    from .legacy_window_qp import WindowObjective
+    from .window_restoration_parallel import fraction_class
+    FractionRestorations = fraction_class(objective, FractionRestorations)
     coords = objective.coords
     trace = getattr(objective, "performance_trace", None)
     guards = guards_of(objective)[1]
@@ -300,8 +226,7 @@ def _shorten_conic(objective, poses, step, alpha, acc, temporal_j, gradient, cos
     restorations = 0
     with FractionRestorations(restore_shape_step, objective, poses, step, alpha,
                               CONIC_FRACTIONS, MAX_CONIC_RESTORATIONS, guards,
-                              enabled=(OPTIONS.parallel_shortening and trace is None
-                                       and not CONTACT_CURVATURE)) as pending:
+                              enabled=trace is None and not isinstance(objective, WindowObjective)) as pending:
         for fraction in CONIC_FRACTIONS:
             scaled = alpha * fraction
             candidate = objective.project(coords.integrate(poses, step, scaled))
@@ -314,8 +239,7 @@ def _shorten_conic(objective, poses, step, alpha, acc, temporal_j, gradient, cos
                     return None
                 restorations += 1
                 restoration_tick = time.monotonic()
-                candidate = (restore_curvature(objective, poses, step * scaled, guards, metric)
-                             if CONTACT_CURVATURE else None)
+                candidate = None
                 if candidate is None:
                     candidate = pending.restore(fraction)
                 if trace is not None:
@@ -394,26 +318,16 @@ def _optimize(objective, poses, iterations, callback, label, converged_decrease)
 
         guard.accepts = traced_accepts
 
-    automatic_iterations = (getattr(objective, "_soft_bulk", False) or
-                            getattr(objective, "priority_clearance", None) is not None)
     iteration_start = len(trace.iterations)
 
     def traced_callback(candidate, row):
-        if automatic_iterations:
-            trace.add_alpha(row.get("alpha", 0.))
-            trace.finish_iteration(row, row.get("step_backend"))
         if callback is not None:
             callback(candidate, row)
 
     try:
-        with trace.instrument(automatic_iterations=automatic_iterations):
+        with trace.instrument(automatic_iterations=False):
             poses, history = _optimize_uncounted(
                 objective, poses, iterations, traced_callback, label, converged_decrease)
-            if automatic_iterations and trace._iteration is not None and history:
-                trace.finish_iteration(history[-1], None)
-        if automatic_iterations:
-            for row, diagnostic in zip(history, trace.iterations[iteration_start:]):
-                row["iteration_performance"] = diagnostic
         if not history:
             stop_reason = "no_history"
         elif history[-1].get("alpha", 0.0) == 0.0:
@@ -445,36 +359,16 @@ def _optimize(objective, poses, iterations, callback, label, converged_decrease)
 
 
 def _optimize_uncounted(objective, poses, iterations, callback, label, converged_decrease):
-    if getattr(objective, '_soft_bulk', False):
-        from .soft_bulk import optimize_bulk
-        return optimize_bulk(objective, poses, iterations, callback, label, converged_decrease)
-    from .runtime_options import OPTIONS
-    if OPTIONS.windowed_priority and getattr(objective, 'priority_clearance', None) is not None:
-        from .window_driver import optimize_windowed_priority
-        return optimize_windowed_priority(objective, poses, iterations, callback, label, converged_decrease)
-    if getattr(objective, 'priority_clearance', None) is not None:
-        from .prioritized_solver import optimize_priority
-        return optimize_priority(objective, poses, iterations, callback, label, converged_decrease)
     coords = objective.coords
-    joint = getattr(objective, 'joint_witness', None)
     trace = getattr(objective, "performance_trace", None)
     frames, width = objective.frames, objective.width
-    # Source fitting stays byte-identical. This experiment starts only after
-    # the immutable reference shape has been established.
-    active_box = OPTIONS.active_joint_bounds and getattr(objective, 'source_shape', None) is not None
-
     def band_step(system, diagonal, held, radial, rhs, damping):
         tick = time.monotonic()
         damped = system.copy(order="F")
         damped[0] += damping * diagonal + DIAGONAL_FLOOR
         _hold_radial(damped, width, radial)
-        if active_box:
-            from .box_step import direction_bounds, solve_box_banded
-            lower, upper = direction_bounds(objective, poses, held)
-            result = solve_box_banded(damped, rhs, lower, upper, _banded_solve, _hold)
-        else:
-            _hold(damped, held)
-            result = _banded_solve(damped, rhs)
+        _hold(damped, held)
+        result = _banded_solve(damped, rhs)
         if trace is not None:
             trace.add_operation("banded_solves", time.monotonic() - tick)
             if result is None:
@@ -488,8 +382,6 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
     cost = acc.cost
     costs = [cost]
     for iteration in range(iterations):
-        if joint is not None:
-            joint.begin(poses, iteration)
         if trace is not None and trace.enabled:
             trace.begin_iteration(label, iteration)
         gradient = acc.gradient.ravel() + temporal_j.T @ temporal_r
@@ -499,10 +391,6 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
         # makes useful contact updates look converged before damping decays.
         diagonal = np.maximum(np.diagonal(acc.hessian, axis1=1, axis2=2).ravel(), DIAGONAL_FLOOR)
         held = _active_bounds(objective, poses, gradient)
-        if active_box:
-            # Scalar variables are selected by the actual coupled direction;
-            # keep only unconditional root holds from the old selector.
-            held = held[~np.isin(held % width, coords.scalar_cols)]
         radial = _root_holds(objective, poses, gradient)
         rhs = -gradient
         rhs[held] = 0.0
@@ -514,28 +402,18 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
         conic_possible = shape is not None and all(
             hasattr(g, 'constraints') for g in objective.candidate_guards)
         model = None
-        if conic_possible and (OPTIONS.direct_acquisition_qp or OPTIONS.objective_soc
-                               or OPTIONS.frame_step_lengths):
-            from .qp_assembly import prepare_model
-            from .qp_guard_rows import UnsupportedRows
-            try:
-                model = prepare_model(objective, poses, system, gradient, diagonal)
-            except UnsupportedRows:
-                # Unknown external guard: preserve its original constraints.
-                # Priority mode never takes this fallback or drops a soft row.
-                pass
         # Every rejection below grows the damping the same way.
         dampings, value, factor = [], damping, growth
         for _ in range(MAX_REJECTIONS):
             dampings.append(value)
             value, factor = min(value * factor, MAX_DAMPING), factor * 2
-        kwargs = {} if model is None else {'model': model}
+        kwargs = {}
         attempts = Attempts(objective, poses, system, gradient, diagonal, held, radial, rhs,
                             dampings, band_step, _conic_proposal, **kwargs)
         for attempt in range(MAX_REJECTIONS):
             if attempt == 1:
                 # The first attempt was rejected: compute the rest at once.
-                if trace is None and joint is None:
+                if trace is None:
                     attempts.speculate(1, shape_solves, MAX_SHAPE_SOLVES, conic_possible)
             # Nonlinear source-shape checks supplement the scalar boxes. A
             # rejected proposal backtracks inside the same immutable envelope.
@@ -556,13 +434,6 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
             conic = False
             trial_damping = damping
             decreased = False
-            checked_short = (OPTIONS.accept_short_banded or joint is not None) and candidate is not None and alpha < .25
-            if checked_short:
-                actual_step = coords.difference(poses, candidate).ravel()
-                predicted = _model_decrease(acc, temporal_j, actual_step, gradient)
-                trial = objective.evaluate(candidate)
-                ratio = (cost - trial[0].cost) / predicted if predicted > 0 else -1.0
-                decreased = bool(np.isfinite(trial[0].cost) and trial[0].cost < cost and ratio > 0)
             if (not decreased and conic_possible and shape_solves < MAX_SHAPE_SOLVES
                     and (candidate is None or alpha < .25)):
                 shape_solves += 1
@@ -586,7 +457,7 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
                                      "constraint_proposal_unsolved")
                 damping, growth = min(damping * growth, MAX_DAMPING), growth * 2
                 continue
-            if candidate is not None and (not checked_short or conic):
+            if candidate is not None:
                 actual_step = coords.difference(poses, candidate).ravel()
                 predicted = _model_decrease(acc, temporal_j, actual_step, gradient)
                 trial = objective.evaluate(candidate)
@@ -600,8 +471,6 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
                     candidate, alpha, trial, ratio = shortened
                     decreased = True
             if decreased:
-                if OPTIONS.accept_short_banded:
-                    step_backend = "shape_conic" if conic else "banded"
                 damping = max(trial_damping * max(1 / 3, 1 - (2 * ratio - 1) ** 3), MIN_DAMPING)
                 growth, accepted = 2.0, True
                 if trace is not None:
@@ -613,8 +482,6 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
                 reason = ("conic_shortening_failed" if conic else "objective_no_decrease")
                 trace.add_failed(time.monotonic() - candidate_tick, reason)
             damping, growth = min(damping * growth, MAX_DAMPING), growth * 2
-        if joint is not None:
-            joint.finish_iteration(accepted)
         if not accepted:
             history.append(dict(phase=label, iteration=iteration, cost=cost, after=cost,
                                 alpha=0.0, damping=damping, seconds=time.monotonic() - start, **stats))

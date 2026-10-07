@@ -6,7 +6,6 @@ of the original trajectory. No objective, guard, reference or budget is rebuilt.
 
 from contextlib import contextmanager
 from collections import OrderedDict
-from dataclasses import replace
 import time
 
 import cvxpy as cp
@@ -167,16 +166,14 @@ class WindowObjective:
 
 @contextmanager
 def serial_proposals():
-    """Outer windows own concurrency; preserve serial proposal mathematics."""
-    from . import proposals, runtime_options
-    speculative, options = proposals.SPECULATE, runtime_options.OPTIONS
+    """Outer windows own attempt concurrency; keep the serial LM mathematics."""
+    from . import proposals
+    speculative = proposals.SPECULATE
     proposals.SPECULATE = False
-    runtime_options.OPTIONS = replace(options, parallel_shortening=False)
     try:
         yield
     finally:
         proposals.SPECULATE = speculative
-        runtime_options.OPTIONS = options
 
 
 @contextmanager
@@ -210,8 +207,6 @@ def solve_local(objective, poses, frames, iterations, convergence):
     # Bounds, references and contact groups stay frozen during this solve.
     # Other users of the facade can still edit a guard between evaluations.
     local._cache_guard_bounds = True
-    from .window_qoco import RESTORATION_DIAGNOSTICS
-    RESTORATION_DIAGNOSTICS.clear()
     progress = dict(converged=False)
     result, history = poses[local.span].copy(), []
 
@@ -220,33 +215,11 @@ def solve_local(objective, poses, frames, iterations, convergence):
         result = candidate
         history.append(row)
 
-    from .runtime_options import OPTIONS
-    barrier = None
-    constrained = None
     with serial_proposals(), observe_convergence(progress):
-        if OPTIONS.continuity_hinge_acquisition or OPTIONS.active_set_acquisition:
-            from .constrained_solver import optimize as constrained_optimize
-            candidate, history, progress['converged'], reason, constrained = constrained_optimize(
-                local, result, iterations, convergence)
-            if candidate is not None:
-                result = candidate
-        elif OPTIONS.barrier_acquisition:
-            from .barrier_solver import optimize as barrier_optimize
-            candidate, history, progress['converged'], reason, barrier = barrier_optimize(
-                local, result, iterations, convergence)
-            if candidate is not None:
-                result = candidate
-        if ((barrier is None and constrained is None) or
-                (barrier is not None and barrier['mode'] == 'legacy_fallback') or
-                (constrained is not None and constrained['mode'] == 'legacy_fallback')):
-            result, history = _optimize(local, result, iterations, accepted,
-                                       'contact_scene', convergence)
-            reason = ('rejected_iteration' if history and history[-1]['alpha'] == 0 else
-                      'converged' if progress['converged'] else 'iteration_quota')
-            if barrier is not None and history:
-                history[-1]['barrier'] = barrier
-            if constrained is not None and history:
-                history[-1]['constrained'] = constrained
+        result, history = _optimize(local, result, iterations, accepted,
+                                   'contact_scene', convergence)
+        reason = ('rejected_iteration' if history and history[-1]['alpha'] == 0 else
+                  'converged' if progress['converged'] else 'iteration_quota')
     lm_seconds = time.monotonic() - started
     costs = (local.evaluated_costs[poses[local.span].tobytes()],
              local.evaluated_costs[result.tobytes()])
@@ -257,7 +230,7 @@ def solve_local(objective, poses, frames, iterations, convergence):
                 evaluation_seconds=local.evaluation_seconds, evaluation_calls=local.evaluation_calls,
                 evaluation_jacobian_calls=local.evaluation_jacobian_calls,
                 parallel_restoration=getattr(local, 'parallel_shortening_stats', {}),
-                qoco_restoration=dict(RESTORATION_DIAGNOSTICS), barrier=barrier, constrained=constrained)
+                qoco_restoration={}, barrier=None, constrained=None)
 
 
 def grid_depths(objective, poses, *, chunk_size=64):

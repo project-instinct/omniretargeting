@@ -113,12 +113,8 @@ def solve(quadratic, linear, matrix, offset, cones, settings, *, radius=None, di
         if len(rows) > FRACTION * total:
             STATS["fallback_rows"] += 1
             break
-        from .gpu_conic import dimensions, solve as solve_gpu
         reduced_matrix = matrix[rows].tocsc()
-        from .runtime_options import OPTIONS
-        solution = (solve_gpu(quadratic, linear, reduced_matrix, offset[rows],
-                              dimensions(reduced), context='repair_working_set')
-                    if OPTIONS.gpu_conic else None)
+        solution = None
         if solution is None:
             solution = clarabel.DefaultSolver(quadratic, linear, reduced_matrix, offset[rows],
                                               reduced, settings()).solve()

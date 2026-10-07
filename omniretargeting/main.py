@@ -640,6 +640,13 @@ def main():
             task = getattr(retargeter, f"last_{name}_tasks", None)
             if task is not None:
                 output_payload.update(task.export())
+        contact_tasks = retargeter.get_contact_task_output(
+            source_markers=(source_motion_data.metadata.get("end_effector_markers")
+                            if source_motion_data is not None else end_effector_markers),
+        )
+        if len(contact_tasks.timestamps_s) != len(retargeted_motion):
+            raise ValueError("Contact/task output must share the saved qpos timeline")
+        output_payload.update(contact_tasks.export())
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         diagnostics = getattr(retargeter, "last_collision_diagnostics", None)
         relation_tasks = getattr(retargeter, "last_body_relation_tasks", None)

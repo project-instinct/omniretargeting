@@ -1,13 +1,10 @@
 """Parallel fraction restoration preserves results, order and consumed counters."""
-from dataclasses import replace
 from types import SimpleNamespace
-import multiprocessing
 import os
 import numpy as np
 import pytest
 
 from omniretargeting._fast.shortening import FractionRestorations
-from omniretargeting._fast import runtime_options, shortening
 
 pytestmark = pytest.mark.skipif(not hasattr(os, 'fork'), reason='fork speculation')
 
@@ -62,21 +59,3 @@ def test_unprefetched_fraction_uses_serial_function_without_extra_children():
     assert objective.parallel_shortening_stats['serial'] == 1
     assert objective.parallel_shortening_stats['consumed'] == 0
     assert objective.guard.rejections == 10
-
-
-def test_full_conic_shortening_matches_serial_numerical_path(monkeypatch):
-    from tests.test_fast_proposals import _solve
-    calls = []
-    original = shortening.FractionRestorations.__enter__
-    def enter(self):
-        calls.append(self.enabled)
-        return original(self)
-    monkeypatch.setattr(shortening.FractionRestorations, '__enter__', enter)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, parallel_shortening=False))
-    serial = _solve(monkeypatch, False)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, parallel_shortening=True))
-    parallel = _solve(monkeypatch, False)
-    assert any(calls), 'the integration case must exercise speculative restorations'
-    assert serial[0].tobytes() == parallel[0].tobytes()
-    assert serial[1] == parallel[1]
-    assert serial[2] == parallel[2]

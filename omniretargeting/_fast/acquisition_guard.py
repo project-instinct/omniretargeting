@@ -15,7 +15,6 @@ target or buried in an object wall, only crosses the extension of the
 target's tangent plane. It may approach its target but not recede from it.
 """
 
-import os
 
 import cvxpy as cp
 import numpy as np
@@ -30,21 +29,18 @@ from .contact_protection import endpoint_protection, surface_protection
 # Surface and self-contact regression defaults are 2 mm, hence also 1 mm here.
 # Runtime margins must stay below the smallest configured slack; half the
 # frozen bound is only an additional per-sample safety clamp.
-HINGE_MARGIN_M = float(os.environ.get('OMNIRETARGETING_FAST_HINGE_MARGIN', '0'))
+HINGE_MARGIN_M = float('0')
 
 
 class AcquisitionNormalGuard:
     @property
     def numerical_slack(self):
         """Only this guard family's numerical reserve; larger opt-in wins."""
-        from .runtime_options import OPTIONS
-        if OPTIONS.abl_normal_slack_1e5:
-            return 1e-5
-        return 1e-6 if OPTIONS.abl_normal_slack else 1e-7
+        return 1e-7
 
     def __init__(self, objective, reference):
         self.objective = objective
-        self.priority = getattr(objective, 'priority_clearance', None)
+        self.priority = None
         self.kin = TrajectoryKinematics(objective.model, objective.coords.cols, cache=objective.kin.cache)
         self.kin.evaluate(reference, with_jacobian=False)
         self.groups, self.names = [], []
@@ -69,9 +65,7 @@ class AcquisitionNormalGuard:
         return self.kin.points(np.broadcast_to(indices, local.shape[:2]), local)
 
     def _add(self, kind, indices, local, target, normal, active, slack, name=None):
-        joint = getattr(self.objective, 'joint_witness', None)
-        if joint is not None:
-            active = joint.support.extract(kind, indices, local, target, normal, active, slack, name)
+        joint = None
         length = np.linalg.norm(normal, axis=-1)
         active = np.asarray(active, bool) & np.isfinite(length) & (length > 1e-12)
         if not active.any():
@@ -84,12 +78,6 @@ class AcquisitionNormalGuard:
         model = self.objective.model
         bodies = model.geom_bodyid[indices] if kind == 'surface' else np.broadcast_to(indices, local.shape[:2])
         yielded = self.penetration[np.arange(len(points))[:, None], model.body_weldid[bodies]]
-        from .runtime_options import OPTIONS
-        if OPTIONS.off_surface_approach_only:
-            # An absent surface does not establish a normal hold. A different
-            # penetrating point on this body must not authorize recession of
-            # a separated/unknown-target point from its unchanged target.
-            yielded = np.where(established, yielded, 0.)
         values = [np.array(x, copy=True) for x in (indices, local, target, normal, active, established,
                                                    bound, np.broadcast_to(yielded, bound.shape))]
         for value in values:

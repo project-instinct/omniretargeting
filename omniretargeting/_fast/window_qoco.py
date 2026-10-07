@@ -12,14 +12,9 @@ acquisition 203 -> 146 s; self penetration 0.99 -> 1.70 mm, frames over 1 cm
 
 import numpy as np
 from scipy import sparse
-from collections import Counter
-import time
 
-WINDOW_QOCO_PROPOSALS = True
-WINDOW_QOCO_RESTORATIONS = False
 TOLERANCE = 1e-4
 MAX_ITERATIONS = 80
-RESTORATION_DIAGNOSTICS = Counter()
 
 
 def solve_proposal(data, variables):
@@ -41,22 +36,3 @@ def solve_proposal(data, variables):
         return None
     step = np.asarray(result.x[:variables], dtype=float)
     return step if np.isfinite(step).all() else None
-
-
-def solve_restoration(data, variables):
-    """Optional restoration attempt; every unusable outcome retains Clarabel.
-
-    This changes proposal arithmetic only. The existing restoration loop and
-    its nonlinear guard acceptance remain the consumers of a solved step.
-    """
-    started = time.perf_counter()
-    RESTORATION_DIAGNOSTICS['attempts'] += 1
-    try:
-        step = solve_proposal(data, variables)
-        RESTORATION_DIAGNOSTICS['solved' if step is not None else 'fallback'] += 1
-        return step
-    except (ImportError, RuntimeError, ValueError, ArithmeticError):
-        RESTORATION_DIAGNOSTICS['fallback'] += 1
-        return None
-    finally:
-        RESTORATION_DIAGNOSTICS['seconds'] += time.perf_counter() - started

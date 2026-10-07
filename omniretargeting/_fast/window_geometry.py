@@ -32,9 +32,6 @@ class WindowGeometry:
             self.native = False
 
     def _bulk(self):
-        from .runtime_options import OPTIONS
-        if not OPTIONS.bulk_cpu_geometry:
-            return None
         if self.bulk is None:
             from .bulk_geometry import BulkGeometry, NativeUnavailable
             try:

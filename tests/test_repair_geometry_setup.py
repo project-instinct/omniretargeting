@@ -76,6 +76,7 @@ def test_cold_cpu_bounds_keep_complete_original_witnesses(monkeypatch):
     monkeypatch.setenv('OMNIRETARGETING_GPU_GEOMETRY', '0')
     original, poses = _geometry()
     screened, _ = _geometry()
+    original._gpu_allowed = screened._gpu_allowed = False
     before = original.measure(poses, jacobians=True)
     repair_geometry_setup.prepare_static_bounds(screened, poses)
     assert screened._repair_static_bounds

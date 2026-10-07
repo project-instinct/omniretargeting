@@ -13,6 +13,7 @@ import mujoco
 import numpy as np
 import trimesh
 
+from omniretargeting.cpu_budget import available_cpus
 from omniretargeting.moving_scene import MovingSceneQuery
 from omniretargeting.scene_metrics_parallel import (
     run_moving_batches,
@@ -168,7 +169,7 @@ if __name__ == "__main__":
     parser.add_argument("--spacing", type=float, default=0.02)
     parser.add_argument("--batch", type=int, default=64)
     parser.add_argument(
-        "--workers", type=int, default=1, help="parallel audit workers (default: 1)"
+        "--workers", type=int, default=min(8, available_cpus()), help="parallel audit workers (default: min(8, available CPUs))"
     )
     args = parser.parse_args()
     if args.workers < 1:

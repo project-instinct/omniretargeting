@@ -7,6 +7,9 @@ caller's current configuration and are deliberately not stored here.
 
 import numpy as np
 
+# Rows per component when the owner sets ``witness_band`` (local repair).
+WITNESS_BAND_CAP = 48
+
 
 def summarize(owner, oid, obj, gid, values, rotation, scale, band):
     world, _, components = values
@@ -38,6 +41,16 @@ def summarize(owner, oid, obj, gid, values, rotation, scale, band):
         if clearance < band:
             result["rows"].append((world[ids[k]], rotation @ signed["directions"][k],
                                    clearance, ids[k], closed, cid))
+            witness_band = getattr(owner, "witness_band", None)
+            if witness_band is not None:
+                # Optional local-repair model: every reliable sample a small
+                # step could make the deepest; the depth above is unchanged.
+                scaled = np.where(reliable, signed["clearance"] * scale, np.inf)
+                near = np.flatnonzero((scaled <= clearance + witness_band) & (scaled < band))
+                near = near[np.argsort(scaled[near], kind="stable")][:WITNESS_BAND_CAP]
+                for j in near[near != k]:
+                    result["rows"].append((world[ids[j]], rotation @ signed["directions"][j],
+                                           float(scaled[j]), ids[j], closed, cid))
     result["known"] = frozenset(result["known"])
     result["penetrating"] = frozenset(result["penetrating"])
     return result

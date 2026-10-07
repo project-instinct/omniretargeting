@@ -157,23 +157,3 @@ def test_direct_restoration_matches_normalized_cvxpy_problem():
     assert status == "optimal"
     np.testing.assert_allclose(actual, delta.value, atol=1e-8, rtol=1e-6)
     np.testing.assert_allclose(actual @ actual / radius**2, problem.value, atol=1e-9)
-
-
-def test_direct_restoration_flag_is_default_off_and_recognized(monkeypatch):
-    from omniretargeting._fast.runtime_options import RuntimeOptions
-    monkeypatch.delenv('OMNIRETARGETING_FAST_DISABLE', raising=False)
-    monkeypatch.delenv('OMNIRETARGETING_FAST_ENABLE', raising=False)
-    assert not RuntimeOptions.from_environment().direct_repair_restoration
-    monkeypatch.setenv('OMNIRETARGETING_FAST_ENABLE', 'direct_repair_restoration')
-    assert RuntimeOptions.from_environment().direct_repair_restoration
-
-
-def test_direct_restoration_retains_original_nonlinear_regression(monkeypatch):
-    from dataclasses import replace
-    from omniretargeting._fast import repair_restoration
-    from tests.test_repair_restoration import (
-        test_restoration_fixes_small_nonlinear_overshoot_without_undoing_leg_progress,
-    )
-    monkeypatch.setattr(repair_restoration, 'OPTIONS',
-                        replace(repair_restoration.OPTIONS, direct_repair_restoration=True))
-    test_restoration_fixes_small_nonlinear_overshoot_without_undoing_leg_progress()

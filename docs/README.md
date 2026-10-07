@@ -13,6 +13,8 @@ the source of truth for details.
 - [`smplx_frame_ids.md`](smplx_frame_ids.md) — SMPL-X frame numbering modes.
 - [`contact_mechanics.md`](contact_mechanics.md) — contact evidence and
   uncertainty semantics.
+- [`contact_task_output.md`](contact_task_output.md) — versioned per-frame
+  body-part tasks alongside complete qpos, including inactive/unknown slots.
 - [`fast_speed.md`](fast_speed.md) — where fast-solver wall time goes, the
   exact accelerations available, and directions already measured to fail.
 

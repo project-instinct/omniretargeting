@@ -40,8 +40,7 @@ def guard_dependencies(guard, frames, count):
 
 
 def _layout_deadband_enabled(count):
-    from .runtime_options import OPTIONS
-    return count >= 600 and OPTIONS.abl_window_layout_deadband
+    return count >= 600 and False
 
 
 def _span(frames, count, order):

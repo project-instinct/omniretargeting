@@ -21,19 +21,19 @@ from scipy.spatial.transform import Rotation
 from .._sequence.orientation_seed import source_orientation_seed
 from .._sequence.continuity_guard import SequenceContinuityGuard
 from .._sequence.proximity import SurfaceProximityTasks
-from ..motion_budgets import CHATTER_RMS_FRACTION, CHATTER_WINDOW, windowed_budget
+from ..motion_budgets import CHATTER_RMS_FRACTION, CHATTER_WINDOW
 from ..sequence_retargeting import prepare_sequence, sequence_config
 from ..surface_contact import SurfaceContactTasks
-from .runtime_options import OPTIONS
 from .contact_guard import ContactGuard
 from .acquisition_guard import AcquisitionNormalGuard
 from .continuity import (
-    CorrectionContinuity, audit_continuity, chatter_reports, correction_derivatives, derivatives,
+    CorrectionContinuity, audit_continuity, chatter_reports,
 )
 from .mesh_repair import repair_original_meshes
 from .objective import FastObjective
 from .performance_trace import PerformanceTrace, explain_guard
-from .reference import ReferenceShape, kinematic_tracking_tasks, register_height
+from .reference import (ReferenceShape, kinematic_tracking_tasks, height_tracking_tasks,
+                        register_height, bound_sole_registration)
 from .sdf import object_sdf, static_scene_sdf
 from .solver import optimize, threadpool_limits
 
@@ -174,7 +174,7 @@ def verify_budgets(model, coords, fixed, motion, bodies=None, shape=None):
         local = maximum_filter1d(before, CHATTER_WINDOW_FRAMES, axis=0, mode="nearest")
         joint_rms = np.sqrt(np.mean(before**2, axis=0))
         derivative_screen = (
-            (correction if OPTIONS.correction_budget else after)
+            after
             > local + CHATTER_RMS_FRACTION * joint_rms + ROUND_OFF_SLACK
         )
         result[f"order_{order}"] = {
@@ -198,7 +198,7 @@ def verify_budgets(model, coords, fixed, motion, bodies=None, shape=None):
             local = maximum_filter1d(before, CHATTER_WINDOW_FRAMES, mode="nearest")
             rms = np.sqrt(np.mean(before**2))
             derivative_screen = (
-                (correction if OPTIONS.correction_budget else after)
+                after
                 > local + CHATTER_RMS_FRACTION * rms + ROUND_OFF_SLACK
             )
             result[f"root_order_{order}"] = {
@@ -207,20 +207,6 @@ def verify_budgets(model, coords, fixed, motion, bodies=None, shape=None):
                 "rms_before": float(np.sqrt(np.mean(before**2))),
                 "rms_after": float(np.sqrt(np.mean(after**2))),
             }
-    if OPTIONS.correction_budget and coords.root_q is not None:
-        original = derivatives(coords, fixed)
-        executed = derivatives(coords, motion)
-        corrections = correction_derivatives(coords, fixed, motion)
-        for order in (1, 2, 3):
-            name = f'root_rotation_order_{order}'
-            if name not in original:
-                continue
-            before, after, delta = original[name], executed[name], corrections[name]
-            bad = np.abs(delta) > windowed_budget(before) + ROUND_OFF_SLACK
-            result[name] = dict(legacy_derivative_budget_violations=int(bad.sum()),
-                rms_before_per_coordinate=np.sqrt(np.mean(before**2, axis=0)).tolist(),
-                rms_after_per_coordinate=np.sqrt(np.mean(after**2, axis=0)).tolist(),
-                correction_rms_per_coordinate=np.sqrt(np.mean(delta**2, axis=0)).tolist())
     change = np.abs(motion[:, qi] - fixed[:, qi])
     posture_frames = np.zeros(len(motion), bool)
     import mujoco
@@ -329,10 +315,10 @@ def _solve_fast_sequence(
     config, common, extra_tasks, reference_trajectory=None, callback=None, *, resources=None, _source_only=False,
 ):
     from .runtime_options import OPTIONS
+    from .foot_targets import anatomical_mapping, prepare_sole_handover
+    mapping = anatomical_mapping(model, mapping, priority)
     started = time.monotonic()
     report = {"backend": "fast", "stages": {}, "runtime_options": OPTIONS.describe()}
-    from .gpu_conic import reset_report, report as gpu_report
-    reset_report()
     trace = PerformanceTrace(OPTIONS.performance_trace)
     from .._core.preprocess_cache import SourceGraphCache
     orientation_targets = common["body_orientation_targets"]
@@ -348,10 +334,6 @@ def _solve_fast_sequence(
     initialization_continuity = None
     seed_envelope = None
     seed_audits = {}
-    if OPTIONS.seed_continuity:
-        report['initialization_seed_envelope'] = dict(
-            enabled=True, reference_rebased=False, audits=seed_audits,
-            status='pending' if reference_trajectory is None else 'unknown_reused_reference_seed_unavailable')
 
     from .._core.source_pose_prefetch import source_key
     prefetch = None if _source_only else getattr(owner,'_source_pose_prefetch',None)
@@ -380,55 +362,39 @@ def _solve_fast_sequence(
     elif reference_trajectory is None:
         orientation_seed = source_orientation_seed(model, initial, roots, priority, orientation_targets, config)
         # Preserve the unnormalized seed before prepare_sequence can clip it.
-        seed_reference = orientation_seed.copy() if OPTIONS.seed_continuity else orientation_seed
+        seed_reference = orientation_seed
         source_tasks = kinematic_tracking_tasks(tasks, priority)
         pose_config = dict(loose, lock_root_xy=True)
         coords, q, task_set, rotations = prepare_sequence(
             model, orientation_seed, positions, names, mapping, roots, source_tasks, priority,
             pose_config, **shared,
         )
-        if OPTIONS.seed_continuity:
-            from .initialization_envelope import SeedInitialization
-            seed_envelope = SeedInitialization(coords, seed_reference)
-            seed_audits['source_prepare'] = seed_envelope.check_normalized(q, stage='source_prepare')
         pose_objective = FastObjective(
             task_set, pose_config, reference=q, temporal_reference=None,
             root_rotations=rotations, framerate=framerate,
         )
         restore_pose_trace = trace.install(pose_objective)
-        if seed_envelope is not None:
-            seed_envelope.attach_source_objective(pose_objective)
         with trace.stage("source_pose"):
             source_pose, history = optimize(
                 pose_objective, q, iterations=loose["iterations"], callback=callback, label="source_pose",
             )
-        if seed_envelope is not None:
-            seed_audits['fit_vs_seed'] = seed_envelope.check_normalized(source_pose, stage='fit_vs_seed')
         # Finish morphology registration against the same source tracking
         # targets. Object reach must not lift the kinematic reference off its
         # world trajectory. All actual contacts enter stage B, unchanged.
         coords, q, task_set, rotations = prepare_sequence(
-            model, source_pose, positions, names, mapping, roots, source_tasks, priority,
+            model, source_pose, positions, names, mapping, roots, height_tracking_tasks(tasks, priority), priority,
             loose, **shared,
         )
-        if seed_envelope is not None:
-            seed_audits['height_prepare'] = seed_envelope.check_normalized(q, stage='height_prepare')
         registration = FastObjective(
             task_set, loose, reference=q, temporal_reference=None,
             root_rotations=rotations, framerate=framerate,
         )
         restore_registration_trace = trace.install(registration)
-        if seed_envelope is None:
-            with trace.stage("source_pose"):
-                source_pose, height_shift = register_height(registration, q)
-        else:
-            with trace.stage("source_pose"):
-                source_pose, height_shift, height_report = seed_envelope.bounded_height_registration(registration, q)
-            report['initialization_seed_envelope']['height_registration'] = height_report
-            seed_audits['postheight_vs_seed'] = seed_envelope.check_normalized(source_pose, stage='postheight_vs_seed')
-        initialization_continuity = (audit_continuity(coords, seed_reference, source_pose)
-                                    if seed_envelope is None else
-                                    seed_envelope.audit(source_pose, stage='postheight_vs_seed'))
+        with trace.stage("source_pose"):
+            source_pose, height_shift = register_height(registration, q)
+            source_pose, sole_shift = bound_sole_registration(registration, source_pose)
+            height_shift += sole_shift
+        initialization_continuity = audit_continuity(coords, seed_reference, source_pose)
         shape = ReferenceShape(registration, source_pose)
         report["stages"]["source_pose"] = {
             "history": history, "seconds": time.monotonic() - tick,
@@ -438,8 +404,9 @@ def _solve_fast_sequence(
                 "min_shift_m": float(height_shift.min(initial=0)),
                 "max_shift_m": float(height_shift.max(initial=0)),
                 "angles_and_xy_unchanged": True,
-                "targets": "source_world_and_body_relative_tracking",
-                "contact_targets_used": False,
+                "targets": "observed_sole_planes_and_morphology_free_targets",
+                "contact_targets_used": True,
+                "sole_extent_correction_max_m": float(sole_shift.max(initial=0.)),
             },
             "source_shape": shape.diagnostics(source_pose),
             "budgets_vs_kinematic_seed": verify_budgets(
@@ -473,8 +440,6 @@ def _solve_fast_sequence(
         model, source_pose, positions, names, mapping, roots, tasks, priority, cfg,
         extra_tasks=tuple(surfaces), **shared,
     )
-    if seed_envelope is not None:
-        seed_audits['acquisition_prepare'] = seed_envelope.check_normalized(q, stage='acquisition_prepare')
     grid_tick = time.monotonic()
     scene_grid = _scene_grid(common.get("scene_query"), positions)
     objects = _object_grids(owner)
@@ -494,102 +459,45 @@ def _solve_fast_sequence(
     # around this reference. Lift the reference smoothly before it is frozen;
     # joint angles, root orientation and the horizontal path are unchanged.
     lift = objective.reference_lift()
-    if seed_envelope is not None:
-        lift, lift_report = seed_envelope.bounded_reference_lift(fixed, lift)
-        report['initialization_seed_envelope']['reference_lift'] = lift_report
     if lift.any():
         objective.apply_reference_lift(lift)  # ``fixed`` in place
         q[:, coords.root_q + 2] += lift
         if shape is not None:
             shape = ReferenceShape(registration, fixed)
-    if seed_envelope is not None:
-        seed_audits['postlift_vs_seed'] = seed_envelope.check_normalized(fixed, stage='postlift_vs_seed')
-        # Overall initialization acceptance includes lift, not just source fit.
-        initialization_continuity = seed_envelope.audit(fixed, stage='postlift_vs_seed')
-        report['initialization_seed_envelope']['status'] = 'checked_against_original_seed'
     if shape is None:
         shape = ReferenceShape(objective, fixed)
     shape.freeze_reference(fixed)
     shape.kin.cache = objective.kin.cache
     objective.source_shape = shape
-    from .frozen_depth import FrozenDepth
-    from .local_reach import unreachable_geoms
-    from .original_clearance import OriginalClearance
-    from .repair_limits import LOCAL_ANGLE, FREE_DRIFT
+    report['sole_targets'] = prepare_sole_handover(objective)
 
-    depth_provider = None
     local_conflicts = []
-    if (OPTIONS.frozen_depth or OPTIONS.original_clearance) and not (OPTIONS.priority_clearance or OPTIONS.windowed_priority):
-        depth_provider = FrozenDepth(objective, getattr(owner, "_scene_objects", ()), common.get("scene_query"))
-        if OPTIONS.frozen_depth:
-            objective.frozen_original_depth = depth_provider
-        depth_provider(fixed)
-        if OPTIONS.original_clearance:
-            local_conflicts = unreachable_geoms(model, fixed, depth_provider.last_measurement,
-                                                angle=LOCAL_ANGLE, slide=FREE_DRIFT,
-                                                closed_static=depth_provider.geometry._static_bound_reuse)
-            if local_conflicts:
-                objective.original_clearance = OriginalClearance(
-                    depth_provider.geometry, [r["geom_id"] for r in local_conflicts])
-    coordinator = None
-    if OPTIONS.priority_clearance or OPTIONS.windowed_priority:
-        from .priority_geometry import acquisition_coordinator
-        coordinator = acquisition_coordinator(objective, fixed, getattr(owner, '_scene_objects', ()),
-                                              common.get('scene_query'), resources)
-    joint = None
-    if OPTIONS.joint_witness and len(q) < 600:
-        from .joint_witness import JointWitness
-        joint = objective.joint_witness = JointWitness(
-            objective, fixed, getattr(owner, '_scene_objects', ()), common.get('scene_query'))
     acquisition_guard = AcquisitionNormalGuard(objective, fixed)
     frozen_acquisition_guard = acquisition_guard
     acquisition_continuity = SequenceContinuityGuard(task_set, fixed, rotations, windowed=True,
-                                                     correction=OPTIONS.correction_budget,
-                                                     chatter=not OPTIONS.reference_derivative_budget,
+                                                     correction=False,
+                                                     chatter=True,
                                                      enforce_chatter=False,
                                                      velocity_limits=_velocity_limits(
                                                          owner, model, coords, framerate
                                                      ))
-    fixed_continuity = CorrectionContinuity(coords, fixed, root_norm=OPTIONS.batch2,
-                                            chatter=not OPTIONS.reference_derivative_budget,
+    fixed_continuity = CorrectionContinuity(coords, fixed, root_norm=False,
+                                            chatter=True,
                                             enforce_chatter=False)
     objective.candidate_guards = [acquisition_guard, acquisition_continuity,
                                   fixed_continuity]
-    if coordinator is not None:
-        objective.candidate_guards = [acquisition_continuity, fixed_continuity, coordinator]
-    if joint is not None:
-        objective.candidate_guards.append(joint)
     # The acquisition guard also enters the objective as stiff one-sided rows,
     # so plain steps rarely need the costly constrained fallback.
-    objective.hinge_guards = [acquisition_guard] if coordinator is None else []
+    objective.hinge_guards = [acquisition_guard]
 
     objective.correction_temporal_scale = CORRECTION_TEMPORAL_WEIGHT
-    if OPTIONS.spline_correction:
-        from .spline_pipeline import run_spline_pipeline
-        trace.add_stage_seconds('grid_setup', time.monotonic() - tick)
-        return run_spline_pipeline(
-            owner, objective, q, getattr(owner, '_scene_objects', ()), common.get('scene_query'),
-            resources, started=started, report=report, trace=trace, source_pose=source_pose,
-            initialization_continuity=initialization_continuity,
-            acquisition_guard=acquisition_guard, acquisition_continuity=acquisition_continuity,
-            fixed_continuity=fixed_continuity, callback=callback, extra_tasks=extra_tasks,
-            surfaces=surfaces, proximity=proximity, grid_seconds=grid_seconds,
-            restore_trace=restore_objective_trace, report_lift=float(lift.max(initial=0.)))
     rounds, penetration = [], []
     # Height registration and the support lift have finished. No collision
     # pass may move this reference to gain a new angular or translation allowance.
     report_lift = float(lift.max(initial=0.0))
     # One worker pool serves every pass: re-weighting only changes weights
     # the parent owns or sends with each evaluation.
-    coarse_report = soft_report = None
-    soft_v4_used = False
-    if OPTIONS.coarse_acquisition or OPTIONS.soft_acquisition or OPTIONS.soft_acquisition_v4 or OPTIONS.soft_acquisition_v5:
-        # Install exact cached signals without starting a full-rate pool
-        # while the coarse problem and its workers are resident.
-        from .guard_signals import prepare
-        prepare(objective)
-    elif not OPTIONS.windowed_priority:
-        objective.start_workers()
+    objective.start_workers()
     trace.add_stage_seconds("grid_setup", time.monotonic() - tick)
     trace.add_stage_detail("grid_setup", "sdf_grid_seconds", grid_seconds)
     trace.add_stage_detail(
@@ -597,54 +505,23 @@ def _solve_fast_sequence(
         max(0.0, trace.stage_seconds["grid_setup"] - grid_seconds))
     try:
         from .legacy_window import MIN_WINDOW_FRAMES, optimize_legacy_windows, unsupported_reason
-        # Parallel time windows for long clips; short clips and unsupported
-        # combinations (priority coordinator, experimental proposal paths,
-        # infeasible entry) keep the whole-trajectory optimizer and record why.
+        # Parallel time windows serve long, feasible clips. Short clips and
+        # infeasible entries use the whole-trajectory optimizer and report why.
         acquisition_tick = time.monotonic()
         trace.current_stage = "contact_acquisition"
         window_status = unsupported_reason(objective, q, min_frames=MIN_WINDOW_FRAMES) or "used"
-        if OPTIONS.coarse_acquisition:
-            from .coarse_acquisition import optimize_coarse_acquisition
-            motion, history, coarse_report = optimize_coarse_acquisition(
-                objective, q, iterations=cfg["iterations"], callback=callback,
-                window_status=window_status)
-        elif OPTIONS.soft_acquisition_v5 and window_status == "used":
-            from .soft_acquisition_v5 import optimize_soft_acquisition_v5
-            motion, history, soft_report = optimize_soft_acquisition_v5(
-                objective, q, iterations=cfg["iterations"], callback=callback)
-            acquisition_guard = objective.soft_acquired_normal_guard
-            soft_v4_used = True
-        elif OPTIONS.soft_acquisition_v4 and window_status == "used":
-            from .soft_acquisition_v4 import optimize_soft_acquisition_v4
-            motion, history, soft_report = optimize_soft_acquisition_v4(
-                objective, q, iterations=cfg["iterations"], callback=callback)
-            acquisition_guard = objective.soft_acquired_normal_guard
-            soft_v4_used = True
-        elif OPTIONS.soft_acquisition and window_status == "used":
-            from .soft_acquisition import optimize_soft_acquisition
-            motion, history, soft_report = optimize_soft_acquisition(
-                objective, q, iterations=cfg["iterations"], callback=callback)
-        elif window_status == "used":
+        if window_status == "used":
             motion, history = optimize_legacy_windows(objective, q, iterations=cfg["iterations"],
                                                       callback=callback, label="contact_scene")
         else:
             motion, history = optimize(objective, q, iterations=cfg["iterations"],
                                        callback=callback, label="contact_scene")
-        if joint is not None:
-            report['joint_witness'] = joint.diagnostics(motion)
-            joint.close()
-            objective.joint_witness = None
-            # Downstream passes retain the original acquisition guard/hinges.
-            acquisition_guard = AcquisitionNormalGuard(objective, fixed)
-            frozen_acquisition_guard = acquisition_guard
-            objective.candidate_guards = [acquisition_guard, acquisition_continuity, fixed_continuity]
-            objective.hinge_guards = [acquisition_guard]
         verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
         trace.add_stage_seconds("contact_acquisition", time.monotonic() - acquisition_tick)
         if window_status == "used":
             trace.absorb_history(history)
         trace.current_stage = None
-        for round_index in range(REWEIGHT_ROUNDS if coordinator is None else 0):
+        for round_index in range(REWEIGHT_ROUNDS):
             budgets, chatter, posture = verified
             rounds.append(budgets)
             if not chatter.any() and not posture.any():
@@ -652,15 +529,9 @@ def _solve_fast_sequence(
             reweight_tick = time.monotonic()
             candidate_tick = time.monotonic()
             trace.current_stage = "reweight"
-            from .reweight import reweight_temporal_signals
-
-            if OPTIONS.batch2:
-                rounds[-1]['reweighted_signals'] = reweight_temporal_signals(
-                    objective, fixed, motion, REWEIGHT_FACTOR)
-            else:
-                for op_index, weight in enumerate(objective.temporal_weight):
-                    touched = np.convolve(chatter.astype(float), np.ones(op_index + 2), "valid") > 0
-                    weight[touched[:len(weight)]] *= REWEIGHT_FACTOR
+            for op_index, weight in enumerate(objective.temporal_weight):
+                touched = np.convolve(chatter.astype(float), np.ones(op_index + 2), "valid") > 0
+                weight[touched[:len(weight)]] *= REWEIGHT_FACTOR
             objective.envelope_weight[posture] *= REWEIGHT_FACTOR
             label = f"reweight_{round_index + 1}"
             if window_status == "used":
@@ -674,8 +545,7 @@ def _solve_fast_sequence(
                 # decrease in its first four steps; end its tail at a 1% step.
                 candidate, more = optimize(objective, motion, iterations=cfg["iterations"],
                                            callback=callback, label=label,
-                                           **({"converged_decrease": REWEIGHT_DECREASE}
-                                              if OPTIONS.loose_reweight else {}))
+                                           **{})
             history += more
             checked = verify_budgets(model, coords, fixed, candidate, objective.envelope_bodies, shape)
             trace.add_stage_seconds("reweight", time.monotonic() - reweight_tick)
@@ -697,88 +567,60 @@ def _solve_fast_sequence(
         # stage changes what the objective evaluates.
         free_tick = time.monotonic()
         trace.current_stage = "free_bodies"
-        if coordinator is not None:
-            from .acquisition_clearance import complete_priority_clearance
-            motion, more, completion = complete_priority_clearance(objective, motion, optimize, callback)
-            history += more
-            penetration.append(completion)
-            verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
-            acquired = motion.copy()
-            contact_guard = ContactGuard(objective, acquired)
-            continuity_guard = CorrectionContinuity(
-                coords, acquired, chatter=not OPTIONS.reference_derivative_budget,
-                enforce_chatter=False,
-            )
+        verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
+        acquired = motion.copy()
+        contact_guard = ContactGuard(objective, acquired)
+        anchored_contacts = ContactGuard(objective, acquired, preserve_positions=True)
+        continuity_guard = CorrectionContinuity(
+            coords, acquired, chatter=True,
+            enforce_chatter=False,
+        )
+        objective.candidate_guards = [anchored_contacts, continuity_guard,
+                                      acquisition_guard, acquisition_continuity] + []
+        if coords.root_q is not None:
+            objective.fixed_root = acquired[:, coords.root_q:coords.root_q + 7].copy()
+        record = {"stage": "free_bodies", "before": objective.penetration_summary(motion)}
+        candidate_tick = time.monotonic()
+        objective.prepare_free_stage(motion)
+        objective.envelope_weight = np.maximum(objective.envelope_weight, REWEIGHT_FACTOR)
+        objective.stop_workers()
+        objective.start_workers()
+        candidate, more = optimize(
+            objective, motion, iterations=min(cfg["iterations"], FREE_STAGE_ITERATIONS),
+            callback=callback, label="free_bodies", converged_decrease=FREE_STAGE_DECREASE,
+        )
+        history += more
+        checked = verify_budgets(model, coords, fixed, candidate, objective.envelope_bodies, shape)
+        record["candidate"] = objective.penetration_summary(candidate)
+        accepted, reasons = smooth_correction(coords, motion, candidate, verified[0], checked[0])
+        for name, guard in (("acquired contact positions and precision", anchored_contacts),
+                            ("acquired per-coordinate temporal bounds", continuity_guard)):
+            guard_tick = time.monotonic()
+            guard_accepted = guard.accepts(candidate)
+            explanation = (None if guard_accepted else
+                           explain_guard(objective, guard, candidate))
+            trace.add_guard(guard, guard_accepted,
+                            time.monotonic() - guard_tick, explanation)
+            if not guard_accepted:
+                accepted = False
+                reasons.append(name)
+        record["accepted"] = bool(accepted)
+        if accepted:
+            motion, verified = candidate, checked
+            trace.add_alpha(1.0)
         else:
-            from .acquisition_clearance import complete_original_clearance
-            if OPTIONS.original_clearance:
-                motion, more, local_conflicts = complete_original_clearance(
-                    objective, motion, depth_provider, local_conflicts, optimize, callback)
-                history += more
-            verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
-            acquired = motion.copy()
-            contact_guard = ContactGuard(objective, acquired)
-            anchored_contacts = ContactGuard(objective, acquired, preserve_positions=True)
-            continuity_guard = CorrectionContinuity(
-                coords, acquired, chatter=not OPTIONS.reference_derivative_budget,
-                enforce_chatter=False,
-            )
-            objective.candidate_guards = [anchored_contacts, continuity_guard,
-                                          acquisition_guard, acquisition_continuity] + (
-                                          [fixed_continuity] if OPTIONS.correction_budget or soft_v4_used else [])
-            if coords.root_q is not None:
-                objective.fixed_root = acquired[:, coords.root_q:coords.root_q + 7].copy()
-            record = {"stage": "free_bodies", "before": objective.penetration_summary(motion)}
-            if OPTIONS.joint_skip_free and joint is not None:
-                record.update(skipped=True, reason='joint_skip_free', iterations=0,
-                              accepted=False, after=record['before'])
-            else:
-                candidate_tick = time.monotonic()
-                objective.prepare_free_stage(motion)
-                objective.envelope_weight = np.maximum(objective.envelope_weight, REWEIGHT_FACTOR)
-                objective.stop_workers()
-                objective.start_workers()
-                candidate, more = optimize(
-                    objective, motion, iterations=min(cfg["iterations"], FREE_STAGE_ITERATIONS),
-                    callback=callback, label="free_bodies", converged_decrease=FREE_STAGE_DECREASE,
-                )
-                history += more
-                checked = verify_budgets(model, coords, fixed, candidate, objective.envelope_bodies, shape)
-                record["candidate"] = objective.penetration_summary(candidate)
-                accepted, reasons = smooth_correction(coords, motion, candidate, verified[0], checked[0])
-                for name, guard in (("acquired contact positions and precision", anchored_contacts),
-                                    ("acquired per-coordinate temporal bounds", continuity_guard)):
-                    guard_tick = time.monotonic()
-                    guard_accepted = guard.accepts(candidate)
-                    explanation = (None if guard_accepted else
-                                   explain_guard(objective, guard, candidate))
-                    trace.add_guard(guard, guard_accepted,
-                                    time.monotonic() - guard_tick, explanation)
-                    if not guard_accepted:
-                        accepted = False
-                        reasons.append(name)
-                record["accepted"] = bool(accepted)
-                if accepted:
-                    motion, verified = candidate, checked
-                    trace.add_alpha(1.0)
-                else:
-                    record["rejected"] = reasons
-                    record["rejected_budgets"] = checked[0]
-                    trace.add_failed(time.monotonic() - candidate_tick, "free_stage_rejected")
-            penetration.append(record)
+            record["rejected"] = reasons
+            record["rejected_budgets"] = checked[0]
+            trace.add_failed(time.monotonic() - candidate_tick, "free_stage_rejected")
+        penetration.append(record)
         trace.add_stage_seconds("free_bodies", time.monotonic() - free_tick)
         trace.current_stage = None
     finally:
         objective.stop_workers()
-        if joint is not None:
-            joint.close()
     # The selected repair group may approach its original target; all other
     # groups remain anchored by RepairLimits. Precision still uses acquisition.
     objective.candidate_guards = [contact_guard, continuity_guard,
-                                  acquisition_guard, acquisition_continuity] + (
-                                      [fixed_continuity] if OPTIONS.correction_budget or soft_v4_used else [])
-    if coordinator is not None:
-        objective.candidate_guards = [acquisition_continuity, fixed_continuity, continuity_guard, coordinator]
+                                  acquisition_guard, acquisition_continuity] + []
     mesh_repair = None
     grid_coverage = [float(np.isfinite(obj["sdf"].clearance).mean()) for obj in objects]
     # Original-geometry repair is not an open-object fallback. A watertight
@@ -803,9 +645,9 @@ def _solve_fast_sequence(
     finally:
         if started_workers:
             objective.stop_workers()
-    if OPTIONS.windowed_priority and coordinator is not None:
-        objective.stats.update(coordinator.collision_diagnostics(motion))
     budgets = verified[0]
+    from .support_handoff import audit_support_handoffs
+    report['support_handoffs'] = audit_support_handoffs(objective, motion)
     final_continuity = audit_continuity(coords, fixed, motion)
     correction_continuity = audit_continuity(coords, acquired, motion)
     report['continuity_acceptance_layers'] = _continuity_layers(
@@ -817,7 +659,7 @@ def _solve_fast_sequence(
         "final": objective.stats, "reweight_rounds": rounds, "budgets": budgets,
         "penetration_stages": penetration,
         "original_mesh_repair": mesh_repair,
-        "frozen_original_depth": [] if depth_provider is None else depth_provider.audits,
+        "frozen_original_depth": [],
         "local_repair_reach_conflicts": local_conflicts,
         "continuity_vs_fixed_reference": final_continuity,
         "continuity_vs_acquired": correction_continuity,
@@ -835,26 +677,6 @@ def _solve_fast_sequence(
         "self_collision": ("bounded original-mesh repair; see original_mesh_repair" if mesh_repair is not None
                            else "not optimized in the fast backend; audited separately"),
     }
-    if joint is not None:
-        from .postprocess_workload import workload
-        report['postprocess_workload'] = workload(report)
-    if coarse_report is not None:
-        report["stages"]["contact_scene"]["coarse_acquisition"] = coarse_report
-    if soft_report is not None:
-        if soft_v4_used:
-            soft_report['final_required_guards'] = dict(
-                sequence_continuity=acquisition_continuity.accepts(motion),
-                correction_continuity=fixed_continuity.accepts(motion),
-                layout=shape.accepts(motion))
-            if not all(soft_report['final_required_guards'].values()):
-                raise RuntimeError('Soft-v4 final motion lost a required frozen guard')
-        report["stages"]["contact_scene"]["soft_acquisition"] = soft_report
-    if coordinator is not None:
-        priority_history = history + ([] if mesh_repair is None else mesh_repair.get('history', []))
-        priority_report = coordinator.diagnostics(motion, solver_history=priority_history)
-        report["stages"]["contact_scene"]["priority_clearance"] = priority_report
-        report.update({name: priority_report[name] for name in
-                       ('accepted_update_count', 'solver_outcome', 'convergence_certified')})
     total_seconds = time.monotonic() - started
     report.update(
         status="solved", frames=len(motion), framerate=float(framerate),
@@ -901,6 +723,5 @@ def _solve_fast_sequence(
     trace.current_stage = None
     restore_objective_trace()
     report["performance"] = trace.report(total_seconds=total_seconds)
-    report["gpu_conic"] = gpu_report()
     owner.last_fast_source_pose = source_pose
     return motion, report

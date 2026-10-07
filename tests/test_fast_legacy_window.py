@@ -293,18 +293,6 @@ def test_same_color_parallel_results_merge_without_shared_rows(monkeypatch):
     assert candidate[fixed].tobytes() == poses[fixed].tobytes()
 
 
-def test_driver_audits_sweep_and_serial_fallback_restores_options(monkeypatch):
-    from omniretargeting._fast import legacy_window, proposals, runtime_options
-    options, speculative = RuntimeOptions(), proposals.SPECULATE
-    monkeypatch.setattr(runtime_options, 'OPTIONS', options)
-    monkeypatch.setattr(legacy_window, 'fork_status', lambda: (False, 'test_serial'))
-    objective, poses = problem()
-    result, history = optimize_legacy_windows(objective, poses, iterations=2)
-    assert history[-1]['sweep_guard_accepted']
-    assert history[0]['worker_count'] == 0
-    assert history[0]['local_alphas']
-    assert not _failures(objective, result)
-    assert runtime_options.OPTIONS is options and proposals.SPECULATE == speculative
 
 
 def test_failed_whole_sweep_rolls_back_and_hides_callback(monkeypatch):
@@ -334,21 +322,6 @@ def test_failed_whole_sweep_rolls_back_and_hides_callback(monkeypatch):
                for row in history)
 
 
-def test_unsupported_combinations_keep_the_whole_trajectory_optimizer(monkeypatch):
-    from dataclasses import replace
-    from omniretargeting._fast import runtime_options
-    from omniretargeting._fast.legacy_window import unsupported_reason
-    from omniretargeting._fast.legacy_window import MIN_WINDOW_FRAMES
-    monkeypatch.setattr(runtime_options, 'OPTIONS', RuntimeOptions())
-    objective, poses = problem()
-    assert 'shorter than' in unsupported_reason(objective, poses, min_frames=MIN_WINDOW_FRAMES)
-    assert unsupported_reason(objective, poses) is None
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(RuntimeOptions(), window_qp=True))
-    assert 'window_qp' in unsupported_reason(objective, poses)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', RuntimeOptions())
-    bad = poses.copy()
-    bad[:, objective.coords.qi[0]] = np.asarray(objective.upper)[..., 0] + 1.
-    assert 'guard-feasible' in unsupported_reason(objective, bad)
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='requires fork')
@@ -566,21 +539,6 @@ def test_queue_refills_idle_worker_before_slowest_job_finishes(monkeypatch):
     assert results[0]['worker_pid'] != results[1]['worker_pid'] == results[2]['worker_pid']
 
 
-def test_failed_local_solve_restores_solver_and_proposal_options(monkeypatch):
-    from omniretargeting._fast import proposals, runtime_options, solver
-    options, speculative = RuntimeOptions(), proposals.SPECULATE
-    monkeypatch.setattr(runtime_options, 'OPTIONS', options)
-    original = solver._progress_converged
-    objective, poses = problem()
-
-    def failed(*args):
-        raise RuntimeError('test failure')
-
-    monkeypatch.setattr(solver, '_optimize', failed)
-    with pytest.raises(RuntimeError, match='test failure'):
-        solve_local(objective, poses, range(8, 16), 4, .003)
-    assert solver._progress_converged is original
-    assert runtime_options.OPTIONS is options and proposals.SPECULATE == speculative
 
 
 @pytest.mark.parametrize('budget, expected_sweeps, stop', [

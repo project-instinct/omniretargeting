@@ -6,7 +6,6 @@ assuming trilinear interpolation is exact. Open/unknown geometry is ineligible.
 No grid value is returned as a witness, depth, or Jacobian input.
 """
 
-import ctypes
 import time
 
 import numpy as np

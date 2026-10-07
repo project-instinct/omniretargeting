@@ -15,9 +15,8 @@ from threadpoolctl import threadpool_limits
 
 from ..cpu_budget import available_cpus
 from . import repair_proposals as proposals
-from .repair_frames import group_frames, halo_frames
+from .repair_frames import halo_frames
 from .repair_parallel_scope import certificate, footprint
-from .runtime_options import OPTIONS
 
 MAX_WORKERS = 8
 
@@ -118,11 +117,6 @@ class ParallelGroups:
         if (not hasattr(os, 'fork') or multiprocessing.current_process().daemon
                 or threading.active_count() != 1):
             return 'requires a single-threaded direct-fork parent'
-        if OPTIONS.witness_memory or OPTIONS.repair_aggregate or not proposals.LOCAL_RESTORATION_ONLY:
-            return 'global witness/aggregate/restoration contract requires serial repair'
-        if (getattr(self.limits.objective, 'priority_clearance', None) is not None
-                or getattr(self.limits.objective, 'original_clearance', None) is not None):
-            return 'private clearance provider requires serial repair'
         from .reference import ReferenceShape
         from .contact_guard import ContactGuard
         from .acquisition_guard import AcquisitionNormalGuard
@@ -198,7 +192,7 @@ class ParallelGroups:
     @staticmethod
     def _gated(gates):
         from .repair_fast_gate import should_skip
-        return gates[0] is not None or (OPTIONS.repair_fast_gate and should_skip(gates[1]))
+        return gates[0] is not None or should_skip(gates[1])
 
     def _dispatch(self, schedule, current, measured, protected):
         head = footprint(self.limits, self.geometry.model, measured)
@@ -216,7 +210,7 @@ class ParallelGroups:
                          if group is None or any(model.body_weldid[model.geom_bodyid[g]] == group
                                                  for g in (key[2:] if key[1] == 'self' else key[-1:]))),
                         default=0.)
-            from .repair_defects import frames as attempt_frames, has_defect
+            from .repair_defects import frames as attempt_frames
             limits.frame_mask = attempt_frames(limits, measured, model, group,
                                                padding=halo_frames(limits.objective.framerate))
             scope = footprint(limits, model, measured)
@@ -239,8 +233,6 @@ class ParallelGroups:
                         occupied.append(scope)
                     continue
             if depth <= _activation_depth() or not scope.write.any():
-                continue
-            if OPTIONS.repair_defect_windows and not has_defect(measured, model, group):
                 continue
             if not all(scope.disjoint(other) for other in occupied):
                 continue

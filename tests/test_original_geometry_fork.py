@@ -122,26 +122,3 @@ def test_coarse_distance_cones_are_lower_bounds_and_unknown_outside_stays_unboun
     assert np.isneginf(bounds.query([[2., 0., 0.]])).all()
     unknown = ClearanceBounds(origin, spacing, np.full(shape, np.nan))
     assert np.isneginf(unknown.query(requested)).all()
-
-
-def test_window_parent_auto_gpu_attempt_ignores_child_env_and_closes_temporary_pools(monkeypatch):
-    from dataclasses import replace
-    from omniretargeting._fast import gpu_geometry, mesh_repair
-    monkeypatch.setattr(mesh_repair, "OPTIONS", replace(mesh_repair.OPTIONS, windowed_priority=True))
-    attempts = []
-    monkeypatch.setattr(gpu_geometry, "initialize_static", lambda geometry: attempts.append(os.getpid()) or False)
-    geometry, poses = _geometry()
-    assert attempts == [os.getpid()] and geometry.scene._r4_serial
-    initial = geometry.measure(poses)
-    assert geometry.parallel is None
-    identity = geometry.reference_observation_id
-    geometry.prepare_fork_queries()
-    assert geometry.fork_self_seed_stats["skipped"] is None
-    assert geometry.fork_self_seed_stats["seeded_pairs"]
-    client = geometry.fork_private_client()
-    assert not client._gpu_allowed and client.parallel is None
-    audit = geometry.measure(poses)
-    _assert_same(audit, initial)
-    assert attempts == [os.getpid(), os.getpid()]
-    assert geometry._fork_queries_prepared and geometry.parallel is None and not geometry._gpu_allowed
-    assert geometry.reference_observation_id == identity

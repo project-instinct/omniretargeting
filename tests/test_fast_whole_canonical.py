@@ -1,6 +1,5 @@
 """Whole acquisition must retain solver-input bytes and nonlinear decisions."""
 
-from dataclasses import replace
 
 import cvxpy as cp
 import numpy as np
@@ -83,22 +82,10 @@ def test_whole_coefficients_and_solutions_are_bitwise_equal(amplitude, acquired,
             assert step.tobytes() == expected_step.tobytes()
 
 
-@pytest.mark.parametrize('amplitude', [0., .001, .01, .1])
-def test_whole_restoration_retains_pose_bytes(amplitude, monkeypatch):
-    monkeypatch.setattr(whole_canonical, 'OPTIONS', replace(whole_canonical.OPTIONS, whole_canonical=False))
-    obj, origin = problem(acquired=True)
-    step = np.random.default_rng(71).normal(scale=amplitude, size=(len(origin), obj.width))
-    expected = shape_step.restore_shape_step(obj, origin, step)
-    actual = whole_canonical.restore_step(obj, origin, step)
-    if expected is None:
-        assert actual is None
-    else:
-        assert actual is not None
-        assert actual.tobytes() == expected.tobytes()
 
 
 def test_unknown_guards_and_non_scalar_sequence_rows_keep_cvxpy(monkeypatch):
-    monkeypatch.setattr(whole_canonical, 'OPTIONS', replace(whole_canonical.OPTIONS, whole_canonical=True))
+    pass
     obj, poses = problem()
     assert whole_canonical.supported(obj)
     from omniretargeting._fast.guard_signals import prepare
@@ -127,36 +114,7 @@ def test_selected_layout_rows_retain_explicit_zeros_and_order():
 
 
 def test_long_clips_keep_the_established_canonical_path(monkeypatch):
-    monkeypatch.setattr(whole_canonical, 'OPTIONS', replace(whole_canonical.OPTIONS, whole_canonical=True))
+    pass
     obj, _ = problem()
     obj.source_shape.seed = np.zeros((600, obj.model.nq))
     assert not whole_canonical.supported(obj)
-
-
-def test_whole_lm_history_and_pose_bytes_match_cvxpy(monkeypatch):
-    from omniretargeting._fast.solver import optimize
-    from omniretargeting._fast.legacy_window_qp import serial_proposals
-    original = shape_step.bounded_shape_step
-    calls = []
-
-    def counted(*args, **kwargs):
-        calls.append(1)
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(shape_step, 'bounded_shape_step', counted)
-    results = []
-    for enabled in (False, True):
-        options = replace(whole_canonical.OPTIONS, whole_canonical=enabled)
-        monkeypatch.setattr(whole_canonical, 'OPTIONS', options)
-        monkeypatch.setattr(shape_step, 'OPTIONS', options)
-        obj, poses = problem()
-        for eff in obj.effectors:
-            eff['contact'] = eff['contact'] + [.8, 0., 0.]
-        with serial_proposals():
-            results.append(optimize(obj, poses.copy(), iterations=3))
-    assert calls, 'Exercise the bounded proposal/restoration path'
-    before, after = results
-    assert before[0].tobytes() == after[0].tobytes()
-    histories = [[{k: v for k, v in row.items() if k != 'seconds'} for row in history]
-                 for _, history in results]
-    assert histories[0] == histories[1]

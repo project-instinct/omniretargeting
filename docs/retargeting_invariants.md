@@ -15,6 +15,24 @@ hard line, and update this file with it.
   every later check. Its quality is therefore judged directly against the source (relation
   angles, per-bone source directions of the seed). Building a better reference is one of the
   most leveraged improvements available.
+- Calibrated sole frames use the same morphology target in source fitting and acquisition
+  (`_fast/foot_targets.py`). Each source hip–knee–ankle segment retains its direction with
+  the robot's segment length; the semantic tip offset uses the measured terminal-chain scale.
+  The target is relative to the robot hip and its Jacobian includes that moving origin. This
+  avoids imposing a human-length leg endpoint as a 2 cm world target during reference fitting.
+  Missing morphology calibration retains the existing tracking semantics. The anatomical hip
+  is the first articulation below its mapped parent, rather than an intermediate serial joint
+  origin displaced by an upstream hip rotation; source arrays and robot profiles stay intact.
+- After the joint fit, height registration holds every joint angle and root XY fixed. Only
+  observed sole contacts provide world-plane measurements (`height_tracking_tasks`); free
+  soles remain morphology-relative. The existing support lift then prevents proximal support
+  penetration before the reference is frozen. Registration shifts and subsequent lifts are
+  reported separately; this is robot height adaptation, never an edit to a source target.
+  The height fit is bounded by the collision sole's extent on observed upward static support
+  planes (`bound_sole_registration`), not only by its semantic marker. An ankle tilt can put
+  collision points below that marker; the minimal extra height is spread over the existing
+  0.5 s lift ramp and reported as `sole_extent_correction_max_m`. Joint angles and XY remain
+  unchanged in this registration step.
 - Continuity follows `AGENTS.md`: added high-frequency content is chatter, while a smooth
   low-frequency clearance correction is not. `motion_budgets.chatter_excess` high-passes each
   signal with Gaussian scale `CHATTER_SCALE_FRAMES = 2`, and allows the source-shaped
@@ -26,8 +44,7 @@ hard line, and update this file with it.
   do not reject a sweep merely because assembling windows creates a flagged frame: that would
   roll back useful clearance. They retain hard URDF velocity rows when the owner supplies its
   URDF, while final audit reports and gates sustained added chatter.
-  `OMNIRETARGETING_FAST_ENABLE=reference_derivative_budget` restores the old per-stencil
-  derivative envelope only as an explicit regression experiment. Support-endpoint
+  Support-endpoint
   world continuity remains protected during local repair because its purpose is preventing
   support slip, not general smoothness.
 - `scripts/review_joint_smoothness.py` audits the same source-relative chatter, URDF velocity
@@ -94,12 +111,38 @@ object and scene.
    the outgoing one, yielding posture first, then the smallest root shift the budgets allow;
    otherwise the support gap is reported (frames, distance, binding constraint).
 
+The fast sole target handover spans `HANDOVER_SECONDS = 0.15` (5 frames at 30 Hz)
+before contact and after departure, with cubic smoothstep interpolation. Short swing gaps
+connect the two boundary corrections directly. Dense material contacts transfer their mean
+rigid displacement to the endpoint at the fixed reference orientation, so approaching a dense
+contact does not aim at an unrelated semantic-foot anchor. World anchors and observed contact
+intervals are unchanged. Solver support stiffness is extended within existing geometric
+contact intervals before an incoming support and after an outgoing support; source role labels
+are unchanged. Sliding sole samples have normal-only endpoint and dense-surface residuals.
+
+An unreachable sole may yield to its morphology target only with a conservative geometric
+certificate: its contact plane lies beyond an outer sphere containing every joint configuration
+and the allowed root translation ball. The radius includes rigid chain lengths, contact sample
+offsets, off-origin pivots and bounded slides. This proves impossibility even without angular
+limits, hence within the actual limits too. Unsupported unbounded translations never produce
+a certificate. The solver's source contact arrays remain intact for auditing the resulting gap.
+The certificate is conservative: collision-constrained or joint-direction-constrained failures
+inside the sphere remain protected contacts and unresolved gaps, not falsely certified misses.
+
 Example: a seated source with longer legs than the robot. Seated, the pelvis is the support and
 the robot's feet hang (reported gap). Before the weight moves to the feet, the robot slides
 forward on the seat until its feet reach the floor, then rises. Sinking the pelvis into the seat
 to keep the feet down trades penetration for contact.
 
-Open problems: there is no explicit make-before-break hand-off check yet. Object support
+`_fast/support_handoff.py` checks incoming sole normal gaps at the last source overlap frame
+before a static proximal geometric contact releases (support/hold role flapping alone is not
+a release). When mechanics identifies a minimal incoming support set, the check uses that set;
+otherwise it conservatively checks observed incoming soles. It runs once after solving, reports every failed
+handoff, and does not trigger another solve. This geometric check and anticipatory targets do
+not yet guarantee a feasible transition when the bounded root/clearance constraints conflict;
+such a transition remains a defect, not certified support or permission to unload the seat.
+
+Open problems: force-balanced make-before-break transitions are not certified. Object support
 mechanics is approximate (`object_support_evidence.py`: touching objects form one system,
 uniform density, nominal demand, full friction cones, environment first) and only promotes skin
 contacts to support.
@@ -147,7 +190,8 @@ contacts to support.
 
 ## Solver Backends
 
-- `--solver fast` checks sustained source layout on candidates, verifies source-relative
+- `--solver fast` always uses its production path; only `performance_trace` is optional timing
+  diagnostics. It checks sustained source layout on candidates, verifies source-relative
   chatter and URDF velocity limits after solving, and reports `budgets` (including
   `relation_*`, `layout_flip_*`, `source_relative_chatter`) and `skipped_tasks`.
 - `--solver sequence` bounds only root/slide translation and fits source directions first,

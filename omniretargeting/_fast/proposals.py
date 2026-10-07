@@ -13,7 +13,6 @@ import multiprocessing
 import os
 
 from scipy.linalg import LinAlgError
-from .box_step import BoxStepFailure
 
 ALPHAS = (1., .5, .25, .125, .0625, .03125, .015625, .0078125)
 # Scheduling only: attempts are computed in forked processes when possible.
@@ -35,8 +34,7 @@ def backtrack(objective, poses, direction, guards, alphas=ALPHAS):
     frames, width = objective.frames, objective.width
     for alpha in ((1.,) if not guards else alphas):
         trial = objective.project(coords.integrate(poses, direction.reshape(frames, width), alpha))
-        from .priority_merit import check_trial
-        if check_trial(objective, trial, guards):
+        if all(guard.accepts(trial) for guard in guards):
             return trial, alpha
     return None, 0.
 
@@ -73,19 +71,11 @@ class Attempts:
         try:
             step = self._band_step(self.system, self.diagonal, self.held, self.radial, self.rhs,
                                    self.dampings[attempt])
-        except BoxStepFailure:
-            # A bounded numerical failure requests the normal conic fallback.
-            # No clipped or unconverged box iterate becomes a candidate.
-            result = (None, None, 0.)
         except LinAlgError:
             result = None
         else:
-            joint = getattr(self.objective, 'joint_witness', None)
-            if joint is None:
-                candidate, alpha = backtrack(self.objective, self.poses, step, guards)
-            else:
-                from .joint_proposal import banded_candidate
-                candidate, alpha = banded_candidate(joint, self.poses, step, guards)
+            joint = None
+            candidate, alpha = backtrack(self.objective, self.poses, step, guards)
             result = (step, candidate, alpha)
         return result, [a - b for a, b in zip(_counters(guards), before)]
 
@@ -121,11 +111,7 @@ class Attempts:
         identical. The final unit damping weights the Gauss-Newton diagonal
         equally; it changes the proposal, never any physical guard budget.
         """
-        from .runtime_options import OPTIONS
         value = self.dampings[attempt]
-        if OPTIONS.conic_trust_damping:
-            number = self.conic_numbers.get(attempt, 1)
-            value = max(value, (0., 1e-3, 1.)[min(number - 1, 2)])
         return value
 
     def conic(self, attempt, number=None):
@@ -136,7 +122,6 @@ class Attempts:
 
     def speculate(self, first, shape_solves, max_shape_solves, conic_possible):
         """Compute attempts ``first..`` at once; conic ones as the loop would reach them."""
-        from .runtime_options import OPTIONS
         if not SPECULATE:
             return
         attempts = range(first, len(self.dampings))
@@ -147,11 +132,6 @@ class Attempts:
             if status != "ok" or result is None:
                 continue
             _, candidate, alpha = result
-            if OPTIONS.accept_short_banded and candidate is not None and alpha < .25:
-                # Its true decrease is checked in the parent before a conic
-                # solve is needed. Subsequent conic retry numbers depend on
-                # that result, so leave them to the sequential consumer too.
-                break
             if (conic_possible and shape_solves < max_shape_solves
                     and (candidate is None or alpha < .25)):
                 shape_solves += 1

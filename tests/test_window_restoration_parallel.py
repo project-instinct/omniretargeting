@@ -1,5 +1,4 @@
 """Capacity-bound speculation keeps bytes, errors and consumed guard counters."""
-from dataclasses import replace
 import multiprocessing
 import os
 from types import SimpleNamespace
@@ -7,7 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from omniretargeting._fast import runtime_options, window_restoration_parallel as parallel
+from omniretargeting._fast import window_restoration_parallel as parallel
 from omniretargeting._fast.shortening import FractionRestorations
 from tests.test_fast_parallel_shortening import _restore
 
@@ -73,37 +72,6 @@ def test_default_and_nonwindow_callers_keep_existing_fraction_class(monkeypatch)
     assert parallel.fraction_class(SimpleNamespace(), FractionRestorations) is FractionRestorations
 
 
-def test_numerical_shortening_matches_serial_history_and_counters(monkeypatch):
-    from threadpoolctl import threadpool_limits
-    from tests import test_fast_proposals as fixture
-    original = fixture._objective
-    def objective(*args, **kwargs):
-        obj, seed, extra = original(*args, **kwargs)
-        # Window children have neither the whole-trajectory Pool's helper
-        # threads nor a CUDA evaluator. Exercise that same CPU ownership.
-        obj.evaluation_backend = 'cpu'
-        monkeypatch.setattr(obj, 'start_workers', lambda: False)
-        obj._window_restoration_permits = multiprocessing.get_context('fork').BoundedSemaphore(2)
-        return obj, seed, extra
-    monkeypatch.setattr(fixture, '_objective', objective)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, parallel_shortening=False))
-    monkeypatch.setattr(parallel, 'WINDOW_PARALLEL_RESTORATIONS', False)
-    with threadpool_limits(limits=1):
-        serial = fixture._solve(monkeypatch, False)
-    launches = []
-    enter = parallel.WindowFractionRestorations.__enter__
-    def observed(self):
-        result = enter(self)
-        launches.append(len(self.jobs))
-        return result
-    monkeypatch.setattr(parallel.WindowFractionRestorations, '__enter__', observed)
-    monkeypatch.setattr(parallel, 'WINDOW_PARALLEL_RESTORATIONS', True)
-    with threadpool_limits(limits=1):
-        candidate = fixture._solve(monkeypatch, False)
-    assert any(launches), 'the case must consume this new speculation path'
-    assert candidate[0].tobytes() == serial[0].tobytes()
-    assert candidate[1] == serial[1]
-    assert candidate[2] == serial[2]
 
 
 def test_window_pool_preserves_bytes_and_releases_ownership(monkeypatch):

@@ -101,9 +101,7 @@ def test_open_object_has_reverse_collision_rows_without_fabricating_signed_volum
 
 @pytest.mark.parametrize("lazy", [False, True])
 def test_original_mesh_repair_keeps_root_and_all_immutable_limits(monkeypatch, lazy):
-    from dataclasses import replace
-    from omniretargeting._fast import mesh_repair
-    monkeypatch.setattr(mesh_repair, "OPTIONS", replace(mesh_repair.OPTIONS, lazy_repair_restoration=lazy))
+    pass
     objective, poses, _ = _objective(temporal=True)
     obj = _open_object(objective, poses)
     before = poses.copy()

@@ -3,7 +3,6 @@
 from types import SimpleNamespace
 import os
 
-import mujoco
 import numpy as np
 
 from ..geometry_query import OPEN_SURFACE_GEOMS, GeometryQueryError, RigidGeometryQuery

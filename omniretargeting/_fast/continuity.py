@@ -7,7 +7,6 @@ from scipy.spatial.transform import Rotation
 
 from .._refinement.math import _difference_operator
 from .kinematics import skew
-from .runtime_options import OPTIONS
 
 from ..motion_budgets import CHATTER_RMS_FRACTION, CHATTER_WINDOW, chatter_excess, windowed_budget
 from ..motion_budgets import CHATTER_EXCESS_TOLERANCE
@@ -94,7 +93,7 @@ def correction_derivatives(coords, fixed, motion):
 
 def audit_continuity(coords, fixed, motion, *, correction=None):
     """Report source-relative chatter and legacy derivative diagnostics."""
-    use_correction = OPTIONS.correction_budget if correction is None else correction
+    use_correction = False if correction is None else correction
     before, after = derivatives(coords, fixed), derivatives(coords, motion)
     correction = correction_derivatives(coords, fixed, motion)
     budget_values = correction if use_correction else after
@@ -160,7 +159,7 @@ class CorrectionContinuity:
     def __init__(self, coords, acquired, *, root_norm=False, correction=None, chatter=None,
                  enforce_chatter=True):
         self.coords = coords
-        self.correction = OPTIONS.correction_budget if correction is None else correction
+        self.correction = False if correction is None else correction
         # Standalone guards retain the legacy explicit envelope for regression
         # tooling; the production fast pipeline opts into chatter semantics.
         self.chatter = False if chatter is None else bool(chatter)

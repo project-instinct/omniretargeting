@@ -451,7 +451,7 @@ def test_deferred_exact_batches_preserve_complete_original_geometry_summary():
     assert_identical(actual_geometry.summary(actual), expected_geometry.summary(expected))
 
 
-@pytest.mark.parametrize("parallel,stream", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("parallel,stream", [(False, False), (True, False)])
 def test_integrated_service_has_exact_rows_jacobians_and_debug_coverage(monkeypatch, parallel, stream):
     pytest.importorskip("warp")
     from tests.test_original_geometry_batches import _problem, _scene
@@ -461,7 +461,7 @@ def test_integrated_service_has_exact_rows_jacobians_and_debug_coverage(monkeypa
     expected = OriginalGeometry(objective, [], _scene("closed"), manifold=True).measure(poses, jacobians=True)
     monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "1")
     monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_DEBUG", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_STREAM", "1" if stream else "0")
+    pass
     actual_geometry = OriginalGeometry(objective, [], _scene("closed"), manifold=True)
     if parallel:
         from omniretargeting._fast import parallel_geometry
@@ -478,211 +478,18 @@ def test_integrated_service_has_exact_rows_jacobians_and_debug_coverage(monkeypa
         actual_geometry.stop_workers()
 
 
-def test_stream_service_failure_after_dispatch_keeps_complete_exact_measurement(monkeypatch):
-    pytest.importorskip("warp")
-    from omniretargeting._fast import gpu_geometry, parallel_geometry
-    from tests.test_original_geometry_batches import _problem, _scene
-
-    objective, poses = _problem()
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "0")
-    expected = OriginalGeometry(objective, [], _scene("closed"), manifold=True).measure(poses, jacobians=True)
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_STREAM", "1")
-    geometry = OriginalGeometry(objective, [], _scene("closed"), manifold=True)
-    monkeypatch.setattr(parallel_geometry, "MIN_FRAMES_PER_WORKER", 2)
-    monkeypatch.setattr(parallel_geometry, "WORKERS", 3)
-    service = gpu_geometry.geometry_service()
-    original, calls = service.candidates, []
-
-    def lose_service(*args, **kwargs):
-        calls.append(1)
-        if len(calls) == 2:
-            raise EOFError("CUDA interpreter disconnected")
-        return original(*args, **kwargs)
-
-    monkeypatch.setattr(service, "candidates", lose_service)
-    geometry.start_workers(len(poses))
-    try:
-        assert_identical(geometry.measure(poses, jacobians=True), expected)
-        assert len(calls) == 2 and not geometry._gpu_allowed
-        assert geometry.gpu_unavailable == "CUDA interpreter disconnected"
-        assert_identical(geometry.measure(poses, jacobians=True), expected)
-    finally:
-        geometry.stop_workers()
 
 
-@pytest.mark.parametrize("stream", [False, True])
-def test_lazy_static_keeps_accepted_rows_and_recovers_from_partial_rejection(monkeypatch, stream):
-    pytest.importorskip("warp")
-    from omniretargeting._fast import parallel_geometry
-    from tests.test_original_geometry_batches import _problem, _scene
-
-    objective, poses = _problem()
-    poses = np.tile(poses, (10, 1))
-    objective.frames = len(poses)
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "0")
-    reference = OriginalGeometry(objective, [], _scene("closed"), manifold=True)
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_STREAM", "1" if stream else "0")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_LAZY_STATIC", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_OVERLAP", "0")
-    geometry = OriginalGeometry(objective, [], _scene("closed"), manifold=True)
-    monkeypatch.setattr(parallel_geometry, "WORKERS", 3)
-    geometry.start_workers(len(poses))
-    try:
-        assert_identical(geometry.measure(poses, jacobians=True), reference.measure(poses, jacobians=True))
-        changed = poses.copy()
-        changed[:, 0] += .001
-        complete = reference.measure(changed, jacobians=True)
-        assert_identical(geometry.measure(changed, jacobians=True, protected_depths=complete["depths"]), complete)
-        previous = {key: cached[0] for key, cached in geometry._static_cache.items()}
-        changed[:, 0] += .001
-        complete = reference.measure(changed, jacobians=True)
-        rejected = geometry.measure(changed, protected_depths={})
-        assert not rejected["complete"] and rejected["rejection_frame"] in range(len(poses))
-        updated = sum(cached[0] != previous[key] for key, cached in geometry._static_cache.items())
-        assert 0 < updated < len(previous), "Rejected candidate queried every static frame"
-        assert_identical(geometry.measure(changed, jacobians=True, protected_depths=complete["depths"]), complete)
-    finally:
-        geometry.stop_workers()
 
 
-def test_lazy_static_finishes_started_frame_when_peer_rejects_during_self_query(monkeypatch):
-    pytest.importorskip("warp")
-    from omniretargeting._fast.gpu_geometry import measure_lazy_static
-    from tests.test_original_geometry_batches import _problem, _scene
-
-    objective, poses = _problem()
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "0")
-    reference = OriginalGeometry(objective, [], _scene("closed"), manifold=True)
-    expected = reference.measure_frames(poses, range(len(poses)))
-    updates = []
-    for key, (signature, _, position, rotation) in reference._static_cache.items():
-        ids = np.flatnonzero(objective.shell_sample_geom == key[1]).astype(np.int32)
-        summary = dict(row=None, rows=[], clearance=np.inf, unknown=False,
-                       origin=position.copy(), _gpu_ids=ids)
-        updates.append((key, signature, summary, position, rotation))
-    geometry = OriginalGeometry(objective, [], _scene("closed"), manifold=True)
-    stop = SimpleNamespace(value=-1)
-    original = geometry.self_query.query
-
-    def reject_peer(*args, **kwargs):
-        result = original(*args, **kwargs)
-        stop.value = 7
-        return result
-
-    monkeypatch.setattr(geometry.self_query, "query", reject_peer)
-    depths = {key: value for _, _, d, _ in expected["frames"] for key, value in d.items()}
-    actual, completed = measure_lazy_static(geometry, poses, list(range(len(poses))),
-                                           updates, False, depths, stop)
-    assert_identical(actual["frames"], expected["frames"][:1])
-    assert completed and not hasattr(geometry, "_gpu_pending_static")
 
 
-@pytest.mark.parametrize("parallel", [False, True])
-def test_moving_gpu_minima_keep_every_exact_row_depth_and_repeat_cache(monkeypatch, parallel):
-    pytest.importorskip("warp")
-    from scipy.spatial.transform import Rotation
-    from omniretargeting._fast import parallel_geometry
-    from tests.test_original_geometry_batches import _problem, _scene
-
-    objective, poses = _problem()
-    objects = [dict(mesh=trimesh.creation.box(extents=[.55, .6, .5]),
-                    translations=np.tile([.1, 0., .6], (len(poses), 1)),
-                    rotations=Rotation.from_euler("z", (np.arange(len(poses)) * .04)[:, None]).as_matrix())]
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "0")
-    reference = OriginalGeometry(objective, objects, _scene("closed"), manifold=True)
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_MOVING", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_OVERLAP", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_DEBUG", "1")
-    geometry = OriginalGeometry(objective, objects, _scene("closed"), manifold=True)
-    if parallel:
-        monkeypatch.setattr(parallel_geometry, "MIN_FRAMES_PER_WORKER", 2)
-        monkeypatch.setattr(parallel_geometry, "WORKERS", 3)
-        geometry.start_workers(len(poses))
-    try:
-        for candidate in (poses, poses, poses + np.eye(1, poses.shape[1], 0) * .001):
-            actual = geometry.measure(candidate, jacobians=True)
-            expected = reference.measure(candidate, jacobians=True)
-            assert hasattr(geometry, "_gpu_moving_tokens")
-            assert not hasattr(geometry, "gpu_moving_unavailable"), getattr(geometry, "gpu_moving_unavailable", None)
-            assert_identical(actual, expected)
-            assert_identical(geometry.summary(actual), reference.summary(expected))
-    finally:
-        geometry.stop_workers()
 
 
-def test_moving_gpu_chunked_minima_preserve_component_and_first_tie_order(monkeypatch):
-    pytest.importorskip("warp")
-    from tests.test_original_geometry_batches import _problem, _scene
-
-    objective, poses = _problem()
-    parts = [trimesh.creation.box(extents=[.55, .6, .5]),
-             trimesh.creation.box(extents=[.7, .8, .6])]
-    objects = [dict(mesh=trimesh.util.concatenate(parts),
-                    translations=np.tile([.1, 0., .6], (len(poses), 1)))]
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "0")
-    reference = OriginalGeometry(objective, objects, _scene("closed"), manifold=True)
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_MOVING", "1")
-    geometry = OriginalGeometry(objective, objects, _scene("closed"), manifold=True)
-    geometry.SCENE_BATCH_POINTS = 2
-    assert len(geometry.moving.objects[0]["closed"]) == 2
-    assert_identical(geometry.measure(poses, jacobians=True), reference.measure(poses, jacobians=True))
 
 
-def test_moving_gpu_reuses_unchanged_geoms_after_local_joint_edit(monkeypatch):
-    pytest.importorskip("warp")
-    from tests.test_original_geometry_batches import _problem, _scene
-
-    objective, poses = _problem()
-    objects = [dict(mesh=trimesh.creation.box(extents=[.55, .6, .5]),
-                    translations=np.tile([.1, 0., .6], (len(poses), 1)))]
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "0")
-    reference = OriginalGeometry(objective, objects, _scene("closed"), manifold=True)
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_MOVING", "1")
-    geometry = OriginalGeometry(objective, objects, _scene("closed"), manifold=True)
-    geometry.measure(poses)
-    changed = poses.copy()
-    changed[:, 7] += .001
-    assert_identical(geometry.measure(changed, jacobians=True),
-                     reference.measure(changed, jacobians=True))
-    stats = geometry.gpu_moving_stats
-    assert stats["reused_geoms"] == 2 * len(poses)
-    assert stats["screened_geoms"] == len(poses)
-    # Returning to a previous pose must replace only the edited body's cache.
-    assert_identical(geometry.measure(poses), reference.measure(poses))
-    assert geometry.gpu_moving_stats["reused_geoms"] == 2 * len(poses)
-    geometry.moving = geometry.moving.fresh_state()
-    assert_identical(geometry.measure(poses), reference.measure(poses))
-    assert geometry.moving.forward_cache is geometry._gpu_moving_cache
 
 
-def test_gpu_minimum_compaction_keeps_exact_winner_and_every_ambiguous_sample():
-    pytest.importorskip("warp")
-    from omniretargeting._fast.gpu_geometry import ResidentScene
-
-    scene = SceneQuery(trimesh.creation.box(extents=[2., 2., 2.]))
-    points = np.column_stack([np.r_[np.linspace(.2, .9, 110), 1., 1.008, 1.5],
-                              np.zeros(113), np.zeros(113)])
-    resident = ResidentScene(scene, points, np.arange(len(points), dtype=np.int32))
-    arguments = (np.zeros((1, 3)), np.eye(3)[None], np.array([0], np.int32),
-                 np.array([len(points)], np.int32))
-    full = resident.candidates(*arguments)
-    compact = resident.candidates(*arguments, minimum=True)
-    exact = scene.query(points)
-    winner = int(np.argmin(exact["clearance"]))
-    assert compact["candidates"] < full["candidates"] / 2
-    assert winner in compact["samples"]
-    assert set(full["samples"][full["ambiguous"]]).issubset(compact["samples"])
-    queried = scene.query(points[compact["samples"]])
-    found = int(np.argmin(queried["clearance"]))
-    assert compact["samples"][found] == winner
-    assert_identical(queried["clearance"][found], exact["clearance"][winner])
-    audited = resident.candidates(*arguments, debug=True, minimum=True)
-    assert 100 in audited["samples"][audited["debug"]]
 
 
 def test_resident_query_with_no_candidates_preserves_empty_cuda_result(monkeypatch):
@@ -702,62 +509,8 @@ def test_resident_query_with_no_candidates_preserves_empty_cuda_result(monkeypat
     assert result["lower_bounds"][0] > .008
 
 
-@pytest.mark.parametrize("unsupported", ["open", "scale"])
-def test_unsupported_moving_minima_keep_original_cpu_unknowns_and_rows(monkeypatch, unsupported):
-    pytest.importorskip("warp")
-    from tests.test_original_geometry_batches import _problem, _scene
-
-    objective, poses = _problem()
-    mesh = trimesh.creation.box(extents=[.55, .6, .5])
-    if unsupported == "open":
-        mesh.update_faces(np.arange(len(mesh.faces) - 2))
-    objects = [dict(mesh=mesh, translations=np.tile([.1, 0., .6], (len(poses), 1)),
-                    scales=np.full(len(poses), 1.1 if unsupported == "scale" else 1.))]
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "0")
-    reference = OriginalGeometry(objective, objects, _scene("closed"), manifold=True)
-    expected = reference.measure(poses, jacobians=True)
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_MOVING", "1")
-    geometry = OriginalGeometry(objective, objects, _scene("closed"), manifold=True)
-    actual = geometry.measure(poses, jacobians=True)
-    assert not hasattr(geometry, "_gpu_moving_tokens")
-    assert_identical(actual, expected)
-    assert_identical(geometry.summary(actual), reference.summary(expected))
 
 
-@pytest.mark.parametrize("parallel", [False, True])
-def test_moving_minimum_debug_audit_preserves_unknown_flags(monkeypatch, parallel):
-    pytest.importorskip("warp")
-    from tests.test_original_geometry_batches import _problem, _scene
-
-    objective, poses = _problem()
-    objects = [dict(mesh=trimesh.creation.box(extents=[.55, .6, .5]),
-                    translations=np.tile([.1, 0., .6], (len(poses), 1)))]
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_MOVING", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_OVERLAP", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_DEBUG", "1")
-    geometry = OriginalGeometry(objective, objects, _scene("closed"))
-    query = geometry.moving.objects[0]["query"]
-    original = query.query
-
-    def hide_unknown(*args, **kwargs):
-        measured = original(*args, **kwargs)
-        measured["uncertain"][:] = True
-        return measured
-
-    monkeypatch.setattr(query, "query", hide_unknown)
-    if parallel:
-        from omniretargeting._fast import parallel_geometry
-        monkeypatch.setattr(parallel_geometry, "MIN_FRAMES_PER_WORKER", 2)
-        monkeypatch.setattr(parallel_geometry, "WORKERS", 3)
-        geometry.start_workers(len(poses))
-    try:
-        with pytest.raises(AssertionError, match="Moving GPU screening"):
-            geometry.measure(poses)
-    finally:
-        geometry.stop_workers()
-    assert not geometry._gpu_moving_cache.cached
 
 
 def test_far_lower_bounds_keep_decisions_when_motion_invalidates_the_bound(monkeypatch):
@@ -783,7 +536,7 @@ def test_far_lower_bounds_keep_decisions_when_motion_invalidates_the_bound(monke
     assert any(key[1] == "static" for key, _ in measured["rows"])
 
 
-@pytest.mark.parametrize("centers", [False, True])
+@pytest.mark.parametrize("centers", [False])
 def test_debug_checks_raise_if_a_screened_sample_is_unknown(monkeypatch, centers):
     pytest.importorskip("warp")
     from tests.test_original_geometry_batches import _problem
@@ -794,7 +547,7 @@ def test_debug_checks_raise_if_a_screened_sample_is_unknown(monkeypatch, centers
     scene = SceneQuery(floor)
     monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY", "1")
     monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_DEBUG", "1")
-    monkeypatch.setenv("OMNIRETARGETING_GPU_GEOMETRY_CENTERS", "1" if centers else "0")
+    pass
     geometry = OriginalGeometry(objective, [], scene)
     original, calls = scene.query, []
 

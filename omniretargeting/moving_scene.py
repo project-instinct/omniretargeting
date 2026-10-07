@@ -379,8 +379,7 @@ class MovingSceneQuery:
         # units) that its winding number decides inside penetrates it. Being
         # outside it says nothing about the nearer, unknown surface.
         unknown = np.flatnonzero(~known)
-        from ._fast.runtime_options import OPTIONS
-        hull_exit = OPTIONS.moving_hull_exit
+        hull_exit = False
         for cid, bounds in zip(obj["nearly_closed"], obj["nearly_bounds"]):
             if not len(unknown):
                 break
@@ -388,14 +387,6 @@ class MovingSceneQuery:
                                         & (local[unknown] <= bounds[1] + band), axis=1)]
             gap = np.maximum(np.maximum(bounds[0] - local[candidates], local[candidates] - bounds[1]), 0)
             selected = candidates[(components[candidates] != cid) & (np.linalg.norm(gap, axis=1) <= band)]
-            if hull_exit:
-                # A sample outside the object's convex hull is outside the
-                # object (the convention ``in_scope`` already uses above), so it
-                # cannot be a material penetration. Cone caps only close the
-                # chain for the inside/outside test; their bounding-box apexes
-                # may leave the hull, and only such cap-enclosed hull-outside
-                # samples were reported here without this switch.
-                selected = selected[~outside[selected]]
             if not len(selected):
                 continue
             signed = obj["query"].winding_side(local[selected], cid)

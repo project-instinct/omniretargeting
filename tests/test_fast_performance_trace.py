@@ -148,8 +148,7 @@ def test_real_constraint_proposal_records_construction_canonicalization_setup_an
 
 
 def test_iteration_backend_does_not_inherit_a_rejected_conic_attempt(monkeypatch):
-    from dataclasses import replace
-    from omniretargeting._fast import proposals, runtime_options, solver
+    from omniretargeting._fast import proposals, solver
 
     class Shape:
         def accepts(self, _poses):
@@ -159,7 +158,7 @@ def test_iteration_backend_does_not_inherit_a_rejected_conic_attempt(monkeypatch
             return poses
 
     monkeypatch.setattr(proposals, "SPECULATE", False)
-    monkeypatch.setattr(runtime_options, "OPTIONS", replace(runtime_options.OPTIONS, accept_short_banded=False))
+    pass
     original = proposals.Attempts.banded
 
     def banded(self, attempt):
@@ -201,28 +200,6 @@ def test_iteration_backend_does_not_inherit_a_rejected_conic_attempt(monkeypatch
         assert row["step_backend"] == "shape_conic"  # Existing production history stays intact.
 
 
-def test_actual_restoration_calls_include_curvature_and_shape_fallback(monkeypatch):
-    from omniretargeting._fast import proposals, proposal_curvature, shape_step, solver
-
-    objective, poses, _ = _objective()
-    objective.performance_trace = trace = PerformanceTrace(stage="contact_acquisition")
-    monkeypatch.setattr(shape_step, "bounded_shape_step", lambda *_args: np.zeros(objective.frames * objective.width))
-    monkeypatch.setattr(proposals, "backtrack", lambda *_args: (None, 0.))
-    monkeypatch.setattr(solver, "backtrack", proposals.backtrack)
-    monkeypatch.setattr(proposal_curvature, "CONTACT_CURVATURE", True)
-    monkeypatch.setattr(proposal_curvature, "restore_curvature", lambda *_args: None)
-    monkeypatch.setattr(shape_step, "restore_shape_step", lambda *_args: poses.copy())
-    trace.begin_iteration("acquire", 0)
-    with trace.instrument():
-        proposal = solver._conic_proposal(objective, poses, None, None, None, 1e-3, [])
-    row = {"alpha": proposal[2]}
-    trace.finish_iteration(row, "shape_conic")
-    diagnostic = row["iteration_performance"]
-    assert diagnostic["restore_calls"] == {"restore_curvature": 1, "restore_shape_step": 1}
-    assert diagnostic["restore_call_count"] == 2
-    operations = trace.report()["operations"]["contact_acquisition"]
-    assert operations["restoration"]["calls"] == 2
-    assert operations["backtracking"]["calls"] == 1
 
 
 def test_rejected_iteration_reports_multiple_rows_and_short_circuited_guard(monkeypatch):
@@ -277,32 +254,6 @@ def test_instrumentation_restores_all_hooks_after_exception():
     assert original == (clarabel.DefaultSolver, clarabel.DefaultSolver.solve, cp.Problem.get_problem_data, shape_step.restore_shape_step)
 
 
-@pytest.mark.parametrize("rejected", [False, True])
-def test_priority_path_records_every_iteration_and_actual_model_calls(monkeypatch, rejected):
-    from tests.test_fast_priority_solver import problem
-    from omniretargeting._fast import qp_assembly, prioritized_solver
-
-    original = qp_assembly.solve_model
-    actual_calls = []
-
-    def solve_model(*args, **kwargs):
-        actual_calls.append(True)
-        return None if rejected else original(*args, **kwargs)
-
-    monkeypatch.setattr(qp_assembly, "solve_model", solve_model)
-    monkeypatch.setattr(prioritized_solver, "solve_model", solve_model)
-    objective, poses = problem()
-    trace = objective.performance_trace = PerformanceTrace(stage="contact_acquisition")
-    result, history = optimize(objective, poses, iterations=2)
-    assert len(trace.report()["iterations"]) == len(history)
-    assert sum(row["proposal_call_count"] for row in trace.iterations) == len(actual_calls)
-    for row in history:
-        diagnostic = row["iteration_performance"]
-        assert diagnostic["banded_feasible_alpha"] == []
-        assert diagnostic["accepted_step_backend"] == (None if rejected else "priority_conic")
-        assert diagnostic["proposal_calls"]["solve_model"] > 0
-    if rejected:
-        np.testing.assert_array_equal(result, poses)
 
 
 def test_numerical_retry_is_counted_without_changing_retry_options(monkeypatch):
@@ -345,23 +296,3 @@ def test_helpers_imported_during_trace_do_not_retain_trace_wrappers(monkeypatch)
         assert module.restore_shape_step is not original
         monkeypatch.setitem(sys.modules, module.__name__, module)
     assert module.restore_shape_step is original
-
-
-def test_soft_bulk_iterations_and_factorization_counts_are_recorded():
-    from omniretargeting._fast.soft_bulk import run_bulk
-    from tests.test_fast_legacy_window import problem
-
-    objective, poses = problem()
-    plain, _, _ = run_bulk(objective, poses, iterations=2, speed_gate=False)
-    objective, poses = problem()
-    trace = PerformanceTrace(stage="contact_acquisition")
-    restore = trace.install(objective)
-    try:
-        traced, history, report = run_bulk(objective, poses, iterations=2, speed_gate=False)
-    finally:
-        restore()
-    np.testing.assert_array_equal(plain, traced)
-    assert len(trace.iterations) == len(history)
-    assert sum(row["proposal_call_count"] for row in trace.iterations) == report["factorizations"]
-    assert all(row["accepted_step_backend"] == "soft_banded" for row in trace.iterations)
-    assert all(row["restore_call_count"] == 0 for row in trace.iterations)

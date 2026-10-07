@@ -18,6 +18,7 @@ from typing import Any
 import mujoco
 import numpy as np
 import trimesh
+from omniretargeting.cpu_budget import available_cpus
 from omniretargeting.moving_scene import MovingSceneQuery
 from omniretargeting.scene_geometry import (
     SceneQuery,
@@ -915,13 +916,14 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     if not len(geom_ids):
         raise ValueError("robot model has no non-world collision geoms")
     model_report = model_description(model_path, payload)
-    source_profile_path = Path(__file__).resolve().parents[1] / "out/generalization_fix_20260926/profiles/g1.json"
+    source_profile_path = Path(__file__).resolve().parents[1] / "robot_models/unitree_g1/unitree_g1_mesh.json"
     if source_profile_path.is_file():
-        source_profile = json.loads(source_profile_path.read_text())
+        from omniretargeting.robot_config import load_robot_config
+        profile_model = Path(load_robot_config(source_profile_path)["urdf_path"])
         model_report["source_profile"] = {
             "path": str(source_profile_path), "sha256": _sha256(source_profile_path),
-            "model_path": source_profile.get("urdf_path"),
-            "match": Path(str(source_profile.get("urdf_path", ""))).resolve() == model_path,
+            "model_path": str(profile_model),
+            "match": profile_model.resolve() == model_path or _sha256(profile_model) == _sha256(model_path),
             "interpretation": "source mesh-collision experiment only; not proof of training-model identity",
         }
     interp = interpolation_profile(payload)
@@ -981,8 +983,8 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
             "seconds_per_audited_frame": elapsed / max(1, len(saved.qpos)),
         },
     }
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, indent=2, sort_keys=True, allow_nan=False) + "\n")
+    from scripts.training_collision_output import write_report
+    write_report(args.output, report)
     return report
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -991,7 +993,7 @@ def main() -> None:
     parser.add_argument("--objects", type=Path, required=True)
     parser.add_argument("--scene-metrics", type=Path)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=min(8, available_cpus()))
     report = audit(parser.parse_args())
     print("SAVED", report["inputs"]["motion"], report["geometry_status"], report["acceptance_status"])
 if __name__ == "__main__":

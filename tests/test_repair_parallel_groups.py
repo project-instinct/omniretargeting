@@ -1,7 +1,6 @@
 """Disjoint CPU proposal footprints retain ordered, exact parent checks."""
 from contextlib import closing
 from copy import deepcopy
-from dataclasses import replace
 import os
 
 import numpy as np
@@ -10,12 +9,11 @@ import pytest
 from omniretargeting._fast import mesh_repair, repair_parallel_groups as parallel, repair_proposals
 from omniretargeting._fast.repair_parallel_scope import Footprint, certificate, footprint
 from omniretargeting._fast.repair_schedule import RepairSchedule
-from omniretargeting._fast.runtime_options import RuntimeOptions
 from tests.test_repair_proposals import _problem
 
 
 def test_default_off_and_worker_limit():
-    assert RuntimeOptions().repair_parallel_groups is True
+    pass
     assert parallel.MAX_WORKERS == 8
 
 
@@ -90,12 +88,6 @@ def test_unrelated_frame_commit_and_anchor_transition_survive(monkeypatch):
     assert certificate(limits, poses, measured, protected, None, .01, scope) == initial
 
 
-@pytest.mark.parametrize('option', ['witness_memory', 'repair_aggregate'])
-def test_global_contract_falls_back_without_forking(monkeypatch, option):
-    limits, geometry, poses, measured, protected, group = _problem(monkeypatch)
-    monkeypatch.setattr(parallel, 'OPTIONS', replace(parallel.OPTIONS, **{option: True}))
-    pool = parallel.ParallelGroups(limits, geometry, count=2)
-    assert not pool.workers and not pool.capacity and pool.stats['disabled_reason']
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='requires fork')
@@ -159,8 +151,7 @@ def test_complete_parallel_switch_retains_exact_parent_acceptance(monkeypatch):
     from tests.test_fast_backend import _objective
     from tests.test_fast_mesh_repair import _open_object
     def run(enabled):
-        monkeypatch.setattr(mesh_repair, 'OPTIONS', replace(mesh_repair.OPTIONS,
-                                                         repair_parallel_groups=enabled))
+        pass
         objective, poses, _ = _objective(temporal=True)
         return mesh_repair.repair_original_meshes(objective, poses, [_open_object(objective, poses)])
     baseline, off = run(False)
@@ -181,7 +172,7 @@ def test_pre_dispatch_fast_gate_is_cached_and_launches_nothing(monkeypatch):
     def forbidden(*args):
         raise AssertionError('Gated head must build neither workers nor a QP')
     for module in (parallel, repair_proposals):
-        monkeypatch.setattr(module, 'OPTIONS', replace(module.OPTIONS, repair_fast_gate=True))
+        pass
     monkeypatch.setattr(repair_proposals, 'gate_predictions', gates)
     monkeypatch.setattr(parallel.ParallelGroups, '_dispatch', forbidden)
     monkeypatch.setattr(mesh_repair, '_qp_step', forbidden)

@@ -1,6 +1,5 @@
 """Restore curved IK constraints without changing a reference or allowance."""
 
-import re
 
 import cvxpy as cp
 import numpy as np
@@ -9,8 +8,6 @@ from cvxpy.reductions.solvers.conic_solvers.clarabel_conif import CLARABEL
 
 from .._sequence.restoration import RESTORATION_ITERATIONS
 from ..conic_solver import RETRY_TOLERANCE, solve_conic
-from .runtime_options import OPTIONS
-from .window_qp import WINDOW_FRAMES, solve_standard
 
 
 def _selected_rows(projection):
@@ -110,31 +107,6 @@ def _solve_restoration(program):
     return None, cp.SOLVER_ERROR
 
 
-def _solve_windowed(program, frames):
-    """Temporal block-coordinate solve of the direct program (``window_qp``), or None.
-
-    Variables are frame-major; the trajectory-wide trust cone enters every
-    window whole, with the other windows' fixed part on its right-hand side.
-    """
-    import clarabel
-
-    quadratic, linear, matrix, offset, cones = program
-    variables = len(linear)
-    if variables % frames:
-        return None
-    sizes = [int(re.match(r"\w+\((\d+)\)", str(cone)).group(1)) for cone in cones]
-    kinds = [str(cone).split("(")[0] for cone in cones]
-    nonneg = sizes[0] if kinds and kinds[0].startswith("Nonnegative") else 0
-    soc = sizes[1:] if nonneg else sizes
-
-    def settings():
-        value = clarabel.DefaultSettings()
-        value.verbose = False
-        value.direct_solve_method = "qdldl"
-        return value
-
-    return solve_standard(quadratic, linear, matrix, offset, nonneg, soc,
-                          np.arange(variables) // (variables // frames), frames, settings=settings)
 
 
 def _cvxpy_restoration_problem(bounds, projection, movement, radius):
@@ -236,9 +208,6 @@ def restore_repair(
     budgets = np.array(
         [baseline["depths"].get(key, 0.0) for key, _ in measurement["rows"]]
     )
-    if OPTIONS.abl_repair_ratchet:
-        from .repair_ablation import collision_budgets
-        budgets = collision_budgets(limits.objective, measurement, baseline)
     for iteration in range(RESTORATION_ITERATIONS):
         if limits.check(candidate)[0]:
             return candidate, {"status": "restored", "iterations": iteration}
@@ -251,18 +220,7 @@ def restore_repair(
         movement = (
             candidate[:, limits.coords.qi] - original_proposal[:, limits.coords.qi]
         ).ravel()
-        if OPTIONS.direct_repair_restoration:
-            program = _restoration_program(bounds, projection, movement, radius)
-            delta, status = None, None
-            if OPTIONS.window_qp and limits.frames >= 2 * WINDOW_FRAMES:
-                delta = _solve_windowed(program, limits.frames)
-                status = cp.OPTIMAL
-            if delta is None:
-                delta, status = _solve_restoration(program)
-        elif OPTIONS.repair_working_set:
-            delta, status = _solve_working_set_restoration(bounds, projection, movement, radius)
-        else:
-            delta, status = _solve_cvxpy_restoration(bounds, projection, movement, radius)
+        delta, status = _solve_working_set_restoration(bounds, projection, movement, radius)
         if delta is None:
             return None, {"status": str(status), "iterations": iteration}
         step = np.asarray(projection @ delta).reshape(limits.frames, limits.width)

@@ -70,9 +70,6 @@ def local_limits(limits, frame, stop=None, *, temporal=False):
         setattr(result, name, getattr(limits, name)[part])
     for name in ('anchors', 'original_anchors', 'targets', 'target_budgets', 'tracking_budgets'):
         setattr(result, name, [value[part] for value in getattr(limits, name)])
-    if getattr(limits, 'ablate_contacts', False):
-        result.contact_planes = tuple(tuple(value[part] for value in plane)
-                                      for plane in limits.contact_planes)
     from .repair_gate_temporal import differences
     result.differences = differences(limits, part) if temporal else []
     result.support_continuity = SimpleNamespace(add=lambda *args: None)

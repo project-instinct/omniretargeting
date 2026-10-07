@@ -1,7 +1,6 @@
 """Physical acquisition distances, fixed eligibility and conservative reuse."""
 
 from copy import copy
-from dataclasses import replace
 from pathlib import Path
 
 import mujoco
@@ -11,7 +10,6 @@ import pytest
 from omniretargeting._fast.batched_self_collision import BatchedSelfCollision
 from omniretargeting._fast.fast_self_collision import FastSelfCollision, acquisition_self_collision
 from omniretargeting._fast.kinematics import TrajectoryKinematics
-from omniretargeting._fast import runtime_options
 from omniretargeting.geometry_query import GeometryQueryError
 from omniretargeting.self_collision import SelfCollisionQuery
 from tests.test_convex_mesh_distance import mesh_pair
@@ -173,32 +171,11 @@ def test_primitive_touch_retains_original_contact_normal_path():
     np.testing.assert_allclose(actual[0][0]['direction'], expected[0]['direction'])
 
 
-def test_default_off_selects_original_rows_and_window_cache(monkeypatch):
-    from tests.test_fast_backend import _objective
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, fast_self_collision=False))
-    assert runtime_options.RuntimeOptions().fast_self_collision
-    model = mesh_pair()
-    query = SelfCollisionQuery(model)
-    chosen = acquisition_self_collision(query)
-    assert type(chosen) is BatchedSelfCollision
-    poses = model.qpos0[None]
-    actual, unknown = evaluate(chosen, poses, True, .002)
-    expected, failures = evaluate(BatchedSelfCollision(query, workers=1), poses, True, .002)
-    assert unknown == failures
-    for a, b in zip(actual[0], expected[0]):
-        for key in a:
-            np.testing.assert_array_equal(a[key], b[key])
-    obj, _, _ = _objective(temporal=True, extra=True)
-    obj.self_collision = SelfCollisionQuery(obj.model)
-    obj.evaluation_backend = 'cpu'
-    obj.prepare_window_evaluation()
-    assert type(obj._window_collision_template) is BatchedSelfCollision
-    assert obj._window_self_cache is not None
 
 
 def test_enabled_band_is_window_only_including_same_size_chunks(monkeypatch):
     from tests.test_fast_backend import _objective
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, fast_self_collision=True))
+    pass
     obj, poses, _ = _objective(temporal=True, extra=True)
     obj.self_collision = SelfCollisionQuery(obj.model)
     obj.evaluation_backend = 'cpu'
@@ -216,26 +193,6 @@ def test_enabled_band_is_window_only_including_same_size_chunks(monkeypatch):
     assert type(acquisition_self_collision(obj.self_collision, window=True)) is FastSelfCollision
 
 
-@pytest.mark.parametrize('jacobian', [False, True])
-def test_whole_trajectory_band_switch_keeps_cost_and_normal_equations(monkeypatch, jacobian):
-    from tests.test_fast_backend import _objective
-    obj, poses, _ = _objective(temporal=True, extra=True)
-    obj.self_collision = SelfCollisionQuery(obj.model)
-    obj.evaluation_backend = 'cpu'
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, fast_self_collision=False))
-    before = obj.evaluate(poses, jacobian)
-    obj.__dict__.pop('_self_batch')
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, fast_self_collision=True))
-    after = obj.evaluate(poses, jacobian)
-    assert type(obj._self_batch) is BatchedSelfCollision
-    assert before[0].cost == after[0].cost
-    for name in ('frame_cost', 'gradient', 'hessian') if jacobian else ('frame_cost',):
-        np.testing.assert_array_equal(getattr(before[0], name), getattr(after[0], name))
-    np.testing.assert_array_equal(before[1], after[1])
-    if jacobian:
-        for name in ('data', 'indices', 'indptr'):
-            np.testing.assert_array_equal(getattr(before[2], name), getattr(after[2], name))
-    assert before[3] == after[3]
 
 
 def test_saved_g1_poses_preserve_all_penetrations_and_physical_active_pair_set():

@@ -34,8 +34,7 @@ def acquisition_self_collision(query, workers=1, *, window=False):
     Whole-trajectory chunks retain the original rows; their native batch
     routine is faster than screening the band one frame at a time.
     """
-    from .runtime_options import OPTIONS
-    if window and OPTIONS.fast_self_collision:
+    if window:
         return FastSelfCollision(query, workers)
     from .batched_self_collision import BatchedSelfCollision
     return BatchedSelfCollision(query, workers)

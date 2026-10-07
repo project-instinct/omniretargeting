@@ -17,15 +17,14 @@ def _content(value):
 
 
 def _signature(geometry, key, witness, fast):
-    if fast:
-        if key[1] != 'self':
-            # These are every witness field read by the MuJoCo Jacobian below.
-            return key, ('point', witness['geom_id'], _content(witness['point']),
-                         _content(witness['direction']))
-        from ..self_collision import SelfCollisionQuery
-        if getattr(geometry.self_query.jacobian, '__func__', None) is SelfCollisionQuery.jacobian:
-            return key, ('self', _content(witness['body_ids']), _content(witness['points']),
-                         _content(witness['direction']))
+    if key[1] != 'self':
+        # These are every witness field read by the MuJoCo Jacobian below.
+        return key, ('point', witness['geom_id'], _content(witness['point']),
+                     _content(witness['direction']))
+    from ..self_collision import SelfCollisionQuery
+    if getattr(geometry.self_query.jacobian, '__func__', None) is SelfCollisionQuery.jacobian:
+        return key, ('self', _content(witness['body_ids']), _content(witness['points']),
+                     _content(witness['direction']))
     return key, _content(witness)
 
 
@@ -45,8 +44,6 @@ def _frame_cache(geometry, frame, pose):
 
 
 def remember(geometry, poses, parts):
-    from .repair_frame_norm import enabled
-    fast = enabled()
     for part in parts:
         for frame, rows, _, _ in part["frames"]:
             if frame == part["rejection"]:
@@ -58,19 +55,17 @@ def remember(geometry, poses, parts):
                     continue
                 if cache is None:
                     cache = _frame_cache(geometry, frame, poses[frame])
-                cache[_signature(geometry, key, row, fast)] = np.array(jac, copy=True)
+                cache[_signature(geometry, key, row, True)] = np.array(jac, copy=True)
 
 
 def linearize(geometry, poses, measurement):
-    from .repair_frame_norm import enabled
-    fast = enabled()
     rows, frame, ready = [], None, False
     reused = computed = 0
     for key, witness in measurement["rows"]:
         if key[0] != frame:
             frame, ready = key[0], False
             cache = _frame_cache(geometry, frame, poses[frame])
-        signature = _signature(geometry, key, witness, fast)
+        signature = _signature(geometry, key, witness, True)
         jacobian = cache.get(signature)
         if jacobian is None:
             if not ready:

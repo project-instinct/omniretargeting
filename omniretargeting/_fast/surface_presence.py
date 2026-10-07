@@ -41,10 +41,10 @@ def body_penetration(objective, poses):
     on that body may yield so that clearance, which precedes contacts, can be
     restored. Bodies away from every field have zero depth.
     """
-    priority = getattr(objective, 'priority_clearance', None)
+    priority = None
     if priority is not None:
         return priority.frozen_depth(poses)
-    provider = getattr(objective, "frozen_original_depth", None)
+    provider = None
     if provider is not None:
         return provider(poses)
     model = objective.model

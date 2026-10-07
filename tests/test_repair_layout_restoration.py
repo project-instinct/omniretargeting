@@ -5,7 +5,6 @@ from scipy import sparse
 from omniretargeting._fast.objective import FastObjective
 from omniretargeting._fast.reference import ReferenceShape
 from omniretargeting._fast.repair_limits import RepairLimits
-from omniretargeting._fast.repair_restoration import restore_repair
 from omniretargeting.sequence_retargeting import prepare_sequence, sequence_config
 
 

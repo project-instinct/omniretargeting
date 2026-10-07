@@ -51,8 +51,7 @@ class TrajectoryKinematics:
         model, data = self.model, self.data
         poses = np.asarray(poses)
         if native is None:
-            from .guard_acceleration import enabled
-            native = enabled() and len(poses) >= 64
+            native = len(poses) >= 64
         key = (self.columns.tobytes(), poses.shape, poses.dtype.str, poses.tobytes())
         previous = self.cache.get(key)
         if previous is not None and (not with_jacobian or 'jacp' in previous):
@@ -119,9 +118,8 @@ class TrajectoryKinematics:
         Returns (frames, k, 3, width).
         """
         bodies = np.asarray(bodies, dtype=int)
-        from .guard_acceleration import enabled
 
-        if (enabled() and self.jacp.shape[-1] and np.asarray(points).dtype == np.float64
+        if (self.jacp.shape[-1] and np.asarray(points).dtype == np.float64
                 and bodies.ndim in (1, 2) and np.all((bodies >= 0) & (bodies < self.model.nbody))):
             from .batched_self_collision import NativeUnavailable
             from .native_point_rows import NativePointRows

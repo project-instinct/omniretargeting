@@ -161,35 +161,6 @@ def test_pair_reuse_with_changed_third_geom_and_threshold_invalidation():
     _assert_rows(query, poses, *result)
 
 
-def test_certified_gpu_seeds_preserve_recentered_support_choices_and_ties():
-    torch = pytest.importorskip('torch')
-    if not torch.cuda.is_available():
-        pytest.skip('CUDA unavailable')
-    from omniretargeting._fast.gpu_self_seeds import GPUSelfSeeds
-
-    model = mesh_pair()
-    query = SelfCollisionQuery(model)
-    poses = _poses(model)
-    kin = TrajectoryKinematics(model, np.arange(model.nv)).evaluate(poses)
-    batch = _batch(query)
-    provider = GPUSelfSeeds()
-    choices, reliable = provider(batch, kin)
-    assert reliable.any()
-    batch.seed_provider = provider
-    _assert_rows(query, poses, *batch.rows(poses, kin, True))
-
-    # Uncertified choices are ignored, even when the supplied indices would
-    # select a different vertex. The original recentered CPU path resolves
-    # all exact ties and small margins.
-    class UncertifiedSeeds:
-        pid = provider.pid
-
-        def __call__(self, batch, kin):
-            return np.zeros_like(choices), np.zeros_like(reliable)
-
-    batch = _batch(query)
-    batch.seed_provider = UncertifiedSeeds()
-    _assert_rows(query, poses, *batch.rows(poses, kin, True))
 
 
 def test_native_failure_keeps_unknown_frames_and_exact_python_fallback(monkeypatch):

@@ -107,6 +107,8 @@ class FrameTerms:
             rows[full, :3] = error[full] / cfg["contact_sigma_m"]
             rows[surface, 0] = normal_error[surface] / cfg["contact_normal_sigma_m"]
             rows[surface, 1:] = tangent[surface] / cfg["contact_tangent_sigma_m"]
+            if 'origin_body' in eff:
+                rows[surface, 1:] = 0.
             # Free targets: world, or around the robot root with morphology
             # scale; approach hands the target over to the contact anchor.
             target = np.where(
@@ -114,6 +116,10 @@ class FrameTerms:
                 eff["tracking"],
                 root_point + eff["scale"] * (eff["tracking"] - roots),
             )
+            target_jac = root_jac
+            if 'origin_body' in eff:
+                target = kin.xpos[:, eff['origin_body']] + eff['relative_target']
+                target_jac = kin.jacp[:, eff['origin_body']] if acc.jacobian else None
             target = target + eff["share"][:, None] * (eff["approach"] - target)
             free_share = 1.0 - eff["share"]
             sigma = np.where(eff["world"], cfg["world_tracking_sigma_m"], cfg["free_tracking_sigma_m"])
@@ -126,7 +132,9 @@ class FrameTerms:
                 jac_rows[surface, 0] = n_jac[surface] / cfg["contact_normal_sigma_m"]
                 t_jac = jac - normal[:, :, None] * n_jac[:, None, :]
                 jac_rows[surface, 1:] = t_jac[surface] / cfg["contact_tangent_sigma_m"]
-                moving = np.where(eff["world"], 0.0, free_share)[:, None, None] * root_jac
+                if 'origin_body' in eff:
+                    jac_rows[surface, 1:] = 0.
+                moving = np.where(eff["world"], 0.0, free_share)[:, None, None] * target_jac
                 jac_rows[free, :3] = ((jac - moving) / sigma[:, None, None])[free]
                 jac_rows *= role[:, :, None]
             acc.add(rows * role, jac_rows)
@@ -169,9 +177,17 @@ class FrameTerms:
             axes = _point_rows(np.broadcast_to(units, (*lever.shape[:2], 3, 3)), lever[..., None, :])
             bodies = np.repeat(surf["bodies"], 3)
             scale = surf["scale"][..., None]
+            base_error, base_axes = error, axes
+            if 'normal_only' in surf:
+                normals = surf['normals']
+                projection = normals[..., :, None] * normals[..., None, :]
+                base_error = np.where(surf['normal_only'][..., None],
+                    np.einsum('fsij,fsj->fsi', projection, error), error)
+                base_axes = np.where(surf['normal_only'][..., None, None],
+                    np.einsum('fsij,fsjk->fsik', projection, axes), axes)
             acc.add_body_rows(
-                (error * scale).reshape(self.frames, -1),
-                (axes * scale[..., None]).reshape(self.frames, -1, 6),
+                (base_error * scale).reshape(self.frames, -1),
+                (base_axes * scale[..., None]).reshape(self.frames, -1, 6),
                 bodies, kin,
             )
             # Priority rows: full vector for sticking samples, normal distance
@@ -338,9 +354,6 @@ class FrameTerms:
         reduced afterwards with contacts held, and contacts on a penetrating
         body may yield by its depth (``surface_presence.body_penetration``).
         """
-        from .window_tracking import skips_proxy_collision
-        if skips_proxy_collision(self):
-            return
         if self.scene_sdf is None and not self.objects:
             return
         kin, cfg = self.kin, self.cfg
@@ -348,8 +361,6 @@ class FrameTerms:
         bodies = self.model.geom_bodyid[geoms]
         target = cfg["scene_clearance_m"]
         sigma = cfg["collision_sigma_m"] * self.clearance_scale
-        original = getattr(self, "original_clearance", None)
-        measured = {} if original is None else original.evaluate(poses, getattr(self, "frame_slice", slice(0, self.frames)).start)
         for field, (key, sdf, rotation, translation, scales) in enumerate(self._clearance_fields()):
             clearance, frame_index, geom_index, points, field_points = self._deepest_samples(
                 sdf, rotation, translation, scales
@@ -370,10 +381,6 @@ class FrameTerms:
                 if rotation is not None:
                     gradient = np.einsum("nij,nj->ni", rotation[frame_index], gradient)
                 rows[frame_index, geom_index] = _point_rows(gradient, lever)
-            if measured:
-                from .original_clearance import replace_deeper_original
-                replace_deeper_original(field, geoms, measured, clearance, deficit, rows, kin, bodies, target)
-                stats[key] = max(stats.get(key, 0.), float(-deficit.min(initial=0.) - target))
             acc.add_body_rows(deficit / sigma, rows * ((deficit < 0) / sigma)[..., None], bodies, kin)
 
     def _self_collision_terms(self, poses, acc, stats):
@@ -385,9 +392,6 @@ class FrameTerms:
         accelerator screens a physical band before the original mesh hinge;
         repair stays authoritative.
         """
-        from .window_tracking import skips_proxy_collision
-        if skips_proxy_collision(self):
-            return
         query = getattr(self, "self_collision", None)
         if query is None:
             return
@@ -398,7 +402,7 @@ class FrameTerms:
         unknown = 0
         batch = None
         if getattr(self, 'evaluation_backend', 'legacy') != 'legacy':
-            from .batched_self_collision import BatchedSelfCollision, NativeUnavailable
+            from .batched_self_collision import NativeUnavailable
             if not hasattr(self, '_self_batch'):
                 import multiprocessing
                 workers = 1 if multiprocessing.current_process().daemon else 12
@@ -492,6 +496,3 @@ class FrameTerms:
             rows, jac = guard.hinge_rows(self.kin, frames, self.envelope_weight, ENVELOPE_SIGMA, acc.jacobian)
             if rows is not None:
                 acc.add(rows, jac)
-        if getattr(self, '_soft_bulk_layouts', ()):
-            from .soft_frame_rows import add_layout
-            add_layout(self, acc, stats)

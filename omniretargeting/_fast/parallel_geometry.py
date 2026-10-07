@@ -25,7 +25,6 @@ WORKERS = max(1, min(16, 2 * available_cpus() // 3))
 # Frames differ greatly in cost. Unpinned workers let idle cores serve the
 # libigl threads of busy ones; pinning each worker to its own share measured
 # slower on a hybrid 8P+8E CPU (67 s vs 57-60 s of omomo_78 G1 measurement).
-PIN_WORKERS = False
 # Fewer frames per worker cost more in round trips than they save.
 MIN_FRAMES_PER_WORKER = 8
 # Recently rejecting frames visited first (a visiting order only).
@@ -52,7 +51,6 @@ def merge_frames(parts):
 
 def _serve(geometry, frames, cores, connection, stop):
     # libigl sizes its thread pools once per process, before this fork. With
-    # ``PIN_WORKERS`` each worker's threads stay on its own cores.
     if cores and hasattr(os, "sched_setaffinity"):
         os.sched_setaffinity(0, cores)
     own = set(frames)
@@ -93,22 +91,11 @@ def _serve(geometry, frames, cores, connection, stop):
         protected = decode_protected(geometry, protected)
         visit = frames if order is None else [frame for frame in order if frame in own]
         try:
-            if moving and moving[0] is not None:
-                from .gpu_geometry import MovingForwardCache
-                if not isinstance(geometry.moving.forward_cache, MovingForwardCache):
-                    geometry.moving.forward_cache = MovingForwardCache()
-                geometry.moving.forward_cache.update(moving[0])
-            if (static_updates is not None and protected is not None
-                    and os.environ.get("OMNIRETARGETING_GPU_GEOMETRY_LAZY_STATIC", "0") != "0"):
-                from .gpu_geometry import measure_lazy_static
-                part, static_updates = measure_lazy_static(
-                    geometry, poses, visit, static_updates, jacobians, protected, stop)
-            else:
-                if static_updates is not None:
-                    from .gpu_geometry import complete_static
-                    complete_static(geometry, static_updates)
-                part = geometry.measure_frames(poses, visit, jacobians=jacobians,
-                                               protected_depths=protected, stop=stop)
+            if static_updates is not None:
+                from .gpu_geometry import complete_static
+                complete_static(geometry, static_updates)
+            part = geometry.measure_frames(poses, visit, jacobians=jacobians,
+                                           protected_depths=protected, stop=stop)
             if static_updates is not None:
                 part["_static_updates"] = [(u[0], geometry._static_cache[u[0]]) for u in static_updates]
                 part["_static_seconds"] = geometry.gpu_exact_seconds
@@ -135,17 +122,14 @@ class ParallelMeasure:
         if count < 2 or not hasattr(os, "fork"):
             return
         context = multiprocessing.get_context("fork")
-        from .repair_frame_norm import enabled
-        if enabled():
-            from .repair_transport import prepare
-            prepare(geometry, context, self.frames)
+        from .repair_transport import prepare
+        prepare(geometry, context, self.frames)
         # First rejected frame found by any worker; -1 while none is known.
         self.stop = context.RawValue("i", -1)
         available = sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else []
         share = max(1, len(available) // count)
         for index in range(count):
-            cores = (set(available[index * share:(index + 1) * share]) or set(available[index::count])
-                     if PIN_WORKERS else set())
+            cores = set()
             parent, child = context.Pipe()
             process = context.Process(target=_serve, daemon=True,
                                       args=(geometry, range(index, self.frames, count), cores, child, self.stop))
@@ -177,9 +161,8 @@ class ParallelMeasure:
 
     def prefetch_self(self, poses):
         """Overlap exact self-pair cache filling with parent GPU scene screening."""
-        from .repair_frame_norm import enabled
         value = np.asarray(poses)
-        if enabled() and not self.prefetched:
+        if not self.prefetched:
             from .repair_transport import pose_message
             value = pose_message(self.geometry, value)
         for _, connection in self.workers:
@@ -247,9 +230,8 @@ class ParallelMeasure:
             for update in moving_updates:
                 moving[update[0] % count].append(update)
 
-        from .repair_frame_norm import enabled
         pose_payload, protected_payload = poses, protected_depths
-        if enabled() and hasattr(self.geometry, '_repair_pose_view'):
+        if hasattr(self.geometry, '_repair_pose_view'):
             from .repair_transport import pose_message, protected_message
             # Streaming may deliberately retain an unfinished self prefetch.
             # Its shared snapshot must survive until the acknowledgements are

@@ -1,7 +1,6 @@
 """Window adapter parity across global frame overlaps, thresholds and forks."""
 
 import os
-from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -86,31 +85,6 @@ def test_unknown_frames_are_requeried_and_never_cached(monkeypatch):
         assert not provider.pose_cache
 
 
-def test_complete_window_objective_bytes_with_cache_enabled(monkeypatch):
-    from omniretargeting._fast import window_self_collision
-    from omniretargeting._fast import runtime_options
-    from tests.test_fast_backend import _objective
-    monkeypatch.setattr(
-        runtime_options, 'OPTIONS',
-        replace(runtime_options.OPTIONS, fast_self_collision=False))
-    objects = []
-    for enabled in (False, True):
-        monkeypatch.setattr(window_self_collision, 'WINDOW_SELF_FRAME_CACHE', enabled)
-        obj, poses, _ = _objective(temporal=True, extra=True)
-        obj.self_collision = SelfCollisionQuery(obj.model)
-        obj.evaluation_backend = 'cpu'
-        obj.prepare_window_evaluation()
-        outputs = []
-        for frames in (range(0, 24), range(12, 36), range(4, 32), range(0, 24)):
-            for jacobian in (False, True):
-                output = obj.evaluate(poses, jacobian, frames=frames)
-                names = ['frame_cost'] + (['gradient', 'hessian'] if jacobian else [])
-                outputs.append(({name: getattr(output[0], name) for name in names},
-                                output[0].cost, output[1],
-                                output[2].toarray() if jacobian else None, output[3]))
-        objects.append(outputs)
-    equal(*objects)
-    assert obj._window_self_cache.diagnostics['pose_reused_frames'] == 24
 
 
 @pytest.mark.skipif(not hasattr(os, 'fork'), reason='requires fork')

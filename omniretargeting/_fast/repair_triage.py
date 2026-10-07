@@ -9,7 +9,6 @@ import numpy as np
 
 from . import repair_prediction
 from .repair_frames import restrict
-from .runtime_options import OPTIONS
 
 
 def progress_bound(limits, poses, geometry, measurement, depth):
@@ -21,9 +20,6 @@ def progress_bound(limits, poses, geometry, measurement, depth):
     Include the QP's box tolerance and outward arithmetic padding. Non-selector
     projections, incomplete evidence and nonfinite data cannot certify a skip.
     """
-    if OPTIONS.abl_repair_ratchet:
-        # The dual certificate below assumes the legacy per-key feasible set.
-        return None
     from .mesh_repair import _joint_projection
     projection = restrict(_joint_projection(limits, geometry.model, measurement), limits.frame_mask)
     if not projection.shape[1]:
@@ -107,7 +103,7 @@ def progress_bound(limits, poses, geometry, measurement, depth):
 
 def certificate(limits, poses, geometry, measurement, depth):
     """Only opt-in, strict certificates under the established predictive gate."""
-    if not getattr(OPTIONS, "repair_triage", False) or not repair_prediction.PREDICTIVE_GATING:
+    if not repair_prediction.PREDICTIVE_GATING:
         return None
     from .mesh_repair import MIN_GROUP_PROGRESS_M
     if MIN_GROUP_PROGRESS_M <= 0:

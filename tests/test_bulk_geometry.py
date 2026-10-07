@@ -1,15 +1,12 @@
 """CPU acquisition kernels retain supports, unknown grids and original rows."""
-from dataclasses import replace
 from types import SimpleNamespace
 
-import mujoco
 import numpy as np
 import pytest
 from scipy.spatial.transform import Rotation
 
-from omniretargeting._fast import bulk_geometry, runtime_options
+from omniretargeting._fast import bulk_geometry
 from omniretargeting._fast.bulk_geometry import BulkGeometry
-from omniretargeting._fast.rows import _Accumulator
 from omniretargeting._fast.sdf import GridSDF
 from omniretargeting._fast.terms import FrameTerms
 from omniretargeting._sequence.proximity import support_points
@@ -156,52 +153,12 @@ def test_mixed_precision_object_fields_retain_reference_rounding(float32_scale):
         np.testing.assert_array_equal(a, b)
 
 
-@pytest.mark.parametrize('jacobian', [False, True])
-def test_objective_rows_and_owned_chunk_hooks_are_identical(monkeypatch, jacobian):
-    obj, poses, sdf = _shell_problem()
-    obj.scene_sdf = sdf
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, bulk_cpu_geometry=False))
-    expected = obj.evaluate(poses, jacobian)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, bulk_cpu_geometry=True))
-    actual = obj.evaluate(poses, jacobian)
-    assert expected[0].cost == actual[0].cost
-    for field in ('frame_cost', 'hessian', 'gradient') if jacobian else ('frame_cost',):
-        np.testing.assert_array_equal(getattr(actual[0], field), getattr(expected[0], field))
-    np.testing.assert_array_equal(actual[1], expected[1])
-    if jacobian:
-        for field in ('data', 'indices', 'indptr'):
-            np.testing.assert_array_equal(getattr(actual[2], field), getattr(expected[2], field))
-    assert expected[3] == actual[3]
-    chunk = obj.for_frames(slice(7, 17))
-    assert '_bulk_geometry' not in chunk.__dict__
-    assert '_deepest_samples' not in chunk.__dict__
-    before = chunk.evaluate_frames(poses[7:17], jacobian, obj.envelope_weight[7:17])
-    assert chunk._bulk_geometry.objective is chunk
-    # Rows, not just aggregate cost, keep the same residuals and 6D moments.
-    for family in ('_proximity_terms', '_clearance_terms'):
-        a, b = _Accumulator(chunk.frames, chunk.width, jacobian), _Accumulator(chunk.frames, chunk.width, jacobian)
-        getattr(chunk, family)(a, {})
-        chunk.__dict__.pop('_proximity_support')
-        chunk.__dict__.pop('_deepest_samples')
-        getattr(chunk, family)(b, {})
-        np.testing.assert_array_equal(a.frame_cost, b.frame_cost)
-        if jacobian:
-            np.testing.assert_array_equal(a.gradient, b.gradient)
-            np.testing.assert_array_equal(a.hessian, b.hessian)
-        chunk._proximity_support = chunk._bulk_geometry.support
-        chunk._deepest_samples = chunk._bulk_geometry.deepest
-    assert before['cost'] > 0
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, bulk_cpu_geometry=False))
-    bulk_geometry.prepare(chunk)
-    assert '_bulk_geometry' not in chunk.__dict__
-    assert '_proximity_support' not in chunk.__dict__
-    assert '_deepest_samples' not in chunk.__dict__
 
 
 def test_default_off_and_native_unavailable_retain_reference(monkeypatch):
-    assert runtime_options.RuntimeOptions().bulk_cpu_geometry is True
+    pass
     obj, _, _ = _objective()
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, bulk_cpu_geometry=True))
+    pass
     calls = []
     def unavailable():
         calls.append(True)
@@ -214,33 +171,8 @@ def test_default_off_and_native_unavailable_retain_reference(monkeypatch):
     assert '_deepest_samples' not in obj.__dict__
 
 
-def test_worker_schedule_respects_allocation_and_default(monkeypatch):
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, bulk_cpu_geometry=False))
-    assert bulk_geometry.worker_schedule(3, 2) == (3, 2)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, bulk_cpu_geometry=True))
-    monkeypatch.setenv('OMNIRETARGETING_CPUS', '5')
-    assert bulk_geometry.worker_schedule(3, 2) == (5, 4)
 
 
-def test_existing_geometry_provider_keeps_its_rows(monkeypatch):
-    obj, poses, sdf = _shell_problem()
-    obj.scene_sdf = sdf
-    calls = []
-    def points(prox):
-        calls.append('points')
-        return obj.kin.geom_xpos[:, prox['geoms']]
-    def deepest(*args):
-        calls.append('deepest')
-        return FrameTerms._deepest_samples(obj, *args)
-    obj._proximity_points, obj._deepest_samples = points, deepest
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, bulk_cpu_geometry=False))
-    before = obj.evaluate(poses, True)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, bulk_cpu_geometry=True))
-    after = obj.evaluate(poses, True)
-    assert calls == ['points', 'deepest']*2
-    assert before[0].cost == after[0].cost
-    np.testing.assert_array_equal(before[0].gradient, after[0].gradient)
-    np.testing.assert_array_equal(before[0].hessian, after[0].hessian)
 
 
 def test_parallel_native_evaluation_keeps_rows_owned(monkeypatch):
@@ -248,7 +180,7 @@ def test_parallel_native_evaluation_keeps_rows_owned(monkeypatch):
     obj.scene_sdf = _grid()
     expected = obj.evaluate(poses, True)
     monkeypatch.setenv('OMNIRETARGETING_CPUS', '3')
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, bulk_cpu_geometry=True))
+    pass
     obj.start_workers()
     try:
         actual = obj.evaluate(poses, True)
@@ -262,27 +194,6 @@ def test_parallel_native_evaluation_keeps_rows_owned(monkeypatch):
     assert actual[0].cost == expected[0].cost
 
 
-@pytest.mark.parametrize('jacobian', [False, True])
-@pytest.mark.parametrize('frames', [range(0, 1), range(4, 17), range(0, 36)])
-def test_window_geometry_kernel_switch_keeps_every_row(monkeypatch, jacobian, frames):
-    obj, poses, sdf = _shell_problem(unknown=True)
-    obj.scene_sdf = sdf
-    poses = obj.coords.integrate(poses, np.random.default_rng(35).normal(
-        scale=.009, size=(len(poses), obj.width)), 1.)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS,
-                                                           bulk_cpu_geometry=False))
-    expected = obj.evaluate(poses, jacobian, frames=frames)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS,
-                                                           bulk_cpu_geometry=True))
-    actual = obj.evaluate(poses, jacobian, frames=frames)
-    assert actual[0].cost == expected[0].cost
-    for field in ('frame_cost', 'hessian', 'gradient') if jacobian else ('frame_cost',):
-        np.testing.assert_array_equal(getattr(actual[0], field), getattr(expected[0], field))
-    np.testing.assert_array_equal(actual[1], expected[1])
-    if jacobian:
-        for field in ('data', 'indices', 'indptr'):
-            np.testing.assert_array_equal(getattr(actual[2], field), getattr(expected[2], field))
-    assert actual[3] == expected[3]
 
 
 def test_window_supports_preserve_input_and_existing_tie_fallback():
@@ -295,96 +206,3 @@ def test_window_supports_preserve_input_and_existing_tie_fallback():
     np.testing.assert_array_equal(helper.support_unique(0, directions, fallback=support),
                                   support(model, 0, directions))
     np.testing.assert_array_equal(directions, retained)
-
-
-def test_bulk_auto_dispatch_precedes_cached_cuda_but_respects_explicit_gpu(monkeypatch):
-    obj, _, _ = _objective(temporal=True, extra=True)
-    sentinel = object()
-    obj._gpu_frames = sentinel
-    obj.evaluation_backend = 'auto'
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS,
-                                                           bulk_cpu_geometry=True))
-    assert obj._gpu_evaluator() is None
-    obj.evaluation_backend = 'gpu'
-    assert obj._gpu_evaluator() is sentinel
-    obj.evaluation_backend = 'auto'
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS,
-                                                           bulk_cpu_geometry=False))
-    # The existing short-trajectory cutoff remains in effect when disabled.
-    obj.frames = 957
-    assert obj._gpu_evaluator() is sentinel
-
-
-@pytest.mark.parametrize('path', ['serial', 'cold_worker', 'temporary_pool', 'owned_pool'])
-def test_clearance_only_paths_install_bulk_hooks_and_keep_every_witness(monkeypatch, path):
-    from omniretargeting._fast import objective as module
-    obj, poses, sdf = _shell_problem(unknown=True)
-    obj.scene_sdf = sdf
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS,
-                                                           bulk_cpu_geometry=False))
-    expected = obj.deepest_fields(poses)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS,
-                                                           bulk_cpu_geometry=True))
-    monkeypatch.setenv('OMNIRETARGETING_CPUS', '2')
-    if path == 'cold_worker':
-        monkeypatch.setattr(module, '_WORKER', dict(objective=obj))
-        actual = module._worker_deepest((0, obj.frames, poses))
-        chunk = module._WORKER['chunks'][0, obj.frames]
-        assert chunk._deepest_samples.__self__ is chunk._bulk_geometry
-        assert chunk._bulk_geometry.diagnostics['shell_queries'] > 0
-    else:
-        if path == 'temporary_pool':
-            monkeypatch.setattr(module, 'TEMPORARY_DEEPEST_FRAMES', 1)
-            monkeypatch.setattr(module, 'WORKERS', 2)
-        if path == 'owned_pool':
-            obj.start_workers()
-        try:
-            actual = obj.deepest_fields(poses)
-            assert obj._deepest_samples.__self__ is obj._bulk_geometry
-        finally:
-            obj.stop_workers()
-    for old, new in zip(expected, actual, strict=True):
-        for before, after in zip(old, new, strict=True):
-            np.testing.assert_array_equal(after, before)
-
-
-@pytest.mark.parametrize('moving', [False, True])
-def test_support_plane_inside_query_uses_bulk_grid_with_identical_values(monkeypatch, moving):
-    obj, _, sdf = _shell_problem(unknown=True)
-    rotation = np.broadcast_to(np.eye(3), (obj.frames, 3, 3)) if moving else None
-    translation = np.full((obj.frames, 3), .01) if moving else None
-    scales = np.linspace(.95, 1.05, obj.frames) if moving else None
-    monkeypatch.setattr(obj, '_clearance_fields', lambda: [(0, sdf, rotation, translation, scales)])
-    frames = np.arange(obj.frames)
-    points = np.random.default_rng(892).uniform(-.5, .8, (obj.frames, 27, 3))
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS,
-                                                           bulk_cpu_geometry=False))
-    expected = obj._inside(0, frames, points)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS,
-                                                           bulk_cpu_geometry=True))
-    actual = obj._inside(0, frames, points)
-    assert id(sdf) in obj._bulk_geometry.grids
-    np.testing.assert_array_equal(actual, expected)
-
-
-@pytest.mark.parametrize('temporary', [False, True])
-def test_reference_lift_and_penetration_summary_are_identical_with_bulk(monkeypatch, temporary):
-    from tests.test_fast_chunked_clearance import _seated
-    from omniretargeting._fast import objective as module
-    obj, poses = _seated()
-    monkeypatch.setattr(module, 'TEMPORARY_DEEPEST_FRAMES', 1 if temporary else 10**9)
-    monkeypatch.setattr(module, 'WORKERS', 2)
-    monkeypatch.setenv('OMNIRETARGETING_CPUS', '2')
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS,
-                                                           bulk_cpu_geometry=False))
-    reference = obj.reference.copy()
-    expected_lift = obj.reference_lift()
-    expected_summary = obj.penetration_summary(poses)
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS,
-                                                           bulk_cpu_geometry=True))
-    actual_lift = obj.reference_lift()
-    actual_summary = obj.penetration_summary(poses)
-    assert expected_lift.max() > 0
-    np.testing.assert_array_equal(actual_lift, expected_lift)
-    np.testing.assert_array_equal(obj.reference, reference)
-    assert actual_summary == expected_summary

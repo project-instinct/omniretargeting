@@ -17,11 +17,11 @@ from threadpoolctl import threadpool_limits
 
 from ..cpu_budget import available_cpus
 from .legacy_window_qp import commit_verdict, grid_depths, guard_failures, solve_local
-from .priority_merit import report_value
+from .report_values import report_value
 from .proposals import guards_of
 from .solver import CONVERGED_DECREASE, INITIAL_DAMPING
 from .window_driver import fork_status
-from .window_schedule import dependency_window, independent_batches, overlaps
+from .window_schedule import dependency_window, independent_batches
 
 CORE_FRAMES = 64
 HALO_FRAMES = 15
@@ -63,20 +63,8 @@ def windows(count, sweep, *, core=CORE_FRAMES, halo=HALO_FRAMES):
 def unsupported_reason(objective, poses=None, *, min_frames=0):
     """Why windows cannot replace this acquisition (the caller keeps the
     whole-trajectory optimizer), or None."""
-    from .runtime_options import OPTIONS
     if min_frames and objective.frames < min_frames:
         return f'clip shorter than {min_frames} frames: whole-trajectory optimizer is faster'
-    if getattr(objective, 'priority_clearance', None) is not None:
-        return 'legacy_windows requires the old objective without a priority coordinator'
-    # These experimental paths inspect concrete whole-trajectory guard types.
-    # Reject unsupported combinations rather than silently changing their math.
-    unsupported = [name for name in ('direct_acquisition_qp', 'objective_soc',
-                                    'frame_step_lengths', 'local_conic_restoration', 'window_qp')
-                   if getattr(OPTIONS, name)]
-    if unsupported:
-        return f'legacy_windows does not yet adapt these experiments: {unsupported}'
-    if getattr(objective, 'original_clearance', None) is not None:
-        return 'legacy_windows does not yet adapt OriginalClearance private query ownership'
     for guard in guards_of(objective)[1]:
         if not all(callable(getattr(guard, name, None)) for name in
                    ('qp_bounds', 'accepts', 'window_dependencies')):
@@ -108,7 +96,7 @@ def _private_worker(objective):
         objective._window_self_cache = self_cache.fork_private_client()
     # A frozen depth provider is normally never queried during acquisition.
     # If present, still detach its inherited query resources explicitly.
-    provider = getattr(objective, 'frozen_original_depth', None)
+    provider = None
     if provider is not None:
         from copy import copy
         private = copy(provider)
@@ -221,25 +209,17 @@ class WindowWorkers:
 
 @contextmanager
 def _workers(objective, count):
-    from .window_shell_service import WINDOW_GPU_SHELL, WindowShellService
-    from .window_eval_service import WINDOW_GPU_EVALUATION, WindowEvalService
     service, evaluation_service, workers = None, None, None
     try:
         from .window_restoration_parallel import WINDOW_PARALLEL_RESTORATIONS
         from .window_cpu_budget import WindowCpuBudget, native_workers
-        if count and not WINDOW_GPU_EVALUATION and not WINDOW_GPU_SHELL:
+        if count:
             if native_workers() > 1:
                 objective._window_cpu_budget = WindowCpuBudget(count)
             if WINDOW_PARALLEL_RESTORATIONS:
                 budget = getattr(objective, '_window_cpu_budget', None)
                 objective._window_restoration_permits = (budget.permits if budget is not None else
                     multiprocessing.get_context('fork').BoundedSemaphore(count))
-        if WINDOW_GPU_EVALUATION:
-            evaluation_service = WindowEvalService(objective)
-            objective._window_eval_client = evaluation_service.client()
-        elif WINDOW_GPU_SHELL:
-            service = WindowShellService(objective)
-            objective._window_shell_client = service.client()
         workers = WindowWorkers(objective, count)
         yield workers
     except BaseException:
@@ -507,19 +487,12 @@ def optimize_legacy_windows(objective, poses, *, iterations, callback=None,
     revisions = np.zeros(len(poses), np.int64)
     remaining, extra_started = int(iterations), None
     extra_remaining = MAX_EXTRA_WINDOW_ITERATIONS
-    from . import window_penetration_schedule as penetration_schedule
-    prioritize_penetration = penetration_schedule.WINDOW_PENETRATION_CONTINUATION
+    prioritize_penetration = False
     summary = dict(max_extra_sweeps=extra_sweeps,
                    extra_window_iteration_budget=MAX_EXTRA_WINDOW_ITERATIONS,
                    extra_window_iterations_reserved=0, extra_window_iterations_completed=0,
                    extra_sweeps=0, grid_seconds=0., grid_scope='acquisition static/moving SDF shell samples',
                    worker_ceiling=ceiling, stop_reason='extra_sweep_cap')
-    if prioritize_penetration:
-        summary.update(continuation_policy='penetration_priority',
-                       extra_window_iteration_budget=MAX_EXTRA_WINDOW_ITERATIONS * extra_sweeps,
-                       round_window_iteration_budget=MAX_EXTRA_WINDOW_ITERATIONS,
-                       self_signal_scope='legacy self witnesses at current poses',
-                       priority_selection=[])
     setup_seconds = time.monotonic() - started
     with _workers(objective, count) as workers:
         for sweep in range(len(sweeps) + (extra_sweeps if focus is None else 0)):
@@ -535,8 +508,7 @@ def optimize_legacy_windows(objective, poses, *, iterations, callback=None,
                     extra_started = time.monotonic()
                 tick = time.monotonic()
                 depths, families = grid_depths(objective, current)
-                self_values, self_unknown = (penetration_schedule.self_depths(objective, current)
-                    if prioritize_penetration else (None, None))
+                self_values, self_unknown = (None, None)
                 summary['grid_seconds'] += time.monotonic() - tick
                 plan, decisions = continuation_plan(previous, revisions, depths, _activation_depth(),
                     components, sweep - len(sweeps),
@@ -546,29 +518,13 @@ def optimize_legacy_windows(objective, poses, *, iterations, callback=None,
                     summary['stop_reason'] = ('rejected_retry_exhausted' if any(
                         'rejected_retry_exhausted' in d['reasons'] for d in decisions) else 'no_eligible_windows')
                     break
-                # Reserve an equal quota for every selected window before a
-                # sweep starts. Never commit a timing-dependent sweep prefix.
-                if prioritize_penetration:
-                    plan, priority = penetration_schedule.allocate(plan, previous, depths,
-                        self_values, self_unknown, _activation_depth(), quota,
-                        MAX_EXTRA_WINDOW_ITERATIONS, sweep - len(sweeps))
-                    summary['priority_selection'].append(dict(sweep=sweep, windows=priority))
-                    if not plan:
-                        summary['stop_reason'] = 'no_productive_continuation'
-                        break
-                    reserved = sum(task.iteration_quota for task in plan)
-                else:
-                    quota = min(quota, extra_remaining // len(plan))
-                    reserved = quota * len(plan)
+                quota = min(quota, extra_remaining // len(plan))
+                reserved = quota * len(plan)
                 if quota <= 0:
                     summary.update(stop_reason='extra_window_iteration_budget',
                                    unfinished_cores=[task.key for task in plan])
                     break
-                from .window_demand_split import split_followups
-                plan = split_followups(plan, previous, len(poses), components, quota,
-                                       MIN_CORE_FRAMES if min_core_frames is None else min_core_frames)
-                if not prioritize_penetration:
-                    extra_remaining -= reserved
+                extra_remaining -= reserved
                 summary['extra_window_iterations_reserved'] += reserved
                 summary['extra_sweeps'] += 1
             else:

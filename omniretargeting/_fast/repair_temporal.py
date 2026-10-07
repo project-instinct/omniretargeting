@@ -5,7 +5,6 @@ correction_budget switch changes this check to frozen-entry corrections too.
 """
 
 import numpy as np
-from .runtime_options import OPTIONS
 
 TOLERANCE = .02
 ROUND_OFF = 2e-7
@@ -26,7 +25,7 @@ class RepairTemporal:
 
     def add(self, bounds, values):
         for _, op, rms, peak in self.groups:
-            current = (op @ (values - self.entry if OPTIONS.correction_budget else values).ravel()).reshape(-1, self.width)
+            current = (op @ values.ravel()).reshape(-1, self.width)
             count = len(current)
             # Each joint owns a separate temporal norm cone; one joint's
             # quiet motion cannot hide extra chatter on another joint.
@@ -41,7 +40,7 @@ class RepairTemporal:
     def check(self, values):
         excess = []
         for order, op, rms, peak in self.groups:
-            current = (op @ (values - self.entry if OPTIONS.correction_budget else values).ravel()).reshape(-1, self.width)
+            current = (op @ values.ravel()).reshape(-1, self.width)
             for name, delta in [('rms', np.sqrt(np.mean(current**2, axis=0)) - rms),
                                 ('peak', np.abs(current).max(axis=0) - peak)]:
                 if delta.max(initial=0) > ROUND_OFF:

@@ -189,6 +189,14 @@ terrain_scale, retargeted_motion = retargeter.retarget_motion(
   - `[3:7]`: Root quaternion (w, x, y, z)
   - `[7:]`: Joint angles in radians
 
+CLI NPZ output also includes a versioned, per-frame `contact_task_*` interface
+for all observed body regions and configured candidates, including knees,
+forearms, pelvis and abdomen. It records activation, type/role, importance,
+confidence, world targets/normals and scene-object association alongside the
+complete `qpos`. Python callers use `retargeter.get_contact_task_output()`.
+See the [v1 contact/task contract](docs/contact_task_output.md) for shapes,
+unknown/inactive values, candidate configuration and reading examples.
+
 ## Advanced Usage
 
 ### Custom Robot Height
@@ -322,12 +330,8 @@ An optional `--support-evidence path/to/evidence.npy` supplies measured source
 support observations when available. This review keeps the source motion and
 scene at their original metric scale.
 
-CUDA conic solving is optional and uses the same clip and robot configuration.
-Install `.[gpu]`, then prefix a Python entry point with
-`.venv/bin/python scripts/run_gpu_solver.py --`. The launcher selects QOCO's
-CUDA backend for conic and bounded least-squares steps and returns to CLARABEL
-if a GPU conic solve fails. CPU remains the default; geometry preparation and
-collision checks still run on CPU.
+Window proposals use CPU QOCO, with Clarabel as the fallback; other conic
+subproblems use CPU Clarabel.
 
 Robot self-collision avoidance is enabled by default, independently of the
 scene penetration resolver. It checks only collision-enabled geoms, respects
@@ -571,24 +575,14 @@ stage `unknown_query`. The repair report lists `query_coverage` per category
 and `query_failure_examples` with frame, geom, body and backend.
 `scripts/review_scene_metrics.py` audits such scenes with the same exact query.
 
-### Banded temporal direction (opt-in)
+### Fast production path
 
-`OMNIRETARGETING_FAST_ENABLE=banded_temporal_direction` tries a cheaper step
-before the full conic fallback: the same damped LM model, trust and joint
-boxes and fixed root, constrained by the frozen mechanical rows (URDF joint
-velocity plus the active contact/layout/root rows), solved by the banded
-primal-dual KKT of `_fast/constrained_ip.py`. Every candidate guard and the
-descent test still accept the step; any failure runs the unchanged conic
-fallback. `banded_guard_direction` solves the same banded problem with the
-frozen rows of every guard. The old all-order reference-derivative rows are
-available only through the explicit `reference_derivative_budget` regression
-switch.
-
-### Repair working set (default) and whole-trajectory QOCO (opt-in)
+Fast uses one production path. `OMNIRETARGETING_FAST_ENABLE` accepts only
+`performance_trace`; algorithm ablations and `OMNIRETARGETING_FAST_DISABLE`
+are no longer available.
 
 Original-mesh repair solves each QP and restoration by exact constraint
-generation (`_fast/working_set.py`, default since 2026-10-05;
-`OMNIRETARGETING_FAST_DISABLE=repair_working_set` restores the complete solves).
+generation (`_fast/working_set.py`).
 These programs carry 10^5 rows and up to 4·10^4 contact cones, of which under one
 percent bind. Each solve starts from the rows and cones near their bound at the
 zero step (restorations also drop constraints that cannot reach their bound
@@ -600,27 +594,28 @@ program as before. Acceptance, guards and original-geometry checks are
 unchanged; only interior-point roundoff differs, which can move a
 path-sensitive clip. `OMNIRETARGETING_WORKING_SET_STATS=1` prints outcome counts.
 
-`OMNIRETARGETING_FAST_ENABLE=whole_qoco_proposals` gives whole-trajectory
-bounded proposals the window path's QOCO solve (1e-4 tolerances,
-`_fast/window_qoco.py`), falling back to Clarabel on any other status. It
-changes the proposal arithmetic and therefore the path.
-
-Other default speed switches (each can be turned off with
-`OMNIRETARGETING_FAST_DISABLE=<name>`): `whole_canonical` assembles
-whole-trajectory proposals and restorations for clips under 600 frames
-directly in Clarabel standard form instead of through CVXPY (bit-identical
-final poses on nine clips); `repair_geometry_reduction` skips exact original
+The canonical assembler builds whole-trajectory proposals and restorations
+for clips under 600 frames directly in Clarabel standard form instead of through CVXPY (bit-identical
+final poses on nine clips); Original geometry reduction skips exact original
 mesh queries only where conservative distance bounds prove the result cannot
-reach any consumer (bit-identical); `stationary_window` ends a pass of short
+reach any consumer (bit-identical); Stationary cost-window convergence ends a pass of short
 unguarded steps once the three-step cost window stops decreasing, as guarded
 passes already did. The last one removes the idle tail of `free_bodies`
 (relative decreases of 1e-6 to 1e-10 for up to 15 iterations) and changes the
 path slightly: on ten validation clips every penetration change stayed below
-1 mm, in both directions. `repair_main_cache` caches repair limit/contact rows
+1 mm, in both directions. The main repair cache stores repair limit/contact rows
 and witnesses per pose and group; window acquisition borrows idle cores for the
 native self-collision and deepest-point queries of busy windows; preprocessing
 runs support evidence in parallel and computes the source pose while the scene
 loads. All three keep final poses bit-identical.
+
+`scripts/benchmark_fast.py --prepare --run-dir <run>` freezes a baseline;
+`--arm <candidate> --source-root <snapshot>` runs a frozen candidate with no
+algorithm switches. Independent audits run concurrently by default;
+`--serial-audits` selects serial auditing. Collision audit worker counts default
+to `min(8, available_cpus())`, with `--workers 1` available for serial checks.
+See [fast performance](docs/fast_speed.md) for the remaining diagnostic and
+resource environment variables.
 
 Fixed per-frame joint velocity, acceleration, and jerk caps have been removed
 so deliberate fast source motion can pass through. Neither the framewise

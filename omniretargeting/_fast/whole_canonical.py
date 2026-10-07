@@ -11,7 +11,6 @@ from types import SimpleNamespace
 import numpy as np
 from scipy import sparse
 
-from ..conic_solver import gpu_enabled
 from ..pose_relations import _tightest_lower
 from .._sequence.continuity_guard import SequenceContinuityGuard
 from .acquisition_guard import AcquisitionNormalGuard
@@ -20,17 +19,10 @@ from .guard_signals import CachedSequenceContinuityGuard
 from .performance_trace import timed_phase
 from .reference import ReferenceShape
 from .rows import _merge_identical
-from .runtime_options import OPTIONS
 
 
 def supported(objective):
     """Only contracts whose numerical constraint construction is known here."""
-    # Joint elastic variables/curvature cones use the expression assembler;
-    # the unchanged packed program remains exact for all existing workloads.
-    if getattr(objective, 'joint_witness', None) is not None:
-        return False
-    if not OPTIONS.whole_canonical or gpu_enabled() or OPTIONS.window_qp:
-        return False
     if type(getattr(objective, 'source_shape', None)) is not ReferenceShape:
         return False
     # Default rollout is limited to the short-clip acquisition workload.
@@ -152,7 +144,7 @@ def canonical_data(objective, poses, lower, upper, quadratic, linear):
 def restore_step(objective, origin, step):
     """The unchanged four-iteration whole restoration, without expressions."""
     from .._sequence.restoration import RESTORATION_ITERATIONS
-    from .shape_step import WORKING_SET_RESTORATION, _ShapeRestoration, _pin_root
+    from .shape_step import _ShapeRestoration, _pin_root
     from .window_canonical import solve_data
     coords = objective.coords
     guard = _ShapeRestoration(objective)
@@ -173,7 +165,7 @@ def restore_step(objective, origin, step):
                                                objective.upper - candidate[:, coords.qi])
         _pin_root(objective, candidate, lo, hi)
         data = canonical_data(objective, candidate, lo, hi, weight, np.zeros(lower.size))
-        delta = solve_data(data, lower.size, working_set=WORKING_SET_RESTORATION)
+        delta = solve_data(data, lower.size, working_set=True)
         if delta is None:
             return None
         candidate = restore_coords.integrate(candidate, delta.reshape(lower.shape), 1)

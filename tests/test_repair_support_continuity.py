@@ -75,15 +75,3 @@ def test_joint_budget_alone_cannot_certify_a_supported_endpoint():
         assert np.all(np.abs(np.diff(changed,n=order,axis=0))<=windowed_budget(np.diff(q,n=order,axis=0)))
     kin.evaluate(changed,False)
     assert not guard.check(kin)[0]
-
-
-def test_disabled_ablation_has_no_rows_or_candidate_rejection():
-    obj, kin, q = problem()
-    guard = SupportContinuity(obj, kin, slack=NUMERICAL_SLACK, enabled=False)
-    q[7, 0] += .2
-    kin.evaluate(q)
-    bounds = LinearBounds(q.size)
-    guard.add(bounds, kin)
-    assert not guard.groups and not bounds.norms
-    valid, report = guard.check(kin)
-    assert valid and report['support_endpoint_temporal_groups'] == 0

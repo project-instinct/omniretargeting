@@ -8,8 +8,8 @@ from scipy import sparse
 from omniretargeting._fast.legacy_window_qp import WindowObjective, serial_proposals
 from omniretargeting._fast.proposals import guards_of
 from omniretargeting._fast.window_canonical import canonical_data, solve_data, restore_step
-from omniretargeting._fast.window_conic import step_bounds
 from omniretargeting.conic_solver import solve_conic, solve_conic_working_set
+from omniretargeting._fast.shape_step import _pin_root
 from tests.test_fast_legacy_window import problem
 
 
@@ -26,48 +26,6 @@ def assert_program_equal(expected, actual):
         assert getattr(expected['dims'], key) == getattr(actual['dims'], key)
 
 
-@pytest.mark.parametrize('frames', [range(0, 8), range(8, 20), range(28, 36)])
-@pytest.mark.parametrize('amplitude', [0., .001, .05])
-@pytest.mark.parametrize('fixed_root', [False, True])
-def test_canonical_window_coefficients_and_order_are_exact(frames, amplitude, fixed_root):
-    obj, poses = problem(extra=True)
-    if fixed_root:
-        obj.fixed_root = poses[:, :7].copy()
-    window = WindowObjective(obj, poses, frames)
-    origin = poses[window.span]
-    candidate = obj.coords.integrate(origin, np.random.default_rng(611).normal(
-        scale=amplitude, size=(len(frames), obj.width)), 1.)
-    lo, hi = step_bounds(window, candidate)
-    count = lo.size
-    rng = np.random.default_rng(12)
-    diagonal, gradient = rng.uniform(1., 3., count), rng.normal(size=count)
-    matrix = sparse.diags(diagonal, format='csc')
-    scale = max(float(np.linalg.norm(gradient, ord=np.inf)), 1.)
-    flat = cp.Variable(count)
-    constraints = [flat >= lo.ravel(), flat <= hi.ravel()]
-    for guard in guards_of(window)[1]:
-        constraints += guard.constraints(candidate, flat)
-    reference = cp.Problem(cp.Minimize((cp.quad_form(flat, cp.psd_wrap(matrix))
-                                       + 2 * gradient @ flat) / scale), constraints)
-    expected, _, _ = reference.get_problem_data(cp.CLARABEL)
-    actual = canonical_data(window, candidate, lo, hi, matrix * (2 * (1 / scale)),
-                            (2 * gradient) * (1 / scale))
-    assert_program_equal(expected, actual)
-    for working_set, solve in ((False, solve_conic), (True, solve_conic_working_set)):
-        # Separate CVXPY Problems, just like separate restoration attempts.
-        reference = cp.Problem(reference.objective, constraints)
-        try:
-            solve(reference, solver=cp.CLARABEL, direct_solve_method='qdldl')
-        except cp.error.SolverError:
-            expected_step = None
-        else:
-            expected_step = flat.value if reference.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) else None
-        step = solve_data(actual, count, working_set=working_set)
-        if expected_step is None:
-            assert step is None
-        else:
-            assert step is not None
-            assert step.tobytes() == expected_step.tobytes()
 
 
 @pytest.mark.parametrize('amplitude', [0., .001, .01, .1])
@@ -115,8 +73,8 @@ def test_canonical_retry_retains_the_same_solver_cache(monkeypatch):
 
 def test_complete_window_lm_history_and_pose_bytes_match_cvxpy(monkeypatch):
     from omniretargeting._fast import shape_step, window_qoco
-    # Canonical Clarabel assembly vs CVXPY; the default QOCO proposals are off here.
-    monkeypatch.setattr(window_qoco, 'WINDOW_QOCO_PROPOSALS', False)
+    # Exercise the production Clarabel fallback when QOCO returns no solution.
+    monkeypatch.setattr(window_qoco, 'solve_proposal', lambda data, variables: None)
     from omniretargeting._fast.legacy_window_qp import solve_local
     original = shape_step._canonical_window
     outputs = []
@@ -159,3 +117,59 @@ def test_shared_cone_descriptors_preserve_repeated_working_set_solutions(monkeyp
             values.append(solve_data(data, variables, working_set=True).tobytes())
         results.append(values)
     assert results[0] == results[1] == results[2]
+
+
+def step_bounds(objective, poses):
+    coords = objective.coords
+    lower, upper = coords.bounds(poses, objective.cfg['angular_step_rad'],
+                                 objective.cfg['translation_step_m'])
+    _pin_root(objective, poses, lower, upper)
+    lower[:, coords.scalar_cols] = np.maximum(lower[:, coords.scalar_cols],
+                                             objective.lower - poses[:, coords.qi])
+    upper[:, coords.scalar_cols] = np.minimum(upper[:, coords.scalar_cols],
+                                             objective.upper - poses[:, coords.qi])
+    return lower, upper
+
+
+@pytest.mark.parametrize('frames', [range(0, 8), range(8, 20), range(28, 36)])
+@pytest.mark.parametrize('amplitude', [0., .001, .05])
+@pytest.mark.parametrize('fixed_root', [False, True])
+def test_canonical_window_coefficients_and_order_are_exact(frames, amplitude, fixed_root):
+    obj, poses = problem(extra=True)
+    if fixed_root:
+        obj.fixed_root = poses[:, :7].copy()
+    window = WindowObjective(obj, poses, frames)
+    origin = poses[window.span]
+    candidate = obj.coords.integrate(origin, np.random.default_rng(611).normal(
+        scale=amplitude, size=(len(frames), obj.width)), 1.)
+    lo, hi = step_bounds(window, candidate)
+    count = lo.size
+    rng = np.random.default_rng(12)
+    diagonal, gradient = rng.uniform(1., 3., count), rng.normal(size=count)
+    matrix = sparse.diags(diagonal, format='csc')
+    scale = max(float(np.linalg.norm(gradient, ord=np.inf)), 1.)
+    flat = cp.Variable(count)
+    constraints = [flat >= lo.ravel(), flat <= hi.ravel()]
+    for guard in guards_of(window)[1]:
+        constraints += guard.constraints(candidate, flat)
+    reference = cp.Problem(cp.Minimize((cp.quad_form(flat, cp.psd_wrap(matrix))
+                                       + 2 * gradient @ flat) / scale), constraints)
+    expected, _, _ = reference.get_problem_data(cp.CLARABEL)
+    actual = canonical_data(window, candidate, lo, hi, matrix * (2 * (1 / scale)),
+                            (2 * gradient) * (1 / scale))
+    assert_program_equal(expected, actual)
+    for working_set, solve in ((False, solve_conic), (True, solve_conic_working_set)):
+        # Separate CVXPY Problems, just like separate restoration attempts.
+        reference = cp.Problem(reference.objective, constraints)
+        try:
+            solve(reference, solver=cp.CLARABEL, direct_solve_method='qdldl')
+        except cp.error.SolverError:
+            expected_step = None
+        else:
+            expected_step = flat.value if reference.status in (cp.OPTIMAL, cp.OPTIMAL_INACCURATE) else None
+        step = solve_data(actual, count, working_set=working_set)
+        if expected_step is None:
+            assert step is None
+        else:
+            assert step is not None
+            assert step.tobytes() == expected_step.tobytes()

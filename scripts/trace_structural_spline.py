@@ -79,13 +79,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', type=Path, required=True)
     parser.add_argument('--source-root', type=Path)
-    parser.add_argument('--arm', choices=list('ABCD'), required=True)
+    parser.add_argument('--arm', required=True)
     parser.add_argument('--repeats', type=int, default=1)
     parser.add_argument('--clips', default='')
     args = parser.parse_args()
     runner = args.run_dir.resolve() / 'benchmark_runner.py'
     module = runpy.run_path(str(runner))
-    args.trace, args.enable = True, None
+    args.trace = True
+    args.repeat_offset = 0
+    args.audit_workers = None
+    args.serial_audits = False
+    args.self_audit_root = None
     call = module['subprocess'].call
 
     def instrumented(command, *rest, **kwargs):

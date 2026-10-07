@@ -32,9 +32,17 @@ def test_key_includes_bits_order_and_each_source_phase_input():
 
 def test_temporary_contact_phase_is_removed_from_source_key():
     inputs=_inputs();expected=source_key(*inputs)
-    inputs[5]['foot']=replace(inputs[5]['foot'],contact_phase=object(),
-                             contact_mask=np.ones(3,bool))
+    inputs[5]['foot']=replace(inputs[5]['foot'],contact_phase=object())
     assert source_key(*inputs)==expected
+
+
+def test_observed_contacts_invalidate_height_registration_prefetch():
+    # Joint fitting ignores contact roles, but the translation-only height
+    # registration now reads the observed sole contact mask. Reusing the old
+    # result after a mask change would register to a different support plane.
+    inputs=_inputs();expected=source_key(*inputs)
+    inputs[5]['foot']=replace(inputs[5]['foot'],contact_mask=np.ones(3,bool))
+    assert source_key(*inputs)!=expected
 
 
 class Result:

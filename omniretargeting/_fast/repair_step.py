@@ -7,8 +7,6 @@ The conic solution remains a proposal for exact nonlinear acceptance.
 import numpy as np
 from scipy import sparse
 
-from .runtime_options import OPTIONS
-from .window_qp import WINDOW_FRAMES, solve_standard
 
 
 def solve_step(limits, poses, geometry, measurement, baseline, projection, *,
@@ -21,9 +19,6 @@ def solve_step(limits, poses, geometry, measurement, baseline, projection, *,
     constraints = limits.constraints(poses, projection=projection)
     collision, phi = geometry.linear_rows(measurement)
     budgets = np.array([baseline["depths"].get(key, 0.) for key, _ in measurement["rows"]])
-    if OPTIONS.abl_repair_ratchet:
-        from .repair_ablation import collision_budgets
-        budgets = collision_budgets(limits.objective, measurement, baseline)
     # Keep the nonlinear guard's tiny tolerance in reserve. Spending it in
     # the linear subproblem leaves no room for curvature and roundoff.
     # Accepted roundoff on a different fixed chain must leave zero feasible.
@@ -109,32 +104,10 @@ def solve_step(limits, poses, geometry, measurement, baseline, projection, *,
     accepted = {"Solved", "AlmostSolved", "InsufficientProgress", "MaxIterations"}
     quadratic = sparse.triu(diagonal @ hessian @ diagonal, format="csc")
     columns_per_frame = joint_variables // limits.frames
-    if (OPTIONS.window_qp and limits.frames >= 2 * WINDOW_FRAMES
-            and columns_per_frame * limits.frames == joint_variables):
-        # Temporal block coordinates (``window_qp``): joint columns are
-        # frame-major; each epigraph belongs to its collision key's frame.
-        frame_of = np.r_[np.arange(joint_variables) // columns_per_frame, [key[0] for key in keys]]
-        x = solve_standard(quadratic, gradient * scale, matrix, rhs, nonneg, soc_sizes, frame_of,
-                           limits.frames, settings=settings, accepted=accepted)
-        if x is not None:
-            step = projection @ (x[:joint_variables] * scale[:joint_variables])
-            return step.reshape(limits.frames, limits.width), "Windowed"
-    from . import repair_qoco
-    if repair_qoco.QOCO_REPAIR_QP:
-        from types import SimpleNamespace
-        x = repair_qoco.solve(dict(P=quadratic, c=gradient * scale, A=matrix, b=rhs,
-                                  dims=SimpleNamespace(zero=0, nonneg=nonneg, soc=soc_sizes)))
-        if x is not None:
-            return (projection @ (x[:joint_variables] * scale[:joint_variables])).reshape(limits.frames, limits.width), "QOCO_SOLVED"
     solution = None
-    if OPTIONS.repair_working_set:
-        # Same optimum on the few rows that can bind (``working_set``).
-        from .working_set import solve as solve_working_set
-        solution = solve_working_set(quadratic, gradient * scale, matrix, rhs, cones, settings)
-    if solution is None and OPTIONS.gpu_conic:
-        from .gpu_conic import dimensions, solve as solve_gpu
-        solution = solve_gpu(quadratic, gradient * scale, matrix, rhs,
-                             dimensions(cones), context='repair_full')
+    # Same optimum on the few rows that can bind (``working_set``).
+    from .working_set import solve as solve_working_set
+    solution = solve_working_set(quadratic, gradient * scale, matrix, rhs, cones, settings)
     if solution is None:
         solution = clarabel.DefaultSolver(quadratic, gradient * scale, matrix, rhs, cones, settings()).solve()
     status = str(solution.status)

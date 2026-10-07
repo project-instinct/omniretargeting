@@ -128,55 +128,14 @@ def test_worker_geometry_has_no_query_capability(monkeypatch):
     assert not any(hasattr(facade, name) for name in ("measure", "moving", "scene", "parallel", "data"))
 
 
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork unavailable")
-def test_certified_prefetch_never_serializes_or_sends_witnesses(monkeypatch):
-    from dataclasses import replace
-    from omniretargeting._fast import repair_triage
-
-    limits, geometry, poses, measured, protected, group = _problem(monkeypatch)
-    options = replace(repair_proposals.OPTIONS, repair_triage=True)
-    monkeypatch.setattr(repair_proposals, "OPTIONS", options)
-    seen = []
-
-    def progress_certificate(local_limits, current, local_geometry, measurement, depth):
-        seen.append(local_limits.movable_body)
-        assert local_limits.frame_mask.any()
-        return {"reason": "projected_witness_temporal_box", "model": "pre_qp_upper_bound"}
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("certified lookahead must not serialize a full dependency")
-
-    monkeypatch.setattr(repair_triage, "certificate", progress_certificate)
-    monkeypatch.setattr(repair_proposals, "certificate", forbidden)
-    schedule = RepairSchedule([group], 12)
-    before = deepcopy(vars(schedule))
-    workers = repair_proposals.RepairProposals(limits, geometry, count=1)
-    try:
-        workers._prefetch_triage = True
-        workers.prefetch(schedule, poses, measured, protected)
-        assert seen == [group]
-        assert not workers.pending and workers.stats["launched"] == 0
-        assert workers.stats["pre_qp_prefetch_skips"] == 1
-        assert vars(schedule) == before and limits.movable_body is None
-        # The actual attempt still computes its certificate from actual state.
-        repair_proposals.transition_group(limits, poses, group)
-        limits.frame_mask = repair_proposals.group_frames(
-            measured, geometry.model, group, limits.frames, repair_proposals.halo_frames(30.))
-        proposal = workers.take(poses, measured, protected, None, .01)
-        assert isinstance(proposal, repair_proposals.LocalProposal)
-        assert seen == [group, group] and proposal.status == "pre_qp_certified_small_progress"
-        assert workers._prefetch_triage
-    finally:
-        workers.close(abort=True)
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="fork unavailable")
 def test_accepted_change_aborts_unconsumed_cpu_jobs_and_refills(monkeypatch):
-    from dataclasses import replace
     import time
 
     limits, geometry, poses, measured, protected, group = _problem(monkeypatch)
-    monkeypatch.setattr(repair_proposals, "OPTIONS", replace(repair_proposals.OPTIONS, repair_triage=True))
+    pass
 
     def pending(limits, geometry, connection, inherited):
         connection.recv()
@@ -224,46 +183,3 @@ def test_automatic_workers_wait_for_consecutive_unchanged_attempts(monkeypatch):
         assert workers.stable_attempts == 0
     finally:
         workers.close(abort=True)
-
-
-@pytest.mark.skipif(not hasattr(os, "fork"), reason="fork unavailable")
-@pytest.mark.parametrize("cached_temporal", [False, True])
-@pytest.mark.parametrize("triage", [False, True])
-def test_complete_repair_replay_preserves_history_and_trajectory(monkeypatch, cached_temporal, triage):
-    from dataclasses import replace
-    from omniretargeting._fast import repair_triage
-    # Exercise this worker class even after the group scheduler/gate defaults
-    # are promoted. Their separate tests cover those execution paths.
-    for module in (mesh_repair, repair_proposals, repair_triage):
-        monkeypatch.setattr(module, "OPTIONS", replace(module.OPTIONS, repair_triage=triage,
-                            repair_fast_gate=False, repair_parallel_groups=False))
-    factory = repair_proposals.RepairProposals
-    monkeypatch.setattr(repair_proposals, "MIN_PARALLEL_FRAMES", 0)
-
-    def run(count):
-        monkeypatch.setattr(repair_proposals, "RepairProposals", lambda limits, geometry: factory(
-            limits, geometry, count=count))
-        objective, poses, _ = _objective(temporal=True)
-        if cached_temporal:
-            from omniretargeting._sequence.continuity_guard import SequenceContinuityGuard
-            from omniretargeting._fast.guard_signals import prepare
-            objective.candidate_guards = [SequenceContinuityGuard(
-                objective.tasks, poses, objective.root_rotations, windowed=True)]
-            prepare(objective)
-        return mesh_repair.repair_original_meshes(objective, poses, [_open_object(objective, poses)])
-
-    def numerical(value):
-        if isinstance(value, dict):
-            return {k: numerical(v) for k, v in value.items()
-                    if k not in ("seconds", "proposal_workers")}
-        if isinstance(value, list):
-            return [numerical(v) for v in value]
-        return value
-
-    serial, reference = run(0)
-    first, report = run(2)
-    repeat, again = run(2)
-    automatic, adaptive = run(None)
-    assert first.tobytes() == serial.tobytes() == repeat.tobytes() == automatic.tobytes()
-    assert numerical(report) == numerical(reference) == numerical(again) == numerical(adaptive)
-    assert report["proposal_workers"]["worker_count"] == 2

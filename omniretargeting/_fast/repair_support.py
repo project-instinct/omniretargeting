@@ -15,13 +15,11 @@ from .rows import _block_rows
 
 
 class SupportContinuity:
-    def __init__(self, objective, kin, *, slack, enabled=True):
+    def __init__(self, objective, kin, *, slack):
         self.groups = []
         self.frames = objective.frames
         self.width = len(kin.columns)
         self.slack = slack
-        if not enabled:
-            return
         policy = getattr(objective.tasks, "contact_phase", None)
         if policy is None:
             return

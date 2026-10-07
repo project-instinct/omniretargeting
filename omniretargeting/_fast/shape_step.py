@@ -9,11 +9,9 @@ import cvxpy as cp
 import numpy as np
 from scipy import sparse
 
-from ..conic_solver import gpu_enabled, solve_conic
+from ..conic_solver import solve_conic
 from .._sequence.restoration import restore_candidate
 from .rows import _merge_identical
-from .runtime_options import OPTIONS
-from .window_qp import WINDOW_FRAMES, solve_windows
 
 
 def _guard_constraints(guards, poses, flat):
@@ -58,14 +56,13 @@ def _pin_root(objective, poses, lower, upper):
 # sent acquisition to other local results; with overshooting conic steps
 # shortened and restored instead of ending the pass (``solver._shorten_conic``)
 # restorations are frequent and acquisition no longer stops on such a path.
-WORKING_SET_RESTORATION = True
 
 
 def _canonical_window(objective):
     from .legacy_window_qp import WindowObjective
     # The assembler reproduces WindowGuard.constraints specifically. Other
     # objectives and optional conic backends keep their established path.
-    return isinstance(objective, WindowObjective) and not gpu_enabled() and not OPTIONS.window_qp
+    return isinstance(objective, WindowObjective)
 
 
 class _ShapeRestoration:
@@ -105,34 +102,11 @@ def restore_shape_step(objective, origin, step):
     lower, upper = coords.bounds(origin, objective.cfg["angular_step_rad"],
                                  objective.cfg["translation_step_m"])
     restored = restore_candidate(_ShapeRestoration(objective), origin, candidate,
-                                 lower, upper, {}, working_set=WORKING_SET_RESTORATION)
+                                 lower, upper, {}, working_set=True)
     # The accepted state must be what the next step's projection keeps.
     return None if restored is None else objective.project(restored)
 
 
-def _qoco_proposal(problem, flat):
-    """Whole-trajectory proposal by the window path's QOCO solve, or None.
-
-    Same program, same canonical data and the same 1e-4 QOCO tolerances as
-    ``window_qoco`` (default for windows since 2026-10-03). Every nonlinear
-    guard and the objective decrease still decide acceptance; any status
-    other than solved returns None and the caller keeps Clarabel.
-    """
-    from .window_qoco import solve_proposal
-    data, _, inverse = problem.get_problem_data(cp.CLARABEL)
-    offsets = [d.var_offsets for d in inverse if hasattr(d, "var_offsets")]
-    if not offsets or offsets[-1].get(flat.id) != 0:
-        return None
-    data = dict(data)
-    for key in ("P", "A"):
-        # QOCO's CSC binding takes 32-bit indices; CVXPY may emit 64-bit ones.
-        matrix = sparse.csc_matrix(data[key])
-        matrix.indices, matrix.indptr = matrix.indices.astype(np.int32), matrix.indptr.astype(np.int32)
-        data[key] = matrix
-    try:
-        return solve_proposal(data, flat.size)
-    except (ImportError, RuntimeError, ValueError, TypeError, ArithmeticError):
-        return None
 
 
 def bounded_shape_step(objective, poses, system, gradient, diagonal, damping):
@@ -155,45 +129,26 @@ def bounded_shape_step(objective, poses, system, gradient, diagonal, damping):
         from .window_canonical import canonical_data, solve_data
         data = canonical_data(objective, poses, lo, hi, matrix * (2 * (1 / scale)),
                               (2 * gradient) * (1 / scale))
-        from .window_qoco import WINDOW_QOCO_PROPOSALS, solve_proposal
-        if WINDOW_QOCO_PROPOSALS:
-            step = solve_proposal(data, count)
-            if step is not None:
-                return step
+        from .window_qoco import solve_proposal
+        step = solve_proposal(data, count)
+        if step is not None:
+            return step
         return solve_data(data, count)
     from .whole_canonical import supported
-    if supported(objective) and not OPTIONS.whole_qoco_proposals:
+    if supported(objective):
         from .whole_canonical import canonical_data
         from .window_canonical import solve_data
         data = canonical_data(objective, poses, lo, hi, matrix * (2 * (1 / scale)),
                               (2 * gradient) * (1 / scale))
         return solve_data(data, count)
     flat = cp.Variable(count)
-    joint = getattr(objective, 'joint_witness', None)
-    if joint is not None:
-        from .joint_canonical import constraints as joint_constraints
-        constraints = joint_constraints(objective, poses, lo, hi, flat)
-    else:
-        constraints = [flat >= lo.ravel(), flat <= hi.ravel()]
-        # Both frozen reference layouts apply; impossible flips are omitted.
-        box = np.maximum(np.abs(lo), np.abs(hi))
-        constraints += shape.constraints(poses, flat, np.where(np.isfinite(box), box, 1e3))
-        constraints += _guard_constraints(objective.candidate_guards, poses, flat)
-    if joint is None:
-        value = (cp.quad_form(flat, cp.psd_wrap(matrix)) + 2 * gradient @ flat) / scale
-    else:
-        value, elastic_rows = joint.proposal(flat, matrix, gradient, scale)
-        constraints += elastic_rows
+    constraints = [flat >= lo.ravel(), flat <= hi.ravel()]
+    # Both frozen reference layouts apply; impossible flips are omitted.
+    box = np.maximum(np.abs(lo), np.abs(hi))
+    constraints += shape.constraints(poses, flat, np.where(np.isfinite(box), box, 1e3))
+    constraints += _guard_constraints(objective.candidate_guards, poses, flat)
+    value = (cp.quad_form(flat, cp.psd_wrap(matrix)) + 2 * gradient @ flat) / scale
     problem = cp.Problem(cp.Minimize(value), constraints)
-    if OPTIONS.window_qp and len(poses) >= 2 * WINDOW_FRAMES:
-        # Temporal block-coordinate step: every linearized bound stays exact.
-        step = solve_windows(problem, flat, len(poses), coords.width)
-        if step is not None:
-            return step
-    if OPTIONS.whole_qoco_proposals:
-        step = _qoco_proposal(problem, flat)
-        if step is not None:
-            return step
     try:
         solve_conic(problem, solver=cp.CLARABEL, direct_solve_method="qdldl")
     except cp.error.SolverError:

@@ -29,6 +29,10 @@ def kinematic_tracking_tasks(tasks, priority):
     for name, task in tasks.items():
         spec = priority.get("effectors", {}).get(name, {})
         world = spec.get("preserve_world_target", task.preserve_world_tracking)
+        # A calibrated sole follows morphology while free, just like a hand.
+        # World support is acquired only after the kinematic branch is fixed.
+        if spec.get("track_orientation", False) and spec.get("_scale_calibrated", False):
+            world = False
         frames = len(task.contact_mask)
         result[name] = replace(
             task, contact_mask=np.zeros(frames, bool), contact_modes=np.full(frames, "none"),
@@ -63,6 +67,65 @@ def register_height(objective, poses):
         raise ValueError("Robot height registration returned a nonfinite shift")
     result = np.array(poses, copy=True)
     result[:, coords.root_q + 2] += shift
+    return result, shift
+
+
+def height_tracking_tasks(tasks, priority):
+    """Register height to observed sole planes with joint angles held fixed.
+
+    Free soles retain the same morphology targets as the pose fit. Active
+    source soles supply only a vertical registration measurement. A later
+    source-supported seat lift prevents this measurement sinking the pelvis;
+    it cannot bend a leg or select a different IK branch.
+    """
+    from .foot_targets import morphology_sole
+    result = kinematic_tracking_tasks(tasks, priority)
+    for name, task in tasks.items():
+        if morphology_sole(priority.get('effectors', {}).get(name, {})):
+            result[name] = replace(result[name], contact_mask=task.contact_mask.copy(),
+                contact_modes=np.where(task.contact_mask, 'sliding', 'none'),
+                surface_managed_mask=None)
+    return result
+
+
+def bound_sole_registration(objective, poses):
+    """Do not register a rigid sole through an observed upward support plane.
+
+    Height registration uses a semantic point, which need not be the lowest
+    collision point when the source tilts its ankle. Bound that affine fit by
+    the collision sole's extent, spreading only the needed height correction.
+    """
+    from scipy.ndimage import maximum_filter1d, uniform_filter1d
+    from ..scene_geometry import collision_geom_ids, geom_surface_offsets
+    from .foot_targets import morphology_sole
+    from .penetration import LIFT_RAMP_SECONDS, UPWARD_COS
+    q = objective.coords.root_q
+    if q is None:
+        return poses, np.zeros(len(poses))
+    model, kin = objective.model, objective.kin
+    kin.evaluate(poses, with_jacobian=False)
+    lower = np.zeros(len(poses))
+    geoms = collision_geom_ids(model)
+    for spec in objective.tasks.effectors.values():
+        if not morphology_sole(spec):
+            continue
+        task = spec['task']
+        normals = np.asarray(task.surface_normals)
+        active = task.contact_mask & (normals[:, 2] >= UPWARD_COS)
+        if task.environment_ids is not None:
+            active &= np.asarray(task.environment_ids) == 0
+        if not active.any():
+            continue
+        on_sole = model.body_weldid[model.geom_bodyid[geoms]] == model.body_weldid[spec['body_id']]
+        for geom in np.asarray(geoms)[on_sole]:
+            offsets = geom_surface_offsets(model, int(geom), objective.cfg['collision_spacing_m'])
+            points = kin.geom_xpos[:, geom, None] + np.einsum('fij,sj->fsi', kin.geom_xmat[:, geom], offsets)
+            gap = np.min(np.sum((points - task.surface_points[:, None]) * normals[:, None], axis=-1), axis=1)
+            needed = (objective.cfg['scene_clearance_m'] - gap) / np.maximum(normals[:, 2], 1e-12)
+            lower = np.maximum(lower, np.where(active, needed, 0.))
+    window = max(3, round(LIFT_RAMP_SECONDS * objective.framerate) | 1)
+    shift = uniform_filter1d(maximum_filter1d(lower, window, mode='nearest'), window, mode='nearest')
+    result = poses.copy(); result[:, q + 2] += shift
     return result, shift
 
 

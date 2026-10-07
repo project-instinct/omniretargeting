@@ -10,8 +10,9 @@ resolution; it is not a collision-free certificate.
 from __future__ import annotations
 
 import hashlib
-import weakref
+from collections import OrderedDict
 from itertools import product
+from threading import RLock
 
 import igl
 import mujoco
@@ -46,8 +47,37 @@ def collision_geom_ids(model, geom_groups=None, body_tokens=None):
     return np.asarray(selected, dtype=int)
 
 
-# Shells already sampled for a model: (geom, spacing) -> (geometry digest, offsets).
-_SHELLS = weakref.WeakKeyDictionary()
+# Content-addressed, process-local shells also survive equivalent model reloads.
+# Bound retained arrays without keeping any MjModel alive. No disk cache.
+_SHELLS = OrderedDict()
+_SHELLS_LOCK = RLock()
+_SHELLS_MAX_BYTES = 128 * 1024 * 1024
+_SHELLS_MAX_ENTRIES = 256
+_SHELLS_BYTES = 0
+
+
+def _geom_surface_key(model, geom_id, spacing):
+    """All sampler inputs, read afresh so in-place model edits invalidate hits.
+
+    Positions, rotations and mesh faces are not read by the local-shell sampler.
+    Mesh dataid/vertex address/count select the compiled vertices; include both
+    that selection and its float64 contents, in their original order.
+    """
+    kind = int(model.geom_type[geom_id])
+    digest = hashlib.sha256()
+    digest.update(np.asarray([kind], dtype=np.int64).tobytes())
+    digest.update(np.asarray(model.geom_size[geom_id], dtype=float).tobytes())
+    if kind == mujoco.mjtGeom.mjGEOM_MESH:
+        mid = int(model.geom_dataid[geom_id])
+        start, n = int(model.mesh_vertadr[mid]), int(model.mesh_vertnum[mid])
+        digest.update(np.asarray([mid, start, n], dtype=np.int64).tobytes())
+        digest.update(np.asarray(model.mesh_vert[start:start + n], dtype=float).tobytes())
+    # Preserve parameter dtype/bytes: e.g. longdouble must not round to float64.
+    parameter = None
+    if spacing is not None:
+        value = np.asarray(spacing)
+        parameter = (value.dtype.str, value.shape, value.tobytes())
+    return geom_id, parameter, digest.digest()
 
 
 def geom_surface_offsets(model, geom_id, spacing=None):
@@ -56,21 +86,28 @@ def geom_surface_offsets(model, geom_id, spacing=None):
     Meshes use the convex hull of compiled MuJoCo vertices (MuJoCo's mesh
     collision representation). No vertex stride removes extremities. ``spacing``
     bounds the sampling grid spacing; callers enforce query budgets explicitly.
-    A shell is sampled once per model geometry; callers receive a copy.
+    Identical model geometry and parameters reuse a process-local shell;
+    callers receive independent writable copies, never the cached array.
     """
     geom_id = int(geom_id)
-    digest = hashlib.sha1(np.asarray(model.geom_size[geom_id], dtype=float).tobytes())
-    digest.update(int(model.geom_type[geom_id]).to_bytes(4, "little"))
-    if int(model.geom_type[geom_id]) == mujoco.mjtGeom.mjGEOM_MESH:
-        mid = int(model.geom_dataid[geom_id])
-        start, n = int(model.mesh_vertadr[mid]), int(model.mesh_vertnum[mid])
-        digest.update(np.ascontiguousarray(model.mesh_vert[start : start + n], dtype=float).tobytes())
-    cache = _SHELLS.setdefault(model, {})
-    key = (geom_id, None if spacing is None else float(spacing))
-    cached = cache.get(key)
-    if cached is None or cached[0] != digest.digest():
-        cached = cache[key] = (digest.digest(), _geom_surface_offsets(model, geom_id, spacing))
-    return cached[1].copy()
+    key = _geom_surface_key(model, geom_id, spacing)
+    global _SHELLS_BYTES
+    with _SHELLS_LOCK:
+        cached = _SHELLS.get(key)
+        if cached is None:
+            cached = _geom_surface_offsets(model, geom_id, spacing)
+            cached.setflags(write=False)
+            if cached.nbytes <= _SHELLS_MAX_BYTES:
+                while _SHELLS and (
+                    _SHELLS_BYTES + cached.nbytes > _SHELLS_MAX_BYTES
+                    or len(_SHELLS) >= _SHELLS_MAX_ENTRIES
+                ):
+                    _SHELLS_BYTES -= _SHELLS.popitem(last=False)[1].nbytes
+                _SHELLS[key] = cached
+                _SHELLS_BYTES += cached.nbytes
+        else:
+            _SHELLS.move_to_end(key)
+        return cached.copy()
 
 
 def _geom_surface_offsets(model, geom_id, spacing=None):

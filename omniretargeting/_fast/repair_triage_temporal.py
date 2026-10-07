@@ -3,7 +3,6 @@
 import numpy as np
 
 from .repair_limits import NUMERICAL_SLACK
-from .runtime_options import OPTIONS
 
 
 def tighten(limits, values, low, high, sweeps=4):
@@ -15,7 +14,7 @@ def tighten(limits, values, low, high, sweeps=4):
     This does not assemble contact/layout rows, cones or a solver program.
     """
     low, high = low.ravel().copy(), high.ravel().copy()
-    signal = values - limits.entry[:, limits.coords.qi] if OPTIONS.correction_budget else values
+    signal = values
     programs = []
     for operator, budget in getattr(limits, 'differences', ()):
         op = operator.tocsr()

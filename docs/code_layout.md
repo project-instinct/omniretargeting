@@ -17,8 +17,13 @@ pipeline file. `tests/test_module_size.py` enforces the limit.
 | Surfaces and posture | `surface_*.py`, `full_body_self_contact.py`, `pose_relations.py`, `body_relations.py` | Build source/robot surface correspondence, self-contact and posture tasks, and morphology-normalized relation diagnostics. |
 | Scene and collision | `scene_geometry.py`, `moving_scene.py`, `geometry_query.py`, `triangle_*.py`, `self_collision*.py` | Query original static/moving geometry and robot collision geoms, including open-surface uncertainty and self-collision. |
 | Correction and refinement | `trajectory_refinement.py`, `_refinement/`, `local_collision_repair.py`, `whole_body_correction.py`, `staged_contact_repair.py` | Improve an existing trajectory while preserving contacts, posture locality, continuity, and collision acceptance. |
-| Motion budgets and quality | `motion_budgets.py`, `motion_quality.py`, `trajectory_validation.py`, `trajectory_fidelity.py` | Define source-relative chatter, the legacy derivative ablation, and validation/reporting fields used across stages. |
+| Motion budgets and quality | `motion_budgets.py`, `motion_quality.py`, `trajectory_validation.py`, `trajectory_fidelity.py` | Define source-relative chatter, validation/reporting fields used across stages. |
 | Review tools | `scripts/review_*.py`, `scripts/trumans_*review*.py`, `scene_metrics_parallel.py`, `training_collision_parallel.py` | Measure the four AGENTS metrics and compare clips without changing motion; the parallel helpers split audits by frame and keep serial aggregation. |
+
+`scripts/benchmark_fast.py` freezes and runs baseline/candidate clips, with concurrent audits
+by default (`--serial-audits` for a serial comparison). The `review_spline_quality.py` and
+`spline_*_details.py` tools measure saved motions and remain independent of the removed
+spline solver. Deleted experiments are recoverable from `out/archive/pre_cleanup_worktree.tar`.
 
 Entry-point compatibility matters more than this table. When moving code, keep
 the public call signature or update callers and tests in the same change.

@@ -16,6 +16,7 @@ from ._core.motion import FramewiseMotionMixin
 from ._core.postprocessing import MotionPostprocessingMixin
 from ._core.scaling import TerrainScalingMixin
 from ._core.visualization import TrajectoryVisualizationMixin
+from .contact_task_output import ContactTaskOutput
 
 try:
     import yourdfpy
@@ -319,6 +320,8 @@ class OmniRetargeter(
         """
         # Step 1: Compute terrain scaling factor
         self.last_motion_solve_reports = []
+        self._contact_output_frames = len(smplx_trajectory)
+        self._contact_output_source_markers = end_effector_markers
         if object_points is not None:
             object_points = np.asarray(object_points, dtype=float)
             if (object_points.ndim != 3 or object_points.shape[0] != len(smplx_trajectory)
@@ -378,6 +381,8 @@ class OmniRetargeter(
         else:
             terrain_scale = 1.0
             scaled_terrain = self.terrain_mesh.copy()
+
+        self._contact_output_scene = scaled_terrain
 
         # Step 3: Process SMPLX trajectory
         processed_trajectory = self._process_smplx_trajectory(smplx_trajectory, terrain_scale)
@@ -766,6 +771,19 @@ class OmniRetargeter(
 
         return terrain_scale, retargeted_motion
 
+
+    def get_contact_task_output(self, *, source_markers=None) -> ContactTaskOutput:
+        """Return versioned per-frame contact/task data without changing q_ref.
+
+        This export-only view includes all observed source regions and
+        configured candidates. Its ``export()`` adds pickle-free NPZ arrays;
+        ``frame(t)`` supplies plain records including inactive/unknown slots.
+        ``source_markers`` supplies fallback material observations when no
+        source table or dense adapter samples were prepared for the solver.
+        """
+        from ._core.contact_output import contact_task_output
+
+        return contact_task_output(self, source_markers=source_markers)
 
     def get_robot_dof(self) -> int:
         """Get the number of degrees of freedom of the robot."""

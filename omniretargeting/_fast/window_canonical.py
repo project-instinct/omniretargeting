@@ -130,7 +130,7 @@ def solve_data(data, variables, *, working_set=False):
 def restore_step(objective, origin, step):
     """The legacy four-step restoration with an identical canonical program."""
     from .._sequence.restoration import RESTORATION_ITERATIONS
-    from .shape_step import WORKING_SET_RESTORATION, _ShapeRestoration, _pin_root
+    from .shape_step import _ShapeRestoration, _pin_root
     coords = objective.coords
     guard = _ShapeRestoration(objective)
     candidate = objective.project(coords.integrate(origin, step.reshape(len(origin), -1), 1.))
@@ -150,13 +150,9 @@ def restore_step(objective, origin, step):
                                                objective.upper - candidate[:, coords.qi])
         _pin_root(objective, candidate, lo, hi)
         data = canonical_data(objective, candidate, lo, hi, weight, np.zeros(lower.size))
-        from .window_restore_reduction import EXACT_WINDOW_RESTORATION, reduce_epigraphs
-        if EXACT_WINDOW_RESTORATION:
-            data = reduce_epigraphs(data, lower.size)
-        from .window_qoco import WINDOW_QOCO_RESTORATIONS, solve_restoration
-        delta = solve_restoration(data, lower.size) if WINDOW_QOCO_RESTORATIONS else None
+        delta = None
         if delta is None:
-            delta = solve_data(data, lower.size, working_set=WORKING_SET_RESTORATION)
+            delta = solve_data(data, lower.size, working_set=True)
         if delta is None:
             return None
         candidate = coords.integrate(candidate, delta.reshape(lower.shape), 1)

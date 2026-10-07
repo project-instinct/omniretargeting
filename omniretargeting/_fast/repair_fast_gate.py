@@ -10,7 +10,6 @@ from types import SimpleNamespace
 import numpy as np
 from scipy import sparse
 
-from .runtime_options import OPTIONS
 from .repair_gate_frames import local_limits
 from .repair_frames import restrict
 from .repair_step import solve_step
@@ -33,13 +32,8 @@ def _predict(limits, poses, geometry, measurement, protected, depth):
     from .mesh_repair import _joint_projection, COLLISION_SIGMA, LIMB_COLLISION_SIGMA, LOCAL_ANGLE
     from .limb_scope import scope_for_body
     started = time.monotonic()
-    if OPTIONS.abl_repair_ratchet or OPTIONS.abl_repair_restore_layout or OPTIONS.abl_contact_regression:
-        # Reduced frame views do not carry the experimental global history
-        # or directional evidence. Retain the full proposal rather than gate it.
-        return None
     local_angle = getattr(limits, 'local_angle', LOCAL_ANGLE)
-    if (measurement.get('failures') or not measurement.get('complete', True)
-            or OPTIONS.repair_aggregate):
+    if measurement.get('failures') or not measurement.get('complete', True):
         return None
     projection = restrict(_joint_projection(limits, geometry.model, measurement), limits.frame_mask)
     if (np.any(np.diff(projection.indptr) != 1) or np.any(projection.data != 1.)

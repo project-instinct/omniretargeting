@@ -45,9 +45,8 @@ def prepare_moving_reduction(geometry, poses):
     import numpy as np
     from ..moving_scene import interpolate_object
     from .repair_static_query import _QUERY
-    from .runtime_options import OPTIONS
     moving = geometry.moving
-    if not OPTIONS.repair_geometry_reduction or moving is None:
+    if moving is None:
         return
     from .original_geometry_reduction import ClosedComponentReduction
     eligible = {i for i, obj in enumerate(moving.objects)

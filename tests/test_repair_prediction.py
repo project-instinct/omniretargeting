@@ -1,5 +1,4 @@
 """Prediction uses the worst linear witness, and gating precedes candidates."""
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -80,40 +79,3 @@ def test_gated_attempt_never_starts_candidates_or_trial_geometry(monkeypatch):
     assert report["history"]
     assert all(r["stop_reason"] == "predicted_small_progress" for r in report["history"])
     assert len(calls) == 1  # Initial baseline only.
-
-
-def test_remote_prediction_gates_before_worker_candidates(monkeypatch):
-    import os
-    if not hasattr(os, "fork"):
-        pytest.skip("fork unavailable")
-    from tests.test_repair_proposals import _problem
-    from omniretargeting._fast.repair_schedule import RepairSchedule
-    monkeypatch.setattr(
-        repair_proposals, 'OPTIONS',
-        replace(repair_proposals.OPTIONS, repair_fast_gate=False))
-    monkeypatch.setattr(repair_prediction, "PREDICTIVE_GATING", True)
-    monkeypatch.setattr(repair_prediction, "linear_prediction", lambda *a: {"predicted_decrease_m": 0.})
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("gated worker started candidate checks")
-
-    monkeypatch.setattr(repair_proposals.LocalProposal, "candidates", forbidden)
-    limits, geometry, poses, measured, protected, group = _problem(monkeypatch)
-    schedule = RepairSchedule([group], 12)
-    workers = repair_proposals.RepairProposals(limits, geometry, count=1)
-    try:
-        workers.prefetch(schedule, poses, measured, protected)
-        repair_proposals.transition_group(limits, poses, group)
-        limits.frame_mask = repair_proposals.group_frames(measured, geometry.model, group, limits.frames,
-                                                         repair_proposals.halo_frames(30.))
-        depth = max(v for k, v in measured["depths"].items() if any(
-            geometry.model.body_weldid[geometry.model.geom_bodyid[g]] == group
-            for g in (k[2:] if k[1] == "self" else k[-1:])))
-        remote = workers.take(poses, measured, protected, None, depth)
-        assert isinstance(remote, repair_proposals.RemoteProposal)
-        assert remote.prediction == {"predicted_decrease_m": 0.}
-        assert remote.done
-        remote.close()
-        assert workers.workers[0][0].is_alive()
-    finally:
-        workers.close(abort=True)

@@ -12,14 +12,11 @@ import numpy as np
 
 from .._sequence.continuity_guard import SequenceContinuityGuard
 from .._sequence.tasks import SequenceTasks
-from .guard_acceleration import enabled
 from .kinematics import TrajectoryKinematics
 
 
 class CachedSequenceContinuityGuard(SequenceContinuityGuard):
     def signals(self, poses, span=None):
-        if not enabled():
-            return super().signals(poses, span)
         first, stop = (0, len(poses)) if span is None else span
         part = np.asarray(poses)[first:stop]
         key = first, stop, part.shape, part.dtype.str, part.tobytes()
@@ -57,8 +54,6 @@ CachedSequenceContinuityGuard.__name__ = SequenceContinuityGuard.__name__
 
 def prepare(objective):
     """Opt in existing temporal guard instances without changing their API."""
-    if not enabled():
-        return
     for guard in objective.candidate_guards:
         if type(guard) is SequenceContinuityGuard and type(guard.tasks) is SequenceTasks:
             guard.__class__ = CachedSequenceContinuityGuard

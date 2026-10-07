@@ -6,7 +6,6 @@ import numpy as np
 import pytest
 from scipy import sparse
 
-from omniretargeting._fast import runtime_options
 from omniretargeting._fast.contact_guard import ContactGuard
 from omniretargeting._fast.repair_limits import RepairLimits
 from omniretargeting._fast.repair_restoration import _restoration_program
@@ -15,8 +14,7 @@ from tests.test_fast_legacy_window import problem
 
 
 def _set_main_cache(monkeypatch, flag):
-    monkeypatch.setattr(runtime_options, 'OPTIONS',
-                        replace(runtime_options.OPTIONS, repair_main_cache=flag == '1'))
+    pass
 
 
 def _program_bytes(program):
@@ -53,8 +51,7 @@ def test_optimized_program_raw_bytes_equal_original_for_fixed_invalid_frames(mon
 @pytest.mark.parametrize('preserve', [False, True])
 @pytest.mark.parametrize('ablate', [False, True])
 def test_contact_boolean_matches_report_at_margins_and_invalid_inputs(monkeypatch, preserve, ablate):
-    from omniretargeting._fast import runtime_options
-    monkeypatch.setattr(runtime_options, 'OPTIONS', replace(runtime_options.OPTIONS, abl_contact_regression=ablate))
+    pass
     objective, poses = _acquired(surfaces=True, moving=True)
     guard = ContactGuard(objective, poses, preserve_positions=preserve)
     _set_main_cache(monkeypatch, '1')

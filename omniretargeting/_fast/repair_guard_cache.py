@@ -9,8 +9,7 @@ import numpy as np
 def accepts(guard, poses):
     from .acquisition_guard import AcquisitionNormalGuard
     from .contact_guard import ContactGuard, NUMERICAL_SLACK
-    from .repair_frame_norm import enabled
-    if (not enabled() or type(guard) not in (AcquisitionNormalGuard, ContactGuard)
+    if (type(guard) not in (AcquisitionNormalGuard, ContactGuard)
             or guard.priority is not None):
         return guard.accepts(poses)
     if getattr(guard.accepts, '__func__', None) is not type(guard).accepts:
@@ -21,7 +20,7 @@ def accepts(guard, poses):
                 or method.__qualname__ != type(guard).__name__ + '.' + name):
             return guard.accepts(poses)
     groups = tuple(guard.groups)
-    config = (getattr(guard, 'shape', None), getattr(guard, 'preserve_positions', None), getattr(guard, 'ablate_contacts', None),
+    config = (getattr(guard, 'shape', None), getattr(guard, 'preserve_positions', None), False,
               getattr(guard, 'numerical_slack', NUMERICAL_SLACK),
               guard.kin.columns.tobytes(), guard.accepts.__func__,
               getattr(guard.diagnostics, '__func__', guard.diagnostics),

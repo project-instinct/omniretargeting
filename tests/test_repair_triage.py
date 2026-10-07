@@ -1,5 +1,4 @@
 """Sound early model bounds, uncertain fallback and no-QP execution."""
-from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -7,7 +6,6 @@ import pytest
 from scipy import sparse
 
 from omniretargeting._fast import mesh_repair, repair_proposals, repair_triage, repair_prediction
-from omniretargeting._fast.runtime_options import RuntimeOptions
 
 
 def problem(monkeypatch, jac, phi, *, low=-.05, high=.05, mask=None):
@@ -74,8 +72,8 @@ def test_uncertainty_cannot_skip(monkeypatch, bad):
 
 def test_opt_in_certificate_precedes_qp_and_preserves_existing_gate(monkeypatch):
     limits, poses, geometry, measured = problem(monkeypatch, [[0.]], [-.01])
-    assert RuntimeOptions().repair_triage
-    monkeypatch.setattr(repair_triage, 'OPTIONS', replace(RuntimeOptions(), repair_triage=True))
+    pass
+    pass
     monkeypatch.setattr(repair_prediction, 'PREDICTIVE_GATING', True)
 
     def forbidden(*a, **k):
@@ -90,7 +88,7 @@ def test_opt_in_certificate_precedes_qp_and_preserves_existing_gate(monkeypatch)
 
 def test_threshold_is_strict_and_useful_witness_falls_back(monkeypatch):
     limits, poses, geometry, measured = problem(monkeypatch, [[1.]], [-.01])
-    monkeypatch.setattr(repair_triage, 'OPTIONS', replace(RuntimeOptions(), repair_triage=True))
+    pass
     assert repair_triage.certificate(limits, poses, geometry, measured, .01) is None
     monkeypatch.setattr(repair_triage, 'progress_bound', lambda *a: dict(upper_decrease_m=1e-4))
     assert repair_triage.certificate(limits, poses, geometry, measured, .01) is None

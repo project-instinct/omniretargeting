@@ -362,20 +362,6 @@ class PerformanceTrace:
                     "shape_step": {"bounded_shape_step": ("constraint_row_construction", None),
                                    "restore_shape_step": ("restoration", "restore")},
                     "window_canonical": {"canonical_data": ("canonicalization", None)},
-                    "local_restoration": {"backtrack_with_restoration": ("backtracking", None),
-                                          "restore_local": ("restoration", "restore"),
-                                          "_bounds": ("constraint_row_construction", None),
-                                          "_program": ("canonicalization", None)},
-                    "proposal_curvature": {"restore_curvature": ("restoration", "restore")},
-                    "qp_assembly": {"prepare_model": ("constraint_row_construction", None),
-                                    "assemble_program": ("canonicalization", None),
-                                    "solve_model": ("solver_setup", None)},
-                    "qp_types": {"solve_program": ("solver_setup", None)},
-                    "barrier_assembly": {"physical_system": ("constraint_row_construction", None),
-                                         "equilibrated_solve": ("banded_solves", None)},
-                    "qp_reduction": {"solve_restricted": ("solver_setup", None)},
-                    "temporal_direction": {"_temporal_rows": ("constraint_row_construction", None)},
-                    "constrained_ip": {"solve": ("numerical_solve", None)},
                 }
                 replacements = {}
                 for module_name, functions in specs.items():
@@ -393,9 +379,6 @@ class PerformanceTrace:
                 from .shape_step import _ShapeRestoration
                 stack.enter_context(patch.object(_ShapeRestoration, "restoration_constraints",
                     timed_phase("constraint_row_construction")(_ShapeRestoration.restoration_constraints)))
-                from .constrained_ip import QuadraticDomain
-                stack.enter_context(patch.object(QuadraticDomain, "__init__",
-                    timed_phase("constraint_row_construction")(QuadraticDomain.__init__)))
                 originals = {id(value): value for module_name, module in list(sys.modules.items())
                              if module is not None and module_name.startswith("omniretargeting.")
                              for value in list(vars(module).values()) if callable(value)}

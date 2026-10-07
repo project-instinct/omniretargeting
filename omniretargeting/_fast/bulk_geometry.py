@@ -246,15 +246,6 @@ class BulkGeometry:
 
 def prepare(objective):
     """Install private hooks on this evaluator only, including copied chunks."""
-    from .runtime_options import OPTIONS
-    if not OPTIONS.bulk_cpu_geometry:
-        objective.__dict__.pop('_bulk_geometry_unavailable', None)
-        helper = objective.__dict__.pop('_bulk_geometry', None)
-        if helper is not None:
-            for name in ('_proximity_support', '_deepest_samples'):
-                if getattr(objective.__dict__.get(name), '__self__', None) is helper:
-                    objective.__dict__.pop(name, None)
-        return
     if getattr(objective, '_bulk_geometry_unavailable', False):
         return
     # Windows/device evaluators already own their geometry providers.
@@ -278,7 +269,5 @@ def worker_schedule(workers, chunks_per_worker):
     The optional bulk kernel gate measured 12/16/24 workers on the same frozen
     evaluation. Respect the existing per-process CPU allocation for windows.
     """
-    from .runtime_options import OPTIONS
-    if OPTIONS.bulk_cpu_geometry:
-        return min(24, available_cpus()), 4
+    return min(24, available_cpus()), 4
     return workers, chunks_per_worker

@@ -41,6 +41,7 @@ def source_key(initial, positions, names, mapping, roots, tasks, priority, confi
     # subsequently attached surface coverage cannot affect their rows.
     try:
         visit((initial,positions,names,mapping,roots,source_tasks,
+               {name:task.contact_mask for name,task in tasks.items()},
                priority,config,{k:common[k] for k in ('framerate','environment_points',
                    'root_orientation_targets','body_orientation_targets')}))
     except TypeError:
@@ -80,8 +81,7 @@ class SourcePosePrefetch:
                  reference, joint_orientations, active):
         from .._fast.runtime_options import OPTIONS
         self.owner = owner;self.job = None
-        if (not active or reference is not None or not can_parallelize() or len(positions)<128
-                or OPTIONS.seed_continuity or OPTIONS.performance_trace or OPTIONS.gpu_conic):
+        if not active or reference is not None or not can_parallelize() or len(positions)<128 or OPTIONS.performance_trace:
             return
         self.job = ForkJob(_prepare,(owner,retargeter,positions,tasks,orientations,objects,joint_orientations),
                            references=(owner.robot_model,))

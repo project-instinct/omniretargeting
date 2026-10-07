@@ -76,11 +76,8 @@ def contact_bounds(guard, poses, *, selector=None):
     # groups. Retain those objects, so recycled IDs cannot certify new state.
     identity = tuple(guard.groups)
     config = (getattr(guard, "preserve_positions", None), guard.kin.columns.tobytes(), CHUNK_FRAMES,
-              getattr(guard, 'ablate_contacts', False))
-    from .repair_frame_norm import enabled
-    fast = enabled()
-    if fast:
-        config += (len(poses), getattr(guard, 'numerical_slack', None), selector_key(selector))
+              False)
+    config += (len(poses), getattr(guard, 'numerical_slack', None), selector_key(selector))
     state = getattr(guard, "_repair_contact_cache", None)
     if (state is None or state[1] != config or len(state[0]) != len(identity)
             or any(a is not b for a, b in zip(state[0], identity))):
@@ -97,9 +94,8 @@ def contact_bounds(guard, poses, *, selector=None):
         if value is None:
             local = _slice(guard, part)
             result = local.repair_bounds(poses[part])
-            if fast:
-                result = [[(shift_project(matrix, start * width, len(poses) * width, selector),
-                            first, second) for matrix, first, second in rows] for rows in result]
+            result = [[(shift_project(matrix, start * width, len(poses) * width, selector),
+                        first, second) for matrix, first, second in rows] for rows in result]
             value = [(names, rows) for names, rows in zip(_families(local), result)]
             cache[key] = value
         cache.move_to_end(key)
@@ -108,7 +104,7 @@ def contact_bounds(guard, poses, *, selector=None):
         for output, (names, rows) in zip(collected, value):
             assert len(names) == len(rows), "Contact row families changed"
             for family, (matrix, first, second) in zip(names, rows):
-                output[family].append((matrix if fast else _shift(matrix, start * width, len(poses) * width),
+                output[family].append((matrix,
                                        first, second))
     result = []
     for output in collected:

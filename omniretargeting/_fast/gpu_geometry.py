@@ -1,6 +1,6 @@
 """Resident Warp prefilter for original-geometry measurement.
 
-OMNIRETARGETING_GPU_GEOMETRY defaults to 1; 0 forces exact CPU measurement.
+Static GPU screening retains exact CPU witnesses and a CPU availability fallback.
 Missing CUDA/Warp or unsupported scenes automatically use the CPU. A fresh
 interpreter owns CUDA, so the solver's forked CPU workers never initialize it.
 Float32 results only select points for the existing float64 SceneQuery; no GPU
@@ -61,10 +61,10 @@ def _resident_candidates(
     sample_ids: wp.array(dtype=int), starts: wp.array(dtype=int), counts: wp.array(dtype=int),
     position: wp.array(dtype=wp.vec3d), rotation: wp.array(dtype=wp.mat33d),
     mesh_center: wp.vec3d, lower: wp.vec3d, upper: wp.vec3d,
-    invert: int, band: float, eps: float, width: int, debug: int, minimum: int,
+    invert: int, band: float, eps: float, width: int, debug: int,
     counter: wp.array(dtype=int), packed: wp.array(dtype=int),
     values: wp.array(dtype=float), minima: wp.array(dtype=float),
-    uncertain: wp.array(dtype=int), robust_minima: wp.array(dtype=float),
+    uncertain: wp.array(dtype=int),
 ):
     job, sample = wp.tid()
     if sample >= counts[job]:
@@ -93,8 +93,6 @@ def _resident_candidates(
         ambiguous = ((winding >= .009 and wp.abs(winding - 1.) >= .009)
                      or distance <= eps or not wp.isfinite(winding))
         unknown = int(ambiguous)
-        if not ambiguous and minimum != 0:
-            wp.atomic_min(robust_minima, job, phi)
         if not ambiguous and phi >= band + eps:
             exact = 0
         wp.atomic_min(minima, job, phi - eps)
@@ -108,27 +106,6 @@ def _resident_candidates(
         uncertain[out] = unknown
 
 
-@wp.kernel
-def _minimum_candidates(
-    packed: wp.array(dtype=int), values: wp.array(dtype=float), uncertain: wp.array(dtype=int),
-    minima: wp.array(dtype=float), width: int, eps: float, debug: int,
-    counter: wp.array(dtype=int), selected: wp.array(dtype=int),
-    selected_values: wp.array(dtype=float), selected_uncertain: wp.array(dtype=int),
-):
-    i = wp.tid()
-    encoded = packed[i]
-    index = encoded
-    if encoded < 0:
-        index = -encoded - 1
-    keep = encoded < 0 or uncertain[i] != 0 or values[i] <= minima[index // width] + 3. * eps
-    if not keep and debug != 0 and (index % width) % 100 == 0:
-        keep = True
-        encoded = -index - 1
-    if keep:
-        out = wp.atomic_add(counter, 0, 1)
-        selected[out] = encoded
-        selected_values[out] = values[i]
-        selected_uncertain[out] = uncertain[i]
 
 
 class WarpScenePrefilter:
@@ -281,7 +258,7 @@ class ResidentScene:
         self.local = wp.array(local, dtype=wp.vec3d, device="cuda:0")
         self.sample_ids = wp.array(sample_ids, dtype=int, device="cuda:0")
 
-    def candidates(self, positions, rotations, starts, counts, *, debug=False, band=.008, minimum=False):
+    def candidates(self, positions, rotations, starts, counts, *, debug=False, band=.008):
         device, query = "cuda:0", self.prefilter
         started = time.perf_counter()
         width, capacity = int(np.max(counts)), int(np.sum(counts))
@@ -292,7 +269,6 @@ class ResidentScene:
         values = wp.empty(capacity, dtype=float, device=device)
         uncertain = wp.empty(capacity, dtype=int, device=device)
         minima = wp.full(len(counts), 1e6, dtype=float, device=device)
-        robust_minima = wp.full(len(counts), 1e6, dtype=float, device=device)
         counter = wp.zeros(1, dtype=int, device=device)
         pos = wp.array(positions, dtype=wp.vec3d, device=device)
         rot = wp.array(rotations.reshape(-1, 3, 3), dtype=wp.mat33d, device=device)
@@ -302,21 +278,9 @@ class ResidentScene:
         wp.launch(_resident_candidates, dim=(len(counts), width), device=device, inputs=[
             query.mesh.id, self.local, self.sample_ids, begin, sizes, pos, rot,
             wp.vec3d(*query.center), wp.vec3d(*bounds[0]), wp.vec3d(*bounds[1]),
-            int(query.scene.enclosed_free_space), band, query.eps, width, int(debug), int(minimum),
-            counter, packed, values, minima, uncertain, robust_minima])
+            int(query.scene.enclosed_free_space), band, query.eps, width, int(debug),
+            counter, packed, values, minima, uncertain])
         count = int(counter.numpy()[0])
-        if minimum and count:
-            selected = wp.empty(count, dtype=int, device=device)
-            selected_values = wp.empty(count, dtype=float, device=device)
-            selected_uncertain = wp.empty(count, dtype=int, device=device)
-            selected_count = wp.zeros(1, dtype=int, device=device)
-            # The extra epsilon covers float32 rounding in this reduction.
-            # The caller still applies its original 2-epsilon CPU selection.
-            wp.launch(_minimum_candidates, dim=count, device=device, inputs=[
-                packed, values, uncertain, robust_minima, width, query.eps, int(debug),
-                selected_count, selected, selected_values, selected_uncertain])
-            count = int(selected_count.numpy()[0])
-            packed, values, uncertain = selected, selected_values, selected_uncertain
         # Slice before D2H: only compacted candidates, never the full shell.
         # Warp 1.17 cannot convert a zero-length CUDA slice to numpy.
         indices = packed[:count].numpy() if count else np.empty(0, np.int32)
@@ -358,7 +322,7 @@ def _gpu_server(connection):
                 else:
                     positions, rotations, starts, counts, debug, *band = args
                     value = scenes[token].candidates(positions, rotations, starts, counts,
-                                                     debug=debug, minimum=command == "query_min",
+                                                     debug=debug,
                                                      band=.008 if not band else band[0])
                 connection.send((True, value))
             except Exception as error:
@@ -406,8 +370,8 @@ class GeometryService:
         return token
 
     def candidates(self, token, positions, rotations, starts, counts, debug=False, *,
-                   minimum=False, band=.008):
-        return self.request("query_min" if minimum else "query", token,
+                   band=.008):
+        return self.request("query", token,
                             (positions, rotations, starts, counts, debug, band))
 
     def centers(self, token, positions):
@@ -455,80 +419,6 @@ def initialize_static(geometry):
     return True
 
 
-class StaticPlan:
-    """Screen one worker's changed geoms while earlier workers query exactly.
-
-    Shells and the scene remain in the CUDA interpreter. Each worker receives
-    only its changed placements and retained original sample IDs. A rejection
-    stops unsent batches; complete candidates still measure every original row.
-    """
-
-    def __init__(self, geometry, updates, debug, scanned, centered, begun):
-        self.geometry, self.updates, self.debug = geometry, updates, debug
-        geometry.gpu_stats = dict(seconds=0., points=0, candidates=0,
-                                  sphere_culled_geoms=int(sum(np.isfinite(u[2]["clearance"]) for u in updates)),
-                                  scan_seconds=scanned - begun, center_seconds=centered - scanned,
-                                  setup_seconds=0., prepare_seconds=centered - begun)
-        if debug:
-            points = []
-            for update in updates:
-                if not np.isfinite(update[2]["clearance"]):
-                    continue
-                ids = geometry._gpu_groups[update[0][1]][::100]
-                points.append(update[3] + np.einsum(
-                    "nij,nj->ni", np.broadcast_to(update[4].reshape(3, 3), (len(ids), 3, 3)),
-                    geometry.objective.shell_local[ids]))
-            if points:
-                exact = geometry.scene.query(np.concatenate(points))
-                assert not exact["uncertain"].any() and np.all(exact["clearance"] >= .008), "Sphere bound hid a witness/unknown"
-
-    def query_worker(self, worker, count):
-        geometry = self.geometry
-        updates = [u for u in self.updates if u[0][0] % count == worker]
-        if not geometry._gpu_allowed:
-            return None
-        active = [u for u in updates if not np.isfinite(u[2]["clearance"])]
-        if not active:
-            return updates
-        try:
-            service = geometry_service()
-            groups = geometry._gpu_groups
-            positions = np.array([u[3] for u in active])
-            rotations = np.array([u[4] for u in active])
-            starts = np.array([geometry._gpu_starts[u[0][1]] for u in active], np.int32)
-            counts = np.array([len(groups[u[0][1]]) for u in active], np.int32)
-            result = service.candidates(geometry._gpu_token, positions, rotations, starts, counts, self.debug)
-        except (ImportError, RuntimeError, ValueError, OSError, EOFError) as error:
-            geometry._gpu_allowed = False
-            geometry.gpu_unavailable = str(error)
-            return None  # Remaining workers retain their exact CPU query path.
-        for field in ("seconds", "points", "candidates"):
-            geometry.gpu_stats[field] += result[field]
-        jobs, samples = result["jobs"], result["samples"]
-        begin = 0
-        debug_points, debug_phi = [], []
-        for job in np.unique(jobs):
-            end = int(np.searchsorted(jobs, job, side="right"))
-            update = active[job]
-            ids = groups[update[0][1]][samples[begin:end]]
-            audit = result["debug"][begin:end]
-            if audit.any():
-                chosen = ids[audit]
-                debug_points.append(update[3] + np.einsum(
-                    "nij,nj->ni", np.broadcast_to(update[4].reshape(3, 3), (len(chosen), 3, 3)),
-                    geometry.objective.shell_local[chosen]))
-                debug_phi.append(result["phi"][begin:end][audit])
-            update[2]["_gpu_ids"] = ids[~audit].astype(np.int32)
-            begin = end
-        for job, update in enumerate(active):
-            update[2]["_gpu_lower_bound"] = float(result["lower_bounds"][job])
-        if debug_points:
-            exact = geometry.scene.query(np.concatenate(debug_points))
-            predicted = np.concatenate(debug_phi)
-            assert not exact["uncertain"].any(), "GPU screening hid an unknown sample"
-            assert np.all(exact["clearance"] >= .008), "GPU screening hid a witness"
-            assert np.all(np.abs(exact["clearance"] - predicted) <= DISTANCE_BAND), "GPU error band exceeded"
-        return updates
 
 
 def prepare_static(geometry, poses, *, frames=None):
@@ -578,32 +468,15 @@ def prepare_static(geometry, poses, *, frames=None):
     positions = np.array([u[3] for u in updates])
     rotations = np.array([u[4] for u in updates])
     radii = np.array([geometry._static_radii[u[0][1]] for u in updates])
-    if os.environ.get("OMNIRETARGETING_GPU_GEOMETRY_CENTERS", "0") != "0":
-        distance, faces, winding = geometry_service().centers(geometry._gpu_token, positions)
-        winding = np.abs(winding)
-        bounds = scene.components[0][0].bounds
-        winding[~np.all((positions >= bounds[0]) & (positions <= bounds[1]), axis=1)] = 0.
-        known = ((faces >= 0) & np.isfinite(distance) & np.isfinite(winding)
-                 & (distance > DISTANCE_BAND)
-                 & ((winding < .009) | (np.abs(winding - 1.) < .009)))
-        sign = np.where(winding > .5, -1., 1.)
-        if scene.enclosed_free_space:
-            sign = -sign
-        lower = sign * distance - DISTANCE_BAND - radii
-        far = known & np.isfinite(lower) & (lower >= .008 + 1e-9)
-    else:
-        from .repair_static_query import query_scene
-        centers = query_scene(geometry, positions)
-        lower = centers["clearance"] - radii
-        far = ~centers["uncertain"] & np.isfinite(lower) & (lower >= .008 + 1e-9)
+    from .repair_static_query import query_scene
+    centers = query_scene(geometry, positions)
+    lower = centers["clearance"] - radii
+    far = ~centers["uncertain"] & np.isfinite(lower) & (lower >= .008 + 1e-9)
     centered = time.perf_counter()
     for index in np.flatnonzero(far):
         updates[index][2]["clearance"] = float(lower[index])
     active = np.flatnonzero(~far)
     debug = os.environ.get("OMNIRETARGETING_GPU_GEOMETRY_DEBUG", "0") != "0"
-    if (getattr(geometry, "parallel", None) is not None
-            and os.environ.get("OMNIRETARGETING_GPU_GEOMETRY_STREAM", "0") != "0"):
-        return StaticPlan(geometry, updates, debug, scanned, centered, begun)
     if len(active):
         service = geometry_service()
         token = getattr(geometry, "_gpu_token", None)
@@ -689,266 +562,16 @@ def complete_static(geometry, updates):
     geometry.gpu_exact_seconds = time.perf_counter() - begun
 
 
-def measure_lazy_static(geometry, poses, frames, updates, jacobians, protected, stop):
-    """Keep GPU candidates pending until moving/self queries need static rows.
-
-    A rejected candidate needs no later exact static work. Accepted candidates
-    still query every retained sample with the original CPU reduction.
-    """
-    completed = []
-    geometry._gpu_pending_static = (updates, completed, stop)
-    geometry.gpu_exact_seconds = 0.
-    try:
-        part = geometry.measure_frames(poses, frames, jacobians=jacobians,
-                                       protected_depths=protected, stop=stop)
-        return part, completed
-    finally:
-        del geometry._gpu_pending_static
 
 
-def lazy_static_frames(geometry, poses, frames):
-    from .mesh_repair import OriginalGeometry
-
-    updates, completed, _ = geometry._gpu_pending_static
-    by_frame = {}
-    for update in updates:
-        by_frame.setdefault(update[0][0], []).append(update)
-    frames = list(frames)
-    # Bound how much exact work a rejected candidate can leave unused, while
-    # amortizing libigl's winding-data construction over several frames.
-    chunk_size = 8
-    for first in range(0, len(frames), chunk_size):
-        # measure_frames checks the shared stop flag before starting a frame.
-        # A peer can reject while this frame's moving/self query is running;
-        # its already started frame still needs a static summary to finish.
-        chunk = frames[first:first + chunk_size]
-        pending = [u for frame in chunk for u in by_frame.get(frame, ())]
-        elapsed = geometry.gpu_exact_seconds
-        complete_static(geometry, pending)
-        geometry.gpu_exact_seconds += elapsed
-        completed.extend(pending)
-        yield from OriginalGeometry._static_frames(geometry, poses, chunk, _gpu_ready=True)
 
 
-class MovingForwardCache:
-    """The existing MovingSceneQuery.forward_cache protocol, without CUDA."""
-
-    def __init__(self):
-        self.cached = {}
-
-    def get(self, pose, frame, object_id):
-        entry = self.cached.get(frame)
-        signature = np.ascontiguousarray(pose).tobytes()
-        return entry[1][object_id] if entry is not None and entry[0] == signature else None
-
-    def update(self, updates):
-        self.cached.update({frame: (signature, groups) for frame, signature, groups in updates})
 
 
-class SparseWorld:
-    """Original moving sample IDs with only queried world points resident.
-
-    Closed-only moving summaries index a world's winning samples; they never
-    inspect other points or the local array. Preserve its original length for
-    sample-key construction, and retain exact original matmul coordinates.
-    """
-
-    def __init__(self, size):
-        self.size, self.points = size, {}
-
-    def __len__(self):
-        return self.size
-
-    def __getitem__(self, index):
-        return self.points[int(index)]
 
 
-def _moving_exact_batch(query, cid, batch):
-    """Keep first exact minima and closed-component failures across batches."""
-    if not batch:
-        return
-    exact = query.query(np.concatenate([item[2] for item in batch]), component_ids=[cid])
-    begin = 0
-    for components, ids, points, worlds, sparse in batch:
-        end = begin + len(ids)
-        signed = {key: value[begin:end] for key, value in exact.items()}
-        reliable = ~signed["uncertain"] & np.isfinite(signed["clearance"])
-        winner = int(np.argmin(signed["clearance"]) if reliable.all()
-                     else np.flatnonzero(~reliable)[0])
-        take = cid not in components
-        if not take:
-            _, old = components[cid]
-            old_valid = not old["uncertain"][0] and np.isfinite(old["clearance"][0])
-            take = old_valid and (not reliable.all() or signed["clearance"][winner] < old["clearance"][0])
-        if take:
-            sample = int(ids[winner])
-            sparse.points[sample] = worlds[winner].copy()
-            components[cid] = (ids[winner:winner + 1].copy(),
-                               {key: value[winner:winner + 1].copy() for key, value in signed.items()})
-        begin = end
-    batch.clear()
 
 
-def prepare_moving(geometry, poses, *, frames=None):
-    """Batch closed-object minima; every possible winning row is float64 CPU.
-
-    Moving forward summaries use only the first minimum per geom/component,
-    its depth and its 8-mm eligibility. Retain all ambiguous samples and all
-    robust candidates within 2*eps of their approximate minimum. Positive
-    minima beyond the witness band contribute zero depth and no row. Open
-    components, pseudonormal signing and nonunit prescribed scales fall back.
-    Reverse samples and self collision keep their existing parallel CPU paths.
-    """
-    import mujoco
-    from ..moving_scene import interpolate_object
-    from ..scene_geometry import SceneQuery
-
-    moving = geometry.moving
-    if (moving is None or not moving.objects or moving.unknown_components
-            or moving.cfg["activation_distance"] != .008
-            or any(obj["query"].closed_sign_method != "winding"
-                   or np.any(obj["surface"].scales != 1.) for obj in moving.objects)):
-        return None
-    cache = getattr(geometry, "_gpu_moving_cache", None)
-    if cache is None:
-        cache = geometry._gpu_moving_cache = MovingForwardCache()
-    moving.forward_cache = cache
-    changed = [frame for frame in (range(len(poses)) if frames is None else frames)
-               if frame not in cache.cached or cache.cached[frame][0] != np.ascontiguousarray(poses[frame]).tobytes()]
-    if not changed:
-        geometry.gpu_moving_stats = dict(changed_frames=0, reused_geoms=0, screened_geoms=0)
-        return []
-    local = np.concatenate([shell["offsets"] for shell in moving.shells])
-    starts = np.r_[0, np.cumsum([len(s["offsets"]) for s in moving.shells])]
-    shell_ranges = {s["geom_id"]: (int(start), len(s["offsets"]))
-                    for s, start in zip(moving.shells, starts)}
-    tokens = getattr(geometry, "_gpu_moving_tokens", None)
-    service = geometry_service()
-    if tokens is None:
-        tokens = {}
-        for oid, obj in enumerate(moving.objects):
-            for cid in obj["closed"]:
-                part = SceneQuery(obj["query"].components[cid][0])
-                tokens[oid, cid] = service.register(part, local, np.arange(len(local), dtype=np.int32))
-        geometry._gpu_moving_tokens = tokens
-    signatures = dict(getattr(geometry, "_gpu_moving_signatures", {}))
-    updates, jobs, reused = [], [[] for _ in moving.objects], 0
-    data = moving.data
-    for frame in changed:
-        pose = poses[frame]
-        data.qpos[:] = pose
-        mujoco.mj_forward(moving.model, data)
-        old = cache.cached.get(frame)
-        current = {shell["geom_id"]: (data.geom_xpos[shell["geom_id"]].tobytes(),
-                                      data.geom_xmat[shell["geom_id"]].tobytes())
-                   for shell in moving.shells}
-        groups = []
-        for oid, obj in enumerate(moving.objects):
-            translation, rotation, scale = interpolate_object(obj["surface"], frame)
-            samples = {}
-            for shell in moving.shells:
-                gid = shell["geom_id"]
-                if np.linalg.norm(data.geom_xpos[gid] - translation) > obj["radius"] + shell["radius"] + .008:
-                    continue
-                if old is not None and signatures.get((frame, gid)) == current[gid]:
-                    # Prescribed object motion and frame time are immutable.
-                    # Keep the exact winner when this material transform is
-                    # byte-identical, even if another joint changed the pose.
-                    samples[gid] = old[1][oid][gid]
-                    reused += 1
-                    continue
-                robot_rotation = data.geom_xmat[gid].reshape(3, 3)
-                samples[gid] = (SparseWorld(len(shell["offsets"])), None, {})
-                jobs[oid].append((samples[gid], shell_ranges[gid],
-                                  (data.geom_xpos[gid] - translation) @ rotation / scale,
-                                  rotation.T @ robot_rotation / scale, shell["offsets"],
-                                  data.geom_xpos[gid].copy(), robot_rotation.copy(),
-                                  translation, rotation, scale))
-            groups.append(samples)
-        signatures.update({(frame, gid): value for gid, value in current.items()})
-        updates.append((frame, np.ascontiguousarray(pose).tobytes(), groups))
-    debug = os.environ.get("OMNIRETARGETING_GPU_GEOMETRY_DEBUG", "0") != "0"
-    for oid, obj in enumerate(moving.objects):
-        active = jobs[oid]
-        if not active:
-            continue
-        positions = np.array([job[2] for job in active])
-        rotations = np.array([job[3] for job in active])
-        begins = np.array([job[1][0] for job in active], np.int32)
-        counts = np.array([job[1][1] for job in active], np.int32)
-        choices = {}
-        for cid in obj["closed"]:
-            result = service.candidates(tokens[oid, cid], positions, rotations, begins, counts, debug,
-                                        minimum=True)
-            first = 0
-            for job in np.unique(result["jobs"]):
-                last = int(np.searchsorted(result["jobs"], job, side="right"))
-                ids = result["samples"][first:last]
-                phi = result["phi"][first:last]
-                audit = result["debug"][first:last]
-                ambiguous = result["ambiguous"][first:last]
-                robust = ~audit & ~ambiguous & np.isfinite(phi)
-                minimum = float(np.min(phi[robust], initial=np.inf))
-                selected = ~audit & (ambiguous | (phi <= minimum + 2 * DISTANCE_BAND))
-                if debug:
-                    audit |= ~selected & ~ambiguous & (ids % 100 == 0)
-                if not selected.any() and not audit.any():
-                    first = last
-                    continue
-                choices.setdefault(int(job), {})[cid] = (ids[selected].astype(np.int64),
-                                                         ids[audit], phi[audit])
-                first = last
-        batches = {cid: [] for cid in obj["closed"]}
-        totals = dict.fromkeys(obj["closed"], 0)
-        audit_points = {cid: [] for cid in obj["closed"]}
-        audit_phi = {cid: [] for cid in obj["closed"]}
-        for job, components in sorted(choices.items()):
-            values, _, _, _, offsets, position, robot_rotation, translation, rotation, scale = active[job]
-            # Preserve the original FULL matmul's float64 operation order.
-            # Transform once per geom/object, shared by all closed components;
-            # only this geom's dense arrays and compact candidates are live.
-            world = offsets @ robot_rotation.T + position
-            local_points = (world - translation) @ rotation / scale
-            for cid, (chosen, audit, predicted) in components.items():
-                if len(chosen):
-                    bounds = obj["query"].components[cid][0].bounds
-                    points = local_points[chosen]
-                    gap = np.maximum(np.maximum(bounds[0] - points, points - bounds[1]), 0)
-                    chosen = chosen[np.linalg.norm(gap, axis=1) <= .008 / scale]
-                    first = 0
-                    while first < len(chosen):
-                        take = min(len(chosen) - first, geometry.SCENE_BATCH_POINTS - totals[cid])
-                        ids = chosen[first:first + take]
-                        batches[cid].append((values[2], ids, local_points[ids], world[ids], values[0]))
-                        first, totals[cid] = first + take, totals[cid] + take
-                        if totals[cid] == geometry.SCENE_BATCH_POINTS:
-                            _moving_exact_batch(obj["query"], cid, batches[cid])
-                            totals[cid] = 0
-                if len(audit):
-                    audit_points[cid].append(local_points[audit])
-                    audit_phi[cid].append(predicted)
-        for cid in obj["closed"]:
-            if debug and audit_points[cid]:
-                exact = obj["query"].query(np.concatenate(audit_points[cid]), component_ids=[cid])
-                assert not exact["uncertain"].any(), "Moving GPU screening hid an unknown sample"
-                error = np.abs(exact["clearance"] - np.concatenate(audit_phi[cid]))
-                assert np.all(error <= DISTANCE_BAND), "Moving GPU error band exceeded"
-                stats = getattr(geometry, "gpu_moving_audit", dict(points=0, max_error=0.))
-                stats["points"] += len(error)
-                stats["max_error"] = max(stats["max_error"], float(error.max(initial=0.)))
-                geometry.gpu_moving_audit = stats
-            _moving_exact_batch(obj["query"], cid, batches[cid])
-        for values, *_ in active:
-            ordered = {cid: values[2][cid] for cid in obj["closed"] if cid in values[2]}
-            values[2].clear()
-            values[2].update(ordered)
-            wanted = {int(ids[0]) for ids, _ in values[2].values()}
-            values[0].points = {sample: values[0].points[sample] for sample in wanted}
-    cache.update(updates)
-    geometry._gpu_moving_signatures = signatures
-    geometry.gpu_moving_stats = dict(changed_frames=len(changed), reused_geoms=reused,
-                                     screened_geoms=sum(map(len, jobs)))
-    return updates
 
 
 if __name__ == "__main__":

@@ -16,7 +16,6 @@ from ..conic_solver import RETRY_TOLERANCE
 
 # Numerical-path experiment. Canonical data/allowances remain unchanged;
 # solver arithmetic can differ, so retain QDLDL until full per-item approval.
-FAER_RESTORATION = False
 FAER_MIN_VARIABLES = 2048
 
 
@@ -81,17 +80,8 @@ def canonical_data(bounds, projection, selected, orthogonal, radius):
 
 
 def solve_data(data, variables):
-    from . import repair_qoco
-    if repair_qoco.QOCO_RESTORATIONS:
-        x = repair_qoco.solve(data)
-        if x is not None:
-            return x[:variables], cp.OPTIMAL
-    from .repair_epigraph import REDUCED_LARGE_RESTORATION, MIN_VARIABLES, eliminate_epigraph
-    if REDUCED_LARGE_RESTORATION and variables >= MIN_VARIABLES:
-        data = eliminate_epigraph(data, variables)
     adapter, cache = CLARABEL(), {}
-    options = dict(direct_solve_method=("faer" if FAER_RESTORATION and variables >= FAER_MIN_VARIABLES
-                                      else "qdldl"))
+    options = dict(direct_solve_method="qdldl")
     for retry in (False, True):
         if retry:
             options.update(tol_gap_abs=RETRY_TOLERANCE, tol_gap_rel=RETRY_TOLERANCE,

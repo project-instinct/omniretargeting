@@ -21,9 +21,8 @@ def prepare_window_evaluation(objective):
     Call before R2 forks window children. No CUDA import or worker is needed.
     """
     from threadpoolctl import threadpool_limits
-    from .batched_self_collision import BatchedSelfCollision, NativeUnavailable, native_library
+    from .batched_self_collision import NativeUnavailable, native_library
     from .fast_self_collision import acquisition_self_collision
-    from .runtime_options import OPTIONS
     from .window_native import library
     threadpool_limits(limits=1)
     for build in (library, native_library):
@@ -31,29 +30,22 @@ def prepare_window_evaluation(objective):
             build()
         except NativeUnavailable:
             pass
-    if OPTIONS.bulk_cpu_geometry:
-        from .bulk_geometry import native_library as bulk_library
-        try:
-            bulk_library()
-        except NativeUnavailable:
-            pass
-        from .window_query_native import prepare
-        try:
-            prepare(objective)
-        except NativeUnavailable:
-            pass
+    from .bulk_geometry import native_library as bulk_library
+    try:
+        bulk_library()
+    except NativeUnavailable:
+        pass
+    from .window_query_native import prepare
+    try:
+        prepare(objective)
+    except NativeUnavailable:
+        pass
     if objective.self_collision is not None and objective.evaluation_backend != 'legacy':
         try:
             objective._window_collision_template = acquisition_self_collision(objective.self_collision, workers=1, window=True)
         except NativeUnavailable:
             objective._window_collision_template = None
-        from .window_self_collision import WINDOW_SELF_FRAME_CACHE
-        if WINDOW_SELF_FRAME_CACHE and not OPTIONS.fast_self_collision:
-            from .self_collision_window import SelfCollisionWindow
-            provider = SelfCollisionWindow(objective.self_collision).prepare()
-            objective._window_self_cache = provider if provider.batch is not None else None
-        else:
-            objective.__dict__.pop('_window_self_cache', None)
+        objective.__dict__.pop('_window_self_cache', None)
     return objective
 
 
@@ -204,14 +196,13 @@ def evaluate_window(objective, poses, with_jacobian, frames):
     part = np.asarray(poses)[frames.start:frames.stop]
     key = (local.kin.columns.tobytes(), part.shape, part.dtype.str, part.tobytes())
     local.kin.cache[key] = {name: getattr(local.kin, name) for name in names}
-    from .window_tracking import skips_proxy_collision, collision_stats
     from .window_self_collision import WindowSelfCollision
     provider = getattr(objective, '_window_self_cache', None)
     if provider is not None and provider.owner_pid != os.getpid():
         # Also support ordinary forked callers outside WindowWorkers. Replace
         # inherited mutable query buffers without preparation or CUDA work.
         objective._window_self_cache = provider = provider.fork_private_client()
-    if (provider is not None and not skips_proxy_collision(local)
+    if (provider is not None
             and local.self_collision is not None and local.evaluation_backend != 'legacy'):
         collision = getattr(local, '_self_batch', None)
         if not isinstance(collision, WindowSelfCollision) or collision.provider is not provider:
@@ -219,9 +210,9 @@ def evaluate_window(objective, poses, with_jacobian, frames):
         local._self_batch.bind(poses, frames)
     elif isinstance(getattr(local, '_self_batch', None), WindowSelfCollision):
         local.__dict__.pop('_self_batch')
-    if (not skips_proxy_collision(local) and local.self_collision is not None
+    if (local.self_collision is not None
             and not hasattr(local, '_self_batch') and local.evaluation_backend != 'legacy'):
-        from .batched_self_collision import BatchedSelfCollision, NativeUnavailable
+        from .batched_self_collision import NativeUnavailable
         template = getattr(objective, '_window_collision_template', None)
         if template is not None:
             local._self_batch = copy.copy(template)
@@ -258,6 +249,6 @@ def evaluate_window(objective, poses, with_jacobian, frames):
     acc.cost = float(acc.frame_cost.sum()) + float(residual @ residual)
     if with_jacobian:
         acc.hessian, acc.gradient = measured['hessian'], measured['gradient']
-    stats = collision_stats(objective, poses, measured['stats'], frames=frames)
+    stats = measured['stats']
     objective.stats = stats
     return acc, residual, matrix, stats, None

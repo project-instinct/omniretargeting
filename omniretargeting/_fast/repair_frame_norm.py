@@ -12,9 +12,6 @@ import numpy as np
 from scipy import sparse
 
 
-def enabled():
-    from .runtime_options import OPTIONS
-    return OPTIONS.repair_main_cache
 
 
 @dataclass
@@ -25,7 +22,7 @@ class FrameJacobian:
 
 def point_jacobians(limits, bounds, bodies, points):
     from .repair_projected import ProjectedBounds
-    if (not enabled() or not isinstance(bounds, ProjectedBounds)
+    if (not isinstance(bounds, ProjectedBounds)
             or bounds.selected is None):
         return limits.kin.point_jacobians(bodies, points)
     frames = np.flatnonzero(bounds.selected.any(axis=1))

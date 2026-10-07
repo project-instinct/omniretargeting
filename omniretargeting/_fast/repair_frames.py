@@ -22,22 +22,13 @@ def halo_frames(framerate):
 def group_frames(measured, model, group, frames, halo, *, activation=None):
     """Boolean frame mask of the group's penetrating keys, dilated by ``halo``."""
     hit = np.zeros(frames, bool)
-    from .runtime_options import OPTIONS
-    defect_band = activation is None and OPTIONS.repair_defect_windows
     if activation is not None:
         activation = float(activation)
-    elif OPTIONS.repair_defect_windows:
-        from .mesh_repair import _activation_depth
-        activation = _activation_depth()
     else:
         activation = 0.
     for key, depth in measured["depths"].items():
         if depth <= activation:
             continue
-        if defect_band:
-            from .repair_defects import active
-            if not active(key, depth):
-                continue
         geoms = key[2:] if key[1] == "self" else key[-1:]
         if group is None or any(model.body_weldid[model.geom_bodyid[g]] == group for g in geoms):
             hit[key[0]] = True

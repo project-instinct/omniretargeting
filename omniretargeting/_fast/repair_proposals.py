@@ -22,23 +22,15 @@ from threadpoolctl import threadpool_limits
 
 from ..cpu_budget import available_cpus
 from .repair_candidates import candidate_steps
-from .repair_frames import group_frames, halo_frames, restrict
-from .runtime_options import OPTIONS
+from .repair_frames import halo_frames, restrict
+from .repair_frames import group_frames as group_frames
 
 MAX_WORKERS = 4
 MIN_PARALLEL_FRAMES = 100
-# Candidate-order experiment: try ordinary fractions before restoration.
-# Keep disabled until full per-item validation and coordinator approval.
-LAZY_RESTORATION = False
-# Preserve restoration-first ordering for small programs that often commit
-# the restored full step. Large programs try every ordinary fraction first.
-# With LOCAL_RESTORATION_ONLY this recipe gave byte-identical final poses on
-# ten clips (TRUMANS 957/1092/1158/1209, six OMOMO) and halves 957 repair.
-LAZY_LARGE_RESTORATION = True
+# Large programs try ordinary fractions before frame-local restoration.
 LAZY_MIN_VARIABLES = 4096
 # Retain only the frame-local restoration attempt; on those clips the
 # full-domain retry changed no final pose.
-LOCAL_RESTORATION_ONLY = True
 
 
 def transition_group(limits, current, group):
@@ -78,7 +70,6 @@ def _guards(limits):
 
 def _candidate_iterator(limits, geometry, current, measured, protected, fixed_q, depth, step, record):
     from .mesh_repair import _joint_projection, restore_repair, DEEP_RESIDUAL_M
-    from .mesh_repair import OPTIONS as options
 
     def restore(candidate):
         projection = _joint_projection(limits, geometry.model, measured)
@@ -86,21 +77,16 @@ def _candidate_iterator(limits, geometry, current, measured, protected, fixed_q,
         result = restore_repair(limits, current, candidate, geometry, measured, protected,
                                 restrict(projection, mask))
         if result[0] is None and mask is not None and not mask.all():
-            if LOCAL_RESTORATION_ONLY:
-                result[1]["full_domain_retry_skipped_experiment"] = True
-            else:
-                result = restore_repair(limits, current, candidate, geometry, measured, protected, projection)
-                result[1]["full_domain_retry"] = True
+            result[1]["full_domain_retry_skipped_experiment"] = True
         return result
 
-    large = (LAZY_LARGE_RESTORATION and
-             restrict(_joint_projection(limits, geometry.model, measured),
+    large = (restrict(_joint_projection(limits, geometry.model, measured),
                       limits.frame_mask).shape[1] >= LAZY_MIN_VARIABLES)
     return candidate_steps(limits, current, step, restore, record,
-                           lazy=options.lazy_repair_restoration or LAZY_RESTORATION or large,
+                           lazy=large,
                            fixed_q=fixed_q,
                            restore_below=.5 if depth <= DEEP_RESIDUAL_M and not large else None,
-                           parallel_restore=options.parallel_repair_restore and not (LAZY_RESTORATION or large))
+                           parallel_restore=not large)
 
 
 class LocalProposal:
@@ -124,17 +110,12 @@ class LocalProposal:
             return
         from . import repair_fast_gate
         if self.fast_prediction is not None:
-            if OPTIONS.repair_fast_gate and repair_fast_gate.should_skip(self.fast_prediction):
+            if repair_fast_gate.should_skip(self.fast_prediction):
                 self.prediction = {**self.fast_prediction, 'reason': 'reduced_predicted_small_progress',
                                    'reduced_gate': self.fast_prediction}
                 self.step = np.zeros((limits.frames, limits.width))
                 self.status, self.stationary = 'reduced_predicted_small_progress', False
                 return
-        if OPTIONS.repair_defect_windows:
-            # Only frame-local constant rows may be elided. The compact
-            # assembler separately retains every complete temporal stencil.
-            limits._repair_sparse_origin = current
-            limits._repair_sparse_origin_valid = limits.check(current)[0]
         self.step, self.status = _qp_step(limits, current, geometry, measured, protected)
         self.stationary = self.step is not None and np.max(np.abs(self.step), initial=0.) < 1e-9
         from . import repair_prediction
@@ -162,7 +143,7 @@ def gate_predictions(limits, current, geometry, measured, protected, depth):
     from . import repair_fast_gate
     prediction = certificate(limits, current, geometry, measured, depth)
     fast = None
-    if prediction is None and (OPTIONS.repair_fast_gate or repair_fast_gate.RECORD_PREDICTIONS):
+    if prediction is None:
         fast = repair_fast_gate.predict(limits, current, geometry, measured, protected, depth)
     return prediction, fast
 
@@ -352,11 +333,9 @@ class RepairProposals:
         self.stats = dict(launched=0, reused=0, stale=0, local=0, discarded=0,
                           useful_cpu_seconds=0., discarded_cpu_seconds=0.,
                           wait_seconds=0., disabled_reason=None)
-        if OPTIONS.repair_triage:
-            self.stats["pre_qp_prefetch_skips"] = 0
-            self.stats["aborted_stale"] = 0
-        if OPTIONS.repair_fast_gate:
-            self.stats["reduced_prefetch_skips"] = 0
+        self.stats["pre_qp_prefetch_skips"] = 0
+        self.stats["aborted_stale"] = 0
+        self.stats["reduced_prefetch_skips"] = 0
         self._prefetch_triage = False
         parallel = getattr(geometry, "parallel", None)
         if count is None:
@@ -364,9 +343,7 @@ class RepairProposals:
             count = (min(MAX_WORKERS, max(0, available_cpus() - occupied - 1))
                      if limits.frames >= MIN_PARALLEL_FRAMES else 0)
         if (not hasattr(os, "fork") or multiprocessing.current_process().daemon
-                or threading.active_count() != 1 or OPTIONS.witness_memory
-                or getattr(limits.objective, "priority_clearance", None) is not None
-                or getattr(limits.objective, "original_clearance", None) is not None
+                or threading.active_count() != 1
                 or (parallel is not None and (parallel.prefetched or parallel.static_sender is not None))):
             count = 0
             self.stats["disabled_reason"] = "requires idle CPU-only proposal state"
@@ -389,7 +366,7 @@ class RepairProposals:
 
     def note_outcome(self, changed):
         self.stable_attempts = 0 if changed else self.stable_attempts + 1
-        if changed and OPTIONS.repair_triage:
+        if changed:
             # Every pending certificate covers the complete old pose bytes.
             # An accepted change proves all are stale. They own CPU-only
             # state, so do not wait for QP/restoration headers to discard them.
@@ -447,7 +424,7 @@ class RepairProposals:
         if self.stats["stale"] >= 2 and self.stats["reused"] == 0:
             self.stats["disabled_reason"] = "two stale certificates without useful reuse"
             return
-        if not self.workers or (OPTIONS.repair_triage and len(self.workers) < self.capacity):
+        if not self.workers or len(self.workers) < self.capacity:
             self._start_workers()
         if not self.workers:
             return
@@ -471,7 +448,7 @@ class RepairProposals:
             from .repair_defects import frames as attempt_frames
             limits.frame_mask = attempt_frames(limits, measured, model, group,
                                                padding=halo_frames(limits.objective.framerate))
-            if OPTIONS.repair_triage and self._prefetch_triage:
+            if self._prefetch_triage:
                 from .repair_triage import certificate as progress_certificate
                 if progress_certificate(limits, current, self.geometry, measured, depth) is not None:
                     # The real attempt checks again after its actual group
@@ -479,13 +456,12 @@ class RepairProposals:
                     # worker solely to return this inexpensive rejection.
                     self.stats["pre_qp_prefetch_skips"] += 1
                     continue
-            if OPTIONS.repair_fast_gate:
-                from .repair_fast_gate import predict, should_skip
-                if should_skip(predict(limits, current, self.geometry, measured, protected, depth)):
-                    # A dispatch decision only. The actual attempt repeats
-                    # prediction after its actual anchor/group transition.
-                    self.stats["reduced_prefetch_skips"] += 1
-                    continue
+            from .repair_fast_gate import predict, should_skip
+            if should_skip(predict(limits, current, self.geometry, measured, protected, depth)):
+                # A dispatch decision only. The actual attempt repeats
+                # prediction after its actual anchor/group transition.
+                self.stats["reduced_prefetch_skips"] += 1
+                continue
             scope = scope_for_body(limits, group)
             fixed_q = None
             if scope is not None:
