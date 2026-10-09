@@ -16,6 +16,8 @@ from omniretargeting.contacts import (
     EntityTrajectory,
     Scene,
     validate_frame_contacts,
+    _vector,
+    _unit_quaternions,
 )
 
 @dataclass
@@ -35,6 +37,15 @@ class MotionFrame:
     def __post_init__(self) -> None:
         if not validate_motion_frame_positions(self.positions):
             raise ValueError("MotionFrame.positions must have finite shape (J, 3) with J greater than zero.")
+        if self.root_orientation is not None:
+            self.root_orientation = _vector(
+                self.root_orientation, (4,), "MotionFrame.root_orientation"
+            )
+            _unit_quaternions(self.root_orientation, "MotionFrame.root_orientation")
+        if self.root_translation is not None:
+            self.root_translation = _vector(
+                self.root_translation, (3,), "MotionFrame.root_translation"
+            )
         if self.object_points is not None and not validate_object_points(self.object_points):
             raise ValueError("MotionFrame.object_points must have finite shape (N, 3) with N >= 0.")
         if self.target_names is not None and (
@@ -74,13 +85,17 @@ class MotionData:
             self.target_names
         ):
             raise ValueError("MotionData.target_names must be unique.")
-        if self.root_orientations is not None and (
-            self.root_orientations.shape[0] != self.positions.shape[0]
-            or self.root_orientations.shape[-1] != 4
-        ):
-            raise ValueError("MotionData.root_orientations must have shape (T, 4) wxyz quaternion when provided.")
-        if self.root_translations is not None and self.root_translations.shape != (self.positions.shape[0], 3):
-            raise ValueError("MotionData.root_translations must have shape (T, 3) when provided.")
+        if self.root_orientations is not None:
+            self.root_orientations = _vector(
+                self.root_orientations, (len(self.positions), 4),
+                "MotionData.root_orientations",
+            )
+            _unit_quaternions(self.root_orientations, "MotionData.root_orientations")
+        if self.root_translations is not None:
+            self.root_translations = _vector(
+                self.root_translations, (len(self.positions), 3),
+                "MotionData.root_translations",
+            )
         if self.object_points is not None:
             if self.object_points.ndim != 3 or self.object_points.shape[2] != 3:
                 raise ValueError("MotionData.object_points must have shape (T, N, 3) when provided.")
@@ -91,6 +106,18 @@ class MotionData:
                 )
             if not np.isfinite(self.object_points).all():
                 raise ValueError("MotionData.object_points must contain finite values.")
+        for name in ("source_height", "human_height", "framerate"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, (int, float, np.integer, np.floating))
+                or not np.isfinite(value) or value <= 0
+            ):
+                raise ValueError(f"MotionData.{name} must be finite and positive when provided.")
+        if (
+            self.source_height is not None and self.human_height is not None
+            and self.source_height != self.human_height
+        ):
+            raise ValueError("MotionData.source_height and human_height must agree when both are provided.")
         if self.source_height is None:
             self.source_height = self.human_height
         if self.human_height is None:
@@ -471,9 +498,17 @@ class DataSource(ABC):
         if not frames:
             raise ValueError("DataSource produced no frames.")
         positions = np.stack([frame.positions for frame in frames], axis=0)
-        root_orientations = _stack_optional([frame.root_orientation for frame in frames])
-        root_translations = _stack_optional([frame.root_translation for frame in frames])
-        object_points = _stack_optional([frame.object_points for frame in frames])
+        root_orientations = _stack_optional([frame.root_orientation for frame in frames], "root_orientation")
+        root_translations = _stack_optional([frame.root_translation for frame in frames], "root_translation")
+        object_points = _stack_optional([frame.object_points for frame in frames], "object_points")
+        target_names = self.target_names
+        if target_names is None:
+            target_names = next((frame.target_names for frame in frames if frame.target_names is not None), None)
+        if any(
+            frame.target_names is not None and list(frame.target_names) != list(target_names)
+            for frame in frames
+        ):
+            raise ValueError("DataSource frame target_names must match the source target order.")
         pose_keys = set(frames[0].entity_poses or {})
         if any(set(frame.entity_poses or {}) != pose_keys for frame in frames):
             raise ValueError(
@@ -495,16 +530,14 @@ class DataSource(ABC):
             }
         )
         contacts = [deepcopy(frame.contacts) for frame in frames]
-        source_height = getattr(self, "source_height", None)
-        if source_height is None:
-            source_height = getattr(self, "human_height", None)
         return MotionData(
             positions=positions,
-            target_names=self.target_names,
+            target_names=target_names,
             root_orientations=root_orientations,
             root_translations=root_translations,
             framerate=self.framerate,
-            source_height=source_height,
+            source_height=self.source_height,
+            human_height=self.human_height,
             object_points=object_points,
             object_mesh=frames[0].object_mesh,
             metadata=dict(getattr(self, "metadata", {})),
@@ -549,7 +582,9 @@ def validate_object_points(points: np.ndarray) -> bool:
     return bool(np.isfinite(points).all())
 
 
-def _stack_optional(values: list[np.ndarray | None]) -> np.ndarray | None:
-    if any(value is None for value in values):
+def _stack_optional(values: list[np.ndarray | None], name: str) -> np.ndarray | None:
+    if all(value is None for value in values):
         return None
+    if any(value is None for value in values):
+        raise ValueError(f"DataSource {name} has mixed availability across frames.")
     return np.stack(values, axis=0)

@@ -302,7 +302,7 @@ class Lafan1DataSource(DataSource):
             None,
         )
 
-        source_height = 1.75  # default fallback
+        source_height = None
         if head_joint_name is not None and foot_joint_names is not None:
             source_height = estimate_body_height(
                 transformed_positions, names,

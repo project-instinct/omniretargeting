@@ -306,6 +306,24 @@ def create_omomo_data_source(motion_file, source_config, runtime_options):
     source_config = dict(source_config or {})
     runtime_options = dict(runtime_options or {})
     adapter_options = dict(source_config.get("adapter_options") or {})
+    allowed = {
+        "sequence_index", "data_root", "n_object_samples", "target_names_override",
+        "target_names", "model_directory", "use_smplx_base_pose", "framerate",
+        "body_position_mode", "object_scale_mode",
+    }
+    profile_fields = {
+        "name", "type", "target_mapping", "joint_mapping", "joint_names",
+        "base_orientation", "height_estimation", "default_pose_on_robot",
+        "metadata", "adapter_options",
+    }
+    for name, options, keys in (
+        ("source fields", source_config, allowed | profile_fields),
+        ("adapter_options", adapter_options, allowed),
+        ("runtime options", runtime_options, allowed | {"metadata"}),
+    ):
+        unknown = set(options) - keys
+        if unknown:
+            raise ValueError(f"Unknown OMOMO {name}: {sorted(unknown)}")
 
     def option(*keys, default=None):
         for container in (runtime_options, adapter_options, source_config):

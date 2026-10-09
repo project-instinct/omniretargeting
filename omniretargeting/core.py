@@ -90,6 +90,7 @@ class OmniRetargeter:
 
         self.base_orientation_config = dict(base_orientation or {})
         self.retargeting_config = dict(retargeting or {})
+        self._validate_retargeting_config()
 
         # Create mapping from source target names to indices.
         self.source_target_indices = {}
@@ -141,40 +142,7 @@ class OmniRetargeter:
 
     def _setup_retargeting_components(self):
         """Setup internal retargeting components."""
-        # Validate source-to-robot mapping and filter out invalid robot links.
-        # CRITICAL: Only keep source targets whose mapped robot links exist in the robot URDF.
-        # This ensures consistent sizes between source target positions and robot link points.
-        
-        # First, filter out source targets mapped to missing robot links.
-        missing_robot_links = self.validate_joint_mapping()
-        if missing_robot_links:
-            print(f"Warning: The following robot links from joint_mapping were not found in URDF: {missing_robot_links}")
-            print("Source targets mapped to these links will be removed from the mapping.")
-            print(f"\nAvailable robot bodies:")
-            for i in range(min(20, self.robot_model.nbody)):
-                body_name = mujoco.mj_id2name(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, i)
-                print(f"  {body_name}")
-            if self.robot_model.nbody > 20:
-                print(f"  ... and {self.robot_model.nbody - 20} more")
-            
-            # Remove source targets with missing robot links from valid_source_target_names.
-            self.valid_source_target_names = [
-                name for name in self.valid_source_target_names
-                if self.valid_source_to_robot_link_mapping[name] not in missing_robot_links
-            ]
-            # Rebuild mapped_source_target_indices and valid_source_to_robot_link_mapping.
-            self.mapped_source_target_indices = [
-                self.source_target_indices[name] for name in self.valid_source_target_names
-            ]
-            self.valid_source_to_robot_link_mapping = {
-                name: self.joint_mapping[name] for name in self.valid_source_target_names
-            }
-        
-        if len(self.valid_source_target_names) == 0:
-            raise ValueError(
-                "No valid source target mappings found after filtering. "
-                "Please check that joint_mapping maps source targets to robot links that exist in the robot URDF."
-            )
+        self.validate_joint_mapping(raise_on_missing=True)
         
         print(f"Successfully initialized retargeting with {len(self.valid_source_target_names)} mapped source targets.")
         print(f"Valid source targets: {self.valid_source_target_names}")
@@ -261,7 +229,7 @@ class OmniRetargeter:
                 framerate=framerate if framerate is not None else motion_data.framerate,
             )
         elif framerate is not None and motion_data.framerate is None:
-            motion_data.framerate = framerate
+            motion_data = replace(motion_data, framerate=framerate)
 
         source_to_robot_scale = self._resolve_source_to_robot_scale(
             apply_source_to_robot_scaling=enable_scene_scaling,
@@ -352,7 +320,42 @@ class OmniRetargeter:
             frames = tqdm(frames, total=total, desc="Retargeting")
         state = self.create_stream_state(scaled_terrain=scaled_terrain)
         for frame in frames:
+            if isinstance(source, DataSource):
+                declared_names = source.target_names
+                if (
+                    declared_names is not None
+                    and list(declared_names) != list(self.source_target_names)
+                ):
+                    raise ValueError(
+                        f"DataSource target_names {declared_names} do not match configured "
+                        f"target order {self.source_target_names}."
+                    )
             yield self.retarget_frame(frame, state)
+
+    def _validate_retargeting_config(self) -> None:
+        allowed = {
+            "penetration_resolver", "penetration_slack", "penetration_correction",
+            "collision_detection_threshold", "terrain_sample_points",
+            "replace_cylinders_with_capsules", "joint_regularization_boost",
+            "laplacian_edge_weighting", "laplacian_distance_decay", "bone_direction",
+            "base_position_tracking_weight", "base_position_tracking_weight_z",
+            "solver_diagnostics", "terrain_deep_penetration_depth",
+            "contact_edge_weight", "solver_max_iter", "foot_stabilization",
+        }
+        unknown = set(self.retargeting_config) - allowed
+        if unknown:
+            raise ValueError(f"Unknown retargeting options: {sorted(unknown)}")
+        max_iter = self.retargeting_config.get("solver_max_iter")
+        if isinstance(max_iter, dict):
+            unknown = set(max_iter) - {"first_frame", "subsequent"}
+            if unknown:
+                raise ValueError(f"Unknown solver_max_iter options: {sorted(unknown)}")
+        from .retargeting import _validate_penetration_slack_options
+
+        _validate_penetration_slack_options(
+            self.retargeting_config.get("penetration_slack")
+        )
+        self._get_foot_stabilization_config()
 
     def create_stream_state(
         self,
@@ -360,6 +363,7 @@ class OmniRetargeter:
     ) -> RetargetingStreamState:
         from .retargeting import GenericInteractionRetargeter
 
+        self._validate_retargeting_config()
         if scaled_terrain is None:
             scaled_terrain = self.terrain_mesh.copy()
 
@@ -475,7 +479,9 @@ class OmniRetargeter:
 
         max_required_idx = max(pelvis_idx, left_hip_idx, right_hip_idx, spine_idx)
         if joints.shape[0] <= max_required_idx:
-            return None
+            raise ValueError(
+                f"Source frame has {len(joints)} targets but orientation requires index {max_required_idx}."
+            )
 
         pelvis = joints[pelvis_idx]
         left_hip = joints[left_hip_idx]
@@ -534,11 +540,23 @@ class OmniRetargeter:
             q_init[3:7] = estimated_quat_wxyz
 
     def retarget_frame(self, frame: MotionFrame | np.ndarray, state: RetargetingStreamState) -> np.ndarray:
-        positions = frame.positions if isinstance(frame, MotionFrame) else frame
+        if not isinstance(frame, MotionFrame):
+            frame = MotionFrame(positions=frame)
+        positions = frame.positions
+        if len(positions) != len(self.source_target_names):
+            raise ValueError(
+                f"Source frame has {len(positions)} targets; expected {len(self.source_target_names)} "
+                f"in configured order {self.source_target_names}."
+            )
+        if frame.target_names is not None and list(frame.target_names) != list(self.source_target_names):
+            raise ValueError(
+                f"Source frame target_names {frame.target_names} do not match configured "
+                f"target order {self.source_target_names}."
+            )
         root_orientation = frame.root_orientation if isinstance(frame, MotionFrame) else None
         root_translation = frame.root_translation if isinstance(frame, MotionFrame) else None
         source_positions = positions
-        q_init = state.q_init
+        q_init = state.q_init.copy()
 
         estimated_quat_wxyz = self._estimate_base_orientation_from_joints(
             source_positions,
@@ -559,7 +577,6 @@ class OmniRetargeter:
         target_quat_wxyz = None
         if estimated_quat_wxyz is not None:
             target_quat_wxyz = estimated_quat_wxyz
-            state.last_estimated_quat = estimated_quat_wxyz
 
         # Extract object points if present
         object_points = frame.object_points if isinstance(frame, MotionFrame) else None
@@ -597,60 +614,70 @@ class OmniRetargeter:
 
         def solve(q_seed: np.ndarray, hard_penetration: bool) -> np.ndarray:
             state.retargeter.hard_penetration_constraint = hard_penetration
-            return state.retargeter.retarget_frame(
-                mapped_source_targets,
-                q_seed,
-                max_iter=max_iter,
-                q_last=state.q_last,
-                target_base_orientation=target_quat_wxyz,
-                object_points=object_points,
-                root_translation=root_translation,
-                **contact_options,
-            )
+            try:
+                return state.retargeter.retarget_frame(
+                    mapped_source_targets,
+                    q_seed,
+                    max_iter=max_iter,
+                    q_last=state.q_last,
+                    target_base_orientation=target_quat_wxyz,
+                    object_points=object_points,
+                    root_translation=root_translation,
+                    **contact_options,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"Retargeting frame {state.frame_idx} solver error: {exc}") from exc
 
         original_hard_penetration = getattr(
             state.retargeter, "hard_penetration_constraint", False
         ) is True
-        q_opt = solve(q_init, original_hard_penetration)
+        try:
+            q_opt = solve(q_init, original_hard_penetration)
 
-        # Hard penetration rows are linearized at the current pose.  When they
-        # reject the only positive step, retrying without those rows prevents a
-        # frame from silently freezing; subsequent frames rebuild the rows at
-        # the new pose and can still enforce them.
-        if (
-            original_hard_penetration
-            and not state.retargeter.last_solve_diagnostics.get("success", True)
-        ):
-            fallback_q_opt = solve(q_init, False)
-            if state.retargeter.last_solve_diagnostics.get("success", True):
-                q_opt = fallback_q_opt
-                self._frame_fallback_count += 1
+            # Hard penetration rows are linearized at the current pose.  When they
+            # reject the only positive step, retrying without those rows prevents a
+            # frame from silently freezing; subsequent frames rebuild the rows at
+            # the new pose and can still enforce them.
+            if (
+                original_hard_penetration
+                and not state.retargeter.last_solve_diagnostics.get("success", False)
+            ):
+                fallback_q_opt = solve(q_init, False)
+                if state.retargeter.last_solve_diagnostics.get("success", False):
+                    q_opt = fallback_q_opt
+                    self._frame_fallback_count += 1
 
-        if state.frame_idx > 0 and state.retargeter.reaches_joint_limit(q_opt):
-            first_solve_diagnostics = dict(state.retargeter.last_solve_diagnostics)
-            q_default = state.q_default.copy()
-            self._align_initial_root_pose(
-                q_default,
-                source_positions,
-                root_translation,
-                root_orientation,
-                estimated_quat_wxyz,
-            )
-            retry_q_opt = solve(q_default, original_hard_penetration)
-            if not state.retargeter.last_solve_diagnostics.get("success", True):
-                if original_hard_penetration:
-                    retry_q_opt = solve(q_default, False)
-                    if state.retargeter.last_solve_diagnostics.get("success", True):
-                        self._frame_fallback_count += 1
+            if state.frame_idx > 0 and state.retargeter.reaches_joint_limit(q_opt):
+                first_solve_diagnostics = dict(state.retargeter.last_solve_diagnostics)
+                q_default = state.q_default.copy()
+                self._align_initial_root_pose(
+                    q_default,
+                    source_positions,
+                    root_translation,
+                    root_orientation,
+                    estimated_quat_wxyz,
+                )
+                retry_q_opt = solve(q_default, original_hard_penetration)
+                if not state.retargeter.last_solve_diagnostics.get("success", False):
+                    if original_hard_penetration:
+                        retry_q_opt = solve(q_default, False)
+                        if state.retargeter.last_solve_diagnostics.get("success", False):
+                            self._frame_fallback_count += 1
+                        else:
+                            state.retargeter.last_solve_diagnostics = first_solve_diagnostics
+                            retry_q_opt = q_opt
                     else:
                         state.retargeter.last_solve_diagnostics = first_solve_diagnostics
                         retry_q_opt = q_opt
-                else:
-                    state.retargeter.last_solve_diagnostics = first_solve_diagnostics
-                    retry_q_opt = q_opt
-            q_opt = retry_q_opt
+                q_opt = retry_q_opt
 
-        state.retargeter.hard_penetration_constraint = original_hard_penetration
+            if not state.retargeter.last_solve_diagnostics.get("success", False):
+                reason = state.retargeter.last_solve_diagnostics.get("failure_reason", "unsuccessful solve")
+                raise RuntimeError(f"Retargeting frame {state.frame_idx} failed after recovery: {reason}")
+        finally:
+            state.retargeter.hard_penetration_constraint = original_hard_penetration
+        if estimated_quat_wxyz is not None:
+            state.last_estimated_quat = estimated_quat_wxyz
         state.q_init = q_opt
         state.q_last = q_opt
         state.frame_idx += 1
@@ -722,12 +749,9 @@ class OmniRetargeter:
         Returns:
             Scale factor to convert source coordinates to robot scale
         """
-        # Use provided source height, or fallback to default human height
-        if source_height is None:
-            source_height = 1.7
-            print(f"Using default source height: {source_height:.3f}m")
-        else:
-            print(f"Using source height from data source: {source_height:.3f}m")
+        if source_height is None or not np.isfinite(source_height) or source_height <= 0:
+            raise ValueError("Automatic scene scaling requires a finite positive source_height.")
+        print(f"Using source height from data source: {source_height:.3f}m")
 
         source_to_robot_scale = self.robot_height / source_height
 
@@ -764,7 +788,20 @@ class OmniRetargeter:
             "body_names": {},
         }
         cfg = dict(defaults)
-        cfg.update(self.retargeting_config.get("foot_stabilization", {}) or {})
+        options = self.retargeting_config.get("foot_stabilization", {})
+        if options is not None:
+            if not isinstance(options, dict):
+                raise ValueError("foot_stabilization must be a dictionary.")
+            unknown = set(options) - set(defaults)
+            if unknown:
+                raise ValueError(f"Unknown foot_stabilization options: {sorted(unknown)}")
+            cfg.update(options)
+        body_names = cfg["body_names"]
+        if not isinstance(body_names, dict):
+            raise ValueError("foot_stabilization.body_names must be a dictionary.")
+        unknown = set(body_names) - {"left", "right"}
+        if unknown:
+            raise ValueError(f"Unknown foot_stabilization.body_names options: {sorted(unknown)}")
         return cfg
 
     def _apply_foot_stabilization(
@@ -782,8 +819,7 @@ class OmniRetargeter:
 
         foot_specs = self._build_foot_stabilization_specs(cfg)
         if not foot_specs:
-            print("Foot stabilization skipped: no foot bodies could be resolved.")
-            return retargeted_motion
+            raise ValueError("Enabled foot stabilization could not resolve any foot bodies.")
 
         stabilized = np.array(retargeted_motion, copy=True)
         stabilized, wall_contact_mask = self._apply_surface_collision_corrections(
@@ -916,15 +952,14 @@ class OmniRetargeter:
         explicit = dict(cfg.get("body_names", {}) or {})
 
         for side in ("left", "right"):
-            body_id = -1
-            
-            # Priority 1: Explicit robot body name from config
-            explicit_name = explicit.get(side)
-            if explicit_name:
+            if side in explicit:
+                explicit_name = explicit[side]
+                if not isinstance(explicit_name, str) or not explicit_name:
+                    raise ValueError(f"Explicit {side} foot body name must be a non-empty string.")
                 body_id = self._body_name_to_id(explicit_name)
-
-            # Priority 2: Keyword-based search of robot body names
-            if body_id < 0:
+                if body_id < 0:
+                    raise ValueError(f"Explicit {side} foot body {explicit_name!r} was not found in robot.")
+            else:
                 body_id = self._search_body_id_by_keywords(side)
 
             resolved[side] = body_id
@@ -933,11 +968,7 @@ class OmniRetargeter:
 
     def _body_name_to_id(self, body_name: str) -> int:
         """Convert a body name to a MuJoCo id."""
-        try:
-            body_id = mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
-        except Exception:
-            return -1
-        return int(body_id) if body_id is not None and body_id >= 0 else -1
+        return int(mujoco.mj_name2id(self.robot_model, mujoco.mjtObj.mjOBJ_BODY, body_name))
 
     def _search_body_id_by_keywords(self, side: str) -> int:
         """Fallback search for foot/ankle body ids when mappings are incomplete."""
@@ -1349,7 +1380,7 @@ class OmniRetargeter:
         return [self.robot_model.joint(i).name for i in range(self.robot_model.njnt)
                 if self.robot_model.joint(i).name and self.robot_model.jnt_type[i] != mujoco.mjtJoint.mjJNT_FREE]
 
-    def validate_joint_mapping(self) -> List[str]:
+    def validate_joint_mapping(self, raise_on_missing: bool = False) -> List[str]:
         """Validate that the joint mapping is compatible with the robot.
         
         Note: joint_mapping maps source target names to robot BODY (link) names, not joint names.
@@ -1361,7 +1392,7 @@ class OmniRetargeter:
         return validate_robot_joint_mapping(
             self.robot_model,
             self.joint_mapping,
-            raise_on_missing=False
+            raise_on_missing=raise_on_missing
         )
 
     def _visualize_trajectory(self, trajectory: np.ndarray, scaled_terrain: trimesh.Trimesh):

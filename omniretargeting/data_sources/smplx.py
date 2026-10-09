@@ -397,10 +397,13 @@ def retarget_smplx_to_robot(
     robot_height: Optional[float] = None,
     smplx_joint_names: Optional[List[str]] = None,
     base_orientation: Optional[Dict[str, str]] = None,
+    source_height: Optional[float] = None,
+    enable_scene_scaling: bool = False,
 ) -> Tuple[float, np.ndarray]:
     """SMPL-X wrapper with standard target names and orientation landmarks.
 
     Supply base_orientation when using custom source target names.
+    Scene scaling requires an explicit measured source_height.
     """
     from omniretargeting.retargeting import retarget_source_to_robot
 
@@ -417,6 +420,8 @@ def retarget_smplx_to_robot(
         joint_mapping=joint_mapping,
         robot_height=robot_height,
         source_target_names=smplx_joint_names,
+        source_height=source_height,
+        enable_scene_scaling=enable_scene_scaling,
         base_orientation=(
             base_orientation
             if base_orientation is not None

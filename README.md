@@ -156,6 +156,12 @@ motion = MotionData(
 )
 ```
 
+Supplied root poses must be finite, with exact shapes `(T, 3)` and
+`(T, 4)`; root quaternions must be unit wxyz. Supplied heights and framerates
+must be finite and positive, and the two height aliases must agree. Dense frame
+fields such as root poses and object samples must be present on every frame or
+absent throughout. Sparse contacts can remain unavailable on individual frames.
+
 ### SMPL-X Data Source
 
 SMPL-X is currently the implemented source adapter. It returns `MotionData` through `SmplxDataSource.load()` and can read:
@@ -226,7 +232,7 @@ Spine3, L_Foot, R_Foot, Neck, L_Collar, R_Collar, Head, L_Shoulder,
 R_Shoulder, L_Elbow, R_Elbow, L_Wrist, R_Wrist
 ```
 
-Pass the corresponding order to `OmniRetargeter(source_target_names=...)`. Any key in `joint_mapping` must be present in `source_target_names`, and each mapped value must match a body name in the robot URDF; unresolved robot body entries are filtered out with a warning at initialization.
+Pass the corresponding order to `OmniRetargeter(source_target_names=...)`. Any key in `joint_mapping` must be present in `source_target_names`, and each mapped value must match a body name in the robot URDF; invalid robot body entries raise `ValueError` at initialization. Incoming named motion must match the configured target count and order; unnamed position arrays must match the count. Streaming also validates declared `DataSource.target_names` for unnamed frames, without loading the complete stream.
 
 ### Terrain Mesh
 Supports common mesh formats:
@@ -234,6 +240,8 @@ Supports common mesh formats:
 - `.stl` (STL mesh)
 - `.ply` (Polygon File Format)
 - `.gltf`/`.glb` (glTF)
+
+Automatic scene scaling requires a finite positive `MotionData.source_height`. Adapters return `None` when height landmarks are unavailable; provide a measured height before enabling automatic scaling.
 
 **Optional Scene Scaling**: the scene is unscaled by default. Pass `enable_scene_scaling=True` to `retarget_motion()` or `--enable-scene-scaling` to the CLI to scale source motion, terrain, and objects by the robot/source height ratio. The CLI also exports the scaled scene beside the output motion. Alternatively, `--scale-factor FACTOR` applies a fixed scale without exporting the scene; the two CLI scaling options are mutually exclusive.
 
@@ -642,6 +650,13 @@ OmniRetargeter(
 
 #### Methods
 
+Unknown solver and OMOMO adapter controls raise `ValueError`. Supplied
+`penetration_slack` keys and type are checked for every resolver; valid inactive
+settings remain available for fallback without activating slack handling.
+Public retargeting
+raises a `RuntimeError` with the zero-based frame index when numerical recovery
+is exhausted; backend exceptions retain their cause and frame context.
+
 - `retarget_motion(motion, base_orientations=None, base_translations=None, framerate=None, visualize_trajectory=True, enable_scene_scaling=False, show_progress=False)` → `(source_to_robot_scale, retargeted_motion)`
 - `get_robot_dof()` → `int`
 - `get_joint_names()` → `List[str]`
@@ -661,9 +676,11 @@ Loads a robot profile JSON, resolves `urdf_path` relative to the profile file, a
 `retarget_source_to_robot(..., source_target_names=names, base_orientation=...)`
 requires source orientation landmarks (`pelvis`, `left_hip`, `right_hip`, and
 `spine`) just like `OmniRetargeter`. Pass the selected profile's orientation
-configuration. `retarget_smplx_to_robot()` supplies standard SMPL-X target names
+configuration. Both wrappers default to `enable_scene_scaling=False`; to scale,
+pass `enable_scene_scaling=True` and an explicit measured `source_height`.
+`retarget_smplx_to_robot()` supplies standard SMPL-X target names
 and orientation landmarks by default; custom names need an explicit
-`base_orientation` override. These wrappers enable scene scaling.
+`base_orientation` override.
 
 ### `SmplxDataSource`
 

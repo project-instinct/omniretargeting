@@ -600,61 +600,31 @@ def estimate_body_height(
     head_joint: str = "Head",
     foot_joints: tuple[str, str] = ("L_Foot", "R_Foot"),
     head_top_offset: float = 0.12,
-    fallback_height: float = 1.75,
     min_height: float = 1.4,
     max_height: float = 2.2,
 ) -> float | None:
-    """Estimate human height from joint positions by finding the head-to-foot distance.
+    """Measure maximum head-to-foot Z-distance, clipped to the height range.
 
-    Estimates height from the maximum head-to-foot Z-distance across all frames,
-    clipped to [*min_height*, *max_height*].  If named joints are not found in
-    *target_names*, returns *fallback_height*.  If *positions* is empty or
-    ``None``, returns ``None``.
-
-    Args:
-        positions: Joint positions array of shape ``(T, J, 3)``.
-        target_names: List of joint names corresponding to the J axis.
-        head_joint: Name of the head joint in *target_names*.
-        foot_joints: Names of the two foot joints in *target_names*.
-        head_top_offset: Additional offset to add for the top of the head.
-        fallback_height: Height to return if named joints are not found.
-        min_height: Minimum valid height for clipping.
-        max_height: Maximum valid height for clipping.
-
-    Returns:
-        Estimated height in meters, or ``None`` if *positions* is empty or ``None``.
+    Return None when positions or the required landmarks are unavailable.
+    An unavailable measurement must not become an assumed source height.
     """
     if positions is None or len(positions) == 0:
         return None
-
-    try:
-        head_idx = target_names.index(head_joint)
-    except ValueError:
-        return fallback_height
-
-    if head_idx >= positions.shape[1]:
-        return fallback_height
-
-    foot_indices: list[int] = []
-    for fn in foot_joints:
-        try:
-            idx = target_names.index(fn)
-            if idx < positions.shape[1]:
-                foot_indices.append(idx)
-        except ValueError:
-            pass
-
-    if not foot_indices:
-        return fallback_height
-
-    try:
-        head_positions = positions[:, head_idx, 2]
-        feet_positions = np.min(positions[:, foot_indices, 2], axis=1)
-        per_frame_height = np.abs(head_positions - feet_positions) + head_top_offset
-        estimated_height = float(np.max(per_frame_height))
-        return float(np.clip(estimated_height, min_height, max_height))
-    except (IndexError, TypeError):
-        return fallback_height
+    if (
+        positions.ndim != 3 or positions.shape[2] != 3
+        or positions.shape[1] != len(target_names)
+        or not np.isfinite(positions).all()
+    ):
+        raise ValueError("Height estimation requires finite positions of shape (T, J, 3) matching target_names.")
+    if head_joint not in target_names or any(name not in target_names for name in foot_joints):
+        return None
+    head_idx = target_names.index(head_joint)
+    foot_indices = [target_names.index(name) for name in foot_joints]
+    head_positions = positions[:, head_idx, 2]
+    feet_positions = np.min(positions[:, foot_indices, 2], axis=1)
+    per_frame_height = np.abs(head_positions - feet_positions) + head_top_offset
+    estimated_height = float(np.max(per_frame_height))
+    return float(np.clip(estimated_height, min_height, max_height))
 
 
 def validate_robot_joint_mapping(
@@ -697,10 +667,15 @@ def validate_robot_joint_mapping(
     missing_bodies = mapped_bodies - robot_bodies
     
     if missing_bodies and raise_on_missing:
-        missing_list = sorted(list(missing_bodies))
+        missing_targets = {
+            target: (value["robot_link"] if isinstance(value, dict) else value)
+            for target, value in joint_mapping.items()
+            if (value["robot_link"] if isinstance(value, dict) else value) in missing_bodies
+        }
         available_sample = sorted(list(robot_bodies))[:10]
         raise ValueError(
-            f"The following robot links from joint_mapping were not found in URDF: {missing_list}. "
+            f"The following source targets map to robot links not found in URDF: "
+            f"{missing_targets}. "
             f"Please check your joint_mapping. Available bodies (first 10): {available_sample}..."
         )
     

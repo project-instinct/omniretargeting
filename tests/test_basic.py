@@ -1323,10 +1323,12 @@ def test_retarget_frame_uses_root_pose_for_frame_zero_init_when_present():
     q_result = np.arange(7, dtype=float)
 
     inner_retargeter = Mock()
+    inner_retargeter.last_solve_diagnostics = {"success": True}
     inner_retargeter.retarget_frame.return_value = q_result
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
     retargeter.retargeting_config = {}
+    retargeter.source_target_names = ["a", "b", "c", "d"]
     retargeter._estimate_base_orientation_from_joints = Mock(return_value=estimated_quat_wxyz)
     retargeter._extract_mapped_source_targets = Mock(return_value=mapped_targets)
 
@@ -1381,10 +1383,12 @@ def test_retarget_frame_falls_back_to_estimated_root_pose_when_absent():
     q_result = np.arange(7, dtype=float) + 10.0
 
     inner_retargeter = Mock()
+    inner_retargeter.last_solve_diagnostics = {"success": True}
     inner_retargeter.retarget_frame.return_value = q_result
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
     retargeter.retargeting_config = {}
+    retargeter.source_target_names = ["a", "b", "c", "d"]
     retargeter._estimate_base_orientation_from_joints = Mock(return_value=estimated_quat_wxyz)
     retargeter._extract_mapped_source_targets = Mock(return_value=mapped_targets)
 
@@ -1435,6 +1439,7 @@ def test_retarget_frame_retries_with_default_initial_guess_at_joint_limit():
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
     retargeter.retargeting_config = {}
+    retargeter.source_target_names = ["a", "b", "c", "d"]
     retargeter._estimate_base_orientation_from_joints = Mock(return_value=estimated_quat_wxyz)
     retargeter._extract_mapped_source_targets = Mock(return_value=mapped_targets)
 
@@ -1497,6 +1502,7 @@ def test_retarget_frame_keeps_first_solution_when_joint_limit_retry_fails():
 
     retargeter = OmniRetargeter.__new__(OmniRetargeter)
     retargeter.retargeting_config = {}
+    retargeter.source_target_names = ["a", "b", "c", "d"]
     retargeter._estimate_base_orientation_from_joints = Mock(return_value=None)
     retargeter._extract_mapped_source_targets = Mock(return_value=mapped_targets)
 

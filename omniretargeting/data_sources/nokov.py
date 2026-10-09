@@ -287,7 +287,7 @@ class NokovDataSource(DataSource):
             positions: Transformed joint positions (T, J, 3) in meters.
 
         Returns:
-            Estimated height in meters, or fallback (1.75) if estimation fails.
+            Estimated height in meters, or None if required landmarks are unavailable.
         """
         return estimate_body_height(
             positions, names,

@@ -200,13 +200,25 @@ def _solve_qp_clarabel(
         P_sym = sp.triu((P + P.T) * 0.5, format="csc")
         solver = clarabel.DefaultSolver(P_sym, np.asarray(c, dtype=float), A, b, cones, settings)
         sol = solver.solve()
-    except Exception as e:
-        print(f"WARNING: CLARABEL QP solve raised: {e}")
-        return None, False
+    except Exception as exc:
+        raise RuntimeError(
+            f"CLARABEL QP setup/solve failed (P shape {P.shape}, {n} variables): {exc}"
+        ) from exc
 
     if sol.status in (clarabel.SolverStatus.Solved, clarabel.SolverStatus.AlmostSolved):
         return np.asarray(sol.x, dtype=float).ravel(), True
     return None, False
+
+
+def _validate_penetration_slack_options(options: Optional[Dict]) -> None:
+    """Validate supplied controls even when slack handling is inactive."""
+    if options is None:
+        return
+    if not isinstance(options, dict):
+        raise ValueError("penetration_slack must be a dictionary when provided.")
+    unknown = set(options) - {"soft_tolerance", "hard_bound", "slack_penalty"}
+    if unknown:
+        raise ValueError(f"Unknown penetration_slack options: {sorted(unknown)}")
 
 
 class GenericInteractionRetargeter:
@@ -305,6 +317,27 @@ class GenericInteractionRetargeter:
                 diagnostics on ``last_solve_diagnostics``. Summary success and
                 feasibility fields are always retained.
         """
+        _validate_penetration_slack_options(penetration_slack)
+        for name, options, allowed in (
+            ("bone_direction", bone_direction, {
+                "enabled", "chains", "lambda_warm", "lambda_smooth", "lambda_bone",
+                "warm_init", "warm_init_iters",
+            }),
+            ("penetration_correction", penetration_correction, {
+                "base_translation_weights", "base_translation_step",
+                "base_rotation_weight", "base_rotation_step", "joint_weight",
+                "joint_range_normalization", "joint_step_fraction",
+                "step_tolerance", "feasibility_tolerance", "max_backtracks",
+                "restoration_penalty",
+            }),
+            ("joint_regularization_boost", joint_regularization_boost, {"default", "joints"}),
+        ):
+            if options is not None:
+                if not isinstance(options, dict):
+                    raise ValueError(f"{name} must be a dictionary when provided.")
+                unknown = set(options) - allowed
+                if unknown:
+                    raise ValueError(f"Unknown {name} options: {sorted(unknown)}")
         self.robot_model = robot_model
         self.robot_data = robot_data
         self.terrain_mesh = terrain_mesh
@@ -383,8 +416,6 @@ class GenericInteractionRetargeter:
                 "penetration_slack requires hard_penetration_constraint=True "
                 "(penetration_resolver 'hard_constraint_slack')."
             )
-        if penetration_slack is not None and not isinstance(penetration_slack, dict):
-            raise ValueError("penetration_slack must be a dictionary when provided.")
         ps = penetration_slack or {}
         self.penetration_slack_enabled = penetration_slack is not None
         self.penetration_soft_tolerance = float(ps.get("soft_tolerance", 1e-3))
@@ -1932,6 +1963,8 @@ def retarget_source_to_robot(
     robot_height: Optional[float] = None,
     source_target_names: Optional[List[str]] = None,
     base_orientation: Optional[Dict[str, str]] = None,
+    source_height: Optional[float] = None,
+    enable_scene_scaling: bool = False,
 ) -> Tuple[float, np.ndarray]:
     """
     High-level function to retarget source target positions to any robot on any terrain.
@@ -1947,7 +1980,8 @@ def retarget_source_to_robot(
             required for orientation estimation, as in OmniRetargeter.
 
     Returns:
-        Tuple of (source_to_robot_scale, retargeted_trajectory)
+        Tuple of (source_to_robot_scale, retargeted_trajectory).
+        Scene scaling requires enable_scene_scaling=True and a measured source_height.
     """
     # Validate inputs
     if not validate_motion_positions(source_positions):
@@ -1963,8 +1997,14 @@ def retarget_source_to_robot(
         source_target_names=source_target_names,
         base_orientation=base_orientation,
     )
+    from .data_sources.base import MotionData
+
     return retargeter.retarget_motion(
-        source_positions,
+        MotionData(
+            positions=source_positions,
+            target_names=source_target_names,
+            source_height=source_height,
+        ),
         visualize_trajectory=False,
-        enable_scene_scaling=True,
+        enable_scene_scaling=enable_scene_scaling,
     )
