@@ -22,7 +22,7 @@ class ConvexHullScope:
         magnitude = max(1., float(np.max(np.abs(bounds))), float(np.max(np.abs(planes))))
         self.radius = self.spacing * np.sqrt(3) / 2 * lipschitz + 1e-12 * magnitude
 
-    def classify(self, points, thresholds, exact):
+    def classify(self, points, thresholds, exact, *, boundary_query=None):
         """Return hull_margin > threshold; exact computes the original margins."""
         points = np.asarray(points, dtype=float).reshape(-1, 3)
         thresholds = np.asarray(thresholds, dtype=float)
@@ -48,5 +48,7 @@ class ConvexHullScope:
         result[ids[certain]] = centre[certain] > thresholds
         boundary = np.flatnonzero(~decided)
         if len(boundary):
-            result[boundary] = exact(points[boundary])[:, None] > thresholds
+            result[boundary] = (exact(points[boundary])[:, None] > thresholds
+                                if boundary_query is None else
+                                boundary_query(points[boundary], *thresholds))
         return result

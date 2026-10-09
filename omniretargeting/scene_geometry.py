@@ -403,6 +403,12 @@ class SceneQuery:
         if grid is None:
             vertices, triangles, bounds, _ = self._component_query_data[cid]
             spacing = max(float(np.max(bounds[1] - bounds[0])), 1e-9) / WINDING_GRID_CELLS
+            # Only deep, enclosed samples consume the grid. Positive and
+            # shallow queries must not build tens of thousands of winding
+            # nodes for a component they will never look up. An empty query
+            # retains the explicit pre-fork warm-up used by repair workers.
+            if len(points) and not np.any(enclosed & (dist >= WINDING_GRID_DEPTH * spacing)):
+                return np.empty(0, dtype=int)
             lower = bounds[0] - spacing
             counts = np.floor((bounds[1] + spacing - lower) / spacing).astype(int) + 2
             axes = [lower[axis] + spacing * np.arange(counts[axis]) for axis in range(3)]
@@ -444,7 +450,8 @@ class SceneQuery:
         scope = getattr(self, '_hull_scope', None)
         if scope is None:
             scope = self._hull_scope = ConvexHullScope(self._hull, self._hull_bounds)
-        return scope.classify(points, thresholds, self.hull_margin)
+        return scope.classify(points, thresholds, self.hull_margin,
+                              boundary_query=getattr(self, '_repair_hull_thresholds', None))
 
     def _unsigned_only(self, cid):
         """Open, without evidence and not nearly closed: unknown everywhere."""

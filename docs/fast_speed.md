@@ -29,6 +29,76 @@
 在 10 个基准 clip（TRUMANS sit180、wipe300、chair150、fridge957，OMOMO 5、78、80、485、182、254）上，
 并发审计让端到端（求解加全部验收）快 1.18–1.40×，最终动作与审计输出和当前实现逐位相同。
 
+## 2026-10-09：近场精确筛选（opt/speed）
+
+基于 `fix/infra-gaps` 的 `1d4e2de`，本轮只优化查询计算，不改源动作、接触/碰撞政策和求解决策规则。
+保留三项：
+
+- 闭合组件多于一个时，用已经变换到物体局部坐标的实际材料样本 min/max 盒，排除离该组件
+  activation band 之外的整组样本，保守余量覆盖舍入边界。近处保留原逐点 mask 和原查询顺序。
+- 原生开放/近闭合 moving repair 的凸包分类，在已有 `ConvexHullScope` 缓存的未决边界点上用
+  C++ 提前判定布尔阈值，不生成 point×facet 大矩阵。只返回能证明相同的布尔结果；靠近阈值时
+  回退**整个原 boundary batch** 的 NumPy/BLAS，避免缩小批次触发 GEMM/GEMV 末位差异。
+  深度、witness、法向、winding、开放面证据仍来自原查询；编译器不可用则保留原路径。
+- 无深层 enclosed 样本消费的 winding grid 延迟创建，真正需要时仍按原算法构建；空调用的预热语义保留。
+
+这没有引入新的运行开关。基线已有的精确 geom/object pose 缓存和局部坐标驻留 winding/AABB
+不是本轮新增；旧 trace 的完整 frame/pose 几乎不重复，再加同类缓存缺少收益空间。
+
+### 正常计时（每臂两次）
+
+`scripts/benchmark_fast.py` 冻结两臂源码，五段各按 A→B 顺序交替两轮；所有重任务都用
+`flock /tmp/omniretargeting_heavy.lock`，显式 `PYTHONPATH=/home/duanxin/Xyk/omni_opt_speed`。
+i7-13790F（16 物理核、24 逻辑 CPU）+ RTX 3090；fresh subprocess，保留 OS 缓存，
+runner 固定 BLAS/OMP/MKL/NUMEXPR 单线程、torch 4 线程。正常计时关闭 trace/cProfile。
+production 是 `timing.production_seconds`（加载到导出）；repair 是 `stage_seconds.original_mesh_repair`。
+表中单位 s，均值 [最小, 最大]；两次样本只支持本机实测，不代表跨机器统计结论。
+
+| clip | production A | production B | repair A | repair B | repair A/B |
+|---|---:|---:|---:|---:|---:|
+| omomo_254 | 67.78 [63.54, 72.03] | 61.75 [61.40, 62.11] | 40.97 [37.66, 44.28] | 35.93 [35.60, 36.27] | 1.140× |
+| omomo_78 | 96.33 [95.63, 97.02] | 95.08 [94.93, 95.22] | 38.83 [38.59, 39.07] | 37.69 [37.63, 37.74] | 1.030× |
+| omomo_485 | 93.72 [93.42, 94.03] | 93.89 [93.32, 94.45] | 47.49 [47.41, 47.56] | 47.54 [46.89, 48.18] | 0.999× |
+| fridge957 | 182.64 [181.59, 183.69] | 182.43 [182.43, 182.43] | 51.93 [51.55, 52.31] | 52.00 [51.91, 52.09] | 0.999× |
+| sit180 | 91.58 [91.57, 91.59] | 90.42 [90.07, 90.77] | 29.56 [29.41, 29.71] | 28.17 [28.03, 28.31] | 1.049× |
+
+**整段 repair 2× 目标未达到。** 五段四次最终 qpos 和 NPZ 全字段逐位相同，最大 qpos 差为 0；
+各次独立逐对 persistence（含阈值持续时长/占比、unknown、最坏帧）及 reset 核心结果相同。
+没有为速度放宽验收；现有深穿透/持续穿透和 unknown 缺陷仍在，物理回放未验证。
+完整测试：2223 passed、9 skipped，114.79 s，包含接触与模块行数检查。
+
+### 热点与未采用的实验
+
+先以 `OMNIRETARGETING_FAST_ENABLE=performance_trace` 在冻结基线上剖析：omomo_254
+production 75.156 s、repair 39.974 s。另对相同的 2143 次生产请求按 worker 缓存顺序重放；
+以下是开启 cProfile 的单进程累计 elapsed（嵌套项重叠），不能当作并行 production 墙钟：
+
+| 热点 | A s | B s |
+|---|---:|---:|
+| 全部查询（排除 hash/setup） | 55.508 | 48.031 |
+| 闭合组件 `_forward_samples` | 8.284 | 1.749 |
+| 开放面 `_open_forward_samples` | 23.351 | 22.009 |
+| `SceneQuery.query` | 15.104 | 15.391 |
+| 凸包分类（含 cache） | 5.054 | 3.437 |
+| reverse witnesses | 5.300 | 5.439 |
+
+重放 206368 个 witness、known/penetrating 身份、unknown 计数及全部输出 digest 相同。
+此重放候选为 v2；最终版本仅将包围盒舍入余量改为随尺度变化，正常五段计时和完整测试使用最终版本。
+
+整段父/worker profile 的 repair 为 47.063 s，其中父 `geometry.measure` 23.450 s、
+初始化 5.602 s、`solve_step` 6.015 s。query 以外仍有显著成本；worker 的 `recv/read` 包括等待，
+不应归为计算热点。fridge957 的移动对象全部闭合，上轮 moving 累计 5.9 s 而 self 50.8 s，
+因此不能把它的整段修复慢归因于开放移动面。
+
+把整个对象的最近组件 AABB 串行化，150 请求反而 3.275→3.548 s，已撤回。
+大组件批量改用 libigl 并行的慢 worker 探针中，AABB 0.928→0.142 s，但一次整 clip pilot 的
+repair 35.810→37.077 s；没有观察到整段收益，未合入。这是单次探针，不能推断统计显著性。
+剩余热点为开放面原三角查询、证据特征/身份 set 合并、reverse，以及修复父进程的初始化和求解。
+继续追求整段 2× 需要覆盖这些部分，不能用局部 kernel 倍数替代整体结果。
+
+完整证据留在本 worktree 的 `out/opt_speed/REPORT.md`、`comparison.json`、`contracts.json`、
+两轮 `metrics_repeat_*.md`、冻结两臂和原始日志中；输出目录不提交到 Git。
+
 ## 耗时结构
 
 - 短于 600 帧走整段 LM（`solver.py`）：banded 正规方程不满足 guard 时退回 `shape_conic`

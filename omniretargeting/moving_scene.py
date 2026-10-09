@@ -251,10 +251,24 @@ class MovingSceneQuery:
                      + self.data.geom_xpos[gid])
             local = (world - translation) @ rotation / scale
             samples[gid] = (world, local, {})
+        # A component-local box can exclude a shell even when the shell is
+        # near another part of this object. Use the already transformed actual
+        # samples, not the robot's visual mesh or an approximate object SDF.
+        sample_bounds = {gid: (local.min(0), local.max(0))
+                         for gid, (_, local, _) in samples.items()} if len(obj["closed"]) > 1 else {}
         for cid in obj["closed"]:
             bounds = obj["query"].components[cid][0].bounds
             groups, points = [], []
             for gid, (_, local, _) in samples.items():
+                if sample_bounds:
+                    lower, upper = sample_bounds[gid]
+                    box_gap = np.maximum(np.maximum(bounds[0] - upper, lower - bounds[1]), 0.)
+                    # Same nonnegative three-coordinate norm as the point test;
+                    # a cushion keeps the activation boundary unpruned.
+                    distance = np.linalg.norm(box_gap)
+                    cushion = 1e-12 * max(1., band / scale, distance)
+                    if distance > band / scale + cushion:
+                        continue
                 gap = np.maximum(np.maximum(bounds[0] - local, local - bounds[1]), 0)
                 ids = np.flatnonzero(np.linalg.norm(gap, axis=1) <= band / scale)
                 if len(ids):

@@ -38,6 +38,20 @@ def prepare_moving(geometry):
         type(obj['query']) is SceneQuery
         and getattr(getattr(obj['query'].query, '__func__', None), '__code__', None)
         is _QUERY.__code__ for obj in geometry.moving.objects)
+    from .hull_threshold import HullThresholds
+    import subprocess
+    for obj in geometry.moving.objects:
+        query = obj['query']
+        if (type(query) is SceneQuery and getattr(query, '_r4_serial', False)
+                and (obj.get('observed_open') or obj.get('nearly_closed'))
+                and getattr(getattr(query.query, '__func__', None), '__code__', None) is _QUERY.__code__
+                and getattr(query.hull_margin, '__func__', None) is SceneQuery.hull_margin
+                and getattr(query.hull_classification, '__func__', None) is SceneQuery.hull_classification):
+            try:
+                if not hasattr(query, '_repair_hull_thresholds'):
+                    query._repair_hull_thresholds = HullThresholds(query)
+            except (OSError, RuntimeError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                pass  # Optional acceleration; retain the original exact query.
 
 
 def prepare_moving_reduction(geometry, poses):
