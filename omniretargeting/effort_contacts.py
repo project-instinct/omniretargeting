@@ -37,11 +37,12 @@ def contact_evidence(saved, model, fixed_objects=None):
     return values
 
 
-def frame_contacts(evidence, model, data, frame):
-    """Two sets: attained patches, and optimistic source-correspondence patches.
+def frame_contacts(evidence, model, data, frame, *, tolerance=CONTACT_GAP_M):
+    """Actual triangle contacts, and optimistic source-correspondence patches.
 
-    The latter only diagnoses overload that persists even granting the source
-    support plan. It cannot certify attained contact or mask a floating robot.
+    With original geometry, scan all collision geoms, not just source-active
+    patches. Without it, correspondence gating is a conservative fallback and
+    cannot prove missing support. The optimistic set is diagnostic only.
     """
     if evidence is None:
         return [], [], {"missing_evidence": True, "unmodelled_object_contacts": 0}
@@ -77,10 +78,50 @@ def frame_contacts(evidence, model, data, frame):
         else:
             stats["rejected_geometry"] += 1
     stats.update(attained_candidates=len(attained), source_candidates=len(optimistic))
+    geometry = evidence.get("geometry")
+    stats["original_triangle_geometry_available"] = geometry is not None
+    if geometry is not None:
+        measured, diagnostics, unknown = geometry.frame(data, frame)
+        measured = [c for c in measured if c["tolerance_m"] == tolerance]
+        # Missing object inertials matter only when the ROBOT actually touches
+        # that object. A source-only label at a floating hand is not a load.
+        fixed = evidence.get("fixed_objects_15mm", fixed) if tolerance > CONTACT_GAP_M else fixed
+        unmodelled = [c for c in measured if c["surface"] > 0 and (
+            fixed is None or c["surface"] > len(fixed) or not fixed[c["surface"] - 1, frame])]
+        object_pairs = {}
+        for contact in unmodelled:
+            key = contact["geom"], contact["surface"]
+            gap = contact.get("convex_extent_gap_m", contact["gap_m"])
+            if key not in object_pairs or abs(gap) < abs(object_pairs[key]["gap_m"]):
+                object_pairs[key] = {
+                    "geom": key[0], "surface": key[1],
+                    "body": model.body(contact["body"]).name,
+                    "gap_m": gap, "gap_sign_known": True,
+                    "source_support": contact["source_support"],
+                    "point_w_m": contact["point"].tolist(),
+                }
+        excluded = {id(c) for c in unmodelled}
+        attained = [c for c in measured if id(c) not in excluded]
+        stats.update(original_triangle_pairs=diagnostics, uncertain_near_surface_points=unknown[tolerance],
+                     invalid_source_normals=stats["invalid_normals"], invalid_normals=0,
+                     source_only_unmodelled_object_candidates=stats["unmodelled_object_contacts"],
+                     unmodelled_object_contacts=len(unmodelled), attained_candidates=len(attained),
+                     unmodelled_object_contact_pairs=list(object_pairs.values()),
+                     unmodelled_object_surfaces=sorted({c["surface"] for c in unmodelled}),
+                     missing_source_support_pairs=[d for d in diagnostics if d["source_support"]
+                                                   and not d["actual_contact"]
+                                                   and (d["gap_sign_known"] or d["nearest_unsigned_m"] > CONTACT_GAP_M)],
+                     missing_source_contact_pairs=[d for d in diagnostics if d["source_candidates"]
+                                                   and not d["actual_contact"]
+                                                   and (d["gap_sign_known"] or d["nearest_unsigned_m"] > CONTACT_GAP_M)],
+                     unresolved_source_support_pairs=[d for d in diagnostics if d["source_support"]
+                                                       and not d["normal_known"]
+                                                       and d["nearest_unsigned_m"] <= CONTACT_GAP_M],
+                     tolerance_m=tolerance)
     return attained, optimistic, stats
 
 
-def load_fixed_objects(prepared_path, objects_path, frames, fps):
+def load_fixed_objects(prepared_path, objects_path, frames, fps, *, distance=CONTACT_GAP_M):
     """Prove a moving seat is still and grounded using existing source logic."""
     if prepared_path is None or objects_path is None:
         return None
@@ -92,7 +133,7 @@ def load_fixed_objects(prepared_path, objects_path, frames, fps):
     if not objects:
         return np.empty((0, frames), bool)
     scene = trimesh.load_mesh(prepared_path.parent / "static_scene.obj", process=False)
-    # This is the same original geometry and grounding/stillness rule as the
-    # source support preparation, not an object mass inferred from its mesh.
-    return object_fixed(scene, objects, frames, prepared["surface_config"]["distance"],
+    # Reuse original geometry and stillness/transitive-grounding mechanics, but
+    # source detection's 30 mm evidence radius is not an attained support gate.
+    return object_fixed(scene, objects, frames, distance,
                         prepared["surface_config"]["sticking_speed"], fps)

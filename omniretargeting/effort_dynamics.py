@@ -162,3 +162,76 @@ def allocate(demand, mapping, base_dofs, joint_dofs, limits):
     return {"status": "balanced", "torque": torque,
             "utilization": float(np.max(np.abs(torque) / limits, initial=0)),
             "coefficients": coeff, "base_residual": residual}
+
+
+def allocate_circular(model, data, demand, contacts, base_dofs, joint_dofs, limits, friction=FRICTION):
+    """Resolve polygon-bracket ambiguity with the actual circular Coulomb cone."""
+    import clarabel
+    from scipy import sparse
+
+    blocks, frames = [], []
+    for contact in contacts:
+        normal = np.asarray(contact["normal"], float)
+        normal = normal / np.linalg.norm(normal)
+        tangent = np.cross(normal, np.eye(3)[np.argmin(np.abs(normal))])
+        tangent /= np.linalg.norm(tangent)
+        orientation = np.c_[normal, tangent, np.cross(normal, tangent)]
+        jacobian = np.zeros((3, model.nv))
+        mujoco.mj_jac(model, data, jacobian, None, contact["point"], contact["body"])
+        blocks.append(jacobian.T @ orientation)
+        frames.append(orientation)
+    if not blocks:
+        return allocate(demand, np.empty((model.nv, 0)), base_dofs, joint_dofs, limits)
+    mapping = np.concatenate(blocks, axis=1)
+    count = mapping.shape[1]
+    motors = mapping[joint_dofs]
+    equality = np.c_[mapping[base_dofs], np.zeros(len(base_dofs))]
+    bounds = np.r_[np.c_[-motors, -limits], np.c_[motors, -limits],
+                   np.r_[np.zeros(count), -1.][None]]
+    cone_rows = sparse.hstack([sparse.diags(np.tile([-friction, -1., -1.], len(contacts))),
+                              sparse.csc_matrix((count, 1))])
+    matrix = sparse.vstack([sparse.csc_matrix(equality), sparse.csc_matrix(bounds), cone_rows]).tocsc()
+    rhs = np.r_[demand[base_dofs], -demand[joint_dofs], demand[joint_dofs], 0., np.zeros(count)]
+    cones = ([clarabel.ZeroConeT(len(base_dofs))] if len(base_dofs) else [])
+    cones += [clarabel.NonnegativeConeT(len(bounds))]
+    cones += [clarabel.SecondOrderConeT(3) for _ in contacts]
+    settings = clarabel.DefaultSettings()
+    settings.verbose = False
+    settings.tol_feas = settings.tol_gap_abs = settings.tol_gap_rel = 1e-10
+    settings.max_iter = 200
+    try:
+        result = clarabel.DefaultSolver(sparse.csc_matrix((count+1, count+1)),
+                                       np.r_[np.zeros(count), 1.], matrix, rhs, cones, settings).solve()
+    except (ValueError, RuntimeError):
+        return {"status": "numerical_unknown", "torque": None, "utilization": None}
+    if str(result.status) == "PrimalInfeasible":
+        return {"status": "base_infeasible", "torque": None, "utilization": None}
+    if str(result.status) not in {"Solved", "AlmostSolved"}:
+        return {"status": "numerical_unknown", "torque": None, "utilization": None}
+    coefficients = np.asarray(result.x[:-1]).reshape(-1, 3)
+    residual = float(np.max(np.abs(mapping[base_dofs] @ coefficients.ravel() - demand[base_dofs]), initial=0))
+    violation = np.linalg.norm(coefficients[:, 1:], axis=1) - friction * coefficients[:, 0]
+    if residual > FORCE_TOLERANCE or violation.max(initial=0) > FORCE_TOLERANCE:
+        return {"status": "numerical_unknown", "torque": None, "utilization": None}
+    torque = demand[joint_dofs] - motors @ coefficients.ravel()
+    return {"status": "balanced", "torque": torque,
+            "utilization": float(np.max(np.abs(torque)/limits, initial=0)),
+            "coefficients": coefficients.ravel(), "base_residual": residual,
+            "forces_w": [orientation @ force for orientation, force in zip(frames, coefficients)],
+            "dual_utilization_lower_bound": float(result.obj_val_dual) if str(result.status) == "Solved"
+                                             and result.r_dual < 1e-9 else None}
+
+
+def balance_residual(demand, mapping, base_dofs):
+    """Diagnostic closest cone wrench, never credited as a fictitious motor."""
+    from scipy.optimize import lsq_linear
+    required = demand[base_dofs]
+    if mapping.shape[1]:
+        result = lsq_linear(mapping[base_dofs], required, bounds=(0., np.inf),
+                            method="bvls", tol=1e-9, max_iter=200)
+        remainder = required - mapping[base_dofs] @ result.x
+    else:
+        remainder = required
+    return {"required_generalized_base_wrench": required.tolist(),
+            "closest_outer_cone_residual": remainder.tolist(),
+            "residual_is_not_actuation": True}

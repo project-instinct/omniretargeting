@@ -157,3 +157,19 @@ def test_explicit_clip_and_missing_directory_are_reported(tmp_path):
     assert "缺失文件 after：" in report
     assert "timing.json" in report.split("缺失文件 after：", 1)[1].splitlines()[0]
     assert "penetration_persistence.json：before=存在；after=缺失" in report
+
+
+def test_infeasible_support_is_shown_separately_from_unknown(tmp_path):
+    root = tmp_path / "arm"
+    clip = _make_arm(root, deep=False)
+    path = clip / "joint_smoothness.json"
+    record = json.loads(path.read_text())
+    record["effort_dynamics"] = {"infeasible_frames": [1, 2, 3], "unknown_frame_count": 1, "audit_error_frames": [4],
+                                  "frame_status_counts": {"infeasible_unsupported": 3, "unknown_object_load": 1}}
+    _write(path, record)
+    output = tmp_path / "comparison.md"
+    main(["--before", str(root), "--after", str(root), "--output", str(output)])
+    report = output.read_text()
+    assert "支撑确定不可行帧 | 3 | 3" in report
+    assert "infeasible_unsupported" in report
+    assert "力矩审计数值错误帧 | 1 | 1" in report

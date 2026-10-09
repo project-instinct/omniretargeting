@@ -16,7 +16,8 @@ the source of truth for details.
 - [`contact_task_output.md`](contact_task_output.md) — versioned per-frame
   body-part tasks alongside complete qpos, including inactive/unknown slots.
 - [`effort_audit.md`](effort_audit.md) — contact-force balance, original URDF
-  motor limits, and unknown/attribution semantics of the independent effort audit.
+  motor limits, actual-triangle support infeasibility, separate 15 mm sensitivity,
+  and missing-data/attribution semantics of the independent effort audit.
 - [`fast_speed.md`](fast_speed.md) — where fast-solver wall time goes, the
   exact accelerations available, and directions already measured to fail.
 

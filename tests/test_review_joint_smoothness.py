@@ -91,7 +91,7 @@ def test_added_gravity_leverage_is_not_labelled_as_source_or_acceleration(tmp_pa
     report = audit(path, before, after)
     assert report["effort_limit_violations"] == 1
     attribution = report["effort_dynamics"]["overload_frame_attribution"][0]
-    assert attribution["classification"] == "added_pose_under_source_contact_assumption"
+    assert attribution["classification"] == "added_pose_or_contact_geometry"
     assert attribution["source_inner_cone_feasible"]
     assert attribution["source_derivatives_at_final_pose_overload"]
 

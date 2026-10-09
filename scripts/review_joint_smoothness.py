@@ -13,6 +13,7 @@ from omniretargeting.motion_budgets import CHATTER_EXCESS_TOLERANCE, chatter_exc
 from omniretargeting.effort_audit import effort_report
 from omniretargeting.effort_contacts import contact_evidence, load_fixed_objects
 from omniretargeting.effort_dynamics import mechanical_limits
+from omniretargeting.effort_geometry import SENSITIVITY_GAP_M, load_geometry
 
 
 def _joint_limits(model_path, model, limits_urdf=None):
@@ -52,6 +53,10 @@ def audit(model_path, before_path, after_path, *, limits_urdf=None, prepared=Non
         raise ValueError("Effort audit model does not match saved collision_model_sha256")
     fixed = load_fixed_objects(prepared, objects, len(after), fps)
     evidence = contact_evidence(saved_after, model, fixed)
+    if evidence is not None:
+        evidence["fixed_objects_15mm"] = load_fixed_objects(prepared, objects, len(after), fps,
+                                                            distance=SENSITIVITY_GAP_M)
+        evidence["geometry"] = load_geometry(prepared, objects, model, len(after), evidence)
     model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
     efforts, dynamics = effort_report(model, before, after, fps, joints, effort_limits, evidence)
     rows = {
@@ -159,6 +164,8 @@ def audit(model_path, before_path, after_path, *, limits_urdf=None, prepared=Non
         "effort_limit_violations": effort_violations,
         "all_individual_budgets_pass": (
             violations == 0 and not dynamics["unknown_frames"]
+            and not dynamics["infeasible_frames"]
+            and not dynamics["audit_error_frames"]
             and not dynamics["unaudited_endpoint_frames"]
             and not dynamics["missing_effort_limits"]
             and all(name in velocity_limits for name in names)
@@ -173,7 +180,7 @@ def audit(model_path, before_path, after_path, *, limits_urdf=None, prepared=Non
             "Added high-frequency joint chatter relative to the fixed source-fit "
             "trajectory, original URDF velocity/effort limits, and instantaneous "
             "contact-force feasibility with exact floating-base balance. Unknown "
-            "contacts/object loads and unaudited endpoints do not pass. This is "
+            "contacts/object loads, infeasible support and unaudited endpoints do not pass. This is "
             "not physical execution certification."
         ),
     }

@@ -92,7 +92,7 @@ def stage_screen(model_path, poses, fps, effort):
     return rows
 
 
-def run(baseline, output):
+def run(baseline, output, clips=CLIPS):
     output.mkdir(parents=True, exist_ok=True)
     model_path = ROOT / "robot_models/unitree_g1/g1_29dof_torsobase_mesh.xml"
     limits_path = ROOT / "robot_models/unitree_g1/g1_29dof_popsicle.urdf"
@@ -100,7 +100,7 @@ def run(baseline, output):
     _, effort, provenance = mechanical_limits(model_path, model, limits_path)
     summary = {"baseline": str(baseline), "baseline_commit": "1d4e2de",
                "model": provenance, "clips": {}, "solver_changed": False}
-    for name in CLIPS:
+    for name in clips:
         started = time.perf_counter()
         clip = baseline / "A/normal/repeat_1" / name
         destination = output / name
@@ -109,6 +109,7 @@ def run(baseline, output):
         inputs = [motion, clip / "fixed_reference.npz", clip / "stage_0.npz", clip / "before_mesh_repair.npz"]
         hashes = {str(p): _sha(p) for p in inputs}
         old = json.loads((clip / "joint_smoothness.json").read_text())
+        print("auditing", name, flush=True)
         result = audit(model_path, clip / "fixed_reference.npz", motion,
                        limits_urdf=limits_path, prepared=clip / "prepared.npy", objects=clip / "objects.npy")
         _save(destination / "joint_smoothness.json", result)
@@ -133,6 +134,9 @@ def run(baseline, output):
             "new_effort_joints": {joint: x["mechanical_limits"]["effort"] for joint, x in result["joints"].items()
                                   if x["mechanical_limits"]["effort"]["violations"]},
             "frame_status_counts": result["effort_dynamics"]["frame_status_counts"],
+            "tolerance_15mm_status_counts": result["effort_dynamics"]["tolerance_15mm_status_counts"],
+            "infeasible_frames": result["effort_dynamics"]["infeasible_frames"],
+            "audit_error_frames": result["effort_dynamics"]["audit_error_frames"],
             "unknown_frames": result["effort_dynamics"]["unknown_frames"],
             "unaudited_endpoint_frames": result["effort_dynamics"]["unaudited_endpoint_frames"],
             "source_fit_overload_frames": result["effort_dynamics"]["source_fit_unavoidable_overload_frames"],
@@ -161,5 +165,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--clips", nargs="+", choices=CLIPS, default=CLIPS)
     args = parser.parse_args()
-    run(args.baseline.resolve(), args.output.resolve())
+    run(args.baseline.resolve(), args.output.resolve(), args.clips)
