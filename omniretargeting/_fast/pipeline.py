@@ -29,7 +29,7 @@ from .acquisition_guard import AcquisitionNormalGuard
 from .continuity import (
     CorrectionContinuity, audit_continuity, chatter_reports,
 )
-from .mesh_repair import repair_original_meshes
+from .whole_body_projection import repair_original_meshes
 from .objective import FastObjective
 from .performance_trace import PerformanceTrace, explain_guard
 from .reference import (ReferenceShape, kinematic_tracking_tasks, height_tracking_tasks,
@@ -659,6 +659,8 @@ def _solve_fast_sequence(
             objective, motion, getattr(owner, "_scene_objects", ()), common.get("scene_query"),
         )
         verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
+        # Preserve already-computed diagnostics if the final audit hits the deadline.
+        report["refinement_budgets"] = verified[0]
         trace.absorb_repair(mesh_repair)
         trace.add_stage_seconds("original_mesh_repair", time.monotonic() - repair_tick)
         trace.current_stage = None

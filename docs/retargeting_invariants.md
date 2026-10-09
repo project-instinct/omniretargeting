@@ -40,8 +40,10 @@ Current mechanisms and known gaps; goals and priorities belong to [`AGENTS.md`](
   opposite side (`LAYOUT_FLIP_MARGIN`) for `LAYOUT_FLIP_WINDOW_FRAMES = 7` consecutive frames.
   Near-zero and brief crossings get a deadband in the linearized rows; a sustained clear flip
   is restored and rejected by exact final acceptance.
-- Secondary corrections stay local to the motion they receive (`_fast/repair_limits.LOCAL_ANGLE`,
-  `max_joint_correction`). This bounds correction locality, not posture against the source.
+- The legacy local pass uses `_fast/repair_limits.LOCAL_ANGLE`. Full-body refinement instead
+  uses all tangent coordinates with a fixed 0.4 rad correction neighborhood and the original
+  joint/root envelopes. This numerical neighborhood is reported as a possible blocker; it
+  does not rebase the source posture reference or freeze individual limb/contact solutions.
 - Distal segments that no other task observes (hands) follow their calibrated source
   orientation closely (`UNOBSERVED_LEAF_SIGMA_SCALE`, `_core/orientation_targets.py`), because
   landmark relations cannot see a leaf turning about its own axis. Leaves whose chain carries a
@@ -84,9 +86,10 @@ object and scene.
    - Where mechanics cannot explain a frame, its contacts stay protected and the uncertainty is
      reported.
 3. Resolve: when not all contacts fit, the lower-ranked one yields and its gap is reported.
-   Contacts are one-sided, pulling a body onto a surface and never into it. Achieved contact
-   accuracy is frozen for later corrections, but a contact body that penetrates yields by its
-   depth. A protected point is frozen at its normal distance only while it lies on an actual
+   Contacts are one-sided, pulling a body onto a surface and never into it. The legacy local
+   stages freeze achieved accuracy, with a penetrating body yielding by its depth; full-body
+   refinement releases these intermediate locks and retains the source contact targets.
+   In the local stages a protected point is frozen at its normal distance only while it lies on an actual
    surface (`_fast/surface_presence.py`); a point off every surface, e.g. buried in an object,
    may approach its target but not recede.
 4. Hand off: when support shifts between contacts the source holds together (standing up from a
@@ -201,7 +204,28 @@ Reset is separately invalid (lateral/self >1 mm or scene/object >5 mm), unknown,
 or stopping thresholds. Audit runs once after solving and never triggers another solve.
 
 The production chain is source_pose → grid → acquisition → reweight → free_bodies →
-original_mesh_repair. ≥600 frames retain window acquisition. It still freezes acquired
-contact accuracy/positions and per-key depth with bounded repair scopes. Unfreezing intermediate
-solutions, using near-field true geometry in the main solve, and jointly moving both self-pair
-chains and support compensators are future directions, not claims about this implementation.
+original_mesh_repair. ≥600 frames retain window acquisition. The legacy local pass supplies an incumbent. A subsequent
+`whole_body_projection` releases its acquired-position and per-key minimum locks: original
+triangle/reverse/self rows directly enter simultaneous root and all-joint corrections. Source
+contact positions remain soft targets; the fixed source reference is never rebased. Physical
+collision pairs merge query representations before the unchanged quality policy ranks them.
+
+The added correction has a curvature regularizer, while source-relative high-frequency bounds
+are explicit linear QP constraints. An operator-splitting proposal gets at most 5 s per step;
+if no admissible progress remains, the same solve refreshes once to a direct QP with the
+three-frame inverse-dynamics Jacobian. It does not raise penalty weights. Long-clip direct
+steps use temporal policy-event working sets, with a 12-frame halo and merged high-pass
+stencils; every time window still contains the whole body. Exact nonlinear layout, continuity, joint projection and
+inverse-dynamics effort screening gate acceptance. Existing mechanical violations are reported;
+refinement cannot create or enlarge one. The inverse-dynamics screen follows the independent
+audit stencil and is not a physical replay certificate. Root movement is bounded by the original
+source envelope and reported explicitly, with compensating joints available.
+
+A lost source-side observation first attempts original-geometry outside proof. If it remains
+unknown, its negative unsigned triangle distance stays as a conservative optimization residual;
+it never supplies a positive-clearance certificate and the unknown remains in diagnostics.
+Already computed `refinement_budgets` and the live refinement ledger survive a deadline
+that skips final diagnostics. They are not a physical acceptance certificate.
+The refinement stops at known policy satisfaction, lack of feasible quality progress after
+the single model refresh, or the
+production deadline. It does not rerun the independent audits or extend the time budget.

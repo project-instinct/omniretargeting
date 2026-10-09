@@ -413,6 +413,16 @@ class MovingSceneQuery:
                 )
         return ~np.asarray(signed["uncertain"], bool)
 
+    def certified_outside(self, pose, time, required):
+        """Resolve lost material observations only with an outside certificate.
+
+        A broad-phase skip or leaving a local evidence patch is not itself
+        proof. The original object hull/triangles must decide every required
+        sample; uncertain samples remain missing.
+        """
+        from .moving_outside import certified_outside
+        return certified_outside(self, pose, time, required)
+
     def query(self, pose, time, dofs=None):
         dofs = np.arange(self.model.nv) if dofs is None else np.asarray(dofs, dtype=int)
         pose = np.asarray(pose, dtype=float)
