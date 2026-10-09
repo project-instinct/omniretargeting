@@ -50,6 +50,7 @@ class SmplxDataSource(DataSource):
     betas: list[float] | None = None
     use_smplx_base_pose: bool = True
     metadata: dict = field(default_factory=dict)
+    height_estimation: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.motion_file = Path(self.motion_file)
@@ -78,8 +79,10 @@ class SmplxDataSource(DataSource):
             positions, orientations, root_orient, trans, framerate, metadata = self._load_arrays(self.motion_file)
             names = self.target_names_override or _default_target_names(positions.shape[1])
 
-            # Compute source height: try betas first, then trajectory, then None
-            source_height = self.compute_human_height()
+            # Explicit landmarks govern the measurement; otherwise try betas first.
+            source_height = (
+                None if self.height_estimation else self.compute_human_height()
+            )
             if source_height is None:
                 source_height = self.estimate_height_from_trajectory(positions, names)
             
@@ -151,7 +154,14 @@ class SmplxDataSource(DataSource):
         Returns:
             Estimated height in meters, or ``None`` if estimation fails.
         """
-        return estimate_body_height(positions, target_names, head_joint="Head", foot_joints=("L_Foot", "R_Foot"))
+        return estimate_body_height(
+            positions, target_names,
+            **{
+                "head_joint": "Head",
+                "foot_joints": ("L_Foot", "R_Foot"),
+                **self.height_estimation,
+            },
+        )
 
     def _load_arrays(
         self,
@@ -357,6 +367,7 @@ def create_smplx_data_source(
         target_names_override=target_names,
         betas=option("betas", "smplx_betas"),
         use_smplx_base_pose=option("use_smplx_base_pose", default=False),
+        height_estimation=option("height_estimation", default={}),
     )
 
 

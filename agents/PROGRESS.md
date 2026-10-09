@@ -1,6 +1,6 @@
 # OmniRetargeting Progress
 
-Updated: 2026-10-09. This log consolidates completed work and current verification;
+Updated: 2026-10-10. This log consolidates completed work and current verification;
 Git history retains earlier implementation details.
 
 ## Current State
@@ -16,9 +16,27 @@ Git history retains earlier implementation details.
   MuJoCo offscreen visualization supports object meshes and `--save-video`.
 - Recent commits: `8818771` (home-relative OMOMO fixture paths), `dd9438f`
   (contact/scene interface), and `f152892` (strict inputs and fallback fixes).
-- All scoped review findings, including the three final failing regressions,
-  are resolved. The completed `agents/REVIEW.md` was removed at the user's request.
-  This cleanup compacts the log and preserves the pending agent-instruction edits.
+- The prior scoped review findings and three final failing regressions were
+  resolved. Completed `agents/REVIEW.md` was removed at the user's request;
+  `98b681d` compacted this log and committed the agent-instruction edits.
+  The branch is published as `origin/feat/contact`; PR #12 is open.
+
+## Configured Height Regression (2026-10-10)
+
+- Verified PR #12's P2 finding before production edits: 18 new adapter/CLI cases
+  failed because configured landmarks were dropped or rejected; another test
+  reproduced SMPL-X model height overriding explicit measurement settings.
+- All five adapters now accept `height_estimation` and forward it to the existing
+  estimator. Precedence: runtime YAML > nested adapter options > source fields;
+  the CLI inherits the top-level profile block when the selected source omits it.
+  Explicit SMPL-X settings govern measurement; omitted settings retain defaults.
+- Permanent regressions use actual NPZ, OMOMO FK, and BVH loading. Three real CLI
+  cases exercise profile/source/YAML settings and verify exported terrain bounds
+  at scale 1.35/1.8 = 0.75. All **19 new cases pass** (1.36 s).
+- Full aorua/robot-data suite: **319 passed, 12 skipped**, three existing
+  deprecation warnings, 35.93 s. Missing licensed SMPL-X assets account for skips.
+  Logs: `/tmp/omniretargeting-height-{before,model-before,fixed,full}.log`.
+  README documents the settings; `git diff --check` passed.
 
 ## Contact and Scene Interface
 
@@ -79,7 +97,7 @@ Git history retains earlier implementation details.
   before returning a pose or advancing stream state. Successful numerical recovery
   remains supported, and temporary solver settings are restored on failure.
 
-## Latest Verification (aorua, 2026-10-09)
+## Previous Verification (aorua, 2026-10-09)
 
 - Installed environment: `~/miniconda3`, `conda activate robot-data`.
   Missing runtime dependencies were installed; tests need no temporary dependency

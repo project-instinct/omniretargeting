@@ -459,6 +459,22 @@ before passing the motion to `OmniRetargeter`. Source body-model details stay in
 adapters; the generic solver receives mapped point indices, world anchors, and
 explicit edge contributions.
 
+Custom height landmarks can be configured in source YAML for both main and
+batch workflows (batch accepts the same block through `--source-options`):
+
+```yaml
+height_estimation:
+  head_joint: crown
+  foot_joints: [sole_l, sole_r]
+  head_top_offset: 0.25
+```
+
+These names refer to source points, and the offset is in meters. For Python
+use, pass the block as `height_estimation` to the adapter constructor or
+through `source_config`/`runtime_options` in `create_data_source`. Missing
+configured landmarks remain an unavailable measurement; automatic scaling
+requires a finite positive `MotionData.source_height`.
+
 #### Migrating older CLI scripts
 
 The main CLI requires `--source-config`; legacy source-loading flags are removed.
@@ -552,6 +568,11 @@ Current shipped profiles contain robot fields and a list of source entries:
   adapter's `motion.target_names` when constructing the retargeter
 - `source[].adapter_options` – source loading and body/skeleton options;
   runtime source options override these, which override direct source fields
+- `height_estimation` – adapter height measurement controls: source `head_joint`,
+  source `foot_joints`, and `head_top_offset` in meters. The CLI uses a top-level
+  profile block when the selected source does not define one. Precedence is
+  source YAML > `source[].adapter_options` > `source[]` > top-level profile.
+  Explicit SMPL-X settings use these landmarks instead of the model height.
 - `base_orientation` – source target names used to estimate root orientation (`pelvis`, `left_hip`, `right_hip`, `spine`)
 - `retargeting` – solver settings forwarded to `GenericInteractionRetargeter`:
   - `collision_detection_threshold`

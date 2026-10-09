@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import joblib
@@ -33,6 +33,7 @@ class OmomoDataSource(DataSource):
     use_smplx_base_pose: bool = True
     body_position_mode: str = "smplx"
     object_scale_mode: str = "per_frame"
+    height_estimation: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.sequence_file = Path(self.sequence_file).expanduser()
@@ -221,7 +222,14 @@ class OmomoDataSource(DataSource):
         Returns:
             Estimated height in meters, or ``None`` if estimation fails.
         """
-        return estimate_body_height(positions, target_names, head_joint="Head", foot_joints=("L_Foot", "R_Foot"))
+        return estimate_body_height(
+            positions, target_names,
+            **{
+                "head_joint": "Head",
+                "foot_joints": ("L_Foot", "R_Foot"),
+                **self.height_estimation,
+            },
+        )
 
     def load(self) -> MotionData:
         if self._motion_data is None:
@@ -309,11 +317,11 @@ def create_omomo_data_source(motion_file, source_config, runtime_options):
     allowed = {
         "sequence_index", "data_root", "n_object_samples", "target_names_override",
         "target_names", "model_directory", "use_smplx_base_pose", "framerate",
-        "body_position_mode", "object_scale_mode",
+        "body_position_mode", "object_scale_mode", "height_estimation",
     }
     profile_fields = {
         "name", "type", "target_mapping", "joint_mapping", "joint_names",
-        "base_orientation", "height_estimation", "default_pose_on_robot",
+        "base_orientation", "default_pose_on_robot",
         "metadata", "adapter_options",
     }
     for name, options, keys in (
@@ -349,6 +357,7 @@ def create_omomo_data_source(motion_file, source_config, runtime_options):
         framerate=option("framerate", default=30.0),
         body_position_mode=option("body_position_mode", default="smplx"),
         object_scale_mode=option("object_scale_mode", default="per_frame"),
+        height_estimation=option("height_estimation", default={}),
     )
 
 

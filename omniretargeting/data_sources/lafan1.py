@@ -232,6 +232,7 @@ class Lafan1DataSource(DataSource):
     motion_file: Path
     start_frame: int = 0
     metadata: dict = field(default_factory=dict)
+    height_estimation: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.motion_file = Path(self.motion_file)
@@ -302,12 +303,18 @@ class Lafan1DataSource(DataSource):
             None,
         )
 
+        height_options = {
+            "head_joint": head_joint_name,
+            "foot_joints": foot_joint_names,
+            **self.height_estimation,
+        }
         source_height = None
-        if head_joint_name is not None and foot_joint_names is not None:
+        if (
+            height_options["head_joint"] is not None
+            and height_options["foot_joints"] is not None
+        ):
             source_height = estimate_body_height(
-                transformed_positions, names,
-                head_joint=head_joint_name,
-                foot_joints=foot_joint_names,
+                transformed_positions, names, **height_options,
             )
 
         framerate = 1.0 / frametime if frametime > 0 else 30.0
@@ -339,11 +346,18 @@ def create_lafan1_data_source(
 ) -> Lafan1DataSource:
     source_config = dict(source_config or {})
     runtime_options = dict(runtime_options or {})
+    adapter_options = dict(source_config.get("adapter_options") or {})
 
     return Lafan1DataSource(
         motion_file=motion_file,
         start_frame=int(runtime_options.get("start_frame", 0)),
         metadata=runtime_options.get("metadata", {}),
+        height_estimation=runtime_options.get(
+            "height_estimation",
+            adapter_options.get(
+                "height_estimation", source_config.get("height_estimation", {})
+            ),
+        ),
     )
 
 

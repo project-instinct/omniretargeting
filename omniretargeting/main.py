@@ -191,6 +191,11 @@ def _run(args, parser: argparse.ArgumentParser):
     }
     selected_source = select_robot_source(robot_config, source_type)
     data_source_source_config = dict(selected_source)
+    if (
+        "height_estimation" not in data_source_source_config
+        and "height_estimation" in robot_config
+    ):
+        data_source_source_config["height_estimation"] = robot_config["height_estimation"]
     print(f"Source type: {source_type}")
     print(f"Motion file: {source_motion_path}")
 

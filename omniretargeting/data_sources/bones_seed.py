@@ -188,6 +188,7 @@ class BonesSeedDataSource(DataSource):
     motion_file: Path
     start_frame: int = 0
     metadata: dict = field(default_factory=dict)
+    height_estimation: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.motion_file = Path(self.motion_file)
@@ -241,8 +242,11 @@ class BonesSeedDataSource(DataSource):
 
         source_height = estimate_body_height(
             transformed_positions, names,
-            head_joint="Head",
-            foot_joints=("LeftFoot", "RightFoot"),
+            **{
+                "head_joint": "Head",
+                "foot_joints": ("LeftFoot", "RightFoot"),
+                **self.height_estimation,
+            },
         )
 
         framerate = 1.0 / frametime if frametime > 0 else 120.0
@@ -274,11 +278,18 @@ def create_bones_seed_data_source(
 ) -> BonesSeedDataSource:
     source_config = dict(source_config or {})
     runtime_options = dict(runtime_options or {})
+    adapter_options = dict(source_config.get("adapter_options") or {})
 
     return BonesSeedDataSource(
         motion_file=motion_file,
         start_frame=int(runtime_options.get("start_frame", 0)),
         metadata=runtime_options.get("metadata", {}),
+        height_estimation=runtime_options.get(
+            "height_estimation",
+            adapter_options.get(
+                "height_estimation", source_config.get("height_estimation", {})
+            ),
+        ),
     )
 
 
