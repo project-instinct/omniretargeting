@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from itertools import combinations
-from copy import copy
+from copy import copy, deepcopy
 from collections import OrderedDict
 
 import mujoco
@@ -33,6 +33,7 @@ def _random_quaternion(rng):
 # ``SelfCollisionQuery._exclude_structural_overlaps``); fixed for reproducibility.
 STRUCTURAL_SAMPLES = 64
 STRUCTURAL_SEED = 0
+STRUCTURAL_REPLACEMENTS = 64
 
 
 def self_collision_config(config=None):
@@ -101,6 +102,7 @@ class SelfCollisionQuery:
                 continue
             pairs.append((a, b))
         self.pairs = np.asarray(pairs, dtype=int).reshape(-1, 2)
+        self.model_pairs = self.pairs.copy()
         self.pair_ids = self.pairs[:, 0] * model.ngeom + self.pairs[:, 1]
         self.pair_queries = 0
         from .convex_mesh_distance import ConvexMeshDistance
@@ -108,7 +110,21 @@ class SelfCollisionQuery:
         self.motion_bounds = CollisionMotionBounds(model, self.geom_ids)
         self._segment_cache = OrderedDict()
         self.structural_pairs = []
+        self.structural_evidence = {}
+        self.structural_sampling = {}
         self._exclude_structural_overlaps()
+
+    def use_model_pairs(self):
+        """Restore compiled MJCF pairs for independent audits.
+
+        Body names are provenance only; evidence remains keyed by geom IDs.
+        """
+        restored = [list(pair) for pair in self.structural_pairs]
+        self.pairs = self.model_pairs.copy()
+        self.pair_ids = self.pairs[:, 0] * self.model.ngeom + self.pairs[:, 1]
+        self.structural_pairs = []
+        self._segment_cache.clear()
+        return restored
 
     def fresh_state(self):
         """Reuse immutable pair filtering and mesh hulls on this fixed model.
@@ -121,8 +137,11 @@ class SelfCollisionQuery:
         result.cfg = dict(self.cfg)
         result.data = mujoco.MjData(self.model)
         result.pairs, result.pair_ids = self.pairs.copy(), self.pair_ids.copy()
+        result.model_pairs = self.model_pairs.copy()
         result.geom_ids = self.geom_ids.copy()
         result.structural_pairs = [list(pair) for pair in self.structural_pairs]
+        result.structural_evidence = deepcopy(self.structural_evidence)
+        result.structural_sampling = deepcopy(self.structural_sampling)
         result.mesh_distance = copy(self.mesh_distance)
         result.mesh_distance.vertices = dict(self.mesh_distance.vertices)
         result.pair_queries = 0
@@ -139,13 +158,17 @@ class SelfCollisionQuery:
         reaching into the ankle), not to a motion. Samples: the default pose
         and fixed-seed configurations of every joint within its limits (free
         and ball joints at random poses). Pairs that separate in any sample
-        are kept.
+        are kept. Failed queries supply no evidence: continue the same RNG
+        stream for at most 64 replacements, requiring 65 determinate samples.
+        This is sampled evidence, not an analytical proof for all joint angles.
         """
         model = self.model
         rng = np.random.default_rng(STRUCTURAL_SEED)
         joint_types = mujoco.mjtJoint
         overlapping = None
-        for sample in range(STRUCTURAL_SAMPLES + 1):
+        sampled_depths, failures, known_indices = {}, [], []
+        required = STRUCTURAL_SAMPLES + 1
+        for sample in range(required + STRUCTURAL_REPLACEMENTS):
             q = model.qpos0.copy()
             for joint in range(model.njnt) if sample else ():
                 address, kind = model.jnt_qposadr[joint], model.jnt_type[joint]
@@ -160,12 +183,38 @@ class SelfCollisionQuery:
                     q[address] = rng.uniform(-np.pi, np.pi)
             try:
                 rows = self.query(q, distance=0.0)
-            except GeometryQueryError:
+            except GeometryQueryError as error:
+                failures.append(dict(sample=sample, reason=str(error)))
                 continue
+            known_indices.append(sample)
             current = {row["pair_index"] for row in rows if row["clearance"] < 0}
+            for row in rows:
+                sampled_depths.setdefault(row["pair_index"], []).append(
+                    max(0., -float(row["clearance"])))
             overlapping = current if overlapping is None else overlapping & current
-            if not overlapping:
-                return
+            if not overlapping or len(known_indices) == required:
+                break
+        certified = len(known_indices) == required
+        self.structural_sampling = dict(
+            seed=STRUCTURAL_SEED, required_samples=required, samples=len(known_indices),
+            attempted_samples=sample + 1, unknown_samples=len(failures),
+            replacement_samples=max(0, sample + 1 - required),
+            replacement_known_samples=sum(index >= required for index in known_indices),
+            replacement_limit=STRUCTURAL_REPLACEMENTS, known_sample_indices=known_indices,
+            failed_samples=failures, default_pose_known=0 in known_indices,
+            status=("no_candidates" if overlapping == set() else "certified" if certified else "uncertified"),
+            uncertified_reason=None if certified or overlapping == set() else "insufficient_determinate_samples")
+        for index in sorted(overlapping or ()):
+            pair = tuple(map(int, self.pairs[index]))
+            depths = sampled_depths[index]
+            self.structural_evidence[pair] = dict(
+                **self.structural_sampling,
+                method="default_pose_and_fixed_seed_joint_limit_samples",
+                overlapping_samples=len(depths), sample_depths_m=depths,
+                minimum_sample_depth_m=min(depths),
+                scope="all determinate sampled configurations; not an analytical proof for all joint angles")
+        if not certified or not overlapping:
+            return
         keep = np.ones(len(self.pairs), bool)
         keep[sorted(overlapping or ())] = False
         self.structural_pairs = [
@@ -320,6 +369,7 @@ class SelfCollisionQuery:
             "mesh_penetration": "full_convex_support_bounds",
             "separated_mesh_clearance": "conservative_supporting_plane_gap",
             "pair_count": len(self.pairs), "config": self.cfg,
+            "structural_sampling": self.structural_sampling,
         }
 
 

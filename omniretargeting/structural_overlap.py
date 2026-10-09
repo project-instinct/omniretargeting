@@ -1,7 +1,8 @@
 """Measured model defects, separate from trajectory quality and reset policy.
 
-The compiled collision model is unchanged: training still needs the proposed
-MJCF excludes. Classification uses deterministic model samples, never the clip.
+Active compiled-model pairs with complete sampled evidence need MJCF excludes.
+Classification uses deterministic model samples, never the clip; uncertified
+candidates remain trajectory pairs.
 """
 
 import numpy as np
@@ -10,7 +11,12 @@ import numpy as np
 class StructuralOverlap:
     def __init__(self, query, frames, labels=None):
         self.model = getattr(query, "model", None)
-        self.evidence = getattr(query, "structural_evidence", {})
+        evidence = getattr(query, "structural_evidence", {})
+        self.evidence = {pair: value for pair, value in evidence.items()
+                         if value["status"] == "certified"}
+        self.uncertified = {pair: value for pair, value in evidence.items()
+                            if value["status"] != "certified"}
+        self.sampling = getattr(query, "structural_sampling", {})
         self.frames = frames
         self.labels = np.arange(frames) if labels is None else np.asarray(labels)
         self.depths = {pair: np.zeros(frames) for pair in self.evidence}
@@ -38,6 +44,9 @@ class StructuralOverlap:
             excludes.append(dict(body1=bodies[0], body2=bodies[1], pair=key,
                 xml=f'<exclude body1="{bodies[0]}" body2="{bodies[1]}"/>'))
         return dict(classification="model_structural_overlap", pairs=pairs, pair_count=len(pairs),
+            sampling=self.sampling,
+            uncertified_pairs={f"self:{a}:{b}": evidence
+                               for (a, b), evidence in self.uncertified.items()},
             trajectory_defect=False, reset_invalid=False, measured=True,
             training_mjcf_recommendation=dict(action="add_contact_excludes", excludes=excludes,
                 applied=False, reason="These pairs remain active in the compiled model and can produce persistent training contact forces."))

@@ -15,6 +15,16 @@
   并行修复和窗口调度均直接使用；不提供实验或关闭主线行为的开关。
 - 唯一运行诊断开关是 `OMNIRETARGETING_FAST_ENABLE=performance_trace`，只记录计时和调用。
   其他 FAST_ENABLE 名称报错；FAST_DISABLE 已移除。
+- 原网格修复对有开放面证据的移动物体启用 `moving_clearance_cache.py`：在物体局部坐标中，
+  物体凸包的外侧距离下界减去包含全部 forward 样本及 reverse 查询范围的球半径，仍大于
+  activation band 时才跳过整个 geom。缓存按中心位移消耗余量；球包络覆盖任意旋转。
+  scale、网格查询、凸包、证据及材料样本身份变化会重新计算。只返回与原 hull-far 分支一致的
+  known 身份和空 witness；近场继续 CPU 原三角查询，不改变深度、unknown 或求解 guard。
+  `prepare_moving` 只为原生 `SceneQuery` 启用，独立审计及自定义 query 保持原路径。
+  8 个基准 clip 各 2 次，NPZ 全字段逐位相同；固定请求重放 254/78/182 跳过 65%/65%/82% 的 geom
+  请求，witness/深度/unknown 的 SHA256 相同。omomo_254（whitechair）production 80.8→67.9 s、
+  repair 50.7→39.0 s；78/80/485 约快 1–3%；182、5 和静态场景（椅子部件闭合，不触发）持平。
+  剩余主耗时是近场开放面查询（whitechair forward material 约 61 ms/次），缓存无法跳过。
 
 在 10 个基准 clip（TRUMANS sit180、wipe300、chair150、fridge957，OMOMO 5、78、80、485、182、254）上，
 并发审计让端到端（求解加全部验收）快 1.18–1.40×，最终动作与审计输出和当前实现逐位相同。

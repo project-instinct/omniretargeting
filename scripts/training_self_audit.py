@@ -4,7 +4,7 @@ import math
 from typing import Any
 import mujoco
 import numpy as np
-from omniretargeting.audit_self_collision import AuditSelfCollisionQuery as SelfCollisionQuery
+from omniretargeting.self_collision import SelfCollisionQuery
 from omniretargeting.training_collision_parallel import query_self_frames
 
 def audit_self(

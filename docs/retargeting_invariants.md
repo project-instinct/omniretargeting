@@ -47,12 +47,16 @@ Current mechanisms and known gaps; goals and priorities belong to [`AGENTS.md`](
   landmark relations cannot see a leaf turning about its own axis. Leaves whose chain carries a
   sole frame (`track_orientation`, the feet) keep the default weight. The rule reads only the
   kinematic tree and resolved effectors, so it needs no per-robot settings.
-- Independent audits restore the compiled geom-pair set with `audit_self_collision.py` and
+- Production and independent audits share `SelfCollisionQuery`; audits restore `model_pairs`
+  with `use_model_pairs()` and
   measure sampled always-overlapping pairs separately as `model_structural_overlap`. They
   retain per-frame depths and deterministic sample evidence, exclude them from trajectory
   defects/reset invalid, and suggest MJCF `<exclude>` entries without applying them.
-  The production `self_collision.py` heuristic is unchanged, including its known weakness:
-  unknown model samples are skipped, so its exclusions are not certified.
+  Classification requires 65 determinate samples (default pose plus seed-0 joint-limit
+  configurations); failed queries contribute no evidence. The same RNG supplies up to 64
+  replacements. Incomplete evidence retains the pair and records an uncertified reason;
+  audits treat it as a trajectory pair. Evidence includes unknown/replacement counts and
+  sample indices/depths; it is not an analytical proof for every joint angle.
 
 ## Contact Pipeline
 
@@ -175,10 +179,14 @@ Force-balanced support transitions and the approximate object-support mechanics 
 
 The declared robot contract is `unitree_g1_mesh.json` → `g1_29dof_torsobase_mesh.xml`:
 original STL convex hull per link, including the hand. `collision_manifest.py` hashes the
-compiled collision model; NPZ stores `collision_model_sha256` and `collision_model_name`.
+compiled contact excludes too. The mesh MJCF explicitly excludes torso×waist_yaw and both
+knee×ankle_roll pairs: all 65 seed-0 samples overlapped, with minimum depths 12.7/17.0/17.0 mm.
+These pairs are absent in solving, acceptance and training; other profiles are unchanged.
+The manifest identifies the compiled collision model; NPZ stores `collision_model_sha256`
+and `collision_model_name`.
 `training_match` checks motion/audit/declared training assets, not a running simulator.
-Missing hashes are unverified; training scene/object hull or CoACD differences remain
-integration defects. The acquisition SDF is a known approximation, not this audit contract.
+Missing hashes are unverified. Training uses the same original scene/object triangle meshes
+(e.g. Isaac/PhysX triangle-mesh collision); hull or convex-decomposition proxies are not used. The acquisition SDF is a known approximation, not this audit contract.
 
 `quality_policy.py` and `review_penetration_persistence.py` report each physical pair
 (robot geom × static scene/object/self geom), never treating scan fragments as new pairs.

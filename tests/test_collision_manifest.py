@@ -42,6 +42,20 @@ def test_collision_geometry_changes_change_hash():
     assert mask_changed["sha256"] != radius_changed["sha256"]
 
 
+def test_structural_contact_excludes_change_hash_without_changing_geoms():
+    xml = MESH_MODEL.read_text()
+    for first, second in [('torso_link', 'waist_yaw_link'),
+                          ('left_knee_link', 'left_ankle_roll_link'),
+                          ('right_knee_link', 'right_ankle_roll_link')]:
+        xml = xml.replace(f'    <exclude body1="{first}" body2="{second}" />\n', '')
+    before = collision_manifest(mujoco.MjModel.from_xml_string(xml))
+    after = collision_manifest(load_model(MESH_MODEL))
+    assert before['geoms'] == after['geoms']
+    assert before['sha256'] != after['sha256']
+    assert len(before['exclude_pairs']) == 4
+    assert len(after['exclude_pairs']) == 7
+
+
 def test_popsicle_and_mesh_models_have_different_manifest_summaries():
     mesh = collision_manifest(load_model(MESH_MODEL))
     popsicle_path = Path(load_robot_config(INSTINCT_PROFILE)["urdf_path"])

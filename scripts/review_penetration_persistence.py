@@ -27,7 +27,7 @@ from omniretargeting.quality_policy import (
     reset_states,
 )
 from omniretargeting.robot_config import load_robot_config
-from omniretargeting.audit_self_collision import AuditSelfCollisionQuery as SelfCollisionQuery
+from omniretargeting.self_collision import SelfCollisionQuery
 from omniretargeting.training_collision_parallel import query_self_frames
 
 

@@ -2,7 +2,6 @@
 from types import SimpleNamespace
 import mujoco
 import numpy as np
-from omniretargeting.audit_self_collision import AuditSelfCollisionQuery
 from omniretargeting.self_collision import SelfCollisionQuery
 from omniretargeting.structural_overlap import StructuralOverlap
 from omniretargeting.geometry_query import GeometryQueryError
@@ -15,7 +14,7 @@ def model_query():
       <body name="b" pos=".15 0 0"><joint type="hinge" range="-.01 .01"/><geom type="sphere" size=".1"/></body>
       <body name="c" pos="1 0 0"><joint type="slide" axis="1 0 0" range="-1 1"/><geom type="sphere" size=".1"/></body>
       </worldbody></mujoco>''')
-    query = AuditSelfCollisionQuery(model)
+    query = SelfCollisionQuery(model)
     query.use_model_pairs()
     return model, query
 
@@ -39,7 +38,7 @@ def test_audit_restores_geom_ids_not_body_name_pairs():
     assert model.nexclude == 0
     legacy = SelfCollisionQuery(model)
     assert legacy.structural_pairs == [['a', 'b']]
-    assert not hasattr(legacy, 'structural_evidence')
+    assert legacy.structural_evidence == query.structural_evidence
 
 
 def test_independent_audits_separate_same_pairs():
@@ -54,16 +53,20 @@ def test_independent_audits_separate_same_pairs():
     assert training['model_structural_overlap']['pair_count'] == 1
 
 
-def test_unknown_model_sample_does_not_certify_structural_overlap(monkeypatch):
+def test_uncertified_candidate_remains_a_trajectory_defect(monkeypatch):
     model, _ = model_query()
-    original = AuditSelfCollisionQuery.query
+    original = SelfCollisionQuery.query
     calls = []
     def query(self, *args, **kwargs):
         calls.append(1)
-        if len(calls) == 2:
+        if len(calls) > 1:
             raise GeometryQueryError('test unknown sample')
         return original(self, *args, **kwargs)
-    monkeypatch.setattr(AuditSelfCollisionQuery, 'query', query)
-    uncertain = AuditSelfCollisionQuery(model)
-    assert not uncertain.structural_evidence
+    monkeypatch.setattr(SelfCollisionQuery, 'query', query)
+    uncertain = SelfCollisionQuery(model)
     assert [1, 2] in uncertain.pairs.tolist()
+    collector = StructuralOverlap(uncertain, 1)
+    assert collector.collect(original(uncertain, model.qpos0), 0)
+    report = collector.describe()
+    assert report['pair_count'] == 0
+    assert report['uncertified_pairs']['self:1:2']['unknown_samples'] == 128

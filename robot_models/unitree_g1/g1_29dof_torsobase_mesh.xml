@@ -270,6 +270,11 @@
     <exclude body1="right_elbow_link" body2="right_wrist_pitch_link" />
     <exclude body1="pelvis" body2="right_hip_roll_link" />
     <exclude body1="pelvis" body2="left_hip_roll_link" />
+    <!-- Default + 64 seed-0 joint-limit samples overlap 65/65:
+         minimum depths (mm): torso/waist_yaw 12.688, L/R knee/ankle_roll 17.026/17.033. -->
+    <exclude body1="torso_link" body2="waist_yaw_link" />
+    <exclude body1="left_knee_link" body2="left_ankle_roll_link" />
+    <exclude body1="right_knee_link" body2="right_ankle_roll_link" />
   </contact>
   <sensor>
     <gyro name="imu_ang_vel" site="imu_in_pelvis" />

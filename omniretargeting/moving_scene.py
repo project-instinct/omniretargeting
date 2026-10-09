@@ -17,6 +17,7 @@ from scipy.spatial.transform import Rotation
 
 from .collision_motion import CollisionMotionBounds
 from .evidence_scope import EvidenceScope
+from .moving_clearance_cache import MovingClearanceCache, empty_summary
 from .moving_reverse_cache import cached_reverse
 from .moving_sample_summary import summarize
 from .scene_geometry import HULL_TOLERANCE, SceneQuery, collision_geom_ids, geom_surface_offsets
@@ -145,6 +146,9 @@ class MovingSceneQuery:
         self.material_cache = OrderedDict()
         self.reverse_cache = OrderedDict()
         self.sample_keys = {}
+        self.clearance_cache = MovingClearanceCache()
+        self._separated_summaries = {}
+        self._clearance_enabled = False  # Only production repair enables screening.
 
     def fresh_state(self):
         """Reuse immutable mesh/BVH construction with independent query state.
@@ -163,6 +167,8 @@ class MovingSceneQuery:
         result.material_cache = OrderedDict()
         result.reverse_cache = OrderedDict()
         result.sample_keys = {}
+        result.clearance_cache = MovingClearanceCache()
+        result._separated_summaries = {}
         return result
 
     def prepare_trajectory(self, poses):
@@ -446,10 +452,17 @@ class MovingSceneQuery:
             ]
             if not shells:
                 continue
+            separated = (self.clearance_cache.separated(
+                self, oid, obj, time, translation, rotation, scale, band, shells)
+                if self._clearance_enabled else set())
             forward_samples = self._material_samples(
-                oid, obj, pose, time, translation, rotation, scale, band, shells)
+                oid, obj, pose, time, translation, rotation, scale, band,
+                [shell for shell in shells if shell["geom_id"] not in separated])
             for shell in shells:
                 gid = shell["geom_id"]
+                if gid in separated:
+                    result["open_known_samples"].update(empty_summary(self, oid, shell)["known"])
+                    continue
                 center = self.data.geom_xpos[gid]
                 robot_rotation = self.data.geom_xmat[gid].reshape(3, 3)
                 summary = forward_samples[gid]

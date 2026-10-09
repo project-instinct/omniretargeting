@@ -25,12 +25,19 @@ def prepare_moving(geometry):
     custom callbacks and missing optional native headers retain their path.
     """
     from types import SimpleNamespace
-    from .repair_static_query import prepare
+    from ..scene_geometry import SceneQuery
+    from .repair_static_query import prepare, _QUERY
     if geometry.moving is None:
         return
     geometry.moving.objects = [
         {**obj, 'query': prepare(SimpleNamespace(scene=obj['query']))}
         for obj in geometry.moving.objects]
+    # Audits retain the unscreened original query. Custom callbacks likewise
+    # cannot be substituted with a geometric certificate of SceneQuery's result.
+    geometry.moving._clearance_enabled = all(
+        type(obj['query']) is SceneQuery
+        and getattr(getattr(obj['query'].query, '__func__', None), '__code__', None)
+        is _QUERY.__code__ for obj in geometry.moving.objects)
 
 
 def prepare_moving_reduction(geometry, poses):

@@ -23,7 +23,7 @@ from omniretargeting.scene_geometry import (
     collision_geom_ids,
     geom_surface_offsets,
 )
-from omniretargeting.audit_self_collision import AuditSelfCollisionQuery as SelfCollisionQuery
+from omniretargeting.self_collision import SelfCollisionQuery
 from omniretargeting.training_collision_match import training_collision_match
 from omniretargeting.training_collision_parallel import query_self_frames
 SCHEMA_VERSION = 1
@@ -687,7 +687,8 @@ def audit_interframe(
             if self_query is not None:
                 try:
                     rows = [r for r in self_query.query(pose) if tuple(sorted(r["pair"]))
-                            not in getattr(self_query, "structural_evidence", {})]
+                            not in {pair for pair, evidence in self_query.structural_evidence.items()
+                                    if evidence["status"] == "certified"}]
                     self_depth = max((max(-row["clearance"], 0.0) for row in rows), default=0.0)
                     if self_depth > depth:
                         category, depth = "self", self_depth

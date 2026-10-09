@@ -21,6 +21,12 @@ def test_acquisition_self_query_keeps_filtering_but_resets_buffers():
     assert new.pair_queries == 0
     assert new.pairs.tobytes() == old.pairs.tobytes()
     assert new.structural_pairs == old.structural_pairs
+    assert new.model_pairs.tobytes() == old.model_pairs.tobytes()
+    assert new.model_pairs is not old.model_pairs
+    assert new.structural_evidence == old.structural_evidence
+    assert new.structural_evidence is not old.structural_evidence
+    assert new.structural_sampling == old.structural_sampling
+    assert new.structural_sampling is not old.structural_sampling
     first, second = old.query(poses[0]), new.query(poses[0])
     assert len(first) == len(second)
     for a, b in zip(first, second):
