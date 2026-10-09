@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import mujoco
@@ -11,63 +10,19 @@ from scipy.spatial.transform import Rotation
 
 from omniretargeting._sequence.continuity_guard import ACCEPTANCE_SLACK
 from omniretargeting.motion_budgets import CHATTER_EXCESS_TOLERANCE, chatter_excess
+from omniretargeting.effort_audit import effort_report
+from omniretargeting.effort_contacts import contact_evidence, load_fixed_objects
+from omniretargeting.effort_dynamics import mechanical_limits
 
 
-def _joint_limits(model_path, model):
+def _joint_limits(model_path, model, limits_urdf=None):
     """Read URDF/MJCF velocity and effort limits by MuJoCo joint name."""
-    velocity, effort = {}, {}
-    try:
-        root = ET.parse(model_path).getroot()
-    except (OSError, ET.ParseError):
-        root = None
-    if root is not None:
-        for joint in root.findall(".//joint"):
-            name = joint.get("name")
-            limit = joint.find("limit")
-            if name is None or limit is None:
-                continue
-            if limit.get("velocity") is not None:
-                velocity[name] = float(limit.get("velocity"))
-            if limit.get("effort") is not None:
-                effort[name] = float(limit.get("effort"))
-    for index in range(model.njnt):
-        name = model.joint(index).name
-        if model.jnt_actfrclimited[index]:
-            lower, upper = model.jnt_actfrcrange[index]
-            effort.setdefault(name, max(abs(float(lower)), abs(float(upper))))
+    velocity, effort, _ = mechanical_limits(model_path, model, limits_urdf)
     return velocity, effort
 
 
-def _velocities(model, poses, fps):
-    """Finite-difference generalized velocities matching model.nv."""
-    result = np.empty((len(poses) - 1, model.nv))
-    for frame in range(len(poses) - 1):
-        mujoco.mj_differentiatePos(
-            model, result[frame], 1.0 / fps, poses[frame], poses[frame + 1]
-        )
-    return result
-
-
-def _inverse_forces(model, poses, fps):
-    """Contact-free generalized inverse dynamics at centered stencils."""
-    if len(poses) < 3:
-        return np.empty((0, model.nv)), np.empty(0, int)
-    velocity = _velocities(model, poses, fps)
-    acceleration = np.diff(velocity, axis=0) * fps
-    data = mujoco.MjData(model)
-    force = np.empty((len(poses) - 2, model.nv))
-    stencil_frames = np.arange(len(poses) - 2)
-    for index, frame in enumerate(stencil_frames):
-        data.qpos[:] = poses[frame + 2]
-        data.qvel[:] = velocity[frame + 1]
-        data.qacc[:] = acceleration[frame]
-        mujoco.mj_inverse(model, data)
-        force[index] = data.qfrc_inverse
-    return force, stencil_frames
-
-
-def audit(model_path, before_path, after_path):
-    model = mujoco.MjModel.from_xml_path(model_path)
+def audit(model_path, before_path, after_path, *, limits_urdf=None, prepared=None, objects=None):
+    model = mujoco.MjModel.from_xml_path(str(model_path))
     saved_before, saved_after = np.load(before_path), np.load(after_path)
     before, after = saved_before["qpos"], saved_after["qpos"]
     fps = float(saved_before["framerate"])
@@ -80,7 +35,7 @@ def audit(model_path, before_path, after_path):
         raise ValueError(
             "Joint audit requires the same model, frames, and positive framerate"
         )
-    if not np.isfinite(before).all() or not np.isfinite(after).all():
+    if not np.isfinite(before).all() or not np.isfinite(after).all() or not np.isfinite(fps):
         raise ValueError("Joint trajectories must be finite")
     joints = np.flatnonzero(
         np.isin(
@@ -88,9 +43,17 @@ def audit(model_path, before_path, after_path):
         )
     )
     q = model.jnt_qposadr[joints]
-    dofs = model.jnt_dofadr[joints]
     names = [model.joint(int(joint)).name for joint in joints]
-    velocity_limits, effort_limits = _joint_limits(model_path, model)
+    if not len(joints):
+        raise ValueError("Joint audit requires scalar actuated joint coordinates")
+    velocity_limits, effort_limits, provenance = mechanical_limits(model_path, model, limits_urdf)
+    saved_hash = saved_after.get("collision_model_sha256")
+    if saved_hash is not None and str(saved_hash) != provenance["collision_model_sha256"]:
+        raise ValueError("Effort audit model does not match saved collision_model_sha256")
+    fixed = load_fixed_objects(prepared, objects, len(after), fps)
+    evidence = contact_evidence(saved_after, model, fixed)
+    model.opt.disableflags |= int(mujoco.mjtDisableBit.mjDSBL_CONSTRAINT)
+    efforts, dynamics = effort_report(model, before, after, fps, joints, effort_limits, evidence)
     rows = {
         name: {
             "units": "rad" if model.jnt_type[joint] == mujoco.mjtJoint.mjJNT_HINGE else "m",
@@ -129,7 +92,6 @@ def audit(model_path, before_path, after_path):
         }
     velocity = np.diff(after[:, q], axis=0) * fps
     velocity_reference = np.diff(before[:, q], axis=0) * fps
-    forces, force_frames = _inverse_forces(model, after, fps)
     chatter_violations = int(np.count_nonzero(chatter > CHATTER_EXCESS_TOLERANCE))
     velocity_violations = 0
     effort_violations = 0
@@ -139,14 +101,9 @@ def audit(model_path, before_path, after_path):
         speed_reference = np.abs(velocity_reference[:, column])
         over_speed = np.zeros(len(speed), bool)
         if limit is not None:
-            over_speed = speed > limit + ACCEPTANCE_SLACK * fps
+            over_speed = speed > limit + 1e-6
             velocity_violations += int(over_speed.sum())
-        effort_limit = effort_limits.get(name)
-        force = np.abs(forces[:, dofs[column]]) if len(forces) else np.empty(0)
-        over_force = np.zeros(len(force), bool)
-        if effort_limit is not None:
-            over_force = force > effort_limit + ACCEPTANCE_SLACK * fps
-            effort_violations += int(over_force.sum())
+        effort_violations += efforts[name]["violations"]
 
         for order in (1, 2, 3):
             first = np.diff(before[:, q], n=order, axis=0)
@@ -187,14 +144,7 @@ def audit(model_path, before_path, after_path):
             "violations": int(over_speed.sum()),
             "worst_frame": int(np.argmax(speed)) if len(speed) else None,
         }
-        rows[name]["mechanical_limits"]["effort"] = {
-            "peak": float(force.max(initial=0)),
-            "violations": int(over_force.sum()),
-            "worst_frame": (
-                int(force_frames[np.argmax(force)]) if len(force) and over_force.any() else None
-            ),
-            "contact_force_split": False,
-        }
+        rows[name]["mechanical_limits"]["effort"] = efforts[name]
 
     violations = chatter_violations + velocity_violations + effort_violations
     return {
@@ -207,15 +157,24 @@ def audit(model_path, before_path, after_path):
         "violating_joint_time_order_entries": chatter_violations,
         "velocity_limit_violations": velocity_violations,
         "effort_limit_violations": effort_violations,
-        "all_individual_budgets_pass": violations == 0,
+        "all_individual_budgets_pass": (
+            violations == 0 and not dynamics["unknown_frames"]
+            and not dynamics["unaudited_endpoint_frames"]
+            and not dynamics["missing_effort_limits"]
+            and all(name in velocity_limits for name in names)
+        ),
+        "mechanical_model": provenance,
+        "missing_velocity_limits": [name for name in names if name not in velocity_limits],
+        "effort_dynamics": dynamics,
         "joints": rows,
         "root_source_relative_chatter": root_chatter,
         "absolute_smoothness_certificate": False,
         "scope": (
             "Added high-frequency joint chatter relative to the fixed source-fit "
-            "trajectory, URDF velocity limits, and contact-free inverse-dynamics "
-            "effort screening. Effort needs a contact-force split for final "
-            "certification; deliberate low-frequency source/solver speed is not chatter."
+            "trajectory, original URDF velocity/effort limits, and instantaneous "
+            "contact-force feasibility with exact floating-base balance. Unknown "
+            "contacts/object loads and unaudited endpoints do not pass. This is "
+            "not physical execution certification."
         ),
     }
 
@@ -225,8 +184,12 @@ if __name__ == "__main__":
     parser.add_argument("--model", required=True)
     parser.add_argument("--before", type=Path, required=True)
     parser.add_argument("--after", type=Path, required=True)
+    parser.add_argument("--limits-urdf", type=Path)
+    parser.add_argument("--prepared", type=Path)
+    parser.add_argument("--objects", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
-    result = audit(args.model, args.before, args.after)
+    result = audit(args.model, args.before, args.after, limits_urdf=args.limits_urdf,
+                   prepared=args.prepared, objects=args.objects)
     args.output.write_text(json.dumps(result, indent=2))
-    print(json.dumps({k: v for k, v in result.items() if k != "joints"}, indent=2))
+    print(json.dumps({k: v for k, v in result.items() if k not in {"joints", "effort_dynamics"}}, indent=2))

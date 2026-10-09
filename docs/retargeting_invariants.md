@@ -164,6 +164,9 @@ Force-balanced support transitions and the approximate object-support mechanics 
   diagnostics. It checks sustained source layout on candidates, verifies source-relative
   chatter and URDF velocity limits after solving, and reports `budgets` (including
   `relation_*`, `layout_flip_*`, `source_relative_chatter`) and `skipped_tasks`.
+  Independent [effort auditing](effort_audit.md) uses contact-force feasibility
+  and original URDF limits; missing reactions or unknown object loads do not pass.
+  Production fast currently has no motor-effort constraint.
 - `--solver sequence` bounds only root/slide translation and fits source directions first,
   without angular slack.
 - Fast has a production deadline from CLI loading to export: default
