@@ -359,6 +359,8 @@ def _optimize(objective, poses, iterations, callback, label, converged_decrease)
 
 
 def _optimize_uncounted(objective, poses, iterations, callback, label, converged_decrease):
+    from .deadline_state import check, accepted as checkpoint
+    check(label + ":evaluate")
     coords = objective.coords
     trace = getattr(objective, "performance_trace", None)
     frames, width = objective.frames, objective.width
@@ -382,6 +384,7 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
     cost = acc.cost
     costs = [cost]
     for iteration in range(iterations):
+        check(label + ":LM_iteration")
         if trace is not None and trace.enabled:
             trace.begin_iteration(label, iteration)
         gradient = acc.gradient.ravel() + temporal_j.T @ temporal_r
@@ -411,6 +414,7 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
         attempts = Attempts(objective, poses, system, gradient, diagonal, held, radial, rhs,
                             dampings, band_step, _conic_proposal, **kwargs)
         for attempt in range(MAX_REJECTIONS):
+            check(label + ":LM_attempt")
             if attempt == 1:
                 # The first attempt was rejected: compute the rest at once.
                 if trace is None:
@@ -489,6 +493,7 @@ def _optimize_uncounted(objective, poses, iterations, callback, label, converged
                 trace.finish_iteration(history[-1], None)
             break
         poses = candidate
+        checkpoint(poses, label, iteration=True)
         acc, temporal_r, temporal_j, stats, _ = trial
         history.append(dict(phase=label, iteration=iteration, cost=cost, after=acc.cost,
                             alpha=alpha, damping=damping, step_backend=step_backend,

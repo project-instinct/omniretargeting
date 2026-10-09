@@ -153,6 +153,8 @@ def main():
                         help="Override the contact handling mode for retargeting.")
 
     args = parser.parse_args()
+    import time
+    production_started = time.monotonic()
 
     source_inputs = (args.source_config, args.source_motion, args.smplx_motion)
     if sum(value is not None for value in source_inputs) != 1:
@@ -472,6 +474,7 @@ def main():
             base_orientation=base_orientation,
             retargeting=retargeting,
         )
+        retargeter._production_started = production_started
         if args.solver is not None:
             sequence = retargeter.retargeting_config.setdefault("sequence_solver", {})
             sequence["enabled"] = args.solver in ("sequence", "mink", "fast")
@@ -585,8 +588,15 @@ def main():
         # Actually, let's look at the example file keys again:
         # ['framerate', 'joint_names', 'joint_pos', 'base_pos_w', 'base_quat_w']
 
+        # Keep the mandatory motion/contact export even after solve expiry.
+        production_deadline = getattr(retargeter, '_production_deadline', None)
+        export_reserve = (None if production_deadline is None else production_deadline.reserve_for_export())
         # Save as .npz with specific keys
+        from .collision_manifest import collision_manifest
+        robot_collision_manifest = collision_manifest(retargeter.robot_model, source_path=robot_urdf_path)
         output_payload = dict(
+            collision_model_sha256=np.asarray(robot_collision_manifest['sha256']),
+            collision_model_name=np.asarray(locals().get('profile_name', Path(robot_urdf_path).stem)),
             framerate=framerate,
             # Preserve the exact MuJoCo generalized configuration.  The
             # exported base_pos_w may refer to torso_link for downstream
@@ -650,7 +660,8 @@ def main():
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         diagnostics = getattr(retargeter, "last_collision_diagnostics", None)
         relation_tasks = getattr(retargeter, "last_body_relation_tasks", None)
-        if relation_tasks is not None and diagnostics is not None:
+        if (relation_tasks is not None and diagnostics is not None
+                and not (export_reserve and export_reserve["lightweight"])):
             diagnostics["body_relations"]["stages"]["final_save"] = relation_tasks.metrics(retargeted_motion)
         if diagnostics is not None:
             from .local_collision_repair import diagnostics_json, trajectory_digest
@@ -664,6 +675,12 @@ def main():
             **output_payload,
         )
 
+        if production_deadline is not None:
+            report = getattr(retargeter, 'last_sequence_report', None)
+            if report is not None:
+                report['deadline'] = dict(report.get('deadline', {}), **production_deadline.describe())
+                report['deadline'].update(export=export_reserve,
+                    production_seconds=production_deadline.elapsed(), exported=True)
         print(f"Done! Terrain scale used: {terrain_scale}")
 
         # Load terrain for visualization/video if needed

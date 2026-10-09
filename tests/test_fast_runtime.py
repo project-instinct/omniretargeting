@@ -152,6 +152,12 @@ def test_fast_pipeline_restores_callers_blas_threads(monkeypatch, fail):
         return [info["num_threads"] for info in threadpoolctl.threadpool_info()
                 if info["user_api"] == "blas"]
 
+    from types import SimpleNamespace
+    import mujoco
+    model = mujoco.MjModel.from_xml_string('<mujoco/>')
+    owner = SimpleNamespace()
+    inputs = (owner, model, model.qpos0, np.zeros((4, 1, 3)), [], {}, None,
+              {}, {}, {}, {'framerate': 30.}, [])
     released = []
 
     def solve(*args, resources):
@@ -162,15 +168,17 @@ def test_fast_pipeline_restores_callers_blas_threads(monkeypatch, fail):
         assert not released
         if fail:
             raise RuntimeError("test solve failure")
-        return "result"
+        return np.empty((4, 0)), {"backend": "fast", "status": "test"}
 
     monkeypatch.setattr(fast_pipeline, "_solve_fast_sequence", solve)
     with threadpoolctl.threadpool_limits(2, user_api="blas"):
         before = counts()
         if fail:
             with pytest.raises(RuntimeError, match="test solve failure"):
-                fast_pipeline.solve_fast_sequence(*([None] * 13))
+                fast_pipeline.solve_fast_sequence(*inputs)
         else:
-            assert fast_pipeline.solve_fast_sequence(*([None] * 13)) == "result"
+            poses, report = fast_pipeline.solve_fast_sequence(*inputs)
+            assert poses.shape == (4, 0) and report['status'] == 'test'
+            assert not report['deadline']['expired']
         assert counts() == before
         assert released == ["geometry"]

@@ -118,7 +118,7 @@ def test_cancellation_releases_owned_descendants(tmp_path):
         while time.monotonic()<deadline:
             status=Path(f'/proc/{pid}/stat')
             try:state=status.read_text().split()[2]
-            except FileNotFoundError:break
+            except (FileNotFoundError, ProcessLookupError):break
             if state=='Z':break
             time.sleep(.01)
         else:raise AssertionError('owned child still running')

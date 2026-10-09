@@ -61,6 +61,7 @@ WINDOW_WORKERS = max(1, min(16, (os.cpu_count() or 2) // 2))
 
 SEQUENCE_DEFAULTS = {
     "iterations": 35,
+    "time_budget_seconds_per_frame": 1.0,
     "angular_step_rad": 0.12,
     "translation_step_m": 0.03,
     "interaction_sigma_m": 0.5,

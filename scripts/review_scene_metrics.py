@@ -86,6 +86,8 @@ def audit(args):
                 **obj,
                 "translations": obj["translations"][start : start + len(poses)],
                 "rotations": obj["rotations"][start : start + len(poses)],
+                **({"scales": np.asarray(obj["scales"])[start : start + len(poses)]}
+                   if obj.get("scales") is not None else {}),
             }
             for obj in objects
         ]

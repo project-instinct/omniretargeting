@@ -5,7 +5,7 @@ current contract and the non-obvious reason behind it; code and tests remain
 the source of truth for details.
 
 - [`retargeting_invariants.md`](retargeting_invariants.md) — current solver
-  mechanisms, their motivation, and their diagnostics.
+  legacy production mechanisms, mesh collision contract, deadline, and pair/reset audits.
 - [`code_layout.md`](code_layout.md) — where entry points and responsibilities
   live.
 - [`ADDING_SOURCE_ADAPTERS.md`](ADDING_SOURCE_ADAPTERS.md) — source-neutral

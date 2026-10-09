@@ -350,7 +350,24 @@ class GeometryService:
         atexit.register(self.close)
 
     def request(self, command, token, args):
+        from .deadline_state import state
+        budget = state()
+        if budget is not None:
+            budget.deadline.check("gpu_service:" + command)
         self.connection.send((command, token, args))
+        while budget is not None and not self.connection.poll(max(0., budget.deadline.remaining())):
+            if not budget.deadline.expired():
+                continue  # Poll timeout rounding must not change a live numeric path.
+            # The reply cannot be consumed safely by a later request. Retire
+            # this owned service; ordinary successful requests are unchanged.
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=.2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            self.connection.close()
+            budget.deadline.check("gpu_service:" + command)
         ok, value = self.connection.recv()
         if not ok:
             raise value

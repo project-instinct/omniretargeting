@@ -5,7 +5,7 @@
 
 ## 可用的加速（都不改变动作输出）
 
-- `scripts/benchmark_fast.py` 默认并发运行独立验收审计；`--serial-audits` 可串行对照。
+- `scripts/benchmark_fast.py` 默认并发运行独立验收审计（含逐对 persistence）；`--serial-audits` 可串行对照。
   只有基线 A 和显式 `--source-root` 指定的候选 arm，候选默认不启用任何诊断。
 - `scripts/review_scene_metrics.py` 和 `scripts/review_training_collision.py` 的 `--workers`
   默认 `min(8, available_cpus())`；`--workers 1` 保留串行。按帧分块后仍以串行顺序归并，
@@ -29,6 +29,8 @@
 - `original_mesh_repair` 占 contact_scene 的 25–50%。多数尝试只降 0.01–0.2 mm：线性化的
   接触/连续性约束与非线性 guard（`CONTACT_DRIFT` 1 mm）不一致，步长常回溯到 1/16–1/64，
   每次回溯都要做一次原几何测量。
+- 开放移动扫描物体的 CPU 原几何查询仍是修复瓶颈；静态 GPU 预筛不等于移动查询已加速。
+  deadline 覆盖加载到导出，原生查询返回后的检查延迟单列，不把预算当作迭代次数。
 - 验收审计里最贵的是 `review_scene_metrics.py`（libigl AABB/winding 已在内部多线程）。
 
 ## 已证伪的方向
@@ -40,8 +42,16 @@
 | 区间预求解删除盒内不可能活跃的行 | 步长盒较宽，只能删除不到 0.3% 的行。 |
 | 推测式执行（banded 与 conic 并发、修复回溯候选批量测量） | 结果逐位相同，但与几何 worker 争抢 CPU，墙钟反而变长。 |
 | 多线程 KKT（faer） | 无收益。 |
+| 冷启动单一协调 AL | 信赖域/filter 控制大步后仍获取不到关键接触；omomo_5 分离 p95 154 mm。不能替代 acquisition。 |
+| 碰撞延拓 | 补齐根旋转步盒、弱阶段释放 filter 后，5 段 OMOMO deep/persistent 全部退化，0 段 eligible；omomo_80 腕穿深 27.2→115.2 mm。 |
+| 只换初值 | 从旧最终运动起步仍破坏接触，首次退化归因包括根朝向界、soft-push、修正时间项；良好初值不足以解决公式冲突。 |
+| acquisition + 协调 AL 混合（al_25–28） | al_25 的 9 个完成片：deep/persistent 30/22→29/28，chatter 53→90，reset invalid 1497→1625，耗时 1823→3031 s；另 2 段绑定异常，不能作为生产替代。 |
+| 混合结构只加预算 | 1/3/6 s/帧中，omomo_254 都选 acquisition 初值；3/6 档同为 27 attempts。sit180 三档同为 17 attempts、P=3（旧最终 P=1）；增加预算不弥补修补链收益。 |
+| 支撑片推广 | sit180 P=3/chatter=41、wipe300 P=5/chatter=19，仍未达到旧最终的 1/29、2/7；刚体片对应本身可冲突，不能靠加罚权修复。 |
+| popsicle 手部契约 | 可视掌面在碰撞 capsule 内 16–42 mm，贴掌面与壳非穿透互斥；当前契约回到原始 mesh，不能跨模型比较后宣称改进。 |
 
-这些实验的删除前代码见 `out/archive/pre_cleanup_worktree.tar`（未提交实验另存
+协调 AL 的研究代码与快照留在研究工作区的 `out/restructure_20261008/`，未移入生产。
+较早实验的删除前代码见 `out/archive/pre_cleanup_worktree.tar`（未提交实验另存
 `out/archive/experimental_untracked.tar`）。结论保留，运行路径只保留主线。
 
 ## 剩余杠杆（未实现，都改变求解路径，需要按 AGENTS.md 指标做完整对照）

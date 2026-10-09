@@ -36,6 +36,7 @@ from .reference import (ReferenceShape, kinematic_tracking_tasks, height_trackin
                         register_height, bound_sole_registration)
 from .sdf import object_sdf, static_scene_sdf
 from .solver import optimize, threadpool_limits
+from . import deadline_state
 
 # Grid proxies of the original geometry (metres).
 SCENE_GRID_SPACING = 0.02
@@ -296,11 +297,19 @@ def solve_fast_sequence(
     frame workers provide the parallelism. Restore caller settings on exit.
     """
     context = nullcontext() if threadpool_limits is None else threadpool_limits(1, user_api="blas")
-    with context, ExitStack() as resources:
-        return _solve_fast_sequence(
-            owner, model, initial, positions, names, mapping, roots, tasks, priority,
-            config, common, extra_tasks, reference_trajectory, callback, resources=resources,
-        )
+    state = deadline_state.PipelineDeadline(owner, model, initial, len(positions), config, common['framerate'])
+    with deadline_state.installed(state), context, ExitStack() as resources:
+        try:
+            deadline_state.check('pipeline_entry')
+            motion, report = _solve_fast_sequence(
+                owner, model, initial, positions, names, mapping, roots, tasks, priority,
+                config, common, extra_tasks, reference_trajectory, callback, resources=resources)
+        except deadline_state.DeadlineExceeded as error:
+            if state.deadline.first_expired_label is None:
+                state.deadline.first_expired_label = str(error)
+            return state.finish(expired=True)
+        state.motion, state.report = motion, report
+        return state.finish()
 
 
 def prepare_fast_source(*args):
@@ -319,6 +328,9 @@ def _solve_fast_sequence(
     mapping = anatomical_mapping(model, mapping, priority)
     started = time.monotonic()
     report = {"backend": "fast", "stages": {}, "runtime_options": OPTIONS.describe()}
+    budget_state = deadline_state.state()
+    if budget_state is not None and not _source_only:
+        budget_state.report = report
     trace = PerformanceTrace(OPTIONS.performance_trace)
     from .._core.preprocess_cache import SourceGraphCache
     orientation_targets = common["body_orientation_targets"]
@@ -431,6 +443,10 @@ def _solve_fast_sequence(
                     stage=report['stages']['source_pose'],callbacks=callbacks,
                     registration=source_registration_view(registration,shape))
 
+    if budget_state is not None:
+        budget_state.source = source_pose.copy()
+    deadline_state.accepted(source_pose, 'source_pose')
+    deadline_state.check('grid_setup', stage='grid_setup')
     # B: contacts, whole-body surfaces and scene grids from the fixed reference.
     tick = time.monotonic()
     # Self-collision rows are part of acquisition (``terms._self_collision_terms``).
@@ -497,6 +513,10 @@ def _solve_fast_sequence(
     report_lift = float(lift.max(initial=0.0))
     # One worker pool serves every pass: re-weighting only changes weights
     # the parent owns or sends with each evaluation.
+    if budget_state is not None:
+        budget_state.reference = fixed.copy()
+    deadline_state.accepted(q, 'grid_setup')
+    deadline_state.check('contact_acquisition', stage='contact_acquisition')
     objective.start_workers()
     trace.add_stage_seconds("grid_setup", time.monotonic() - tick)
     trace.add_stage_detail("grid_setup", "sdf_grid_seconds", grid_seconds)
@@ -516,12 +536,14 @@ def _solve_fast_sequence(
         else:
             motion, history = optimize(objective, q, iterations=cfg["iterations"],
                                        callback=callback, label="contact_scene")
+        deadline_state.accepted(motion, 'contact_acquisition')
         verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
         trace.add_stage_seconds("contact_acquisition", time.monotonic() - acquisition_tick)
         if window_status == "used":
             trace.absorb_history(history)
         trace.current_stage = None
         for round_index in range(REWEIGHT_ROUNDS):
+            deadline_state.check('reweight', stage='reweight')
             budgets, chatter, posture = verified
             rounds.append(budgets)
             if not chatter.any() and not posture.any():
@@ -558,6 +580,7 @@ def _solve_fast_sequence(
                 trace.add_failed(time.monotonic() - candidate_tick, "reweight_rejected")
                 continue
             motion, verified = candidate, checked
+            deadline_state.accepted(motion, trace.current_stage or 'reweight')
             trace.add_alpha(1.0)
         # Free-body penetration: every contact held, a small correction of the
         # accepted motion, kept only if it adds no chatter or layout flip
@@ -565,6 +588,7 @@ def _solve_fast_sequence(
         # The acquisition workers still hold the same immutable fields and
         # shells: they measure the deepest samples below, before the free
         # stage changes what the objective evaluates.
+        deadline_state.check('free_bodies', stage='free_bodies')
         free_tick = time.monotonic()
         trace.current_stage = "free_bodies"
         verified = verify_budgets(model, coords, fixed, motion, objective.envelope_bodies, shape)
@@ -607,6 +631,7 @@ def _solve_fast_sequence(
         record["accepted"] = bool(accepted)
         if accepted:
             motion, verified = candidate, checked
+            deadline_state.accepted(motion, trace.current_stage or 'reweight')
             trace.add_alpha(1.0)
         else:
             record["rejected"] = reasons
@@ -627,6 +652,7 @@ def _solve_fast_sequence(
     # object, a floor-only scene, or self-collision needs the same bounded
     # correction and audit; grid coverage says nothing about those overlaps.
     if common.get("scene_query") is not None or objects or config.get("self_collision_enabled", True):
+        deadline_state.check('original_mesh_repair', stage='original_mesh_repair')
         repair_tick = time.monotonic()
         trace.current_stage = "original_mesh_repair"
         motion, mesh_repair = repair_original_meshes(
@@ -637,6 +663,8 @@ def _solve_fast_sequence(
         trace.add_stage_seconds("original_mesh_repair", time.monotonic() - repair_tick)
         trace.current_stage = None
     # Final statistics; worker chunks give the same values as a serial pass.
+    deadline_state.accepted(motion, 'original_mesh_repair')
+    deadline_state.check('final_audit', stage='final_audit')
     audit_tick = time.monotonic()
     trace.current_stage = "final_audit"
     started_workers = objective.start_workers()

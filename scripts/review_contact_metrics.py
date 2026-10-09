@@ -50,6 +50,8 @@ def evaluate(prepared, motion, choices, *, start=0):
         (len(poses), len(inputs["surface"].get("surface_contact_parts", ())), 3), np.nan
     )
     surface_scene_gaps = {}
+    from omniretargeting.contact_side import ContactSides
+    contact_sides = ContactSides()
     proximity_values = {}
     proximity = (
         SurfaceProximityTasks(model, **inputs["proximity"])
@@ -78,6 +80,9 @@ def evaluate(prepared, motion, choices, *, start=0):
                 delta = point - task.contact_positions[f]
                 values[name]["contact_vector"].append(np.linalg.norm(delta))
                 normal = task.surface_normals[f]
+                sid = getattr(task, "environment_ids", None)
+                contact_sides.add(spec["robot_body"], 0 if sid is None else sid[f], [f],
+                                  [float(delta @ normal / np.linalg.norm(normal))])
                 values[name]["contact_normal"].append(
                     abs(delta @ normal / np.linalg.norm(normal))
                 )
@@ -108,6 +113,8 @@ def evaluate(prepared, motion, choices, *, start=0):
                     / normal_length
                 )
                 surface_scene_gaps.setdefault(part, []).append(source_surface_gap)
+                contact_sides.add(model.body(int(model.geom_bodyid[gid])).name,
+                    surface["surface_contact_surface_ids"][f, k], [f], [source_surface_gap])
                 normal_error = (
                     abs((point - surface["surface_contact_targets_w"][f, k]) @ normal)
                     / normal_length
@@ -171,6 +178,7 @@ def evaluate(prepared, motion, choices, *, start=0):
         "surface_vector_error_m": {
             name: summary(v) for name, v in surface_values.items()
         },
+        "contact_side": contact_sides.report(),
         "surface_normal_error_m": {
             name: summary(v) for name, v in surface_normal_values.items()
         },

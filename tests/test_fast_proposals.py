@@ -21,6 +21,13 @@ def _solve(monkeypatch, speculate):
     # An incompatible target: many proposals leave the envelopes and are rejected.
     for effector in objective.effectors:
         effector["contact"] = effector["contact"] + [0.8, 0.0, 0.3]
+    original_banded = proposals.Attempts.banded
+    original_conic = proposals.Attempts.conic
+    # A failed linear solve on the first attempt forces the retry path under
+    # both schedules. Later attempts use the actual solver and guard checks.
+    monkeypatch.setattr(proposals.Attempts, "banded",
+                        lambda self, k: None if k == 0 else original_banded(self, k))
+    monkeypatch.setattr(proposals.Attempts, "conic", original_conic)
     speculated = []
     original = proposals.Attempts.speculate
     monkeypatch.setattr(proposals.Attempts, "speculate",
@@ -33,8 +40,10 @@ def _solve(monkeypatch, speculate):
 
 @pytest.mark.parametrize("diverse", [False])
 def test_speculative_attempts_equal_the_sequential_loop(monkeypatch, diverse):
-    sequential = _solve(monkeypatch, False)
-    speculative = _solve(monkeypatch, True)
+    with monkeypatch.context() as patch:
+        sequential = _solve(patch, False)
+    with monkeypatch.context() as patch:
+        speculative = _solve(patch, True)
     assert speculative[3], "no iteration rejected its first attempt"
     np.testing.assert_array_equal(speculative[0], sequential[0])
     assert speculative[1] == sequential[1]

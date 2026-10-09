@@ -21,12 +21,13 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-ROOT = Path("/home/duanxin/Xyk/omniretargeting")
+ROOT = Path(__file__).resolve().parents[1]
 TRUMANS = {
     "sit180": ("2023-02-13@22-31-47", 50, 230),
     "wipe300": ("2023-01-16@23-06-03", 120, 420),
     "chair150": ("2023-02-16@17-10-37", 0, 150),
     "fridge957": ("2023-02-19@22-45-43", 0, 957),
+    "chair2745": ("2023-02-16@17-10-37", 0, 2745),
 }
 OMOMO = (5, 78, 80, 485, 182, 254)  # test_diffusion_manip_seq_joints24.p sequence indices
 CLIPS = list(TRUMANS) + [f"omomo_{i}" for i in OMOMO]
@@ -81,7 +82,7 @@ def prepare(args):
     shutil.copy2(Path(__file__), run / "benchmark_runner.py")
     # The run keeps a self-contained profile: its model path is resolved once here.
     from omniretargeting.robot_config import load_robot_config
-    profile = ROOT / "robot_models/unitree_g1/unitree_g1_mesh.json"
+    profile = ROOT / "robot_models/unitree_g1" / args.robot_profile
     frozen = dict(json.loads(profile.read_text()), urdf_path=load_robot_config(profile)["urdf_path"])
     save(run / "g1_profile.json", frozen)
     configs = {clip: source_config(clip) for clip in CLIPS}
@@ -153,6 +154,7 @@ def child(args):
 
     def capture(owner, model, initial, positions, names, mapping, roots, tasks, priority,
                 solver_config, common, extra, *a, **kw):
+        captured["owner"] = owner
         surface = owner.last_surface_contact_tasks
         prepared = dict(model_path=model_path, initial=initial, positions=positions, source_names=names,
             mapping=mapping, roots=roots, effectors=priority,
@@ -180,6 +182,7 @@ def child(args):
         np.savez(out / "contact_plan.npz", **stack_contact_tasks(tasks), **prepared["surface"])
         if report.get("contact_offset_choice"):
             np.savez(out / "contact_choices.npz", **report["contact_offset_choice"])
+        captured["report"] = report
         save(out / "fast_report.json", report)
         save(out / "final.json", dict(stages=[], main_pipeline=True, effective_config=owner.retargeting_config))
         return motion, report
@@ -206,6 +209,14 @@ def child(args):
         save(out / "invariants.json", dict(source_joints=True, terrain_scale=True, object_translations=True, frames=len(data.positions)))
     finally:
         timing["wall_seconds"] = time.perf_counter() - started
+        owner = captured.get('owner')
+        deadline = getattr(owner, '_production_deadline', None)
+        if deadline is not None:
+            report = captured.get('report', {})
+            timing['production_seconds'] = report.get('deadline', {}).get('production_seconds', deadline.elapsed())
+            timing['deadline'] = report.get('deadline', {})
+            if report:
+                save(out / 'fast_report.json', report)
         save(out / "timing.json", timing)
     print("TIMING", json.dumps(timing), flush=True)
     print("SOURCE_AND_OBJECT_INVARIANTS_PASS", flush=True)
@@ -236,14 +247,16 @@ def run_audits(out, source, env, python, *, scene_workers=None, concurrent=True,
     ]
     jobs = [(name, [str(python), str(source / "scripts" / f"review_{name}.py")] + tail, source, env)
             for name, tail in commands]
-    dependent = None
-    if self_audit_root is not None:
-        root = Path(self_audit_root).resolve()
-        dependent = ("training_collision", [
-            str(python), str(root / "scripts/review_training_collision.py"), "--prepared", str(prepared),
-            "--motion", str(motion), "--objects", str(out / "objects.npy"),
-            "--scene-metrics", str(out / "scene_metrics.json"), "--output", str(out / "training_collision.json")] + self_tail,
-            root, dict(env, PYTHONPATH=str(root)))
+    root = Path(self_audit_root or source).resolve()
+    dependent = ("training_collision", [
+        str(python), str(root / "scripts/review_training_collision.py"), "--prepared", str(prepared),
+        "--motion", str(motion), "--objects", str(out / "objects.npy"),
+        "--scene-metrics", str(out / "scene_metrics.json"), "--output", str(out / "training_collision.json")] + self_tail,
+        root, dict(env, PYTHONPATH=str(root)))
+
+    persistence = ("penetration_persistence", [str(python), str(root / "scripts/review_penetration_persistence.py"),
+        "--clip-dir", str(out), "--output", str(out / "penetration_persistence.json")] + self_tail,
+        root, dict(env, PYTHONPATH=str(root)))
 
     def start(job):
         name, cmd, cwd, job_env = job
@@ -268,6 +281,7 @@ def run_audits(out, source, env, python, *, scene_workers=None, concurrent=True,
                 if name == "scene_metrics" and dependent is not None:
                     scene_receipt(receipts)
                     running.append(start(dependent))
+                    running.append(start(persistence))
             time.sleep(.02)
 
     receipts = []
@@ -278,7 +292,7 @@ def run_audits(out, source, env, python, *, scene_workers=None, concurrent=True,
             drain([start(job)], receipts)
     return dict(status="completed_with_failures" if any(r["returncode"] for r in receipts) else "geometry_and_metrics_completed",
                 receipts=receipts, concurrent=concurrent, scene_workers=scene_workers,
-                physics="unverified: physical replay unavailable", reset="unverified: reset acceptance unavailable")
+                physics="unverified: physical replay unavailable", reset="see penetration_persistence.json: invalid/unknown/candidate")
 
 
 def run(args):
@@ -330,6 +344,8 @@ def run(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prepare", action="store_true")
+    parser.add_argument("--robot-profile", default="unitree_g1_mesh.json",
+                        help="Profile under robot_models/unitree_g1 frozen by --prepare")
     parser.add_argument("--run-dir", type=Path)
     parser.add_argument("--arm", default="A", help="A for baseline; any other name for a candidate")
     parser.add_argument("--source-root", type=Path)

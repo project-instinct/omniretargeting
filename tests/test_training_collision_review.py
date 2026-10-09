@@ -172,6 +172,9 @@ def test_enabled_self_query_does_not_overwrite_unknown_measurement(monkeypatch):
     class Query:
         cfg = {'penetration_tolerance': .001}
 
+        def use_model_pairs(self):
+            return []
+
         def query(self, _pose):
             raise RuntimeError('synthetic native query failure')
 

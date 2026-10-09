@@ -43,9 +43,11 @@ def run(args):
             raise ValueError(f"Contact-offset choices do not cover the motion: {name}")
     model = mujoco.MjModel.from_xml_path(prepared["model_path"])
     data = mujoco.MjData(model)
-    server = viser.ViserServer(
-        host="0.0.0.0", port=args.viser_port, label="Contact motion review"
-    )
+    if args.record_only:
+        from omniretargeting.viser_recording import RecordingScene
+        server = RecordingScene(label="Contact motion review")
+    else:
+        server = viser.ViserServer(host="0.0.0.0", port=args.viser_port, label="Contact motion review")
     server.scene.configure_default_lights(cast_shadow=False)
     server.initial_camera.look_at = tuple(poses[0, :3])
     server.initial_camera.position = tuple(poses[0, :3] + [1.8, -1.8, 1.2])

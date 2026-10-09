@@ -577,6 +577,29 @@ and `query_failure_examples` with frame, geom, body and backend.
 
 ### Fast production path
 
+Fast retains the production chain: fixed source reference → grid → acquisition →
+reweight → free_bodies → original_mesh_repair → final audit/export. Coordinated AL
+remains research code. Acquisition uses the legacy guarded LM/conic solver and,
+for clips of at least 600 frames, its window scheduler; later stages still freeze
+acquired contacts and restrict repair scopes.
+
+The default fast production budget is 1 second per saved frame, measured from
+CLI loading through export (`sequence_solver.time_budget_seconds_per_frame`).
+Checks at LM/window/repair boundaries stop work and retain the last accepted
+motion; reweight/free trials require stage acceptance. Export reserves max(2 s,
+5% of the budget). Native calls finish before the next check, and `deadline`
+reports any overshoot, incomplete audits and skipped stages. Before expiry the
+numerical path is unchanged. Independent audits never trigger another solve.
+
+The G1 collision contract is `unitree_g1_mesh.json` (original STL convex hulls).
+Use that profile explicitly with the CLI; benchmark preparation defaults to it.
+Output records `collision_model_sha256`/`collision_model_name`; training must use
+the same compiled collision model. `review_penetration_persistence.py` reports
+physical-pair depth, duration and frame fraction plus reset candidate/unknown/
+invalid. Structural model overlaps are measured separately with proposed MJCF
+excludes; they are not trajectory defects. The legacy solver's structural-pair
+heuristic is unchanged. See [the policy](docs/retargeting_invariants.md).
+
 Fast uses one production path. `OMNIRETARGETING_FAST_ENABLE` accepts only
 `performance_trace`; algorithm ablations and `OMNIRETARGETING_FAST_DISABLE`
 are no longer available.
@@ -609,7 +632,8 @@ native self-collision and deepest-point queries of busy windows; preprocessing
 runs support evidence in parallel and computes the source pose while the scene
 loads. All three keep final poses bit-identical.
 
-`scripts/benchmark_fast.py --prepare --run-dir <run>` freezes a baseline;
+`scripts/benchmark_fast.py --prepare --run-dir <run> --robot-profile unitree_g1_mesh.json`
+freezes a baseline, including the chair2745 long clip;
 `--arm <candidate> --source-root <snapshot>` runs a frozen candidate with no
 algorithm switches. Independent audits run concurrently by default;
 `--serial-audits` selects serial auditing. Collision audit worker counts default

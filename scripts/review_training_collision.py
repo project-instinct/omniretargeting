@@ -1,9 +1,6 @@
-"""Final geometry-only collision audit for a training-facing robot model.
-The audit deliberately does not repair or optimize the input.  It reuses the
-project's original-mesh scene/object queries and MuJoCo collision-geom self
-collision filters.  Training interpolation and reset rules are measured only
-when the motion payload carries an explicit, sourced configuration; otherwise
-the corresponding sections are reported as unverified rather than inferred.
+"""Geometry-only audit of compiled collision geoms, without repair.
+Uses original scene/object queries; training interpolation and reset require
+explicit sourced configuration, otherwise their status remains unverified.
 """
 from __future__ import annotations
 import argparse
@@ -18,6 +15,7 @@ from typing import Any
 import mujoco
 import numpy as np
 import trimesh
+from omniretargeting.collision_manifest import collision_manifest
 from omniretargeting.cpu_budget import available_cpus
 from omniretargeting.moving_scene import MovingSceneQuery
 from omniretargeting.scene_geometry import (
@@ -25,7 +23,8 @@ from omniretargeting.scene_geometry import (
     collision_geom_ids,
     geom_surface_offsets,
 )
-from omniretargeting.self_collision import SelfCollisionQuery
+from omniretargeting.audit_self_collision import AuditSelfCollisionQuery as SelfCollisionQuery
+from omniretargeting.training_collision_match import training_collision_match
 from omniretargeting.training_collision_parallel import query_self_frames
 SCHEMA_VERSION = 1
 STATIC_SAMPLING_M = 0.02
@@ -100,7 +99,7 @@ def _mesh_assets(path: Path) -> list[Path]:
                 raise FileNotFoundError(f"robot mesh referenced by {path}: {resolved}")
             assets.add(resolved)
     return sorted(assets)
-def model_description(model_path: Path, motion_payload: dict[str, Any]) -> dict[str, Any]:
+def model_description(model_path: Path, motion_payload: dict[str, Any], model=None, training_model_path=None):
     """Hash the XML plus every referenced mesh, not only the small XML file."""
     resolved = model_path.resolve()
     xml_hash = _sha256(resolved)
@@ -111,32 +110,28 @@ def model_description(model_path: Path, motion_payload: dict[str, Any]) -> dict[
     composite.update(xml_hash.encode("ascii"))
     for item in mesh_hashes:
         composite.update(item["sha256"].encode("ascii") + b"\0")
-    model = mujoco.MjModel.from_xml_path(str(resolved))
+    if model is None:
+        model = mujoco.MjModel.from_xml_path(str(resolved))
+    manifest = collision_manifest(model, source_path=resolved)
     ids = collision_geom_ids(model)
     geom_types: dict[str, int] = {}
     for geom_type in np.unique(model.geom_type[ids]):
         geom_types[str(mujoco.mjtGeom(int(geom_type))).split(".")[-1]] = int(
             np.sum(model.geom_type[ids] == geom_type)
         )
-    expected = _scalar(motion_payload.get("training_model"))
-    match = {
-        "status": "unverified",
-        "reason": "motion payload has no explicit training_model identifier",
-    }
-    if isinstance(expected, dict):
-        expected_hash = expected.get("sha256")
-        if expected_hash:
-            match = {
-                "status": "match" if expected_hash == composite.hexdigest() else "mismatch",
-                "expected_sha256": str(expected_hash),
-            }
-        else:
-            match = {"status": "unverified", "reason": "training_model has no sha256"}
+    match = training_collision_match(
+        manifest,
+        motion_payload,
+        training_model_path,
+        legacy_asset_sha256=composite.hexdigest(),
+    )
     return {
         "path": str(resolved),
         "xml_sha256": xml_hash,
         "meshes": mesh_hashes,
-        "collision_model_sha256": composite.hexdigest(),
+        "asset_bundle_sha256": composite.hexdigest(),
+        "collision_model_sha256": manifest["sha256"],
+        "collision_manifest": manifest,
         "collision_geom_ids": ids.tolist(),
         "collision_geom_count": int(len(ids)),
         "collision_geom_types": geom_types,
@@ -532,64 +527,8 @@ def audit_moving(
         "frame_depths_max_m": depths.max(axis=1).tolist(),
         **moving.describe(),
     }, moving
-def audit_self(
-    model: mujoco.MjModel,
-    trajectory: TrainingTrajectory,
-    geom_ids: np.ndarray,
-    workers: int = 1,
-) -> tuple[dict[str, Any], SelfCollisionQuery | None]:
-    try:
-        query = SelfCollisionQuery(model)
-    except Exception as error:
-        return {
-            **_depth_summary(np.zeros((len(trajectory.qpos), len(geom_ids))), model, geom_ids, trajectory.labels),
-            "status": "unknown",
-            "reason": f"initialization failed: {type(error).__name__}: {error}",
-            "unknown_query_count": len(trajectory.qpos),
-        }, None
-    depths = np.zeros((len(trajectory.qpos), model.ngeom), dtype=float)
-    frame_depth = np.zeros(len(trajectory.qpos), dtype=float)
-    min_clearance = np.full(len(trajectory.qpos), np.inf)
-    errors: list[dict[str, Any]] = []
-    error_frames: set[int] = set()
-    pair_depths = {}
-    for frame, frame_result in enumerate(query_self_frames(query, trajectory.qpos, workers)):
-        rows = frame_result["rows"]
-        error = frame_result.get("error")
-        if error is not None:
-            error_frames.add(frame)
-            errors.append({"frame": int(trajectory.labels[frame]), "message": error})
-            continue
-        if rows:
-            pair_depth = max(max(-row["clearance"], 0.0) for row in rows)
-            frame_depth[frame] = pair_depth
-            for row in rows:
-                pair = tuple(map(int, row['pair']))
-                pair_depths.setdefault(pair, np.zeros(len(trajectory.qpos)))[frame] = max(-row['clearance'], 0.)
-                for gid in pair:
-                    depths[frame, gid] = max(depths[frame, gid], -row['clearance'], 0.)
-            min_clearance[frame] = min(float(row["clearance"]) for row in rows)
-    peak = frame_depth
-    max_frame = int(np.argmax(peak)) if len(peak) else 0
-    from scripts.spline_collision_details import self_details
-    return {
-        "mean_m": float(np.mean(peak)),
-        "p95_m": float(np.quantile(peak, 0.95)),
-        "max_m": float(np.max(peak, initial=0.0)),
-        "worst_frame": int(trajectory.labels[max_frame]) if len(trajectory.labels) else None,
-        "worst_body": _body_name(model, int(np.argmax(depths[max_frame]))) if depths.size else None,
-        "frames_over_1mm": np.flatnonzero(peak > query.cfg["penetration_tolerance"] + DEPTH_EPSILON_M).tolist(),
-        "frames_over_5mm": np.flatnonzero(peak > RESET_STATIC_FAILURE_M + DEPTH_EPSILON_M).tolist(),
-        "frames_over_1cm": np.flatnonzero(peak > RESET_DEFECT_M + DEPTH_EPSILON_M).tolist(),
-        "status": "unknown" if errors else "measured",
-        "unknown_query_count": len(error_frames),
-        "errors": errors,
-        "frame_depths_max_m": frame_depth.tolist(),
-        "frame_min_clearance_m": [None if not math.isfinite(x) else x for x in min_clearance],
-        **self_details(pair_depths, model, trajectory.labels, query.cfg['penetration_tolerance']),
-        **{key: value for key, value in query.describe().items() if key != 'status'},
-        "query_status": query.describe()['status'],
-    }, query
+from scripts.training_self_audit import audit_self
+
 def _required_motion_steps(
     model: mujoco.MjModel,
     first: np.ndarray,
@@ -747,7 +686,8 @@ def audit_interframe(
                     body = _body_name(model, gid)
             if self_query is not None:
                 try:
-                    rows = self_query.query(pose)
+                    rows = [r for r in self_query.query(pose) if tuple(sorted(r["pair"]))
+                            not in getattr(self_query, "structural_evidence", {})]
                     self_depth = max((max(-row["clearance"], 0.0) for row in rows), default=0.0)
                     if self_depth > depth:
                         category, depth = "self", self_depth
@@ -915,7 +855,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
     geom_ids = collision_geom_ids(model)
     if not len(geom_ids):
         raise ValueError("robot model has no non-world collision geoms")
-    model_report = model_description(model_path, payload)
+    model_report = model_description(model_path, payload, model, getattr(args, "training_model", None))
     source_profile_path = Path(__file__).resolve().parents[1] / "robot_models/unitree_g1/unitree_g1_mesh.json"
     if source_profile_path.is_file():
         from omniretargeting.robot_config import load_robot_config
@@ -924,7 +864,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
             "path": str(source_profile_path), "sha256": _sha256(source_profile_path),
             "model_path": str(profile_model),
             "match": profile_model.resolve() == model_path or _sha256(profile_model) == _sha256(model_path),
-            "interpretation": "source mesh-collision experiment only; not proof of training-model identity",
+            "interpretation": "declared mesh collision contract; runtime loading requires separate provenance",
         }
     interp = interpolation_profile(payload)
     saved = TrainingTrajectory(
@@ -993,6 +933,7 @@ def main() -> None:
     parser.add_argument("--objects", type=Path, required=True)
     parser.add_argument("--scene-metrics", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--training-model", type=Path)
     parser.add_argument("--workers", type=int, default=min(8, available_cpus()))
     report = audit(parser.parse_args())
     print("SAVED", report["inputs"]["motion"], report["geometry_status"], report["acceptance_status"])

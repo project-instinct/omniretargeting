@@ -98,6 +98,8 @@ class OriginalGeometry:
 
     def __init__(self, objective, scene_objects, scene_query, *, manifold=False,
                  columns=None, reference_poses=None):
+        from .deadline_state import check
+        check("repair_geometry:start")
         self.objective, self.model = objective, objective.model
         self.frames = objective.frames
         selected = np.asarray(objective.coords.di if columns is None else columns)
@@ -121,6 +123,7 @@ class OriginalGeometry:
             self.moving = MovingSceneQuery(self.model, scene_objects, objective.frames) if scene_objects else None
             from .repair_geometry_setup import self_query
             self.self_query = self_query(objective)
+        check("repair_geometry:model_queries")
         # Per-frame exact pair results of the last query (see ``query``'s reuse).
         self._self_reuse = {}
         self._window_frame_cache = {}
@@ -162,6 +165,7 @@ class OriginalGeometry:
         if self.scene is not None:
             from .repair_static_query import prepare
             prepare(self)
+        check("repair_geometry:static_preparation")
         from .repair_geometry_setup import prepare_moving
         if reuse:
             # Prepare the immutable provider, then share its object list.
@@ -170,6 +174,7 @@ class OriginalGeometry:
             self.moving = None if reusable.moving is None else reusable.moving.fresh_state()
         else:
             prepare_moving(self)
+        check("repair_geometry:moving_preparation")
         self.static_reused = 0
         self._window_parent_mode = bool(False)
         # CUDA belongs to a spawned service; neither the solver process nor
@@ -183,6 +188,7 @@ class OriginalGeometry:
             except (ImportError, RuntimeError, ValueError, OSError, EOFError) as error:
                 self._gpu_allowed = False
                 self.gpu_unavailable = str(error)
+        check("repair_geometry:gpu_preparation")
         if reference_poses is not None:
             self.freeze_reference_observations(reference_poses)
 
@@ -504,7 +510,9 @@ class OriginalGeometry:
             return protected_depths is not None and bool(failures or any(
                 _regressed(value, protected_depths.get(key, 0.)) for key, value in depths.items()))
 
+        from .deadline_state import check
         for frame in frames:
+            check("repair_measure_frame")
             if stop is not None and stop.value >= 0:
                 break
             pose = poses[frame]
@@ -748,8 +756,12 @@ def repair_original_meshes(objective, poses, scene_objects=(), scene_query=None)
     limits = RepairLimits(objective, entry)
     geometry = OriginalGeometry(objective, scene_objects, scene_query, manifold=True)
     from .repair_geometry_setup import prepare_static_bounds, prepare_moving_reduction
+    from .deadline_state import check
+    check("repair_static_bounds")
     prepare_static_bounds(geometry, entry)
+    check("repair_moving_reduction")
     prepare_moving_reduction(geometry, entry)
+    check("repair_workers")
     # Frame-parallel measurement returns the serial rows; see parallel_geometry.
     geometry.start_workers(len(entry))
     try:
@@ -762,6 +774,8 @@ def repair_original_meshes(objective, poses, scene_objects=(), scene_query=None)
 
 
 def _repair(objective, entry, limits, geometry, started):
+    from .deadline_state import check, accepted
+    check("repair_initial_geometry")
     baseline = geometry.measure(entry, jacobians=True)
     current, measured = entry.copy(), baseline
     protected = {"depths": dict(baseline["depths"])}
@@ -793,6 +807,7 @@ def _repair(objective, entry, limits, geometry, started):
     proposals = geometry._repair_proposals = RepairProposals(limits, geometry)
     iteration = -1
     while (scheduled := schedule.next()) is not None:
+        check("repair_group_attempt")
         group, group_iteration = scheduled
         iteration += 1
         # Preserve baseline history numbering, including unused attempts
@@ -855,6 +870,7 @@ def _repair(objective, entry, limits, geometry, started):
         new_witnesses = 0
         with closing(proposal.candidates(record)) as candidates:
             for alpha, candidate in candidates:
+                check("repair_trial")
                 if first_geometry_candidate is None:
                     first_geometry_candidate = candidate.copy()
                 # Unmoved frames reuse their exact per-pose cache entries.
@@ -881,6 +897,7 @@ def _repair(objective, entry, limits, geometry, started):
                     if candidate_prediction is not None:
                         record["model_progress"]["predicted_candidate_decrease_m"] = candidate_prediction["predicted_decrease_m"]
                 current = candidate
+                accepted(current, "original_mesh_repair")
                 measured = geometry.linearize(current, checked)
                 for key in protected["depths"].keys() | measured["depths"].keys():
                     protected["depths"][key] = min(protected["depths"].get(key, 0.), measured["depths"].get(key, 0.))

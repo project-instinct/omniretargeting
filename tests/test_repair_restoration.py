@@ -33,9 +33,10 @@ def test_source_shape_rows_preserve_both_frozen_references():
     step = objective.coords.difference(poses, turned).ravel()
     assert shape.accepts(turned)
     assert violation(shape.repair_bounds(poses), step) <= 1e-10
-    # Hip and knee together flip a clear layout component.
+    # A sustained cross-limb hand/leg flip violates the current layout contract.
+    # Same-leg hip/knee folding is not a layout relation.
     candidate = poses.copy()
-    candidate[:, objective.coords.qi[:2]] -= 0.8
+    candidate[:, objective.coords.qi[-1]] += 1.2
     step = objective.coords.difference(poses, candidate).ravel()
     assert not shape.accepts(candidate)
     assert violation(shape.repair_bounds(poses), step) > 0.01

@@ -453,6 +453,7 @@ def optimize_legacy_windows(objective, poses, *, iterations, callback=None,
     parameters retain the original full-rate schedule and continuation caps.
     """
     from .mesh_repair import _activation_depth
+    from .deadline_state import check, accepted as checkpoint_motion
     sweeps = SWEEP_ITERATIONS if sweep_iterations is None else tuple(sweep_iterations)
     extra_sweeps = MAX_EXTRA_SWEEPS if max_extra_sweeps is None else max_extra_sweeps
     if not sweeps or any(q <= 0 for q in sweeps) or extra_sweeps < 0:
@@ -496,6 +497,7 @@ def optimize_legacy_windows(objective, poses, *, iterations, callback=None,
     setup_seconds = time.monotonic() - started
     with _workers(objective, count) as workers:
         for sweep in range(len(sweeps) + (extra_sweeps if focus is None else 0)):
+            check(label + ":window_sweep")
             extra = sweep >= len(sweeps)
             quota = min(remaining, EXTRA_ITERATIONS if extra else sweeps[sweep])
             if quota <= 0:
@@ -584,6 +586,7 @@ def optimize_legacy_windows(objective, poses, *, iterations, callback=None,
                     record.update(sweep_rolled_back=True, accepted=False, alpha=0.)
                 summary['stop_reason'] = 'sweep_guard_failure'
                 break
+            checkpoint_motion(current, label, iteration=True)
             if callback is not None and len(history) > first_record:
                 callback(current.copy(), dict(history[-1]))
         budget = getattr(objective, '_window_cpu_budget', None)

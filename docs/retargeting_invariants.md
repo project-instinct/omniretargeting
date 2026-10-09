@@ -1,38 +1,15 @@
 # Retargeting Design (current implementation)
 
-How the current pipeline realizes the goal in [`AGENTS.md`](../AGENTS.md), with the constants
-and code locations behind it. `AGENTS.md` owns the goal metrics, hard lines and trade-off
-order; this file explains the mechanisms. Each mechanism is the current approach, not a
-requirement: replace it when the cross-clip metrics show a better result without crossing a
-hard line, and update this file with it.
+Current mechanisms and known gaps; goals and priorities belong to [`AGENTS.md`](../AGENTS.md).
 
 ## Reference and Jitter Budgets
-
 - Before any clearance optimization the pipeline builds a source-shaped robot reference. Later
   stages measure posture and continuity against it, and it stays fixed within a run: rebasing
   it to the latest candidate let repeated passes progressively twist the robot.
-- Because later stages are bounded relative to the reference, a distorted reference passes
-  every later check. Its quality is therefore judged directly against the source (relation
-  angles, per-bone source directions of the seed). Building a better reference is one of the
-  most leveraged improvements available.
-- Calibrated sole frames use the same morphology target in source fitting and acquisition
-  (`_fast/foot_targets.py`). Each source hip–knee–ankle segment retains its direction with
-  the robot's segment length; the semantic tip offset uses the measured terminal-chain scale.
-  The target is relative to the robot hip and its Jacobian includes that moving origin. This
-  avoids imposing a human-length leg endpoint as a 2 cm world target during reference fitting.
-  Missing morphology calibration retains the existing tracking semantics. The anatomical hip
-  is the first articulation below its mapped parent, rather than an intermediate serial joint
-  origin displaced by an upstream hip rotation; source arrays and robot profiles stay intact.
-- After the joint fit, height registration holds every joint angle and root XY fixed. Only
-  observed sole contacts provide world-plane measurements (`height_tracking_tasks`); free
-  soles remain morphology-relative. The existing support lift then prevents proximal support
-  penetration before the reference is frozen. Registration shifts and subsequent lifts are
-  reported separately; this is robot height adaptation, never an edit to a source target.
-  The height fit is bounded by the collision sole's extent on observed upward static support
-  planes (`bound_sole_registration`), not only by its semantic marker. An ankle tilt can put
-  collision points below that marker; the minimal extra height is spread over the existing
-  0.5 s lift ramp and reported as `sole_extent_correction_max_m`. Joint angles and XY remain
-  unchanged in this registration step.
+- Sole morphology targets use source bone directions and robot segment lengths, relative to
+  the robot hip (`foot_targets.py`). Source fitting and acquisition share calibrated offsets.
+  Height registration holds joints and root XY fixed, follows observed sole planes, and spreads
+  the collision-sole extent correction over 0.5 s; registration and support lift are reported.
 - Continuity follows `AGENTS.md`: added high-frequency content is chatter, while a smooth
   low-frequency clearance correction is not. `motion_budgets.chatter_excess` high-passes each
   signal with Gaussian scale `CHATTER_SCALE_FRAMES = 2`, and allows the source-shaped
@@ -44,9 +21,7 @@ hard line, and update this file with it.
   do not reject a sweep merely because assembling windows creates a flagged frame: that would
   roll back useful clearance. They retain hard URDF velocity rows when the owner supplies its
   URDF, while final audit reports and gates sustained added chatter.
-  Support-endpoint
-  world continuity remains protected during local repair because its purpose is preventing
-  support slip, not general smoothness.
+  Local repair also protects support-endpoint world continuity against slip.
 - `scripts/review_joint_smoothness.py` audits the same source-relative chatter, URDF velocity
   limits, and a contact-free inverse-dynamics effort screen. The effort screen reports
   candidates for a contact-force split; it is not yet a final torque certificate.
@@ -72,8 +47,12 @@ hard line, and update this file with it.
   landmark relations cannot see a leaf turning about its own axis. Leaves whose chain carries a
   sole frame (`track_orientation`, the feet) keep the default weight. The rule reads only the
   kinematic tree and resolved effectors, so it needs no per-robot settings.
-- Self-collision pairs that overlap in every sampled configuration are model geometry
-  ("always in collision", `self_collision.py`) and are left out of checks and reports.
+- Independent audits restore the compiled geom-pair set with `audit_self_collision.py` and
+  measure sampled always-overlapping pairs separately as `model_structural_overlap`. They
+  retain per-frame depths and deterministic sample evidence, exclude them from trajectory
+  defects/reset invalid, and suggest MJCF `<exclude>` entries without applying them.
+  The production `self_collision.py` heuristic is unchanged, including its known weakness:
+  unknown model samples are skipped, so its exclusions are not certified.
 
 ## Contact Pipeline
 
@@ -129,11 +108,6 @@ a certificate. The solver's source contact arrays remain intact for auditing the
 The certificate is conservative: collision-constrained or joint-direction-constrained failures
 inside the sphere remain protected contacts and unresolved gaps, not falsely certified misses.
 
-Example: a seated source with longer legs than the robot. Seated, the pelvis is the support and
-the robot's feet hang (reported gap). Before the weight moves to the feet, the robot slides
-forward on the seat until its feet reach the floor, then rises. Sinking the pelvis into the seat
-to keep the feet down trades penetration for contact.
-
 `_fast/support_handoff.py` checks incoming sole normal gaps at the last source overlap frame
 before a static proximal geometric contact releases (support/hold role flapping alone is not
 a release). When mechanics identifies a minimal incoming support set, the check uses that set;
@@ -142,10 +116,7 @@ handoff, and does not trigger another solve. This geometric check and anticipato
 not yet guarantee a feasible transition when the bounded root/clearance constraints conflict;
 such a transition remains a defect, not certified support or permission to unload the seat.
 
-Open problems: force-balanced make-before-break transitions are not certified. Object support
-mechanics is approximate (`object_support_evidence.py`: touching objects form one system,
-uniform density, nominal demand, full friction cones, environment first) and only promotes skin
-contacts to support.
+Force-balanced support transitions and the approximate object-support mechanics remain unverified.
 
 ## Penetration
 
@@ -179,14 +150,9 @@ contacts to support.
   `triangle_cylinder.py`). Such a sheet has no solid side: crossing it is penetration, a geom
   wholly behind it is not detected. Any other component, geom type, tied exit or uncertified
   witness stays `unknown_query`, counted by category; it is never zero depth.
-- A residual deeper than 1 cm usually traces to a joint limit, a sustained layout collapse,
-  chatter/velocity limit, or correction locality. Penetration held in place only by
-  lower-priority terms means the
-  penetration weight is too low.
 - InstinctLab has no terrain-aware spawn penetration detection: its reset height offset is an
   unconditional vertical lift that cannot fix lateral intersections, and physics separation is
   a downstream fallback, not a repaired trajectory.
-
 
 ## Solver Backends
 
@@ -196,12 +162,38 @@ contacts to support.
   `relation_*`, `layout_flip_*`, `source_relative_chatter`) and `skipped_tasks`.
 - `--solver sequence` bounds only root/slide translation and fits source directions first,
   without angular slack.
-- Open problem: no backend has a wall-clock budget yet. The 957-frame TRUMANS clip has taken
-  1664–3236 s (`out/speedup_20261001/runs/*957*/timing.json`), above the 1 s/frame target in
-  `AGENTS.md`. A budget should return the best accepted result so far and report the rest.
+- Fast has a production deadline from CLI loading to export: default
+  `sequence_solver.time_budget_seconds_per_frame=1.0`, with max(2 s, 5%) export reserve.
+  LM iterations/attempts, window sweeps, reweight/free phases and repair-group attempts check
+  it; GPU service waits also use the remaining budget. Expiry keeps accepted motion; a reweight/free
+  iteration needs its original stage guard. Before acquisition, the accepted source/initial
+  pose is an explicitly unfinished fallback. Native calls finish before a cooperative check;
+  `deadline` reports elapsed time, reserve, first expiry, overshoot and `skipped_stages`.
+  Budget-unexpired objectives, iterations, guards and numeric decisions are unchanged.
 
-## Useful Diagnostics
+## Collision contract and independent acceptance
 
-Beyond the metrics in `AGENTS.md`, these help locate a problem: horizontal/vertical components
-of penetration corrections, relation angles against the fixed reference as well as the source,
-and the seed's per-bone source directions.
+The declared robot contract is `unitree_g1_mesh.json` → `g1_29dof_torsobase_mesh.xml`:
+original STL convex hull per link, including the hand. `collision_manifest.py` hashes the
+compiled collision model; NPZ stores `collision_model_sha256` and `collision_model_name`.
+`training_match` checks motion/audit/declared training assets, not a running simulator.
+Missing hashes are unverified; training scene/object hull or CoACD differences remain
+integration defects. The acquisition SDF is a known approximation, not this audit contract.
+
+`quality_policy.py` and `review_penetration_persistence.py` report each physical pair
+(robot geom × static scene/object/self geom), never treating scan fragments as new pairs.
+They give Dmax, worst frame and D/F/L/runs at 0.5/2/5/10/20 mm; unknown is not a pass.
+Deep means >10 mm. Persistent means >5 mm for >0.3 s or >10% frames; non-support/lateral/self
+also fails at >2 mm for >1 s or >25% frames. Verified same-surface normal support residuals
+≤5 mm are marked physically unverified; mild brief residuals are reported, not auto-resolved.
+Saved depth caches lack per-frame support exit-normal/component certificates: support waivers
+remain provisional and cannot pass; reset stays unknown unless another pair proves invalid.
+Reset is separately invalid (lateral/self >1 mm or scene/object >5 mm), unknown, or candidate
+(geometry only). These are independent audit policies; this port does not alter legacy guards
+or stopping thresholds. Audit runs once after solving and never triggers another solve.
+
+The production chain is source_pose → grid → acquisition → reweight → free_bodies →
+original_mesh_repair. ≥600 frames retain window acquisition. It still freezes acquired
+contact accuracy/positions and per-key depth with bounded repair scopes. Unfreezing intermediate
+solutions, using near-field true geometry in the main solve, and jointly moving both self-pair
+chains and support compensators are future directions, not claims about this implementation.
