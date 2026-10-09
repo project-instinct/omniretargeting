@@ -20,6 +20,7 @@ from .utils import (
     transform_points_local_to_world,
     get_adjacency_list,
     calculate_exponential_edge_weights,
+    calculate_contact_edge_weights,
     calculate_laplacian_coordinates,
     calculate_laplacian_matrix,
     sample_mujoco_geom_local_points,
@@ -242,6 +243,7 @@ class GenericInteractionRetargeter:
         penetration_correction: Optional[Dict] = None,
         solver_diagnostics: bool = False,
         terrain_deep_penetration_depth: float = 0.5,
+        contact_edge_weight: float = 0.0,
     ):
         """Initialize the generic retargeter.
 
@@ -316,6 +318,9 @@ class GenericInteractionRetargeter:
             )
         self.laplacian_edge_weighting = laplacian_edge_weighting
         self.laplacian_distance_decay = float(laplacian_distance_decay)
+        self.contact_edge_weight = float(contact_edge_weight)
+        if not np.isfinite(self.contact_edge_weight) or self.contact_edge_weight < 0:
+            raise ValueError("contact_edge_weight must be finite and non-negative.")
 
         # ---- Parse target mapping (supports mixed string/dict values) ----
         # Extract link names and optional local-frame offsets for each source target.
@@ -687,7 +692,7 @@ class GenericInteractionRetargeter:
             group: float(np.linalg.norm(values[indices])) if indices else 0.0
             for group, indices in self.dof_group_indices.items()
         }
-    
+
     def _validate_joint_mapping(self):
         """Validate that all mapped robot links exist. Raise error if any are missing.
         
@@ -787,6 +792,8 @@ class GenericInteractionRetargeter:
         target_base_orientation: Optional[np.ndarray] = None,
         object_points: Optional[np.ndarray] = None,
         root_translation: Optional[np.ndarray] = None,
+        contact_anchors: Optional[np.ndarray] = None,
+        contact_edges: Optional[List[Tuple[int, int, float]]] = None,
     ) -> np.ndarray:
         """
         Retarget a single frame of source target positions to robot motion.
@@ -799,6 +806,11 @@ class GenericInteractionRetargeter:
             object_points: Optional object surface points (K, 3)
             root_translation: Optional source root translation (3,) for base
                 position tracking.
+            contact_anchors: Resolved world-space scene anchors (A, 3). Appended
+                after ordinary object samples as fixed environment vertices.
+            contact_edges: (mapped source index, anchor index, confidence) records;
+                source indices use source_target_positions order, anchor indices
+                use contact_anchors order. Active when contact_edge_weight > 0.
 
         Returns:
             Optimized robot configuration
@@ -806,6 +818,18 @@ class GenericInteractionRetargeter:
         # self.terrain_points are sampled from the terrain mesh passed to this retargeter.
         # The caller owns any batch scaling before constructing the stream state.
         terrain_points = self.terrain_points
+        anchor_offset = len(source_target_positions) + len(terrain_points)
+        if object_points is not None:
+            anchor_offset += len(object_points)
+        if contact_edges and self.contact_edge_weight > 0:
+            if contact_anchors is None:
+                raise ValueError("contact_edges require contact_anchors.")
+            object_points = np.vstack(
+                [
+                    object_points if object_points is not None else np.empty((0, 3)),
+                    contact_anchors,
+                ]
+            )
 
         # Create interaction mesh
         vertices, tetrahedra = self.create_interaction_mesh(
@@ -818,7 +842,20 @@ class GenericInteractionRetargeter:
         # Distance-dependent edge weights (TopoRetarget Eq. 5), computed once on
         # the source configuration and reused for the robot-side Laplacian.
         # None means uniform weighting (original OmniRetarget behavior).
-        if self.laplacian_edge_weighting == "exponential":
+        if contact_edges and self.contact_edge_weight > 0:
+            edges = [
+                (source, anchor_offset + anchor, confidence)
+                for source, anchor, confidence in contact_edges
+            ]
+            edge_weights = calculate_contact_edge_weights(
+                vertices,
+                adj_list,
+                edges,
+                self.contact_edge_weight,
+                weighting=self.laplacian_edge_weighting,
+                kappa=self.laplacian_distance_decay,
+            )
+        elif self.laplacian_edge_weighting == "exponential":
             edge_weights = calculate_exponential_edge_weights(
                 vertices, adj_list, kappa=self.laplacian_distance_decay
             )
@@ -1467,7 +1504,7 @@ class GenericInteractionRetargeter:
                     J_full = J_base
 
                 J_reduced = J_full[:, self.dof_indices]
-                    
+
                 J_dict[target_name] = J_reduced
                 p_dict[target_name] = pos
 
@@ -1484,7 +1521,7 @@ class GenericInteractionRetargeter:
         # This is critical for correct Laplacian matching!
         source_target_names_ordered = self.source_target_names
         num_targets = len(source_target_names_ordered)
-        
+
         if num_targets > 0:
             J_V = np.zeros((3 * num_targets, self.nv_a))
             for i, target_name in enumerate(source_target_names_ordered):
@@ -1894,6 +1931,7 @@ def retarget_source_to_robot(
     joint_mapping: Dict[str, str],
     robot_height: Optional[float] = None,
     source_target_names: Optional[List[str]] = None,
+    base_orientation: Optional[Dict[str, str]] = None,
 ) -> Tuple[float, np.ndarray]:
     """
     High-level function to retarget source target positions to any robot on any terrain.
@@ -1905,6 +1943,8 @@ def retarget_source_to_robot(
         joint_mapping: Mapping from source target names to robot links
         robot_height: Robot height override
         source_target_names: Ordered source target names for source_positions
+        base_orientation: Source names for pelvis, left_hip, right_hip, and spine;
+            required for orientation estimation, as in OmniRetargeter.
 
     Returns:
         Tuple of (source_to_robot_scale, retargeted_trajectory)
@@ -1921,9 +1961,10 @@ def retarget_source_to_robot(
         joint_mapping=joint_mapping,
         robot_height=robot_height,
         source_target_names=source_target_names,
+        base_orientation=base_orientation,
     )
     return retargeter.retarget_motion(
         source_positions,
         visualize_trajectory=False,
-        enable_terrain_scaling=True,
+        enable_scene_scaling=True,
     )

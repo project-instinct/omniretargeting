@@ -15,11 +15,23 @@ from .registry import (
     register_data_source,
     registered_source_types,
 )
+from omniretargeting.contacts import (
+    Contact,
+    EntityPose,
+    EntityTrajectory,
+    Scene,
+    SceneEntity,
+)
 
 __all__ = [
     "DataSource",
     "MotionData",
     "MotionFrame",
+    "Contact",
+    "EntityPose",
+    "EntityTrajectory",
+    "Scene",
+    "SceneEntity",
     "create_data_source",
     "get_data_source_factory",
     "get_source_extensions",

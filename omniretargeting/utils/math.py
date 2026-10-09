@@ -459,6 +459,46 @@ def calculate_exponential_edge_weights(
     return edge_weights
 
 
+def calculate_contact_edge_weights(
+    vertices: np.ndarray,
+    adj_list: list[list[int]],
+    contact_edges: list[tuple[int, int, float]],
+    contact_weight: float,
+    weighting: str = "uniform",
+    kappa: float = 30.0,
+) -> list[np.ndarray]:
+    """Add symmetric contact contributions to raw spatial weights, then normalize.
+
+    Edges are full interaction-graph vertex indices. Repeated contributions to
+    the same edge are summed; contact-record aggregation belongs to the caller.
+    The adjacency list is extended in place for edges missing from Delaunay.
+    """
+    rows = []
+    for i, neighbors in enumerate(adj_list):
+        distances = np.linalg.norm(vertices[neighbors] - vertices[i], axis=1)
+        weights = (
+            np.exp(-kappa * distances)
+            if weighting == "exponential"
+            else np.ones(len(neighbors))
+        )
+        rows.append(dict(zip(neighbors, weights)))
+    for source, anchor, confidence in contact_edges:
+        contribution = contact_weight * confidence
+        for i, j in ((source, anchor), (anchor, source)):
+            rows[i][j] = rows[i].get(j, 0.0) + contribution
+    result = []
+    for i, row in enumerate(rows):
+        adj_list[i] = list(row)
+        weights = np.array(list(row.values()), dtype=float)
+        total = weights.sum()
+        if len(weights) and (not np.isfinite(total) or total <= 0):
+            raise ValueError(
+                f"Interaction graph row {i} has no finite positive edge weight."
+            )
+        result.append(weights / total if len(weights) else weights)
+    return result
+
+
 def calculate_laplacian_coordinates(
     vertices: np.ndarray,
     adj_list: list[list[int]],

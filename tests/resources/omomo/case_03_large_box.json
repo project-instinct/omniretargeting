@@ -5,6 +5,7 @@
     "omomo_sequence_index": 31,
     "omomo_data_root": "~/Datasets/OMOMO",
     "smplx_model_directory": "~/Datasets/smplx",
+    "body_position_mode": "rest_offsets",
     "n_object_samples": 32,
     "terrain": {
         "type": "flat",

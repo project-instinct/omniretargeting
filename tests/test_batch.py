@@ -46,6 +46,22 @@ def test_build_command_default_disables_scene_scaling(tmp_path):
     assert not (tmp_path / "motions" / "stem").exists()
 
 
+def test_activated_subprocess_preserves_path_with_spaces(tmp_path):
+    import json
+
+    input_path = tmp_path / "motion clip.json"
+    input_path.write_text('{"valid": true}')
+    log_path = tmp_path / "logs with spaces" / "job.log"
+    result = batch_processing.run_single_job(
+        [sys.executable, "-m", "json.tool", str(input_path)],
+        activation_prefix="true",
+        log_file=log_path,
+        timeout=10,
+    )
+    assert result["returncode"] == 0, log_path.read_text()
+    assert json.loads(log_path.read_text()) == {"valid": True}
+
+
 def test_build_command_places_video_beside_retargeted_motion(tmp_path):
     cmd = _build_command(
         tmp_path / "c.yaml",

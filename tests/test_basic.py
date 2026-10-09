@@ -21,7 +21,7 @@ from omniretargeting.main import export_scaled_objects, select_robot_source
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TEST_RESOURCES = REPO_ROOT / "tests" / "resources"
-SMPLX_MODEL_DIR = Path("/localhdd/Datasets/")
+SMPLX_MODEL_DIR = Path("~/Datasets/smplx").expanduser()
 ROBOT_PROFILE_CASES = (
     pytest.param("unitree_g1", REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json", id="g1"),
     pytest.param("unitree_h1", REPO_ROOT / "robot_models" / "unitree_h1" / "unitree_h1.json", id="h1"),
@@ -82,8 +82,8 @@ def test_export_scaled_objects_scales_pose_translations_with_scene(tmp_path):
     poses = json.loads(pose_path.read_text())
     assert poses[0]["translation"] == [2.0, 4.0, 6.0]
     assert poses[1]["translation"] == [-2.0, 1.0, 8.0]
-    assert poses[0]["scale"] == 1.0
-    assert poses[1]["scale"] == 0.5
+    assert poses[0]["scale"] == 0.5
+    assert poses[1]["scale"] == 0.25
 
 
 ROBOT_MOTION_MATRIX_ROBOTS = (
@@ -987,7 +987,7 @@ def test_load_robot_config_nested_source_profile(tmp_path):
                         "height_estimation": {"head_target": "Head", "foot_targets": ["Pelvis"]},
                         "base_orientation": {"pelvis": "Pelvis", "spine": "Head"},
                         "adapter_options": {
-                            "model_directory": "/localhdd/Datasets/",
+                            "model_directory": "~/Datasets/smplx",
                             "betas": [0.0, 0.0],
                             "gender": "neutral",
                         },
@@ -1006,7 +1006,7 @@ def test_load_robot_config_nested_source_profile(tmp_path):
     assert config["height_estimation"] == {"head_target": "Head", "foot_targets": ["Pelvis"]}
     assert config["base_orientation"] == {"pelvis": "Pelvis", "spine": "Head"}
     assert config["retargeting"]["terrain_sample_points"] == 7
-    assert config["selected_source"]["adapter_options"]["model_directory"] == "/localhdd/Datasets/"
+    assert config["selected_source"]["adapter_options"]["model_directory"] == "~/Datasets/smplx"
 
 
 @pytest.mark.parametrize("_profile_name,profile_path", ROBOT_PROFILE_CASES)
@@ -1576,6 +1576,7 @@ def test_create_stream_state_passes_hard_penetration_constraint():
         penetration_correction=None,
         solver_diagnostics=False,
         terrain_deep_penetration_depth=0.5,
+        contact_edge_weight=0.0,
     )
 
 

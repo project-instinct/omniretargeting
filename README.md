@@ -27,13 +27,19 @@ data_source = create_data_source(
     motion_file="path/to/motion.npz",
     source_config={"model_directory": "/path/to/models"}
 )
+motion = data_source.load()
 
 # Create retargeter
 retargeter = OmniRetargeter(
     robot_urdf_path="robot.urdf",
     terrain_mesh_path="terrain.obj",
-    joint_mapping={"Pelvis": "torso_link", ...},
-    robot_height=1.6
+    joint_mapping={"Pelvis": "torso_link"},
+    robot_height=1.6,
+    source_target_names=motion.target_names,
+    base_orientation={
+        "pelvis": "Pelvis", "left_hip": "L_Hip",
+        "right_hip": "R_Hip", "spine": "Spine1",
+    },
 )
 
 # Retarget motion (batch mode)
@@ -70,19 +76,19 @@ pip install -e ".[dev,test]"
 
 ```python
 from omniretargeting import OmniRetargeter, load_robot_config
-from omniretargeting.data_sources.smplx import SmplxDataSource
+from omniretargeting.data_sources import create_data_source
 from pathlib import Path
 
-# Load a robot profile. The default profiles currently use SMPL-X target names.
+# Load a robot profile and its selected source entry (SMPL-X for this profile).
 cfg = load_robot_config("robot_models/unitree_g1/unitree_g1.json")
+source_cfg = cfg["selected_source"]
 
-# Load source motion as MotionData. SMPL-X is the implemented adapter today.
-source = SmplxDataSource(
+# The adapter handles source loading, target ordering, and source height.
+source = create_data_source(
+    source_type=source_cfg["type"],
     motion_file=Path("path/to/motion_stageii.npz"),
-    model_directory="path/to/smplx/models",
-    gender="neutral",
-    target_names_override=cfg.get("source_target_names"),
-    betas=cfg.get("smplx_betas"),
+    source_config=source_cfg,
+    runtime_options={"model_directory": "path/to/smplx/models", "gender": "neutral"},
 )
 motion = source.load()
 
@@ -92,15 +98,13 @@ retargeter = OmniRetargeter(
     joint_mapping=cfg["joint_mapping"],
     robot_height=cfg.get("robot_height"),
     source_target_names=motion.target_names,
-    height_estimation=cfg.get("height_estimation"),
     base_orientation=cfg.get("base_orientation"),
     retargeting=cfg.get("retargeting"),
-    link_offset_config=cfg.get("link_offset_config"),
 )
 
 source_to_robot_scale, retargeted_motion = retargeter.retarget_motion(
     motion,
-    enable_terrain_scaling=True,
+    enable_scene_scaling=True,
     visualize_trajectory=False,
 )
 
@@ -110,10 +114,13 @@ print(f"Retargeted motion shape: {retargeted_motion.shape}")  # (T, 7 + DOF)
 
 For a ready-to-run setup, omniretargeting ships with robot profiles under
 `robot_models/`. These profiles contain robot assets, target-to-link mappings,
-height/orientation helpers, link offsets, and retargeting settings.
+source adapter options, orientation landmarks, link offsets, and retargeting
+settings. Source height comes from `MotionData.source_height`; link offsets are
+stored in each `target_mapping` entry as `offset` alongside `robot_link`.
 
 ```python
 from omniretargeting import OmniRetargeter, load_robot_config
+from omniretargeting.data_sources.smplx import DEFAULT_SMPLX_TARGET_NAMES
 
 cfg = load_robot_config("robot_models/unitree_g1/unitree_g1.json")
 retargeter = OmniRetargeter(
@@ -121,11 +128,9 @@ retargeter = OmniRetargeter(
     terrain_mesh_path="path/to/terrain.obj",
     joint_mapping=cfg["joint_mapping"],
     robot_height=cfg.get("robot_height"),
-    source_target_names=cfg.get("source_target_names"),
-    height_estimation=cfg.get("height_estimation"),
+    source_target_names=DEFAULT_SMPLX_TARGET_NAMES,
     base_orientation=cfg.get("base_orientation"),
     retargeting=cfg.get("retargeting"),
-    link_offset_config=cfg.get("link_offset_config"),
 )
 ```
 
@@ -230,7 +235,7 @@ Supports common mesh formats:
 - `.ply` (Polygon File Format)
 - `.gltf`/`.glb` (glTF)
 
-**Optional Terrain Scaling**: the terrain mesh is unscaled by default. If `enable_terrain_scaling=True` is passed to `retarget_motion()` (or `--output-scaled-terrain` is set on the CLI), OmniRetargeting computes a source-to-robot scale factor from the robot/source height ratio and retargets against the scaled source motion and scaled mesh.
+**Optional Scene Scaling**: the scene is unscaled by default. Pass `enable_scene_scaling=True` to `retarget_motion()` or `--enable-scene-scaling` to the CLI to scale source motion, terrain, and objects by the robot/source height ratio. The CLI also exports the scaled scene beside the output motion. Alternatively, `--scale-factor FACTOR` applies a fixed scale without exporting the scene; the two CLI scaling options are mutually exclusive.
 
 ### Robot URDF
 Standard URDF format for humanoid robots. The system automatically:
@@ -270,10 +275,21 @@ with `_retargeted.npz` if it doesn't already):
 | `base_pos_w`   | `(T, 3)`   | Root position in world frame.                    |
 | `base_quat_w`  | `(T, 4)`   | Root quaternion in world frame (wxyz).           |
 
-If `--output-scaled-terrain` is provided, the scaled terrain mesh used for
-retargeting is exported to that path as well. If `--scaled-objects DIR` is
-provided and the source adapter exposes an object mesh, the CLI also exports a
-scaled object mesh plus per-frame object poses into that directory.
+With `--enable-scene-scaling`, scene exports go into a directory named after
+the normalized output stem. For `--output /path/to/output.npz`:
+
+```text
+/path/to/
+├── output_retargeted.npz
+├── output_retargeted.contacts.json  # when contact annotations are available
+└── output_retargeted/
+    ├── scaled_terrain.obj
+    ├── <object_name>.obj            # when the adapter exposes an object mesh
+    └── <object_name>_poses.json     # when object poses are available
+```
+
+`--save-video PATH` writes to the supplied path. Without automatic scene scaling,
+the CLI writes motion and available contact annotations without scene exports.
 
 ## Advanced Usage
 
@@ -284,7 +300,9 @@ retargeter = OmniRetargeter(
     robot_urdf_path=robot_urdf,
     terrain_mesh_path=terrain_mesh,
     joint_mapping=joint_mapping,
-    robot_height=1.8  # Override auto-detected height
+    robot_height=1.8,  # Override auto-detected height
+    source_target_names=motion.target_names,
+    base_orientation=cfg.get("base_orientation"),
 )
 ```
 
@@ -294,10 +312,20 @@ The CLI is driven by a per-robot JSON profile. The URDF path, joint mapping,
 and retargeting settings all come from the profile — the CLI does **not**
 accept a separate URDF argument.
 
-#### Recommended: YAML source configs
+#### YAML source configs
 
-New workflows should use `--source-config`, which moves source-specific options
-into a YAML file instead of requiring many CLI flags.
+`--source-config` is required. Edit a template in `config_templates/` to set
+motion and model paths, adapter options, and optional terrain. For example:
+
+```yaml
+type: smplx
+motion: /path/to/motion_stageii.npz
+model_directory: path/to/smplx/models
+terrain: /path/to/terrain.obj
+```
+
+Set `terrain` in the YAML; omitting it uses flat ground. Raw SMPL-X parameters
+require `model_directory`; processed target-position files do not.
 
 **SMPL-X example**
 
@@ -305,9 +333,8 @@ into a YAML file instead of requiring many CLI flags.
 python -m omniretargeting.main \
   --robot-config robot_models/unitree_g1/unitree_g1.json \
   --source-config config_templates/smplx_template.yaml \
-  --terrain /path/to/terrain.obj \
   --output /path/to/output.npz \
-  --output-scaled-terrain /path/to/scaled-terrain.obj \
+  --enable-scene-scaling \
   --framerate 30 \
   --penetration-resolver xyz_nudge
 ```
@@ -318,53 +345,137 @@ python -m omniretargeting.main \
 python -m omniretargeting.main \
   --robot-config robot_models/unitree_g1/unitree_g1.json \
   --source-config config_templates/omomo_floorlamp_example.yaml \
-  --terrain /path/to/terrain.obj \
   --output /path/to/output.npz \
-  --output-scaled-terrain /path/to/scaled-terrain.obj \
-  --scaled-objects /path/to/scaled-objects \
+  --enable-scene-scaling \
   --save-video /path/to/output.mp4
 ```
 
-#### Legacy CLI compatibility
+**HSOI contacts and implicit detection**
 
-The legacy flags still work for existing scripts and tests, but they now emit
-DeprecationWarnings and should be migrated to `--source-config` over time.
+`MotionData` now carries optional `entity_trajectories` and a sparse
+`contact_trajectory`: one variable-length contact list per frame. `None` means
+unavailable annotations; `[]` means no detected contacts. Each `Contact` names a
+human target and scene body, and stores a body-local surface point plus optional
+confidence and normal. Entity orientations use `wxyz` quaternions. Scene geometry
+and explicit static poses live in `Scene.entities`; moving bodies supply an
+`EntityTrajectory`. `MotionFrame` carries `entity_poses`, `contacts`, and the scene.
+
+The geometric detector finds the nearest triangle surface for configured
+point/body pairs, checks distance and optional speed **in the body's frame**, and
+removes short contact runs. It supports walls and moving objects as well as ground.
+Anchors are computed each frame to preserve sliding. Existing available
+annotations, including empty lists, survive unless `overwrite: true` is set.
+The local `hoi-retarget` implementation provides the binary contact, local-anchor,
+and proximity/speed stance precedents; object detection here extends that approach
+to arbitrary scene meshes without importing the reference implementation.
+
+On aorua, activate `robot-data` using the installed Miniconda path. This environment
+needs `joblib` and `PyYAML` for the OMOMO adapter and CLI; both are declared package
+dependencies. Install them in your chosen environment if missing:
 
 ```bash
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate robot-data
+python -m pip install joblib PyYAML
 python -m omniretargeting.main \
-  --robot-config robot_models/unitree_g1/unitree_g1.json \
-  --motion /path/to/motion_stageii.npz \
-  --model-dir /path/to/smplx/models \
-  --terrain /path/to/terrain.obj \
-  --output /path/to/output.npz
+  --source-config config_templates/omomo_contacts_example.yaml \
+  --output /tmp/omomo_contacts.npz --progress
 ```
+
+The example uses OMOMO's recorded shaped rest offsets and the existing skeleton
+FK helper (`body_position_mode: rest_offsets`), so SMPL-X models and Torch are
+optional. `body_position_mode: smplx` retains the existing model-based path.
+OMOMO has varying recorded object scales: `object_scale_mode: per_frame` retains
+legacy world samples, while `first_frame` explicitly uses one constant scale for
+rigid scene geometry, samples, visualization, and contact anchors. Detecting
+contacts with the OMOMO object requires constant scale; the example chooses
+`first_frame`. Terrain-only detection works with either scale mode. Omitting
+`pairs` checks all named targets against the available scene entities; a
+varying-scale legacy object has no rigid scene entity.
+
+Tune `contact_detection.pairs`, `distance_threshold`, `velocity_threshold`
+(`null` allows distance-only sliding detection), and `min_contact_frames` in YAML.
+Thresholds use the input motion's units, before scene scaling. Tune
+`contact_edge_weight` separately, or override it with `--contact-edge-weight`.
+The default solver weight is zero. Every contact used by the graph needs a source
+target mapping to a robot link point; additional `target_mapping` entries in the
+source YAML extend or override the robot profile, as shown for G1 toes.
+
+Contact contributions are added to ordinary spatial edges before normalization.
+Source coordinates and robot Laplacians use the same frozen normalized graph;
+scene samples and inserted anchors have zero Jacobians during each frame solve.
+Duplicate records for the same pair/anchor use maximum confidence. Each pair's
+distinct active anchors become one confidence-weighted centroid in the graph,
+with their mean confidence as the edge contribution. This keeps the number of
+anchor residual rows independent of patch density; the original surface anchors
+remain in the annotations. Weighting improves interaction relationships;
+it does not enforce exact attachment or prevent object penetration.
+
+Output paths are normalized to `*_retargeted.npz`. With annotations, the CLI also
+writes `*_retargeted.contacts.json` containing contacts and resolved scene pose
+tracks in the output scale. Geometry stays separate. Use `contact_annotations`
+in source YAML to read an edited JSON contact trajectory on the original input
+timeline; the stored scale is converted back to source coordinates automatically.
+For a resampled output, annotations must first be aligned to the input timeline.
+Object exports preserve the body's local origin. Rigid scene geometry includes
+the constant object scale and exports unit pose scales, matching local contact
+coordinates. Legacy varying-scale objects retain their recorded pose scales;
+scene scale is baked into exported geometry once in either case.
+`MotionData.copy()`, `slice_frames(slice(...))`, `scaled(factor)`,
+`transformed(wxyz, translation)`, and `resample(fps)` preserve HSOI fields.
+Resampling selects entire nearest-frame contact lists, with earlier frames winning
+ties; translations and orientations use linear interpolation and SLERP on the
+same time grid. Rigid legacy object samples are regenerated from local samples
+and the resampled body pose; world samples without that representation retain
+linear interpolation. For a geometry-only entity, existing world samples are
+converted into its original body poses, resampled locally, and transformed
+by the new poses without dropping samples. Short events can be lost through
+downsampling.
+
+Batch jobs accept the same settings through `--source-options`. OMOMO `.p` files
+contain many sequences; this command runs the specified `sequence_index` from
+each matching file, rather than expanding every sequence in the dataset:
+
+```bash
+python -m omniretargeting.batch \
+  --source-folder ~/Datasets/OMOMO/data --source-type omomo \
+  --file-pattern test_diffusion_manip_seq_joints24.p \
+  --robot-config robot_models/unitree_g1/unitree_g1.json \
+  --output-dir /tmp/omomo_contact_batch --max-workers 1 \
+  --source-options '{"sequence_index":318,"body_position_mode":"rest_offsets","object_scale_mode":"first_frame","contact_detection":{"pairs":{"floorlamp":["L_Wrist","R_Wrist"]},"distance_threshold":0.10,"velocity_threshold":null,"min_contact_frames":3},"contact_edge_weight":10}'
+```
+
+For Python use, construct scene entities and trajectories alongside `MotionData`,
+then call `detect_contacts(motion, config)` and attach its returned frame lists
+before passing the motion to `OmniRetargeter`. Source body-model details stay in
+adapters; the generic solver receives mapped point indices, world anchors, and
+explicit edge contributions.
+
+#### Migrating older CLI scripts
+
+The main CLI requires `--source-config`; legacy source-loading flags are removed.
+Move motion paths, model directories, and terrain paths into the YAML fields
+`motion`, `model_directory`, and `terrain`. Use `--enable-scene-scaling` for scene
+exports. The batch entry point accepts `--terrain` and JSON `--source-options`,
+and writes those settings into each generated source YAML.
 
 Main arguments:
 
 | Flag | Default | Description |
 |---|---|---|
 | `--robot-config` | `robot_models/unitree_g1/unitree_g1.json` | Path to robot profile JSON. |
-| `--source-config` | `None` | Recommended YAML source configuration file. See `config_templates/`. |
+| `--source-config` | *(required)* | YAML source configuration file. See `config_templates/`. |
 | `--output` | *(required)* | Output `.npz` path (normalized to end in `_retargeted.npz`). |
-| `--terrain` | flat ground | Path to terrain mesh; a default flat terrain is generated if omitted. |
-| `--output-scaled-terrain` | `None` | Enables scene scaling and exports the scaled terrain mesh. |
-| `--scaled-objects` | `None` | Directory for scaled object mesh exports and per-frame object poses when the source adapter provides them. |
+| `--enable-scene-scaling` | off | Scale motion, terrain, and objects by the robot/source height ratio; export the scene into the normalized output stem directory. |
+| `--scale-factor FACTOR` | `None` | Apply a fixed scene scale without scene exports; mutually exclusive with `--enable-scene-scaling`. |
 | `--framerate` | auto / 30 | Motion framerate; auto-detected from the source file when possible. |
+| `--output-framerate` | `None` | Resample source motion to this framerate before retargeting. |
 | `--vis` | off | Launch a MuJoCo viewer on the retargeted motion. |
 | `--save-video PATH` | off | Render the retargeted motion to video (requires `imageio[ffmpeg]`, and `MUJOCO_GL=egl`/`osmesa` for headless). |
-| `--replace-cylinders-with-capsules` | off | Swap cylinder collision geoms for capsules (IsaacLab/PhysX convention). |
-| `--penetration-resolver {hard_constraint,hard_constraint_slack,xyz_nudge}` | `xyz_nudge` | Contact handling mode; overrides the value in the profile. Slack mode uses configured values or its documented defaults. |
-
-Legacy source-loading flags:
-
-| Flag | Status | Description |
-|---|---|---|
-| `--source` | deprecated | Source entry name or source type from the robot profile. |
-| `--motion` | deprecated | Legacy path to source motion file. |
-| `--source-options` | deprecated | Legacy JSON object with adapter-specific options. |
-| `--model-dir` | deprecated | Legacy adapter model directory, e.g. SMPL-X model files. |
-| `--smplx_motion` | deprecated alias | Legacy alias for `--motion`. |
-| `--smplx_model_dir` | deprecated alias | Legacy alias for `--model-dir`. |
+| `--progress` | off | Show a progress bar while retargeting frames. |
+| `--contact-edge-weight` | profile / YAML, otherwise `0` | Override the interaction graph's extra contact weight. |
+| `--cprofile PATH` | `None` | Write cProfile statistics for the complete retargeting run. |
+| `--penetration-resolver {hard_constraint,hard_constraint_slack,xyz_nudge}` | profile value | Contact handling mode; overrides the value in the profile. Slack mode uses configured values or its documented defaults. |
 
 ### Batch Processing
 
@@ -379,7 +490,7 @@ python -m omniretargeting.batch \
   --source-type smplx \
   --robot-config robot_models/unitree_g1/unitree_g1.json \
   --output-dir /tmp/batch_output \
-  --model-dir /path/to/smplx/models
+  --source-options '{"model_directory":"path/to/smplx/models"}'
 ```
 
 | Flag | Default | Description |
@@ -388,28 +499,32 @@ python -m omniretargeting.batch \
 | `--source-type` | *(required)* | Source type: `smplx`, `lafan1`, `nokov`, or `omomo`. |
 | `--robot-config` | *(required)* | Path to robot profile JSON. |
 | `--output-dir` | *(required)* | Directory for batch outputs (configs, logs, motions). |
-| `--model-dir` | `None` | Model directory (required for SMPL-X). |
 | `--terrain` | `None` | Path to terrain mesh applied to all motions. |
-| `--max-workers` | auto | Maximum parallel workers (reserved; currently sequential). |
+| `--max-workers` | auto | Maximum parallel workers, sized from the probe job and available memory. |
 | `--framerate` | auto | Override framerate for all motions. |
-| `--source-options` | `None` | JSON string of extra source options for all motions. |
+| `--source-options` | `None` | JSON adapter options for all motions, including `model_directory` for raw SMPL-X. |
 | `--skip-test-job` | off | Skip the initial probe job and process all files directly. |
 | `--timeout` | `3600` | Per-file timeout in seconds. |
+| `--video` | off | Save per-motion videos beside the motion outputs. |
+| `--scale-factor FACTOR` | `None` | Apply one scene scale to all motions; export the shared terrain once when `--terrain` is supplied. |
 
 Output layout under `--output-dir`:
 
 ```
 output-dir/
-├── repo_status.log          # git status snapshot before processing
+├── git_status/              # repository snapshots before processing
+│   ├── omniretargeting.status
+│   └── omniretargeting.diff  # when changes are present
 ├── configs/                 # per-motion YAML source configs
 │   └── <name>_config.yaml
 ├── logs/                    # per-motion subprocess stdout/stderr
 │   └── <name>.log
-└── motions/<name>/          # per-motion outputs
-    ├── <name>_retargeted.npz
-    ├── <name>_retargeted.mp4
-    ├── <name>_scaled_terrain.obj
-    └── <name>_scaled_objects/   # when source provides object meshes
+├── motions/
+│   ├── <name>_retargeted.npz
+│   ├── <name>_retargeted.contacts.json  # when annotations are available
+│   └── <name>_retargeted.mp4           # with --video
+└── terrain/
+    └── scaled_terrain.obj   # with --scale-factor and --terrain
 ```
 
 ### Robot Profile Config (Per-Humanoid)
@@ -418,16 +533,18 @@ Keep one JSON profile per humanoid robot (for example under
 `robot_models/<robot_name>/`). Relative `urdf_path` values are resolved against
 the profile file's directory.
 
-Current shipped profiles use a flat schema:
+Current shipped profiles contain robot fields and a list of source entries:
 
 - `name` – optional profile name, used in log output
 - `urdf_path` – **required**, path to the robot URDF (relative to the profile file)
-- `joint_mapping` – **required**, source target name → robot body name
+- `source[].target_mapping` – **required** for the selected source, source target
+  name → robot body name or `{robot_link, offset}`; normalized to `joint_mapping`
 - `robot_height` – optional override for auto-detected robot height
-- `source_target_names` / `smplx_joint_names` – optional custom source target ordering
-- `height_estimation` – source target names and `head_top_offset` used to estimate source height
+- `source[].target_names` – optional custom source target ordering; use the
+  adapter's `motion.target_names` when constructing the retargeter
+- `source[].adapter_options` – source loading and body/skeleton options;
+  runtime source options override these, which override direct source fields
 - `base_orientation` – source target names used to estimate root orientation (`pelvis`, `left_hip`, `right_hip`, `spine`)
-- `link_offset_config` – optional robot-link local offsets for mapped link target points
 - `retargeting` – solver settings forwarded to `GenericInteractionRetargeter`:
   - `collision_detection_threshold`
   - `terrain_sample_points`
@@ -518,16 +635,14 @@ OmniRetargeter(
     joint_mapping,
     robot_height=None,
     source_target_names=None,
-    height_estimation=None,
     base_orientation=None,
     retargeting=None,
-    link_offset_config=None,
 )
 ```
 
 #### Methods
 
-- `retarget_motion(motion, base_orientations=None, base_translations=None, framerate=None, visualize_trajectory=True, enable_terrain_scaling=False)` → `(source_to_robot_scale, retargeted_motion)`
+- `retarget_motion(motion, base_orientations=None, base_translations=None, framerate=None, visualize_trajectory=True, enable_scene_scaling=False, show_progress=False)` → `(source_to_robot_scale, retargeted_motion)`
 - `get_robot_dof()` → `int`
 - `get_joint_names()` → `List[str]`
 - `validate_joint_mapping()` → `List[str]` (robot body names from `joint_mapping` that are missing from the URDF)
@@ -540,6 +655,15 @@ cfg = load_robot_config("robot_models/unitree_g1/unitree_g1.json")
 ```
 
 Loads a robot profile JSON, resolves `urdf_path` relative to the profile file, and normalizes legacy flat and nested profile fields. Raises if no non-empty mapping is available.
+
+### Position-array wrappers
+
+`retarget_source_to_robot(..., source_target_names=names, base_orientation=...)`
+requires source orientation landmarks (`pelvis`, `left_hip`, `right_hip`, and
+`spine`) just like `OmniRetargeter`. Pass the selected profile's orientation
+configuration. `retarget_smplx_to_robot()` supplies standard SMPL-X target names
+and orientation landmarks by default; custom names need an explicit
+`base_orientation` override. These wrappers enable scene scaling.
 
 ### `SmplxDataSource`
 
@@ -573,7 +697,7 @@ Declared in `pyproject.toml` / `setup.py`:
 OmniRetargeting adapts the interaction-mesh retargeting approach from the
 holosoma_retargeting project to work with generic robots and terrains:
 
-1. **Source-to-Robot Scaling** (optional): Computes the robot/source height ratio and uses it to scale source motion and the terrain mesh before retargeting (enabled by `enable_terrain_scaling=True` or `--output-scaled-terrain`).
+1. **Source-to-Robot Scaling** (optional): Computes the robot/source height ratio and scales source motion, terrain, and objects before retargeting (enabled by `enable_scene_scaling=True` or `--enable-scene-scaling`).
 2. **Generic Robot Support**: Works with any URDF through automatic model loading, body-name validation, and auto-detected height.
 3. **Interaction Mesh**: Builds a tetrahedral interaction mesh from mapped source targets and terrain sample points.
 4. **Optimization**: Per-frame SQP optimization with Laplacian-deformation objective, joint limits, and a target base-orientation term for smoothness.

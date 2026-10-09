@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -401,7 +402,7 @@ def run_single_job(
     ``peak_memory_mb`` in the result dict.
     """
     if activation_prefix:
-        full_cmd = f"{activation_prefix} && {' '.join(cmd)}"
+        full_cmd = f"{activation_prefix} && {shlex.join(cmd)}"
         shell_cmd: list[str] = ["bash", "-lc", full_cmd]
     else:
         shell_cmd = cmd

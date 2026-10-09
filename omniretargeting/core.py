@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Iterable, Iterator
 
 import numpy as np
@@ -17,6 +17,7 @@ from matplotlib.animation import FuncAnimation
 from mpl_toolkits.mplot3d import Axes3D
 
 from .data_sources.base import DataSource, MotionData, MotionFrame
+from .contacts import resolve_contact_anchors
 from .utils import (
     compute_mesh_height_at_point,
     detect_robot_height,
@@ -245,15 +246,19 @@ class OmniRetargeter:
         
         motion_data = self._coerce_motion_data(motion)
         if base_orientations is not None or base_translations is not None:
-            motion_data = MotionData(
-                positions=motion_data.positions,
-                target_names=motion_data.target_names,
-                root_orientations=base_orientations if base_orientations is not None else motion_data.root_orientations,
-                root_translations=base_translations if base_translations is not None else motion_data.root_translations,
+            motion_data = replace(
+                motion_data,
+                root_orientations=(
+                    base_orientations
+                    if base_orientations is not None
+                    else motion_data.root_orientations
+                ),
+                root_translations=(
+                    base_translations
+                    if base_translations is not None
+                    else motion_data.root_translations
+                ),
                 framerate=framerate if framerate is not None else motion_data.framerate,
-                source_height=motion_data.source_height,
-                object_points=motion_data.object_points,
-                metadata=dict(motion_data.metadata),
             )
         elif framerate is not None and motion_data.framerate is None:
             motion_data.framerate = framerate
@@ -264,23 +269,10 @@ class OmniRetargeter:
         )
         scaled_terrain = self._scale_terrain_mesh(source_to_robot_scale) if enable_scene_scaling else self.terrain_mesh.copy()
 
-        scaled_motion_data = MotionData(
-            positions=motion_data.positions * source_to_robot_scale if enable_scene_scaling else motion_data.positions,
-            target_names=motion_data.target_names,
-            root_orientations=motion_data.root_orientations,
-            root_translations=(
-                motion_data.root_translations * source_to_robot_scale
-                if enable_scene_scaling and motion_data.root_translations is not None
-                else motion_data.root_translations
-            ),
-            framerate=motion_data.framerate,
-            source_height=motion_data.source_height,
-            object_points=(
-                motion_data.object_points * source_to_robot_scale
-                if enable_scene_scaling and motion_data.object_points is not None
-                else motion_data.object_points
-            ),
-            metadata=dict(motion_data.metadata),
+        scaled_motion_data = (
+            motion_data.scaled(source_to_robot_scale)
+            if enable_scene_scaling
+            else motion_data
         )
 
         if visualize_trajectory:
@@ -418,6 +410,7 @@ class OmniRetargeter:
             terrain_deep_penetration_depth=float(
                 self.retargeting_config.get("terrain_deep_penetration_depth", 0.5)
             ),
+            contact_edge_weight=float(self.retargeting_config.get("contact_edge_weight", 0.0)),
         )
 
         q_init = np.zeros(self.robot_model.nq)
@@ -570,6 +563,29 @@ class OmniRetargeter:
 
         # Extract object points if present
         object_points = frame.object_points if isinstance(frame, MotionFrame) else None
+        contact_options = {}
+        if isinstance(frame, MotionFrame):
+            environment = [] if object_points is None else [object_points]
+            legacy_body_id = (
+                frame.metadata.get("object_points_body_id")
+                if object_points is not None
+                else None
+            )
+            if frame.scene is not None:
+                for body_id, entity in frame.scene.entities.items():
+                    if body_id != legacy_body_id and len(entity.local_samples):
+                        environment.append(
+                            frame.scene.pose(body_id, frame.entity_poses).to_world(
+                                entity.local_samples
+                            )
+                        )
+            if environment:
+                object_points = np.vstack(environment)
+            if float(self.retargeting_config.get("contact_edge_weight", 0.0)) > 0:
+                anchors, edges = resolve_contact_anchors(
+                    frame, self.valid_source_target_names
+                )
+                contact_options = {"contact_anchors": anchors, "contact_edges": edges}
 
         solver_max_iter = self.retargeting_config.get("solver_max_iter")
         if isinstance(solver_max_iter, dict):
@@ -589,6 +605,7 @@ class OmniRetargeter:
                 target_base_orientation=target_quat_wxyz,
                 object_points=object_points,
                 root_translation=root_translation,
+                **contact_options,
             )
 
         original_hard_penetration = getattr(

@@ -22,6 +22,8 @@ setup(
         "yourdfpy",
         "clarabel",
         "libigl",
+        "joblib",
+        "PyYAML",
         "tyro",
         "imageio[ffmpeg]",
         # Additional dependencies for generic mesh processing

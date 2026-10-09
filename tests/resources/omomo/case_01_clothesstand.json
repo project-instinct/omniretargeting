@@ -5,6 +5,7 @@
     "omomo_sequence_index": 0,
     "omomo_data_root": "~/Datasets/OMOMO",
     "smplx_model_directory": "~/Datasets/smplx",
+    "body_position_mode": "rest_offsets",
     "n_object_samples": 100,
     "robot_config": "robot_models/unitree_g1/unitree_g1.json",
     "terrain": {

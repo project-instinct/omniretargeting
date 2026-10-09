@@ -77,6 +77,7 @@ class TestCaseLoader:
             data_root=config["omomo_data_root"],
             n_object_samples=config.get("n_object_samples", 100),
             model_directory=config.get("smplx_model_directory"),
+            body_position_mode=config.get("body_position_mode", "smplx"),
         )
         motion_data = source.load()
         return source, motion_data
@@ -131,10 +132,10 @@ class TestOmomoCoordinateConventions:
     """Regression checks for OMOMO coordinate and object-transform semantics."""
 
     def test_reconstructed_pelvis_uses_expected_joint_names(self):
-        omomo_root = "/home/ziwen/Datasets/OMOMO"
+        omomo_root = "~/Datasets/OMOMO"
         sequence_file = f"{omomo_root}/data/test_diffusion_manip_seq_joints24.p"
 
-        if not Path(sequence_file).exists():
+        if not Path(sequence_file).expanduser().exists():
             pytest.skip("OMOMO dataset not available")
 
         source = OmomoDataSource(
@@ -142,7 +143,7 @@ class TestOmomoCoordinateConventions:
             sequence_index=318,
             data_root=omomo_root,
             n_object_samples=20,
-            model_directory="/home/ziwen/Datasets/smplx",
+            body_position_mode="rest_offsets",
         )
         motion_data = source.load()
 
@@ -154,10 +155,10 @@ class TestOmomoCoordinateConventions:
         np.testing.assert_allclose(motion_data.root_translations, motion_data.positions[:, 0, :], atol=5e-3)
 
     def test_object_points_follow_recorded_object_com(self):
-        omomo_root = "/home/ziwen/Datasets/OMOMO"
+        omomo_root = "~/Datasets/OMOMO"
         sequence_file = f"{omomo_root}/data/test_diffusion_manip_seq_joints24.p"
 
-        if not Path(sequence_file).exists():
+        if not Path(sequence_file).expanduser().exists():
             pytest.skip("OMOMO dataset not available")
 
         source = OmomoDataSource(
@@ -165,7 +166,7 @@ class TestOmomoCoordinateConventions:
             sequence_index=318,
             data_root=omomo_root,
             n_object_samples=20,
-            model_directory="/home/ziwen/Datasets/smplx",
+            body_position_mode="rest_offsets",
         )
         motion_data = source.load()
 
@@ -180,10 +181,10 @@ class TestOmomoDataValidation:
     
     def test_omomo_data_structure(self):
         """Test basic OMOMO data loading without retargeting."""
-        omomo_root = "/home/ziwen/Datasets/OMOMO"
+        omomo_root = "~/Datasets/OMOMO"
         sequence_file = f"{omomo_root}/data/train_diffusion_manip_seq_joints24.p"
         
-        if not Path(sequence_file).exists():
+        if not Path(sequence_file).expanduser().exists():
             pytest.skip("OMOMO dataset not available")
         
         source = OmomoDataSource(
@@ -191,7 +192,7 @@ class TestOmomoDataValidation:
             sequence_index=0,
             data_root=omomo_root,
             n_object_samples=50,
-            model_directory="/home/ziwen/Datasets/smplx",
+            body_position_mode="rest_offsets",
         )
         
         motion_data = source.load()
@@ -213,14 +214,14 @@ class TestOmomoDataValidation:
     
     def test_omomo_all_objects_loadable(self):
         """Test that all 15 OMOMO objects can be loaded."""
-        omomo_root = "/home/ziwen/Datasets/OMOMO"
+        omomo_root = "~/Datasets/OMOMO"
         sequence_file = f"{omomo_root}/data/train_diffusion_manip_seq_joints24.p"
         
-        if not Path(sequence_file).exists():
+        if not Path(sequence_file).expanduser().exists():
             pytest.skip("OMOMO dataset not available")
         
         import joblib
-        data = joblib.load(sequence_file)
+        data = joblib.load(Path(sequence_file).expanduser())
         
         # Find one sequence per object
         object_sequences = {}
@@ -242,7 +243,7 @@ class TestOmomoDataValidation:
                     sequence_index=seq_idx,
                     data_root=omomo_root,
                     n_object_samples=20,
-                    model_directory="/home/ziwen/Datasets/smplx",
+                    body_position_mode="rest_offsets",
                 )
                 motion_data = source.load()
                 print(f"  ✓ {obj_name:20s} - {motion_data.object_points.shape[1]} samples")

@@ -396,9 +396,19 @@ def retarget_smplx_to_robot(
     joint_mapping: Dict[str, str],
     robot_height: Optional[float] = None,
     smplx_joint_names: Optional[List[str]] = None,
+    base_orientation: Optional[Dict[str, str]] = None,
 ) -> Tuple[float, np.ndarray]:
-    """Backward-compatible wrapper for older SMPL-X-specific callers."""
+    """SMPL-X wrapper with standard target names and orientation landmarks.
+
+    Supply base_orientation when using custom source target names.
+    """
     from omniretargeting.retargeting import retarget_source_to_robot
+
+    if smplx_joint_names is None:
+        # Preserve the wrapper's input error before deriving the default order.
+        if not validate_smplx_trajectory(smplx_trajectory):
+            raise ValueError("Invalid source position trajectory format")
+        smplx_joint_names = _default_target_names(smplx_trajectory.shape[1])
 
     return retarget_source_to_robot(
         source_positions=smplx_trajectory,
@@ -407,6 +417,16 @@ def retarget_smplx_to_robot(
         joint_mapping=joint_mapping,
         robot_height=robot_height,
         source_target_names=smplx_joint_names,
+        base_orientation=(
+            base_orientation
+            if base_orientation is not None
+            else {
+                "pelvis": "Pelvis",
+                "left_hip": "L_Hip",
+                "right_hip": "R_Hip",
+                "spine": "Spine1",
+            }
+        ),
     )
 
 

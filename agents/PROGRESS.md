@@ -5,8 +5,257 @@
 - Source-agnostic adapter architecture with per-source `target_mapping` and `base_orientation`
 - Data sources: SMPL-X, OMOMO, LAFAN1 (BVH), Nokov (BVH)
 - HOI support: `object_points` in `MotionData`/`MotionFrame`, scene scaling, OMOMO adapter
-- CLI: YAML `--source-config` mode + legacy CLI compatibility
+- CLI: required YAML `--source-config`, explicit scene scaling, main/batch entry points
 - Visualization: MuJoCo offscreen rendering, object mesh injection, `--save-video`
+
+## Contact Interface Commit Preparation (2026-10-09)
+
+- Committed only home-relative paths in the three OMOMO JSON fixtures first
+  (`8818771`); their `body_position_mode` additions remain with the interface.
+- Prepared the contact trajectory interface, adapters, solver integration,
+  CLI/export fixes, documentation, and regression tests as the second commit.
+- Fresh aorua/`robot-data` full suite: **210 passed, 12 skipped**, three
+  existing deprecation warnings, in 24.92 seconds. Log:
+  `/tmp/omniretargeting-commit-check.log`. JSON parsing and staged whitespace
+  checks passed. No pre-commit configuration is present.
+- Left agent-rule edits and the latest fallback review outside these commits.
+
+## Remaining README CLI Finding Fixed (2026-10-09)
+
+- Read the complete current `agents/REVIEW.md` and fixed its one remaining
+  finding. Per-frame OMOMO scaling stays outside the agreed review scope.
+- README main workflows now require source YAML, put terrain in YAML, use
+  `--enable-scene-scaling`, and describe actual normalized scene export paths.
+  Removed the legacy compatibility claim and corrected argument tables,
+  fixed-scale behavior, the batch model-options example, and batch output layout.
+- Corrected main CLI output help to describe NPZ output.
+- Added a regression that extracts all README main/batch shell commands and
+  calls the real entry-point parsers before asset loading or job execution.
+  It reproduced four failures before the fix; all five current commands parse.
+- Verified on aorua in `robot-data`: public API/documentation, batch, contact CLI,
+  and scene-export checks: **30 passed**. Log:
+  `/tmp/omniretargeting-readme-cli-check.log`. `git diff --check` passed.
+- Marked the review finding resolved while preserving its original reproduction.
+  No retargeting or contact behavior changed.
+
+## Review Scope Decision (2026-10-09)
+
+- Per the user's decision, removed per-frame object scaling from the open
+  findings in `agents/REVIEW.md`; treat it as OMOMO dataset inaccuracy.
+- Retained the P2 README CLI finding for another agent to fix at the user's
+  request. No implementation changes or new test runs were made.
+
+## Hazard Re-review (2026-10-09)
+
+- Rechecked `agents/REVIEW.md`, the latest fixes, and related code paths.
+  Confirmed all six previous findings and the earlier three remain resolved.
+- Rewrote the report within 200 lines with two reproduced pre-existing P2
+  hazards: variable-scale object visualization freezes the first-frame scale,
+  and README CLI commands still advertise removed options.
+- Fresh verification on aorua in `robot-data`: **205 passed, 12 skipped**,
+  three existing deprecation warnings, in 25.06 seconds. Independent helper
+  and CLI subprocess probes confirmed both hazards; `git diff --check` passed.
+- Recorded annotation timeline and mutually exclusive scaling requirements
+  as documented boundaries. Package code and tests were not changed.
+
+## Second Review Fixes (2026-10-09)
+
+- Read the complete updated `agents/REVIEW.md` and fixed all six findings.
+  Preserved the original reproductions and added their resolution.
+- Geometry-only scene entities retain world samples by recovering local
+  coordinates from original poses and resampling them in the body frame.
+  Static and rotating regressions check sample count and pose consistency.
+- OMOMO factory options now use runtime > nested `adapter_options` > direct
+  source fields. A loaded-profile regression exercises actual adapter loading
+  and runtime overrides of framerate and object scale mode.
+- Object exports keep the body origin and apply scene scale once. Rigid
+  exports use baked scene geometry and explicit body poses with unit scale;
+  legacy varying-scale exports keep dimensionless recorded pose scales.
+  Export/reload tests check world vertices and local contact anchor alignment.
+- Exposed source orientation configuration on the generic public wrapper and
+  added SMPL-X-specific default names/landmarks in the compatibility wrapper.
+  Real G1 frame tests exercise both wrappers and custom name overrides;
+  invalid-input tests preserve the existing ValueError before name derivation.
+- Activated batch subprocesses quote argv with `shlex.join()`. A real
+  subprocess regression covers paths and log directories containing spaces.
+- Updated all README constructor examples, source/profile option descriptions,
+  and wrapper documentation. Signature checks cover five examples; both
+  quick-start blocks execute with bundled robot assets and processed positions.
+- Focused verification in aorua's installed `robot-data`: **54 passed** in
+  3.25 seconds. Log: `/tmp/omniretargeting-review2-focused.log`.
+- Final full suite: **205 passed, 12 skipped**, with
+  three existing deprecation warnings, in 25.44 seconds. Log:
+  `/tmp/omniretargeting-review2-pytest.log`. Licensed SMPL-X asset tests remain
+  skipped; public wrappers and processed-position README flows were executed.
+- A real activated OMOMO CLI run with nested profile options and spaced paths
+  completed **109 finite frames at 45fps**, with 158 contact records and scene
+  scale `0.7589267358`. Reloaded exports reproduced source world geometry to
+  **8.41e-9 m** maximum error and used the same object poses as annotations.
+  Outputs, temporary configs, and log: `/tmp/omniretargeting review2/`.
+  `git diff --check` passed.
+
+## Second Review of Current Changes and Codebase (2026-10-09)
+
+- Re-reviewed the working tree against HEAD `8e2c09a`, confirmed the previous
+  three findings are resolved, and rewrote `agents/REVIEW.md`.
+- Recorded six reproduced P2 findings: resampling drops legacy object samples
+  for geometry-only scene entities (current regression); nested OMOMO adapter
+  options are ignored; object exports change origins and apply scene scale
+  twice; the public retargeting wrapper omits required orientation settings;
+  activated batch commands split paths containing spaces; README examples
+  use unsupported constructor arguments (five pre-existing codebase issues).
+- Fresh verification on aorua in `robot-data`: **188 passed, 12 skipped**, with
+  three existing deprecation warnings, in 23.34 seconds. Separate probes
+  confirmed all six findings; `git diff --check` passed. Only this report
+  and the required log were changed; package code and tests were not edited.
+
+## HSOI Review Fixes (2026-10-09)
+
+- Fixed all three correctness findings in `agents/REVIEW.md`; retained the
+  original review and added a resolution section.
+- Rigid legacy `object_points` now follow local scene samples transformed by
+  the resampled pose, including SLERP rotations. Unrepresented world samples
+  retain linear interpolation. Regressions use a rotating OMOMO adapter clip
+  in both `first_frame` and `per_frame` scale modes.
+- The CLI's OMOMO constant-scale requirement now applies only to explicitly
+  requested object-body detection. Terrain-only pairs and omitted pairs work
+  with varying legacy object scale; omitted pairs use available scene entities.
+- Solver graph construction reduces each source-point/body patch to one
+  confidence-weighted centroid with mean confidence. Duplicate observations
+  use maximum confidence, zero-confidence anchors are excluded, and original
+  surface annotations remain intact. This preserves the raw pair budget and
+  avoids multiplying reverse anchor residual rows. The objective regression
+  covers one, two, and eight near-identical anchors at weights 10 and 100.
+- New regressions reproduced the original hazards. Verification on aorua in
+  the installed `robot-data` environment: focused suite **46 passed**; full
+  suite **188 passed, 12 skipped**, with three existing deprecated-argument
+  warnings, in 22.80 seconds. Log:
+  `/tmp/omniretargeting-review-fixes-pytest.log`.
+
+- Real `main.py` checks on prepared OMOMO sequence 318 both completed at 45fps
+  with **109 frames**: rigid object/terrain detection (`first_frame`, 158 contact
+  records), and terrain-only detection preserving varying object scale
+  (`per_frame`, 154 records). Both outputs have finite robot values, unit base
+  quaternions, and aligned contact frame counts. Configs, NPZ/contact outputs,
+  and logs are under `/tmp/omniretargeting-review-{rigid,terrain}*`.
+
+## Current Changes Review (2026-10-09)
+
+- Reviewed the working-tree changes against HEAD `8e2c09a`, including the new
+  contact module, tests, HSOI design, and example configuration.
+- Wrote `agents/REVIEW.md` with three P2 findings: rigid object samples diverge
+  from interpolated poses after resampling; terrain-only OMOMO contact detection
+  is rejected for varying object scale; multiple anchors increase a contact
+  pair's solver influence despite its fixed raw edge budget.
+- Verified on aorua in `robot-data`: focused suite **39 passed**; full suite
+  **181 passed, 12 skipped**, with three existing deprecation warnings, in 22.68
+  seconds. Separate in-memory reproductions confirmed the three findings, and
+  `git diff --check` passed. Package code and tests were not changed by the review.
+
+## HSOI Environment and Reference Data Follow-up (2026-10-09)
+
+- Installed the missing runtime dependencies directly into aorua's `robot-data`
+  conda environment: joblib 1.6.0, PyYAML 6.0.3, and joblib's cloudpickle dependency.
+  Verification now runs without `/tmp/omniretargeting-hsoi-deps` or a custom
+  `PYTHONPATH`.
+- Replaced OMOMO reference-fixture paths and integration-test dataset lookups
+  with `~/Datasets/...`. Dataset availability checks and direct joblib loading
+  explicitly expand `~`; the adapter already expands its input paths.
+  SMPL-X reference paths in the basic tests now also start at `~`.
+- Configured OMOMO fixtures and coordinate/data validation tests explicitly to
+  use the prepared dataset's `rest_offsets` FK mode. This machine does not have
+  SMPL-X body-model assets; tests still check named joints, pelvis trajectories,
+  object transforms, synchronized frames, and loading the available object types.
+  The fixture loader forwards `body_position_mode`, so a fixture can select the
+  existing SMPL-X path when those optional assets are provided.
+- Corrected the private aorua computation notes to use `~/miniconda3`,
+  `conda activate robot-data`, and a home-relative repository path.
+- Full suite in the installed environment: **181 passed, 12 skipped, no failures**,
+  with three existing deprecation warnings, in 22.91 seconds. All nine OMOMO
+  integration tests pass. Log: `/tmp/omniretargeting-hsoi-installed-pytest.log`.
+- Re-ran the real 73-frame OMOMO contact example through `main.py` with ordinary
+  environment activation. Robot output and annotations were written to
+  `/tmp/omniretargeting-hsoi-installed_retargeted.npz` and the corresponding
+  `.contacts.json`; log: `/tmp/omniretargeting-hsoi-installed-main.log`.
+
+## HSOI Contact Implementation (2026-10-09)
+
+- Implemented `Contact`, `EntityPose`, `EntityTrajectory`, `SceneEntity`, and
+  `Scene` in `omniretargeting/contacts.py`. Motion data/frame contracts validate
+  aligned timelines, unique source names, explicit body poses, contact endpoints,
+  finite anchors, optional confidence, normals, and unit wxyz orientations.
+- Motion copy, slicing, frame/data-source round-trip, resampling, uniform scaling,
+  and world-frame changes carry scene poses and sparse annotations. Resampling
+  uses a shared time grid and nearest contact lists, with earlier-frame ties;
+  it preserves empty and unavailable frames and supports single-frame clips.
+- Added generic mesh contact detection using Open3D nearest triangle queries,
+  distance, optional body-relative speed, and minimum per-pair run duration.
+  Existing available annotations are retained unless overwrite is requested.
+  Sliding anchors remain per-frame; moving objects and arbitrary surfaces use
+  the same body-local geometry/pose contract.
+- Added optional `contact_edge_weight` (default zero). Explicit mapped contact
+  anchors are fixed environment vertices; raw spatial and symmetric contact
+  contributions are combined before normalization, and the same graph is reused
+  by source coordinates and every robot SQP iteration. Duplicate pair/anchor
+  records use maximum confidence; distinct anchors share the pair's weight budget.
+  Unmapped source contacts raise a named error when graph weighting is enabled.
+- OMOMO supports explicit `body_position_mode: rest_offsets`, reusing the existing
+  skeleton FK helper without SMPL-X/Torch. The existing `smplx` mode remains the
+  default. `object_scale_mode: first_frame` explicitly bakes one constant object
+  scale into rigid geometry; `per_frame` retains legacy world samples and does
+  not represent varying scale as a rigid scene trajectory. Original scales are
+  retained in metadata. World samples are never transformed twice.
+- Added `config_templates/omomo_contacts_example.yaml`, editable JSON annotation
+  output beside the normalized NPZ, annotation reload with scale conversion,
+  source-YAML target-mapping overrides, and README manual/API examples.
+  Batch discovery now recognizes OMOMO `.p`/`.pkl`; `--file-pattern` can select
+  sequence archives. Each matching archive runs the configured `sequence_index`;
+  batch does not implicitly expand every sequence in an archive.
+- Verified directly on aorua in `robot-data`. Actual conda installation is
+  `/home/leo/miniconda3`, not the Anaconda path in the computation notes.
+  Missing `joblib`, PyYAML, and Black were installed only under
+  `/tmp/omniretargeting-hsoi-deps` for verification; no conda environment was edited.
+  OMOMO/CLI dependencies are declared in both package manifests and README.
+- Full suite: **174 passed, 16 skipped, 3 failed**. The three existing OMOMO
+  integration fixture failures reference unavailable `/home/ziwen/Datasets/...`
+  paths. All new contact and adapter tests pass, including detection on rotating
+  moving bodies, sliding, empty/unavailable frames, changing pairs, articulated
+  IDs, discrete resampling, scaled/world-transformed anchors, graph equality,
+  and zero environment Jacobians.
+- Real prepared OMOMO sequence 318 (`sub17_floorlamp_023`): `main.py` completed
+  all **73 frames**, detecting 106 records with the example thresholds (103 toe/
+  terrain and 3 wrist/object records). `batch.py` completed **1/1** archive job
+  through its subprocess path and wrote 73 robot/contact frames. Separate real
+  runs verified automatic scaling plus 15fps resampling (**37 frames**, scale
+  `0.7589267358`) and manual scale `0.8` (**73 frames**). Saved entity translations
+  and local-anchor scale conversion were independently checked against source
+  data. All robot outputs are finite; quaternion norm error is below `7e-16`.
+  Output artifacts/logs are under `/tmp/omniretargeting-hsoi-*`.
+- Contact thresholds and graph weights remain tuning parameters. This verification
+  establishes executable data flow and math consistency, not exact attachment
+  quality or object non-penetration guarantees.
+
+## HSOI Interface Simplification (2026-10-09)
+
+- Defined `contact_trajectory` as a temporal list of variable-length contact lists:
+  each contact carries its human point, scene body, and local contact location.
+- Replaced packed offsets and the availability flag with direct frame lists;
+  `[]` means no detected contacts, and `None` means unavailable annotations.
+- Removed `evaluation_scope` and exhaustive-pair coverage rules from the design.
+- Contact frames report detected records, an available empty result, or unavailable
+  annotations; detector candidate selection remains in detector configuration.
+
+## HSOI Interface Design (2026-10-08)
+
+- Documented the proposed human/entity trajectories and sparse per-frame contacts
+  in `agents/HSOI_TRAJECTORY.md`; implementation remains pending.
+- Contact records carry their own source-point/scene-body endpoints, allowing
+  pairs to change each frame without persistent contact or track IDs.
+- Consistency review clarified annotation availability, source-point resolution,
+  legacy world-space object samples,
+  discrete contact resampling, and shared normalized source/robot graph weights.
+- Added implementation tasks and acceptance cases to the design document;
+  changes remain documentation-only.
 
 ## Current Work (2026-09-07)
 
