@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 
 import joblib
@@ -13,6 +14,7 @@ from scipy.spatial.transform import Rotation
 from omniretargeting.utils import estimate_body_height
 
 from .base import DataSource, MotionData
+from .omomo_validity import prepare_object_frames
 from .smplx import _SMPLX_ROOT_OFFSET, DEFAULT_SMPLX_TARGET_NAMES
 
 
@@ -45,7 +47,11 @@ class OmomoDataSource(DataSource):
         if self.sequence_index < 0 or self.sequence_index >= len(data):
             raise ValueError(f"Sequence index {self.sequence_index} out of range (max: {len(data)-1})")
 
-        self.sequence = data[self.sequence_index]
+        self.sequence, self.object_valid, self.object_gap_report = prepare_object_frames(
+            data[self.sequence_index], self.framerate,
+        )
+        if self.object_gap_report["invalid_frame_count"]:
+            print("OMOMO object gaps: " + json.dumps(self.object_gap_report), flush=True)
         self.seq_name = self.sequence["seq_name"]
 
         parts = self.seq_name.split("_")
@@ -63,6 +69,11 @@ class OmomoDataSource(DataSource):
             "object_name": self.object_name,
             "gender": self._sequence_gender(),
             "source": "omomo",
+            "object_valid": self.object_valid,
+            "object_gap_report": self.object_gap_report,
+            "source_frame_indices": np.arange(
+                self.object_gap_report["retained_start"], self.object_gap_report["retained_stop"],
+            ),
         }
 
     def _sequence_gender(self) -> str:

@@ -617,6 +617,11 @@ def main():
             # Backward-compatible alias retained for existing consumers.
             smplx_joints_w=smplx_trajectory * terrain_scale,
         )
+        if source_motion_data is not None:
+            from .source_validity import export_object_validity
+            output_payload.update(export_object_validity(
+                source_motion_data.metadata, len(retargeted_motion),
+            ))
         if object_pose is not None:
             object_pos, object_quat = object_pose
             output_payload["object_pos_w"] = object_pos

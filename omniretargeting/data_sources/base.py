@@ -126,6 +126,23 @@ class MotionData:
             if val is not None and isinstance(val, np.ndarray) and val.shape[0] == T:
                 new_metadata[key] = linear_interpolate(val, dst_indices, axis=0)
 
+        # A synthesized time must not hide an invalid source endpoint.
+        valid = new_metadata.get("object_valid")
+        if valid is not None:
+            valid = np.asarray(valid, dtype=bool)
+            if valid.shape != (T,):
+                raise ValueError("object_valid must share the motion timeline")
+            new_metadata["object_valid"] = (
+                valid[np.floor(dst_indices).astype(int)] & valid[np.ceil(dst_indices).astype(int)]
+            )
+        indices = new_metadata.get("source_frame_indices")
+        if indices is not None:
+            if np.asarray(indices).shape != (T,):
+                raise ValueError("source_frame_indices must share the motion timeline")
+            new_metadata["source_frame_indices"] = linear_interpolate(
+                np.asarray(indices), dst_indices, axis=0,
+            )
+
         # Semantic per-frame metadata has to follow the resampling too. A
         # trajectory that keeps its original length while positions are
         # resampled is silently misaligned in time, and nothing downstream can

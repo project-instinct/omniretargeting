@@ -801,6 +801,13 @@ def audit_reset(
         },
     }
     geometry = _reset_geometry(profile, static, moving, self_report, trajectory.labels)
+    if "object_valid" in payload:
+        valid = np.asarray(payload["object_valid"], dtype=bool)
+        if valid.shape != (len(trajectory.labels),):
+            raise ValueError("object_valid must share the saved reset timeline")
+        invalid_labels = trajectory.labels[~valid].tolist()
+        geometry["source_object_invalid_frames"] = invalid_labels
+        geometry["failed_frames"] = sorted(set(geometry["failed_frames"]) | set(invalid_labels))
     result.update(
         geometry_status="failed" if geometry["failed_frames"] else "unverified",
         **geometry,

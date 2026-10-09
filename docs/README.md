@@ -10,6 +10,7 @@ the source of truth for details.
   live.
 - [`ADDING_SOURCE_ADAPTERS.md`](ADDING_SOURCE_ADAPTERS.md) — source-neutral
   loader contract and registration.
+- [`omomo_object_validity.md`](omomo_object_validity.md) — OMOMO 空物体帧补齐、同步截断与 reset 排除。
 - [`smplx_frame_ids.md`](smplx_frame_ids.md) — SMPL-X frame numbering modes.
 - [`contact_mechanics.md`](contact_mechanics.md) — contact evidence and
   uncertainty semantics.

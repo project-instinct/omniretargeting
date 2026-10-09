@@ -7,7 +7,7 @@ pipeline file. `tests/test_module_size.py` enforces the limit.
 | Area | Entry points | Responsibility |
 | --- | --- | --- |
 | CLI and orchestration | `main.py`, `core.py`, `_core/` | Parse configuration, load sources and robots, select a backend, assemble contact inputs, run retargeting, post-process, and export. |
-| Source adapters | `data_sources/` | Translate one input format to the source-neutral `MotionData` contract. Format-specific parsing, SMPL-X extraction, surface sampling, inertia, and frame provenance stay here. |
+| Source adapters | `data_sources/` | Translate one input format to the source-neutral `MotionData` contract. Format-specific parsing, SMPL-X extraction, surface sampling, inertia, and frame provenance stay here; OMOMO empty object poses are handled in `omomo_validity.py` before FK/contact preparation. |
 | Robot model | `robot_config.py`, `robot_models/` | Load robot geometry, joints, collision geoms, limits, and declared correspondence facts. Algorithm policy belongs in solver defaults, not robot profiles. |
 | Framewise solver | `retargeting.py`, `_solver/` | Solve one frame with the interaction graph, contact hierarchy, orientation and posture tasks, and bounded SQP steps. |
 | Sequence solver | `sequence_retargeting.py`, `_sequence/`, `_core/sequence.py` | Solve the whole trajectory with temporal tasks, source-shape initialization, guarded nonlinear steps, and windowed correction. |
@@ -19,6 +19,7 @@ pipeline file. `tests/test_module_size.py` enforces the limit.
 | Correction and refinement | `trajectory_refinement.py`, `_refinement/`, `local_collision_repair.py`, `whole_body_correction.py`, `staged_contact_repair.py` | Improve an existing trajectory while preserving contacts, posture locality, continuity, and collision acceptance. |
 | Deadline | `_fast/deadline.py`, `_fast/deadline_state.py` | Production wall-clock budget, export reserve and accepted checkpoints; no change to unexpired numeric decisions. |
 | Collision contract and audit policy | `collision_manifest.py`, `training_collision_match.py`, `self_collision.py`, `structural_overlap.py`, `quality_policy.py` | Compiled mesh identity, shared structural sample evidence, physical-pair D/L/F and reset states; `audit_self_collision.py` is a compatibility alias. |
+| Source validity export | `source_validity.py` | Export original object validity and source reset exclusions without changing solver decisions; geometry audits merge these exclusions. |
 | Motion budgets and quality | `motion_budgets.py`, `motion_quality.py`, `trajectory_validation.py`, `trajectory_fidelity.py` | Define source-relative chatter, validation/reporting fields used across stages. |
 | Review tools | `scripts/review_*.py`, `scripts/trumans_*review*.py`, `scene_metrics_parallel.py`, `training_collision_parallel.py` | Measure the four AGENTS metrics and compare clips without changing motion; the parallel helpers split audits by frame and keep serial aggregation. |
 
