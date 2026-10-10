@@ -297,6 +297,8 @@ def _pair_json(
         "other": pair["other"],
         "max_depth_m": float(depths.max()),
         "worst_frame": int(labels[int(stats["worst_frame"])]),
+        "unknown_frame_count": stats["unknown_frame_count"],
+        "unknown_frames": labels[np.asarray(stats["unknown_frames"], dtype=int)].tolist(),
         "mean_depth_when_penetrating_m": (
             float(np.mean(depths[penetrating])) if np.any(penetrating) else 0.0
         ),
@@ -484,6 +486,7 @@ def _reset_report(
     self_error_frames: set[int],
     lateral: np.ndarray,
     support_unverified: np.ndarray | None = None,
+    object_valid: np.ndarray | None = None,
 ) -> dict[str, Any]:
     static_depth = np.asarray(static_depth, dtype=float)
     moving_depth = np.asarray(moving_depth, dtype=float)
@@ -494,12 +497,15 @@ def _reset_report(
     unknown[list(self_error_frames)] = True
     if support_unverified is not None:
         unknown |= np.asarray(support_unverified, bool)
-    states = reset_states(static_depth, moving_depth, self_depth, lateral, unknown)
+    states = reset_states(static_depth, moving_depth, self_depth, lateral, unknown,
+                          object_valid=object_valid)
     usable = states == "candidate"
     local_unusable = np.flatnonzero(~usable)
     over_scene = np.maximum(static_depth, moving_depth) > RESET_SCENE_M + DEPTH_EPSILON_M
     over_self = self_depth > RESET_SELF_M + DEPTH_EPSILON_M
+    source_invalid = np.zeros(len(labels), bool) if object_valid is None else ~np.asarray(object_valid, bool)
     reasons = {
+        "source_object_invalid": compress_frame_indices(labels[np.flatnonzero(source_invalid)]),
         "scene_depth_over_threshold": compress_frame_indices(
             labels[np.flatnonzero(over_scene)]
         ),
@@ -644,6 +650,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         qpos = np.asarray(motion["qpos"], dtype=float).copy()
         frames_per_second = _motion_framerate(motion, args.frames_per_second)
         motion_start = int(motion.get("frame_start", 0))
+        object_valid = np.asarray(motion["object_valid"], bool) if "object_valid" in motion else None
 
     start = int(scene_record.get("start", motion_start))
     frames = len(qpos)
@@ -809,6 +816,7 @@ def audit(args: argparse.Namespace) -> dict[str, Any]:
         scene_unknown=scene_unknown,
         self_error_frames=set(self_errors),
         support_unverified=support_unverified,
+        object_valid=object_valid,
         lateral=_lateral_reset_mask(
             model, static_depth, moving_sequences, moving_depth, support_index
         ),

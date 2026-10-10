@@ -239,8 +239,11 @@ def evaluate(series: Mapping[Any, Mapping[str, Any]], fps: float) -> dict:
     }
 
 
-def reset_states(static: np.ndarray, moving: np.ndarray, self_depth: np.ndarray, lateral: np.ndarray, unknown: np.ndarray) -> np.ndarray[str]:
-    """Return per-frame reset labels in invalid > unknown > candidate priority."""
+def reset_states(
+    static: np.ndarray, moving: np.ndarray, self_depth: np.ndarray,
+    lateral: np.ndarray, unknown: np.ndarray, *, object_valid: np.ndarray | None = None,
+) -> np.ndarray[str]:
+    """Return reset labels; reconstructed source object rows are always invalid."""
     static = _vector("static", static).astype(float)
     moving = _vector("moving", moving, length=len(static)).astype(float)
     self_depth = _vector("self_depth", self_depth, length=len(static)).astype(float)
@@ -252,6 +255,8 @@ def reset_states(static: np.ndarray, moving: np.ndarray, self_depth: np.ndarray,
         | (scene > RESET_SCENE_M + DEPTH_EPSILON_M)
         | (lateral & (scene > RESET_SELF_M + DEPTH_EPSILON_M))
     )
+    if object_valid is not None:
+        invalid |= ~_vector("object_valid", object_valid, length=len(static)).astype(bool)
     return np.where(invalid, "invalid", np.where(unknown, "unknown", "candidate"))
 
 
