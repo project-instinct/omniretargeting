@@ -303,6 +303,8 @@ def _smoothness(run: dict[str, Any]) -> dict[str, Any]:
                 magnitude = _number(item.get("peak")) or _number(
                     item.get("peak_per_second")
                 )
+                if magnitude is None:
+                    continue
                 if magnitude > (_number(target.get("peak")) or -math.inf):
                     target.clear()
                     target.update(item)
@@ -317,6 +319,13 @@ def _smoothness(run: dict[str, Any]) -> dict[str, Any]:
         "velocity_worst": velocity_explicit,
         "effort": record.get("effort_limit_violations"),
         "effort_worst": effort_worst,
+        "effort_unknown_frames": _nested(record, "effort_dynamics", "unknown_frame_count"),
+        "effort_infeasible_frames": len(_nested(record, "effort_dynamics", "infeasible_frames"))
+                                    if _nested(record, "effort_dynamics", "infeasible_frames") is not None else None,
+        "effort_status_counts": _nested(record, "effort_dynamics", "frame_status_counts"),
+        "effort_audit_error_frames": len(_nested(record, "effort_dynamics", "audit_error_frames"))
+                                     if _nested(record, "effort_dynamics", "audit_error_frames") is not None else None,
+        "effort_unaudited_endpoints": _nested(record, "effort_dynamics", "unaudited_endpoint_frames"),
         "root_translation_chatter": _nested(root, "translation", "violations"),
         "root_rotation_chatter": _nested(root, "rotation", "violations"),
     }
@@ -611,6 +620,14 @@ def render(result: dict[str, Any]) -> str:
         lines.append(_row("source-relative chatter违例", bs["chatter"], as_["chatter"]))
         lines.append(_row("速度超限", bs["velocity"], as_["velocity"]))
         lines.append(_row("力矩超限（effort screen）", bs["effort"], as_["effort"]))
+        lines.append(_row("力矩未判定帧", bs["effort_unknown_frames"], as_["effort_unknown_frames"]))
+        lines.append(_row("支撑确定不可行帧", bs["effort_infeasible_frames"], as_["effort_infeasible_frames"]))
+        lines.append(_row("力矩审计数值错误帧", bs["effort_audit_error_frames"], as_["effort_audit_error_frames"]))
+        for side, smooth in (("before", bs), ("after", as_)):
+            if smooth["effort_status_counts"] is not None:
+                lines.append(f"- {side} 力矩/支撑帧状态：{smooth['effort_status_counts']}。")
+            if smooth["effort_unaudited_endpoints"] is not None:
+                lines.append(f"- {side} 力矩未审计端点帧：{smooth['effort_unaudited_endpoints']}；不能据超限计数为零判定通过。")
         lines.append(_row("root世界HF translation", bs["root_translation_chatter"], as_["root_translation_chatter"]))
         lines.append(_row("root世界HF rotation", bs["root_rotation_chatter"], as_["root_rotation_chatter"]))
         for side, smooth in (("before", bs), ("after", as_)):

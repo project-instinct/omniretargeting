@@ -3,6 +3,24 @@ import json
 from scripts.compare_benchmark_runs import main
 
 
+def test_unknown_effort_has_no_peak_and_is_visible_in_report(tmp_path):
+    before, after = tmp_path / "before", tmp_path / "after"
+    _make_arm(before, deep=False)
+    clip = _make_arm(after, deep=False)
+    path = clip / "joint_smoothness.json"
+    record = json.loads(path.read_text())
+    record["joints"]["left_knee_joint"]["mechanical_limits"]["effort"] = {"peak": None, "violations": 0, "worst_frame": None}
+    record["effort_dynamics"] = {"unknown_frame_count": 18, "unaudited_endpoint_frames": [0, 19]}
+    _write(path, record)
+    output = tmp_path / "report.md"
+    payload = tmp_path / "report.json"
+    main(["--before", str(before), "--after", str(after), "--output", str(output), "--json", str(payload)])
+    assert "力矩未判定帧" in output.read_text()
+    assert "不能据超限计数为零判定通过" in output.read_text()
+    result = json.loads(payload.read_text())
+    assert result["details"]["clip"]["after"]["smoothness"]["effort_unknown_frames"] == 18
+
+
 def _write(path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -139,3 +157,19 @@ def test_explicit_clip_and_missing_directory_are_reported(tmp_path):
     assert "缺失文件 after：" in report
     assert "timing.json" in report.split("缺失文件 after：", 1)[1].splitlines()[0]
     assert "penetration_persistence.json：before=存在；after=缺失" in report
+
+
+def test_infeasible_support_is_shown_separately_from_unknown(tmp_path):
+    root = tmp_path / "arm"
+    clip = _make_arm(root, deep=False)
+    path = clip / "joint_smoothness.json"
+    record = json.loads(path.read_text())
+    record["effort_dynamics"] = {"infeasible_frames": [1, 2, 3], "unknown_frame_count": 1, "audit_error_frames": [4],
+                                  "frame_status_counts": {"infeasible_unsupported": 3, "unknown_object_load": 1}}
+    _write(path, record)
+    output = tmp_path / "comparison.md"
+    main(["--before", str(root), "--after", str(root), "--output", str(output)])
+    report = output.read_text()
+    assert "支撑确定不可行帧 | 3 | 3" in report
+    assert "infeasible_unsupported" in report
+    assert "力矩审计数值错误帧 | 1 | 1" in report

@@ -243,7 +243,7 @@ def run_audits(out, source, env, python, *, scene_workers=None, concurrent=True,
         ("scene_metrics", ["--prepared", str(prepared), "--motion", str(motion), "--objects", str(out / "objects.npy"), "--output", str(out / "scene_metrics.json"), "--batch", "16"] + scene_tail),
         ("source_pose", ["--prepared", str(prepared), "--motion", str(motion), "--output", str(out / "source_pose.json")]),
         ("contact_metrics", ["--prepared", str(prepared), "--motion", str(motion), "--output", str(out / "contact_metrics.json")]),
-        ("joint_smoothness", ["--model", model, "--before", str(out / "fixed_reference.npz"), "--after", str(motion), "--output", str(out / "joint_smoothness.json")]),
+        ("joint_smoothness", ["--model", model, "--before", str(out / "fixed_reference.npz"), "--after", str(motion), "--prepared", str(prepared), "--objects", str(out / "objects.npy"), "--output", str(out / "joint_smoothness.json")]),
     ]
     jobs = [(name, [str(python), str(source / "scripts" / f"review_{name}.py")] + tail, source, env)
             for name, tail in commands]

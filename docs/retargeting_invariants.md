@@ -22,9 +22,12 @@ Current mechanisms and known gaps; goals and priorities belong to [`AGENTS.md`](
   roll back useful clearance. They retain hard URDF velocity rows when the owner supplies its
   URDF, while final audit reports and gates sustained added chatter.
   Local repair also protects support-endpoint world continuity against slip.
-- `scripts/review_joint_smoothness.py` audits the same source-relative chatter, URDF velocity
-  limits, and a contact-free inverse-dynamics effort screen. The effort screen reports
-  candidates for a contact-force split; it is not yet a final torque certificate.
+- `scripts/review_joint_smoothness.py` audits the same source-relative chatter, original URDF
+  velocity/effort limits and actual-triangle contact-force balance. Missing support or an
+  impossible base wrench is `infeasible_unsupported`; genuinely missing geometry/object
+  dynamics stays unknown. The independent 15 mm sensitivity never changes the 5 mm primary
+  geometry gate. See [effort auditing](effort_audit.md); instantaneous witnesses are not
+  physical execution certificates.
 
 ## Posture
 
@@ -164,6 +167,9 @@ Force-balanced support transitions and the approximate object-support mechanics 
   diagnostics. It checks sustained source layout on candidates, verifies source-relative
   chatter and URDF velocity limits after solving, and reports `budgets` (including
   `relation_*`, `layout_flip_*`, `source_relative_chatter`) and `skipped_tasks`.
+  Independent [effort auditing](effort_audit.md) uses contact-force feasibility
+  and original URDF limits; missing reactions or unknown object loads do not pass.
+  Production fast currently has no motor-effort constraint.
 - `--solver sequence` bounds only root/slide translation and fits source directions first,
   without angular slack.
 - Fast has a production deadline from CLI loading to export: default
