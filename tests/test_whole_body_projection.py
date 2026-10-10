@@ -60,11 +60,27 @@ def test_direction_has_root_and_compensating_joints_and_is_temporally_smooth():
     assert np.max(np.abs(np.diff(step, n=2, axis=0))) < 1e-5
 
 
-def test_inverse_force_screen_uses_the_independent_audits_execution_stencils():
-    from scripts.review_joint_smoothness import _inverse_forces
+def _legacy_inverse_forces(model, poses, fps):
+    # The screen keeps the pre-effort-audit execution stencil (backward
+    # differences, raw mj_inverse); opt/screen measured the corrected stencil
+    # as a wipe300 regression, so the screen is pinned to this definition.
+    import mujoco
+    velocity = np.empty((len(poses) - 1, model.nv))
+    for frame in range(len(poses) - 1):
+        mujoco.mj_differentiatePos(model, velocity[frame], 1. / fps, poses[frame], poses[frame + 1])
+    acceleration = np.diff(velocity, axis=0) * fps
+    data, force = mujoco.MjData(model), []
+    for frame in range(len(poses) - 2):
+        data.qpos[:], data.qvel[:], data.qacc[:] = poses[frame + 2], velocity[frame + 1], acceleration[frame]
+        mujoco.mj_inverse(model, data)
+        force.append(data.qfrc_inverse.copy())
+    return np.array(force)
+
+
+def test_inverse_force_screen_keeps_its_execution_stencil():
     from omniretargeting._fast.projection_mechanics import inverse_forces, MechanicalScreen
     obj, poses, _ = _objective(temporal=True)
-    expected = _inverse_forces(obj.model, poses, obj.framerate)[0]
+    expected = _legacy_inverse_forces(obj.model, poses, obj.framerate)
     np.testing.assert_array_equal(inverse_forces(obj.model, poses, obj.framerate), expected)
     joint = obj.model.dof_jntid[obj.coords.di[-1]]
     obj.model.jnt_actfrclimited[joint] = True
