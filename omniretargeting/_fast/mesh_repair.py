@@ -529,9 +529,15 @@ class OriginalGeometry:
                     required = self._moving_evidence_baseline.setdefault(
                         frame, frozenset(measured.get("open_penetrating_samples", ())))
                 missing = required.difference(measured.get("open_known_samples", ()))
-                outside = set()
+                certify = getattr(self.moving, "certified_outside", None)
+                outside = set() if certify is None else certify(pose, frame, missing)
                 if not missing.issubset(outside):
                     failures.append(f"lost original source-side observation at frame {frame}")
+                    if getattr(self, "uncertain_exit_rows", False):
+                        from .uncertain_exit import material_rows
+                        measured["rows"].extend(material_rows(
+                            self.moving, pose, frame, missing - outside,
+                            self.di if jacobians else []))
                 for row in measured["rows"]:
                     # Closed, observed-open and reverse witnesses protect
                     # different overlaps. One larger depth cannot conceal a
