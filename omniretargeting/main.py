@@ -1,6 +1,7 @@
 import argparse
 import cProfile
 from contextlib import contextmanager
+from dataclasses import replace
 import numpy as np
 import trimesh
 from pathlib import Path
@@ -8,10 +9,19 @@ import tempfile
 import os
 import json
 import yaml
+from scipy.spatial.transform import Rotation
 
 from omniretargeting import OmniRetargeter
 from omniretargeting.robot_config import load_robot_config
 from omniretargeting.data_sources.registry import create_data_source
+from omniretargeting.contacts import (
+    EntityPose,
+    Scene,
+    SceneEntity,
+    detect_contacts,
+    load_contact_trajectory,
+    save_hsoi_annotations,
+)
 from omniretargeting.utils import normalize_retargeted_output_path
 from omniretargeting.utils import create_flat_terrain
 from omniretargeting.visualizer import (
@@ -86,24 +96,40 @@ def export_scaled_objects(
     scaled_objects_dir.mkdir(parents=True, exist_ok=True)
 
     object_name = motion_data.metadata.get("object_name", "object")
-    centroid_local = motion_data.metadata.get("object_centroid_local")
-    if centroid_local is None:
-        centroid_local = np.asarray(motion_data.object_mesh.vertices, dtype=float).mean(axis=0)
-
     scene_scale = float(source_to_robot_scale) if apply_scene_scaling else 1.0
+    body_id = motion_data.metadata.get("object_points_body_id", object_name)
+    entity = (
+        motion_data.scene.entities.get(body_id)
+        if motion_data.scene is not None
+        else None
+    )
+    if entity is not None and entity.geometry is not None:
+        # Rigid geometry already includes the adapter's constant object scale.
+        scaled_mesh = entity.geometry.copy()
+        track = (motion_data.entity_trajectories or {}).get(body_id)
+        body_poses = [
+            track.pose(t) if track is not None else motion_data.scene.pose(body_id, {})
+            for t in range(len(motion_data.positions))
+        ]
+        translations = np.stack([pose.translation for pose in body_poses])
+        rotations = Rotation.from_quat(
+            np.stack([pose.orientation for pose in body_poses]), scalar_first=True
+        ).as_matrix()
+        scales = np.ones(len(body_poses))
+    else:
+        scaled_mesh = motion_data.object_mesh.copy()
+        translations = motion_data.metadata.get("object_translations")
+        rotations = motion_data.metadata.get("object_rotations")
+        scales = motion_data.metadata.get("object_scales")
 
-    # Save centered object mesh so per-frame transforms carry the motion explicitly.
-    scaled_mesh = motion_data.object_mesh.copy()
-    scaled_mesh.apply_translation(-centroid_local)
+    # Retain the original body origin shared by poses and local contact anchors.
+    # Scene scale is baked into geometry once; pose scales stay dimensionless.
     if apply_scene_scaling:
         scaled_mesh.apply_scale(scene_scale)
     mesh_path = scaled_objects_dir / f"{object_name}.obj"
     scaled_mesh.export(mesh_path)
     print(f"Saved scaled object mesh to {mesh_path}")
 
-    translations = motion_data.metadata.get("object_translations")
-    rotations = motion_data.metadata.get("object_rotations")
-    scales = motion_data.metadata.get("object_scales")
     if translations is None or rotations is None or scales is None:
         return mesh_path, None
 
@@ -112,9 +138,11 @@ def export_scaled_objects(
         poses.append(
             {
                 "frame": t,
-                "translation": (np.asarray(translations[t], dtype=float) * scene_scale).tolist(),
+                "translation": (
+                    np.asarray(translations[t], dtype=float) * scene_scale
+                ).tolist(),
                 "rotation_matrix": np.asarray(rotations[t]).tolist(),
-                "scale": float(scales[t]) * scene_scale,
+                "scale": float(scales[t]),
             }
         )
 
@@ -163,6 +191,11 @@ def _run(args, parser: argparse.ArgumentParser):
     }
     selected_source = select_robot_source(robot_config, source_type)
     data_source_source_config = dict(selected_source)
+    if (
+        "height_estimation" not in data_source_source_config
+        and "height_estimation" in robot_config
+    ):
+        data_source_source_config["height_estimation"] = robot_config["height_estimation"]
     print(f"Source type: {source_type}")
     print(f"Motion file: {source_motion_path}")
 
@@ -170,9 +203,26 @@ def _run(args, parser: argparse.ArgumentParser):
 
     if not isinstance(joint_mapping, dict) or not joint_mapping:
         raise ValueError("Joint mapping must be a non-empty JSON object.")
+    joint_mapping = {
+        **joint_mapping,
+        **runtime_source_options.pop("target_mapping", {}),
+    }
 
     robot_height = robot_config.get("robot_height")
     retargeting = robot_config.get("retargeting")
+    contact_detection = runtime_source_options.pop("contact_detection", None)
+    contact_annotations = runtime_source_options.pop("contact_annotations", None)
+    contact_weight = runtime_source_options.pop("contact_edge_weight", None)
+    if getattr(args, "contact_edge_weight", None) is not None:
+        contact_weight = args.contact_edge_weight
+    if contact_weight is not None:
+        retargeting = {**(retargeting or {}), "contact_edge_weight": contact_weight}
+    if args.penetration_resolver is not None:
+        if retargeting is None:
+            retargeting = {}
+        else:
+            retargeting = dict(retargeting)
+        retargeting["penetration_resolver"] = args.penetration_resolver
 
     # Handle terrain
     temp_terrain_paths = []
@@ -197,6 +247,25 @@ def _run(args, parser: argparse.ArgumentParser):
             runtime_options=runtime_source_options,
         )
         motion_data = data_source.load()
+        entities = (
+            dict(motion_data.scene.entities) if motion_data.scene is not None else {}
+        )
+        if "terrain" in entities:
+            raise ValueError(
+                "Scene body ID 'terrain' is reserved for the CLI terrain mesh."
+            )
+        entities["terrain"] = SceneEntity(
+            geometry=trimesh.load(terrain_path, force="mesh"),
+            static_pose=EntityPose(np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])),
+        )
+        motion_data = replace(motion_data, scene=Scene(entities))
+        if contact_annotations is not None:
+            motion_data = replace(
+                motion_data,
+                contact_trajectory=load_contact_trajectory(
+                    contact_annotations, source_coordinates=True
+                ),
+            )
         source_positions = motion_data.positions
         source_orientations = motion_data.metadata.get("joint_orientations")
         framerate = args.framerate or motion_data.framerate
@@ -215,22 +284,42 @@ def _run(args, parser: argparse.ArgumentParser):
             framerate = args.output_framerate
             print(f"Resampled: {motion_data.positions.shape[0]} frames at {framerate}fps")
 
+        if contact_detection is not None and contact_detection.get("enabled", True):
+            selected_pairs = contact_detection.get("pairs")
+            if (
+                source_type == "omomo"
+                and motion_data.metadata["object_name"]
+                not in motion_data.scene.entities
+                and selected_pairs is not None
+                and motion_data.metadata["object_name"] in selected_pairs
+            ):
+                raise ValueError(
+                    "OMOMO has time-varying object scale. Set object_scale_mode: first_frame "
+                    "to detect contacts with the requested object body."
+                )
+            motion_data = replace(
+                motion_data,
+                contact_trajectory=detect_contacts(motion_data, contact_detection),
+            )
+        if motion_data.contact_trajectory is not None:
+            counts = [
+                len(contacts)
+                for contacts in motion_data.contact_trajectory
+                if contacts is not None
+            ]
+            print(
+                f"Contacts: {sum(counts)} records across {len(counts)} available frames"
+            )
+
         print(f"Loaded trajectory with shape: {source_positions.shape}")
         if source_orientations is not None:
             print(f"Loaded orientations with shape: {source_orientations.shape}")
         else:
             print("Warning: Orientations not available for this file format.")
 
+        original_motion_data = motion_data
         if args.scale_factor is not None:
-            motion_data.positions = motion_data.positions * args.scale_factor
-            if motion_data.root_translations is not None:
-                motion_data.root_translations = motion_data.root_translations * args.scale_factor
-            if motion_data.object_points is not None:
-                motion_data.object_points = motion_data.object_points * args.scale_factor
-            if motion_data.source_height is not None:
-                motion_data.source_height *= args.scale_factor
-            if motion_data.human_height is not None:
-                motion_data.human_height *= args.scale_factor
+            motion_data = motion_data.scaled(args.scale_factor)
             source_positions = motion_data.positions
 
             scaled_terrain = trimesh.load(terrain_path, force="mesh")
@@ -277,7 +366,7 @@ def _run(args, parser: argparse.ArgumentParser):
 
             if motion_data.object_mesh is not None:
                 export_scaled_objects(
-                    motion_data,
+                    original_motion_data,
                     scene_output_dir,
                     source_to_robot_scale,
                     apply_scene_scaling=True,
@@ -285,13 +374,13 @@ def _run(args, parser: argparse.ArgumentParser):
 
         # Save output
         print(f"Saving output to {args.output}...")
-        
+
         # Extract data for saving
         # retargeted_motion shape: (T, 7 + DOF) -> [pos(3), quat(4), joints(DOF)]
-        
+
         # Get joint names from robot model
         joint_names = retargeter.get_joint_names()
-        
+
         # Extract components
         base_pos = retargeted_motion[:, :3]
         base_quat = retargeted_motion[:, 3:7]  # wxyz (MuJoCo convention, consistent with entire pipeline)
@@ -306,7 +395,20 @@ def _run(args, parser: argparse.ArgumentParser):
             base_pos_w=base_pos,
             base_quat_w=base_quat,  # wxyz quaternion
         )
-        
+        if motion_data.contact_trajectory is not None:
+            annotation_motion = (
+                motion_data.scaled(source_to_robot_scale)
+                if args.enable_scene_scaling
+                else motion_data
+            )
+            annotation_path = Path(args.output).with_suffix(".contacts.json")
+            save_hsoi_annotations(
+                annotation_motion,
+                annotation_path,
+                source_to_robot_scale=source_to_robot_scale,
+            )
+            print(f"Saved contact annotations and scene poses to {annotation_path}")
+
         print(f"Done! Source-to-robot scale used: {source_to_robot_scale}")
 
         # Load terrain for visualization/video if needed
@@ -323,9 +425,10 @@ def _run(args, parser: argparse.ArgumentParser):
         vis_object_meshes = None
         if args.vis or args.save_video:
             vis_object_meshes = build_object_tracks(
-                motion_data,
+                original_motion_data,
                 source_to_robot_scale=source_to_robot_scale,
-                apply_scene_scaling=args.enable_scene_scaling or args.scale_factor is not None,
+                apply_scene_scaling=args.enable_scene_scaling
+                or args.scale_factor is not None,
             )
             if vis_object_meshes:
                 print(f"Loaded object track for visualization: {vis_object_meshes[0].name}")
@@ -375,7 +478,11 @@ def main():
         required=True,
         help="Path to YAML source configuration file (see config_templates/ for examples)",
     )
-    parser.add_argument("--output", required=True, help="Path to save output motion (.npy)")
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Path to save output motion (.npz; normalized to *_retargeted.npz)",
+    )
     scaling_group = parser.add_mutually_exclusive_group()
     scaling_group.add_argument(
         "--enable-scene-scaling",
@@ -388,6 +495,13 @@ def main():
         default=None,
         help="Scale the source motion, terrain, and objects by this factor without exporting a scaled scene.",
     )
+    parser.add_argument(
+        "--penetration-resolver",
+        dest="penetration_resolver",
+        choices=["hard_constraint", "hard_constraint_slack", "xyz_nudge"],
+        default=None,
+        help="Contact handling mode; overrides the value in the robot profile.",
+    )
     parser.add_argument("--vis", action="store_true", help="Visualize the retargeted motion")
     parser.add_argument("--save-video", dest="save_video", default=None, help="Save retargeted motion video to file (e.g. /tmp/out.mp4). Uses offscreen rendering (set MUJOCO_GL=egl for headless).")
     parser.add_argument("--framerate", type=float, default=None, help="Framerate of the motion (optional, defaults to 30.0 or auto-detected)")
@@ -395,6 +509,12 @@ def main():
                         help="Resample motion to this framerate before retargeting (e.g. 30 to downsample 120fps data)")
     parser.add_argument("--progress", action="store_true",
                         help="Show a progress bar while retargeting frames")
+    parser.add_argument(
+        "--contact-edge-weight",
+        type=float,
+        default=None,
+        help="Extra interaction-graph contact weight; overrides profile and source config (default: 0)",
+    )
     parser.add_argument(
         "--cprofile",
         metavar="PROFILE_FILE_PATH",

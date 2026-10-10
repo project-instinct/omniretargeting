@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import joblib
@@ -13,7 +13,7 @@ from scipy.spatial.transform import Rotation
 from .base import DataSource, MotionData
 from .smplx import DEFAULT_SMPLX_TARGET_NAMES, _SMPLX_ROOT_OFFSET
 from omniretargeting.utils import estimate_body_height
-
+from omniretargeting.contacts import EntityTrajectory, Scene, SceneEntity
 
 @dataclass
 class OmomoDataSource(DataSource):
@@ -31,6 +31,9 @@ class OmomoDataSource(DataSource):
     model_directory: str | None = None
     framerate: float = 30.0
     use_smplx_base_pose: bool = True
+    body_position_mode: str = "smplx"
+    object_scale_mode: str = "per_frame"
+    height_estimation: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.sequence_file = Path(self.sequence_file).expanduser()
@@ -38,12 +41,16 @@ class OmomoDataSource(DataSource):
         if self.model_directory is not None:
             self.model_directory = str(Path(self.model_directory).expanduser())
         self._motion_data: MotionData | None = None
+        if self.body_position_mode not in ("smplx", "rest_offsets"):
+            raise ValueError("body_position_mode must be 'smplx' or 'rest_offsets'.")
+        if self.object_scale_mode not in ("per_frame", "first_frame"):
+            raise ValueError("object_scale_mode must be 'per_frame' or 'first_frame'.")
 
         if not self.sequence_file.exists():
             raise FileNotFoundError(f"Sequence file not found: {self.sequence_file}")
 
         data = joblib.load(self.sequence_file)
-        if self.sequence_index >= len(data):
+        if self.sequence_index < 0 or self.sequence_index >= len(data):
             raise ValueError(f"Sequence index {self.sequence_index} out of range (max: {len(data)-1})")
 
         self.sequence = data[self.sequence_index]
@@ -115,6 +122,10 @@ class OmomoDataSource(DataSource):
 
     def _object_pose_data(self) -> dict[str, np.ndarray]:
         obj_scale = np.asarray(self.sequence["obj_scale"], dtype=np.float32)
+        if not np.isfinite(obj_scale).all() or np.any(obj_scale <= 0):
+            raise ValueError("OMOMO obj_scale must contain finite positive scales.")
+        if self.object_scale_mode == "first_frame":
+            obj_scale = np.full_like(obj_scale, obj_scale[0])
         obj_rot = np.asarray(self.sequence["obj_rot"], dtype=np.float32)
         obj_trans = np.asarray(self.sequence["obj_trans"], dtype=np.float32).reshape(len(obj_scale), 3)
         obj_com = np.asarray(self.sequence["obj_com_pos"], dtype=np.float32).reshape(len(obj_scale), 3)
@@ -135,6 +146,8 @@ class OmomoDataSource(DataSource):
         return np.array(object_points, dtype=np.float32)
 
     def _load_body_positions(self) -> np.ndarray:
+        if self.body_position_mode == "rest_offsets":
+            return self._load_rest_offset_positions()
         import smplx
         import torch
 
@@ -170,6 +183,35 @@ class OmomoDataSource(DataSource):
         )
         return output.joints.detach().cpu().numpy()[:, :22, :].astype(np.float32)
 
+    def _load_rest_offset_positions(self) -> np.ndarray:
+        """FK using OMOMO's recorded shaped rest offsets, without body models.
+
+        The root offset is zero and `trans` is the pelvis trajectory. This mode
+        uses dataset skeleton geometry rather than reconstructing an SMPL-X body.
+        """
+        from .lafan1 import _quat_fk
+
+        parents = np.array(
+            [-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19]
+        )
+        root = np.asarray(self.sequence["root_orient"], dtype=float)
+        body = np.asarray(self.sequence["pose_body"], dtype=float).reshape(
+            len(root), 21, 3
+        )
+        rotations = Rotation.from_rotvec(
+            np.concatenate([root[:, None], body], axis=1).reshape(-1, 3)
+        )
+        quaternions = rotations.as_quat(scalar_first=True).reshape(len(root), 22, 4)
+        offsets = np.asarray(self.sequence["rest_offsets"], dtype=float)[:22]
+        if offsets.shape != (22, 3) or not np.allclose(offsets[0], 0):
+            raise ValueError(
+                "OMOMO rest_offsets mode requires 22 local offsets with zero root offset."
+            )
+        local_positions = np.broadcast_to(offsets, (len(root), 22, 3)).copy()
+        local_positions[:, 0] = np.asarray(self.sequence["trans"], dtype=float)
+        _, positions = _quat_fk(quaternions, local_positions, parents)
+        return positions.astype(np.float32)
+
     def _estimate_height_from_positions(self, positions: np.ndarray, target_names: list[str]) -> float | None:
         """Estimate human height using shared utility.
 
@@ -180,7 +222,14 @@ class OmomoDataSource(DataSource):
         Returns:
             Estimated height in meters, or ``None`` if estimation fails.
         """
-        return estimate_body_height(positions, target_names, head_joint="Head", foot_joints=("L_Foot", "R_Foot"))
+        return estimate_body_height(
+            positions, target_names,
+            **{
+                "head_joint": "Head",
+                "foot_joints": ("L_Foot", "R_Foot"),
+                **self.height_estimation,
+            },
+        )
 
     def load(self) -> MotionData:
         if self._motion_data is None:
@@ -191,6 +240,31 @@ class OmomoDataSource(DataSource):
             target_names = self.target_names or DEFAULT_SMPLX_TARGET_NAMES[: positions.shape[1]]
             object_pose = self._object_pose_data()
             object_centroid_local = np.asarray(self.object_mesh.vertices, dtype=np.float32).mean(axis=0)
+            # Rigid HSOI geometry bakes a constant scale into the body's frame.
+            # Variable-scale legacy world samples remain available, but are never
+            # represented as a rigid trajectory without an explicit scale policy.
+            scene = None
+            entity_trajectories = None
+            if np.all(object_pose["scale"] == object_pose["scale"][0]):
+                geometry = self.object_mesh.copy()
+                geometry.apply_scale(float(object_pose["scale"][0]))
+                scene = Scene(
+                    {
+                        self.object_name: SceneEntity(
+                            geometry=geometry,
+                            local_samples=self.object_local_points
+                            * object_pose["scale"][0],
+                        )
+                    }
+                )
+                entity_trajectories = {
+                    self.object_name: EntityTrajectory(
+                        object_pose["translation"],
+                        Rotation.from_matrix(object_pose["rotation"]).as_quat(
+                            scalar_first=True
+                        ),
+                    )
+                }
 
             # Correct root_orient from SMPLX T-pose frame to body-aligned frame
             # and convert from axis-angle to wxyz quaternion at the boundary.
@@ -202,11 +276,17 @@ class OmomoDataSource(DataSource):
                 positions=positions,
                 target_names=target_names,
                 root_orientations=root_orient if self.use_smplx_base_pose else None,
-                root_translations=positions[:, 0, :] if self.use_smplx_base_pose else None,
+                root_translations=(
+                    positions[:, 0, :] if self.use_smplx_base_pose else None
+                ),
                 framerate=self.framerate,
-                source_height=self._estimate_height_from_positions(positions, target_names),
+                source_height=self._estimate_height_from_positions(
+                    positions, target_names
+                ),
                 object_points=object_points,
                 object_mesh=self.object_mesh,
+                scene=scene,
+                entity_trajectories=entity_trajectories,
                 metadata={
                     **self.metadata,
                     "joint_orientations": None,
@@ -215,6 +295,12 @@ class OmomoDataSource(DataSource):
                     "object_scales": object_pose["scale"],
                     "object_centroid_world": object_pose["centroid_world"],
                     "object_centroid_local": object_centroid_local,
+                    "object_points_body_id": self.object_name,
+                    "body_position_mode": self.body_position_mode,
+                    "object_scale_mode": self.object_scale_mode,
+                    "recorded_object_scales": np.asarray(
+                        self.sequence["obj_scale"]
+                    ).copy(),
                 },
             )
 
@@ -227,19 +313,38 @@ class OmomoDataSource(DataSource):
 def create_omomo_data_source(motion_file, source_config, runtime_options):
     source_config = dict(source_config or {})
     runtime_options = dict(runtime_options or {})
+    adapter_options = dict(source_config.get("adapter_options") or {})
+    allowed = {
+        "sequence_index", "data_root", "n_object_samples", "target_names_override",
+        "target_names", "model_directory", "use_smplx_base_pose", "framerate",
+        "body_position_mode", "object_scale_mode", "height_estimation",
+    }
+    profile_fields = {
+        "name", "type", "target_mapping", "joint_mapping", "joint_names",
+        "base_orientation", "default_pose_on_robot",
+        "metadata", "adapter_options",
+    }
+    for name, options, keys in (
+        ("source fields", source_config, allowed | profile_fields),
+        ("adapter_options", adapter_options, allowed),
+        ("runtime options", runtime_options, allowed | {"metadata"}),
+    ):
+        unknown = set(options) - keys
+        if unknown:
+            raise ValueError(f"Unknown OMOMO {name}: {sorted(unknown)}")
 
     def option(*keys, default=None):
-        for container in (runtime_options, source_config):
+        for container in (runtime_options, adapter_options, source_config):
             for key in keys:
                 if key in container and container[key] is not None:
                     return container[key]
         return default
 
-    sequence_index = runtime_options.get("sequence_index", 0)
-    data_root = runtime_options.get("data_root", "/home/ziwen/Datasets/OMOMO")
-    n_object_samples = runtime_options.get("n_object_samples", 100)
-    target_names_override = runtime_options.get("target_names_override", None)
-    model_directory = runtime_options.get("model_directory", None)
+    sequence_index = option("sequence_index", default=0)
+    data_root = option("data_root", default="~/Datasets/OMOMO")
+    n_object_samples = option("n_object_samples", default=100)
+    target_names_override = option("target_names_override", "target_names")
+    model_directory = option("model_directory")
 
     return OmomoDataSource(
         sequence_file=motion_file,
@@ -249,9 +354,13 @@ def create_omomo_data_source(motion_file, source_config, runtime_options):
         target_names=target_names_override,
         model_directory=model_directory,
         use_smplx_base_pose=option("use_smplx_base_pose", default=False),
+        framerate=option("framerate", default=30.0),
+        body_position_mode=option("body_position_mode", default="smplx"),
+        object_scale_mode=option("object_scale_mode", default="per_frame"),
+        height_estimation=option("height_estimation", default={}),
     )
 
 
 from .registry import register_data_source
 
-register_data_source("omomo", create_omomo_data_source, extensions=[".npz"])
+register_data_source("omomo", create_omomo_data_source, extensions=[".p", ".pkl"])

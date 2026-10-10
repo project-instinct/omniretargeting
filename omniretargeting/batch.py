@@ -60,6 +60,8 @@ def main() -> None:
                         help="Scan source folder recursively for motion files")
     parser.add_argument("--exclude-suffix", default=None,
                         help="Exclude files ending with this suffix (e.g. '_M.bvh' for mirrored files)")
+    parser.add_argument("--file-pattern", default=None,
+                        help="Process only filenames matching this glob (e.g. '*_seq_joints24.p' for OMOMO)")
     parser.add_argument("--resume", action="store_true",
                         help="Skip motions whose retargeted output already exists")
     parser.add_argument("--video", action="store_true",
@@ -118,6 +120,8 @@ def main() -> None:
 
     # Scan for motion files
     motion_files = scan_source_folder(source_folder, args.source_type, recursive=args.recursive, exclude_suffix=args.exclude_suffix)
+    if args.file_pattern is not None:
+        motion_files = [path for path in motion_files if path.match(args.file_pattern)]
     if not motion_files:
         print(f"Error: no motion files found in {args.source_folder} for type '{args.source_type}'")
         sys.exit(1)

@@ -25,6 +25,8 @@ dependencies = [
     "yourdfpy",
     "clarabel",
     "libigl",
+    "joblib",
+    "PyYAML",
     "tyro",
     # Additional dependencies for generic mesh processing
     "open3d",

@@ -50,6 +50,7 @@ class SmplxDataSource(DataSource):
     betas: list[float] | None = None
     use_smplx_base_pose: bool = True
     metadata: dict = field(default_factory=dict)
+    height_estimation: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.motion_file = Path(self.motion_file)
@@ -78,8 +79,10 @@ class SmplxDataSource(DataSource):
             positions, orientations, root_orient, trans, framerate, metadata = self._load_arrays(self.motion_file)
             names = self.target_names_override or _default_target_names(positions.shape[1])
 
-            # Compute source height: try betas first, then trajectory, then None
-            source_height = self.compute_human_height()
+            # Explicit landmarks govern the measurement; otherwise try betas first.
+            source_height = (
+                None if self.height_estimation else self.compute_human_height()
+            )
             if source_height is None:
                 source_height = self.estimate_height_from_trajectory(positions, names)
             
@@ -151,7 +154,14 @@ class SmplxDataSource(DataSource):
         Returns:
             Estimated height in meters, or ``None`` if estimation fails.
         """
-        return estimate_body_height(positions, target_names, head_joint="Head", foot_joints=("L_Foot", "R_Foot"))
+        return estimate_body_height(
+            positions, target_names,
+            **{
+                "head_joint": "Head",
+                "foot_joints": ("L_Foot", "R_Foot"),
+                **self.height_estimation,
+            },
+        )
 
     def _load_arrays(
         self,
@@ -357,6 +367,7 @@ def create_smplx_data_source(
         target_names_override=target_names,
         betas=option("betas", "smplx_betas"),
         use_smplx_base_pose=option("use_smplx_base_pose", default=False),
+        height_estimation=option("height_estimation", default={}),
     )
 
 
@@ -396,9 +407,22 @@ def retarget_smplx_to_robot(
     joint_mapping: Dict[str, str],
     robot_height: Optional[float] = None,
     smplx_joint_names: Optional[List[str]] = None,
+    base_orientation: Optional[Dict[str, str]] = None,
+    source_height: Optional[float] = None,
+    enable_scene_scaling: bool = False,
 ) -> Tuple[float, np.ndarray]:
-    """Backward-compatible wrapper for older SMPL-X-specific callers."""
+    """SMPL-X wrapper with standard target names and orientation landmarks.
+
+    Supply base_orientation when using custom source target names.
+    Scene scaling requires an explicit measured source_height.
+    """
     from omniretargeting.retargeting import retarget_source_to_robot
+
+    if smplx_joint_names is None:
+        # Preserve the wrapper's input error before deriving the default order.
+        if not validate_smplx_trajectory(smplx_trajectory):
+            raise ValueError("Invalid source position trajectory format")
+        smplx_joint_names = _default_target_names(smplx_trajectory.shape[1])
 
     return retarget_source_to_robot(
         source_positions=smplx_trajectory,
@@ -407,6 +431,18 @@ def retarget_smplx_to_robot(
         joint_mapping=joint_mapping,
         robot_height=robot_height,
         source_target_names=smplx_joint_names,
+        source_height=source_height,
+        enable_scene_scaling=enable_scene_scaling,
+        base_orientation=(
+            base_orientation
+            if base_orientation is not None
+            else {
+                "pelvis": "Pelvis",
+                "left_hip": "L_Hip",
+                "right_hip": "R_Hip",
+                "spine": "Spine1",
+            }
+        ),
     )
 
 

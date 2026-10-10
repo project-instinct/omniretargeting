@@ -9,6 +9,7 @@ there explicitly.
 from omniretargeting.utils.math import (
     align_terrain_to_coordinates,
     calculate_exponential_edge_weights,
+    calculate_contact_edge_weights,
     calculate_laplacian_coordinates,
     calculate_laplacian_matrix,
     compute_mesh_bounding_box,
@@ -36,6 +37,7 @@ from omniretargeting.utils.math import _has_floating_joint, _inject_floating_joi
 __all__ = [
     "align_terrain_to_coordinates",
     "calculate_exponential_edge_weights",
+    "calculate_contact_edge_weights",
     "calculate_laplacian_coordinates",
     "calculate_laplacian_matrix",
     "compute_mesh_bounding_box",

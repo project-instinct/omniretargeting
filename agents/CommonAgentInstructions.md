@@ -11,6 +11,11 @@ This a rule starting point for most agents. The `AGENTS.md` file should guide th
 - do not overwrite or revert unrelated work
 - state assumptions, risks, and limitations clearly
 - do not go out-side of the project folder without explicitly asking (once will do)
+- always log the current progress in `PROGRESS.md` if the file is present
+- avoid worktrees in `pip install -e .` repos unless the import path is verified, because Python may still run the original source tree.
+- when fixing bugs, or issues, explain to the user on what the root causes are before propose the fixing operation.
+- The `scripts/` directory holds entry scripts only: a script may import other modules, but code under `scripts/` must never be imported by other code. Put reusable code in a `pip`-installable package instead.
+	- Minor or historical deviations from a convention are allowed only as clearly stated exceptions. Do not add callers or otherwise broaden the deviation.
 
 ## Code of Conduct Following Linus's Coding Taste
 

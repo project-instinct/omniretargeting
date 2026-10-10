@@ -1,0 +1,39 @@
+# Run manually:
+# python -m omniretargeting.main --source-config config_templates/omomo_contacts_example.yaml --output /tmp/omomo_contacts.npz --progress
+type: omomo
+motion: ~/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p
+sequence_index: 318
+data_root: ~/Datasets/OMOMO
+n_object_samples: 50
+
+# Recorded shaped-skeleton FK requires no SMPL-X models or Torch.
+# Use smplx plus model_directory for the existing body-model reconstruction.
+body_position_mode: rest_offsets
+use_smplx_base_pose: true
+
+# Explicitly replace OMOMO's varying scale by the first frame's scale.
+# The same choice drives world samples, visualization, and rigid scene geometry.
+object_scale_mode: first_frame
+
+# Additional named source points need explicit robot link-point mappings.
+# These G1 toe offsets can be tuned independently of detector thresholds.
+target_mapping:
+  L_Foot: {robot_link: left_ankle_roll_link, offset: [0.12, 0.0, -0.04]}
+  R_Foot: {robot_link: right_ankle_roll_link, offset: [0.12, 0.0, -0.04]}
+
+# Distance is in source motion units; speed is measured in each body's frame.
+# null velocity_threshold enables distance-only detection, including fast sliding.
+contact_detection:
+  enabled: true
+  pairs:
+    floorlamp: [L_Wrist, R_Wrist]
+    terrain: [L_Foot, R_Foot]
+  distance_threshold: 0.10
+  velocity_threshold: 0.30
+  min_contact_frames: 3
+  overwrite: false
+
+# Extra raw graph contribution before row normalization (0 disables graph use).
+contact_edge_weight: 10.0
+# Optional edited annotations, on the ORIGINAL source timeline:
+# contact_annotations: /tmp/omomo_contacts.contacts.json
