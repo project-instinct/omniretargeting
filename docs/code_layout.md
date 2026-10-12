@@ -24,6 +24,7 @@ pipeline file. `tests/test_module_size.py` enforces the limit.
 | Motion budgets and quality | `motion_budgets.py`, `motion_quality.py`, `trajectory_validation.py`, `trajectory_fidelity.py` | Define source-relative chatter, validation/reporting fields used across stages. |
 | Review tools | `scripts/review_*.py`, `scripts/trumans_*review*.py`, `scene_metrics_parallel.py`, `training_collision_parallel.py` | Measure the four AGENTS metrics and compare clips without changing motion; the parallel helpers split audits by frame and keep serial aggregation. |
 
+`scripts/retarget_and_audit.py` solves one source and audits it once (shared `capture_run`/`run_audits` with the benchmark).
 `scripts/benchmark_fast.py` freezes and runs baseline/candidate clips, with concurrent audits
 by default (`--serial-audits` for a serial comparison); default profile is mesh and the suite includes chair2745.
 `compare_benchmark_runs.py` compares saved audits; `render_contact_closeups.py` and

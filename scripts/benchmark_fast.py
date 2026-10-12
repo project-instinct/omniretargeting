@@ -108,6 +108,16 @@ def prepare(args):
 
 
 def child(args):
+    config = json.loads((args.run_dir / "inputs.json").read_text())[args.child]
+    capture_run(config, args.output, args.run_dir / "g1_profile.json", source_root=args.source_root)
+
+
+def capture_run(config, output, profile, *, source_root=ROOT, extra_argv=(), check_source_root=True):
+    """Run the production CLI once and keep every file the audits read.
+
+    The solver arguments are the CLI ones; capture hooks only observe the call.
+    ``extra_argv`` appends CLI options (for example ``--source-denoise auto``).
+    """
     import numpy as np
     import torch
     import omniretargeting._fast.pipeline as pipeline
@@ -116,15 +126,15 @@ def child(args):
     from omniretargeting.contact import stack_contact_tasks
     from omniretargeting.robot_config import load_robot_config
 
-    for module in (pipeline, cli):
-        if not Path(module.__file__).resolve().is_relative_to(args.source_root.resolve()):
-            raise RuntimeError(f'Snapshot import escaped source root: {module.__file__}')
+    if check_source_root:
+        for module in (pipeline, cli):
+            if not Path(module.__file__).resolve().is_relative_to(Path(source_root).resolve()):
+                raise RuntimeError(f'Snapshot import escaped source root: {module.__file__}')
 
-    out = args.output.resolve()
+    out = Path(output).resolve()
     out.mkdir(parents=True, exist_ok=False)
-    config = json.loads((args.run_dir / "inputs.json").read_text())[args.child]
     save(out / "source.json", config)
-    profile = args.run_dir / "g1_profile.json"
+    profile = Path(profile).resolve()
     model_path = load_robot_config(profile)["urdf_path"]
     timing, captured = {}, {}
     original, original_repair, create = pipeline.solve_fast_sequence, pipeline.repair_original_meshes, cli.create_data_source
@@ -189,8 +199,9 @@ def child(args):
 
     torch.set_num_threads(4)
     argv = ["omniretargeting.main", "--source-config", str(out / "source.json"), "--robot-config", str(profile),
-            "--solver", "fast", "--output-base-link", "torso_link", "--output", str(out / "final_retargeted.npz")]
-    save(out / "invocation.json", dict(argv=argv, source_root=str(args.source_root), runtime_options=OPTIONS.describe(),
+            "--solver", "fast", "--output-base-link", "torso_link", "--output", str(out / "final_retargeted.npz"),
+            *extra_argv]
+    save(out / "invocation.json", dict(argv=argv, source_root=str(source_root), runtime_options=OPTIONS.describe(),
         environment={k: v for k, v in os.environ.items() if k.startswith("OMNIRETARGETING_") or k in THREADS}))
     started = time.perf_counter()
     try:
@@ -236,7 +247,8 @@ def run_audits(out, source, env, python, *, scene_workers=None, concurrent=True,
     prepared = out / "prepared.npy"
     invocation = json.loads((out / "invocation.json").read_text())
     profile = Path(invocation["argv"][invocation["argv"].index("--robot-config") + 1])
-    model = json.loads(profile.read_text())["urdf_path"]
+    # Profiles may name the model relative to their own directory.
+    model = str((profile.parent / json.loads(profile.read_text())["urdf_path"]).resolve())
     scene_tail = ["--workers", str(scene_workers)] if scene_workers else []
     self_tail = ["--workers", str(scene_workers)] if scene_workers else []
     commands = [

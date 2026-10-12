@@ -236,6 +236,14 @@ python -m omniretargeting.main \
   --output /path/to/retargeted.npz
 ```
 
+One command solves and audits a source (any adapter config), keeping every file
+the audits and the web viewer read; write the run directory to the data disk:
+
+```bash
+.venv/bin/python scripts/retarget_and_audit.py --source source.json \
+    --out /home/duanxin/DataHHD/<project>/out/<run> --source-denoise auto --record
+```
+
 `--source-denoise {off,auto}` defaults to `off`. For noisy video-estimated
 SMPL-X, opt in with `--source-denoise auto`: the adapter resamples repeated
 lower-rate estimates (zero-order hold) at their true sample times, estimates
