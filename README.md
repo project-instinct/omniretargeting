@@ -236,6 +236,17 @@ python -m omniretargeting.main \
   --output /path/to/retargeted.npz
 ```
 
+`--source-denoise {off,auto}` defaults to `off`. For noisy video-estimated
+SMPL-X, opt in with `--source-denoise auto`: the adapter resamples repeated
+lower-rate estimates (zero-order hold) at their true sample times, estimates
+translation and angular noise, smooths noisy channels without phase lag
+(robust GCV Whittaker; sparse genuine takeoffs/impacts are released), spreads
+isolated root jumps, stabilizes conservative foot plants and debounces bounded
+contact intervals. Raw source files, scenes and objects stay unchanged. NPZ
+`source_denoise_json` and the adjacent `.denoise.json` record every operation.
+SMPL-X, OMOMO and TRUMANS adapters support this option; clean motions are left
+unchanged. See [source denoising](docs/source_denoise.md) for thresholds and limits.
+
 The CLI infers `.pkl` as `parc_ms` and `.npz` as `smplx`. For an ambiguous
 format such as BVH, add one adapter name, for example
 `--source-type lafan1`; source JSON remains available only for real per-source

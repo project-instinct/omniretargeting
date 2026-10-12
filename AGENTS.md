@@ -158,6 +158,8 @@
 - Python 文件不超过 1000 行，按职责拆分（`tests/test_module_size.py`）。
 - 通用求解器契约与数据源无关；SMPL-X 提取放在 loaders/adapters 和接触标记准备阶段。
 - 补丁小而聚焦，复用现有工具，保留无关的用户改动。
+- 运行输出（求解结果、审计、日志、录制）写到机械盘 `/home/duanxin/DataHHD/<仓库或 worktree 名>/out/`，
+  仓库里的 `out` 只是指向它的软链接；系统盘只放代码和环境。
 - WebViser/WebVisualizer 预览只用端口 `8183`：本机检查 `http://127.0.0.1:8183/`，给用户
   `http://10.19.126.196:8183/<page>/`。
 

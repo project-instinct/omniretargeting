@@ -58,6 +58,7 @@ class SmplxDataSource(DataSource):
     # Some exporters retain pre-resampling frame IDs only as provenance. Those
     # IDs must not introduce frames into the already published output cadence.
     frame_id_semantics: str = "timeline"
+    source_denoise: str = "off"
 
     def __post_init__(self) -> None:
         self.motion_file = Path(self.motion_file)
@@ -333,6 +334,8 @@ class SmplxDataSource(DataSource):
         self,
         motion_file: Path,
     ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None, float | None, dict]:
+        if self.source_denoise != "off" and motion_file.suffix == ".npy":
+            raise ValueError("Source denoise requires raw SMPL-X parameters, not positions-only .npy")
         if motion_file.suffix == ".npy":
             joints = np.load(motion_file, allow_pickle=True)
             print("Warning: Cannot compute orientations from .npy file (positions only). Returning None for orientations.")
@@ -342,6 +345,8 @@ class SmplxDataSource(DataSource):
         framerate = self._detect_framerate(motion) if isinstance(motion, np.lib.npyio.NpzFile) else None
 
         if isinstance(motion, np.lib.npyio.NpzFile) and "global_joint_positions" in motion:
+            if self.source_denoise != "off":
+                raise ValueError("Source denoise requires raw SMPL-X parameters, not processed joints")
             return self._load_processed_npz(motion, framerate)
 
         return self._load_raw_npz(motion, framerate)
@@ -426,6 +431,13 @@ class SmplxDataSource(DataSource):
         trans, root_orient, pose_body, pose_hand, timeline_metadata = self._prepare_raw_timeline(
             motion, framerate
         )
+        if self.source_denoise != "off":
+            from .source_denoise import denoise_parameters
+            sample_ids = motion["inference_frame_ids"] if "inference_frame_ids" in motion else None
+            trans, root_orient, pose_body, denoise_report = denoise_parameters(
+                trans, root_orient, pose_body, framerate, self.source_denoise, sample_ids=sample_ids,
+            )
+            timeline_metadata["source_denoise"] = denoise_report
         if body_model is None:
             body_model = smplx.create(
                 self.model_directory,
@@ -491,6 +503,24 @@ class SmplxDataSource(DataSource):
             body_model.lbs_weights.detach().cpu().numpy(), orientations,
             self._posed_vertices_cache,
         )
+        denoise_report = timeline_metadata.get("source_denoise")
+        if denoise_report and denoise_report.get("support_requested", False):
+            from .denoise_support import support_translation
+            correction = support_translation(self._sole_metadata_cache["foot_sole_points"],
+                                             framerate, denoise_report)
+            joints = joints + correction[:, None, :]
+            trans = trans + correction
+            shift = torch.as_tensor(correction, dtype=output.vertices.dtype,
+                                    device=output.vertices.device)[:, None, :]
+            output.vertices = output.vertices + shift
+            output.joints = output.joints + shift
+            self._posed_vertices_cache = output.vertices.detach().cpu().numpy()
+            self._sole_metadata_cache = smplx_sole_metadata(
+                reference.vertices.detach().cpu().numpy()[0],
+                reference.joints.detach().cpu().numpy()[0],
+                body_model.lbs_weights.detach().cpu().numpy(), orientations,
+                self._posed_vertices_cache,
+            )
         end_effector_markers = _extract_smplx_end_effector_markers(
             body_model,
             output,
@@ -503,6 +533,8 @@ class SmplxDataSource(DataSource):
         body_surfaces = sample_smplx_surfaces(
             body_model, reference, self._posed_vertices_cache, _SMPLX_ROOT_OFFSET.T,
         )
+        if denoise_report:
+            body_surfaces["full_body"]["source_denoise"] = denoise_report
         return joints, orientations, root_orient, trans, framerate, {
             **timeline_metadata,
             "body_surface_samples": body_surfaces,
@@ -598,6 +630,7 @@ def create_smplx_data_source(
         betas=option("betas", "smplx_betas"),
         use_smplx_base_pose=option("use_smplx_base_pose", default=False),
         frame_id_semantics=option("frame_id_semantics", default="timeline"),
+        source_denoise=option("source_denoise", default="off"),
     )
 
 

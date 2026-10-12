@@ -34,6 +34,7 @@ class OmomoDataSource(DataSource):
     model_directory: str | None = None
     framerate: float = 30.0
     use_smplx_base_pose: bool = True
+    source_denoise: str = "off"
 
     def __post_init__(self):
         self.sequence_file = Path(self.sequence_file)
@@ -172,7 +173,7 @@ class OmomoDataSource(DataSource):
         adapter = SmplxDataSource(
             self.sequence_file, model_directory=self._resolve_model_directory(),
             gender=self._sequence_gender(), use_smplx_base_pose=self.use_smplx_base_pose,
-            frame_id_semantics="provenance",
+            frame_id_semantics="provenance", source_denoise=self.source_denoise,
         )
         raw = dict(self.sequence)
         raw["pose_body"] = np.asarray(raw["pose_body"]).reshape(-1, 63)
@@ -269,6 +270,7 @@ def create_omomo_data_source(motion_file, source_config, runtime_options):
         model_directory=model_directory,
         use_smplx_base_pose=option("use_smplx_base_pose", default=True),
         framerate=float(option("framerate", default=30.0)),
+        source_denoise=option("source_denoise", default="off"),
     )
 
 

@@ -3,6 +3,11 @@
 Current mechanisms and known gaps; goals and priorities belong to [`AGENTS.md`](../AGENTS.md).
 
 ## Reference and Jitter Budgets
+- Source parameters remain immutable by default. Explicit `--source-denoise auto`
+  authorizes an in-memory video-estimate reference before FK; its filtering,
+  jump/support corrections and contact debounce are recorded in the NPZ/report.
+  Raw geometric observations remain separate from temporally accepted contacts.
+  See [source denoising](source_denoise.md).
 - Before any clearance optimization the pipeline builds a source-shaped robot reference. Later
   stages measure posture and continuity against it, and it stays fixed within a run: rebasing
   it to the latest candidate let repeated passes progressively twist the robot.
@@ -43,6 +48,14 @@ Current mechanisms and known gaps; goals and priorities belong to [`AGENTS.md`](
   opposite side (`LAYOUT_FLIP_MARGIN`) for `LAYOUT_FLIP_WINDOW_FRAMES = 7` consecutive frames.
   Near-zero and brief crossings get a deadband in the linearized rows; a sustained clear flip
   is restored and rejected by exact final acceptance.
+- The source-layout judgement (`source_flips`, acceptance) measures both sides on the source's
+  body axes: the robot reference heading carried into the source by a per-frame Kabsch fit.
+  A trunk landmark judges layout only if its normalized position between the two farthest
+  limb-root groups matches the source within `TRUNK_PLACEMENT_TOLERANCE = 0.25`
+  (`comparable_trunk`). G1 maps SMPL-X `Spine3` (chest, ~0.6 of hips→shoulders) to the
+  `torso_link` origin (~0.2): a hanging elbow is below the source chest but above that point,
+  which read as 300–600 false flip frames per seated HER clip. Solver hinge pair selection still
+  uses the historical fit (`_hinge_rotations`) so solves are unchanged; moving it is open work.
 - The legacy local pass uses `_fast/repair_limits.LOCAL_ANGLE`. Full-body refinement instead
   uses all tangent coordinates with a fixed 0.4 rad correction neighborhood and the original
   joint/root envelopes. This numerical neighborhood is reported as a possible blocker; it

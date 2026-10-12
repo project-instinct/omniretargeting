@@ -173,6 +173,14 @@ def build_source_contacts(
     stay &= (obs["normal_speed"] <= config["normal_speed"]) | (
         obs["distance"] <= config["touch_distance"]
     )
+    denoise = full_body.get("source_denoise")
+    debounced = bool(denoise and denoise.get("applied"))
+    if debounced:
+        from .data_sources.source_denoise import debounce_contacts
+        # Geometry still bounds gap filling; speed threshold flicker alone may
+        # be debounced, but invalid/unknown surfaces and departures may not.
+        geometric_stay = valid & (obs["distance"] <= exit_distance)
+        geometric_stay &= obs["normal_opposition"] >= config["normal_opposition"]
     active = np.zeros_like(valid)
     sets = [set() for _ in range(len(points))]
     for region in np.unique(regions):
@@ -186,13 +194,38 @@ def build_source_contacts(
                 _close_short_gaps(timeline, int(np.floor(max_gap_s * framerate)))
                 & remain
             )
-            timeline = _remove_short_runs(
-                timeline, max(1, int(np.ceil(min_duration_s * framerate)))
-            )
+            if debounced:
+                velocity = np.sum(obs["relative_velocity"] * obs["normals"], axis=-1)
+                normal_velocity = np.median(velocity[:, group], axis=1)
+                timeline, merges = debounce_contacts(
+                    timeline, framerate, normal_velocity=normal_velocity, eligible=(geometric_stay & membership).any(1),
+                )
+                denoise["contact_merges"].extend(
+                    dict(region=str(region), surface=int(surface), stage="scene_detection",
+                         fps=float(framerate), frame_space="prepared", **e)
+                    for e in merges
+                )
+            else:
+                timeline = _remove_short_runs(
+                    timeline, max(1, int(np.ceil(min_duration_s * framerate)))
+                )
             timeline |= (authored & membership & stay).any(1)
-            active |= timeline[:, None] & membership & stay
+            permitted = geometric_stay if debounced else stay
+            active |= timeline[:, None] & membership & permitted
             for frame in np.flatnonzero(timeline):
                 sets[frame].add((str(region), int(surface)))
+    if debounced:
+        # Keep raw observations intact. Accepted short gaps are bounded touches,
+        # not invented sticking anchors with a raw mode of "none" and zero weight.
+        bridged = active & ~obs["active"]
+        accepted_modes = obs["modes"].copy()
+        accepted_modes[bridged] = "touch"
+        confidence = obs["confidence"].copy()
+        strength = np.clip((config["distance"]-obs["distance"]) /
+                           (config["distance"]-config["touch_distance"]), 0, 1)
+        geometric_confidence = strength**2*(3-2*strength)*np.clip(obs["normal_opposition"],0,1)
+        confidence[bridged] = geometric_confidence[bridged]
+        obs.update(accepted_modes=accepted_modes, accepted_confidence=confidence)
     events, previous = [], set()
     for frame, current in enumerate(sets):
         if current != previous:

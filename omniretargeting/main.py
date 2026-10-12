@@ -116,6 +116,8 @@ def main():
         default=None,
         help="Legacy direct path to an SMPLX motion file (.npz)",
     )
+    parser.add_argument("--source-denoise", choices=["off", "auto"], default="off",
+                        help="Opt-in adaptive SMPL-X video-estimate denoising (default: off).")
     parser.add_argument("--output", required=True, help="Path to save output motion (.npz)")
     parser.add_argument("--solver", choices=["framewise", "sequence", "mink", "fast"], default=None,
                         help="Retargeting solver; sequence jointly optimizes all input frames, "
@@ -173,6 +175,13 @@ def main():
         source_config = direct_source_config(args.source_motion, args.source_type)
     else:
         source_config = None
+
+    if args.source_denoise == "auto":
+        if source_config is None:
+            source_config = direct_source_config(args.smplx_motion, "smplx")
+            source_config["model_directory"] = args.smplx_model_dir
+        if source_config["type"] not in {"smplx", "omomo", "trumans"}:
+            parser.error("--source-denoise auto requires a SMPL-X based adapter")
 
     # Load robot profile config (default profile path can be overridden by --robot-config).
     robot_config = {}
@@ -256,6 +265,9 @@ def main():
                 source_type,
                 source_motion_path,
                 source_config=source_config,
+                **({"runtime_options": {"source_denoise": args.source_denoise}}
+                   if args.source_denoise == "auto" or "source_denoise" in source_config
+                   or "source_denoise" in (source_config.get("adapter_options") or {}) else {}),
             )
             source_motion_data = data_source.load()
             if source_motion_data.metadata.get("scene_enclosed_free_space"):
@@ -617,6 +629,10 @@ def main():
             # Backward-compatible alias retained for existing consumers.
             smplx_joints_w=smplx_trajectory * terrain_scale,
         )
+        import json
+        denoise_report = (source_motion_data.metadata.get("source_denoise")
+                          if source_motion_data is not None else None)
+        denoise_report = denoise_report or {"mode": "off", "enabled": False, "applied": False}
         if source_motion_data is not None:
             from .source_validity import export_object_validity
             output_payload.update(export_object_validity(
@@ -675,6 +691,15 @@ def main():
             diagnostic_path = Path(args.output).with_suffix(".diagnostics.json")
             diagnostic_path.write_text(diagnostics_json(diagnostics), encoding="utf-8")
             print(f"Saved collision/contact diagnostics to {diagnostic_path}")
+        if denoise_report.get("enabled"):
+            denoise_report.update(output_fps=float(framerate), output_frames=len(retargeted_motion))
+        output_payload["source_denoise_json"] = np.asarray(json.dumps(denoise_report))
+        if args.source_denoise == "auto":
+            Path(args.output).with_suffix(".denoise.json").write_text(
+                json.dumps(denoise_report, indent=2) + "\n")
+            report = getattr(retargeter, "last_sequence_report", None)
+            if report is not None:
+                report["source_denoise"] = denoise_report
         np.savez(
             args.output,
             **output_payload,

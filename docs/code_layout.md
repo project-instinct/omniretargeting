@@ -7,7 +7,7 @@ pipeline file. `tests/test_module_size.py` enforces the limit.
 | Area | Entry points | Responsibility |
 | --- | --- | --- |
 | CLI and orchestration | `main.py`, `core.py`, `_core/` | Parse configuration, load sources and robots, select a backend, assemble contact inputs, run retargeting, post-process, and export. |
-| Source adapters | `data_sources/` | Translate one input format to the source-neutral `MotionData` contract. Format-specific parsing, SMPL-X extraction, surface sampling, inertia, and frame provenance stay here; OMOMO empty object poses are handled in `omomo_validity.py` before FK/contact preparation. |
+| Source adapters | `data_sources/` | Translate one input format to the source-neutral `MotionData` contract. Format-specific parsing, SMPL-X extraction, surface sampling, inertia, and frame provenance stay here; Opt-in video noise filtering and support stabilization live in `data_sources/source_denoise.py` and `denoise_support.py` before FK/surface sampling; OMOMO empty object poses are handled in `omomo_validity.py` before FK/contact preparation. |
 | Robot model | `robot_config.py`, `robot_models/` | Load robot geometry, joints, collision geoms, limits, and declared correspondence facts. Algorithm policy belongs in solver defaults, not robot profiles. |
 | Framewise solver | `retargeting.py`, `_solver/` | Solve one frame with the interaction graph, contact hierarchy, orientation and posture tasks, and bounded SQP steps. |
 | Sequence solver | `sequence_retargeting.py`, `_sequence/`, `_core/sequence.py` | Solve the whole trajectory with temporal tasks, source-shape initialization, guarded nonlinear steps, and windowed correction. |

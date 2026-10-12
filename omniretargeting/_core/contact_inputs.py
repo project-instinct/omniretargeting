@@ -102,11 +102,11 @@ def unified_contact_inputs(owner, source, positions, scene, objects, markers, fp
                 obs["normals"][frame, chosen].copy(),
                 obs["distance"][frame, chosen].copy(),
                 np.linalg.norm(obs["relative_velocity"][frame, chosen], axis=1),
-                obs["confidence"][frame, chosen].copy(),
+                obs.get("accepted_confidence", obs["confidence"])[frame, chosen].copy(),
                 contact.copy(),
                 forward_directions=supplied.get("forward_directions"),
                 up_directions=supplied.get("up_directions"),
-                contact_modes=obs["modes"][frame, chosen].copy(),
+                contact_modes=obs.get("accepted_modes", obs["modes"])[frame, chosen].copy(),
                 environment_ids=obs["surface_ids"][frame, chosen].copy(),
                 surface_managed=dense,
             )

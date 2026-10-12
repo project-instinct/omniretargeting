@@ -35,6 +35,7 @@ class TrumansDataSource(DataSource):
     framerate: float = 30.0
     frame_start: int = 0
     frame_stop: int | None = None
+    source_denoise: str = "off"
 
     def __post_init__(self):
         self.data_root = Path(self.data_root)
@@ -96,7 +97,8 @@ class TrumansDataSource(DataSource):
             indices, scene, objects = self._clip()
         try:
             adapter = SmplxDataSource(self.data_root / "seg_name.npy", model_directory=self.model_directory,
-                                      gender="male", use_smplx_base_pose=True, frame_id_semantics="provenance")
+                                      gender="male", use_smplx_base_pose=True, frame_id_semantics="provenance",
+                                      source_denoise=self.source_denoise)
             model = None
             if pending is not None:
                 import smplx
@@ -117,8 +119,10 @@ class TrumansDataSource(DataSource):
         recorded = np.asarray(np.load(self.data_root / "human_joints.npy", mmap_mode="r")[indices, :22],
                               dtype=np.float64) @ WORLD_ROTATION.T
         error = float(np.linalg.norm(positions - recorded, axis=-1).max())
-        if error > RECONSTRUCTION_TOLERANCE_M:
+        if not body.get("source_denoise", {}).get("applied", False) and error > RECONSTRUCTION_TOLERANCE_M:
             raise ValueError(f"SMPL-X reconstruction differs from recorded joints by {error} m")
+        if body.get("source_denoise", {}).get("applied", False):
+            recorded = positions
         root = Rotation.from_matrix(Rotation.from_rotvec(root_orient).as_matrix() @ _SMPLX_ROOT_OFFSET)
         aligned = Rotation.from_quat(orientations.reshape(-1, 4), scalar_first=True).as_matrix() @ _SMPLX_ROOT_OFFSET
         self._motion_data = MotionData(
@@ -165,6 +169,7 @@ def create_trumans_data_source(motion_file, source_config, runtime_options):
         framerate=float(options.get("framerate", 30.0)),
         frame_start=int(options.get("frame_start", 0)),
         frame_stop=None if stop is None else int(stop),
+        source_denoise=options.get("source_denoise", "off"),
     )
 
 

@@ -234,3 +234,63 @@ def test_identical_layout_rows_of_both_references_merge_with_the_same_optimum():
     assert 0 < shared_rows < separate_rows
     assert shared_value == pytest.approx(separate_value, rel=1e-8)
     np.testing.assert_allclose(shared, separate, atol=1e-5)
+
+
+def test_fit_rotations_is_the_kabsch_rotation():
+    from omniretargeting.pose_relations import _fit_rotations
+
+    rng = np.random.default_rng(4)
+    source = rng.normal(size=(5, 9, 3))
+    truth = Rotation.random(5, random_state=1).as_matrix()
+    reference = np.einsum("fij,fkj->fki", truth, source) + rng.normal(size=(5, 1, 3))
+    fitted = _fit_rotations(reference, source)
+    np.testing.assert_allclose(fitted, truth, atol=1e-9)
+    np.testing.assert_allclose(np.linalg.det(fitted), 1.0)
+
+
+def _trunk_figure(chest_height):
+    """pelvis(root) -> chest -> two shoulders -> elbows; pelvis -> two hips."""
+    parents = [-1, 0, 1, 2, 1, 4, 0, 0]
+    points = np.array([
+        [0, 0, 1.0], [0, 0, chest_height], [0, .2, 1.45], [0, .25, 1.15],
+        [0, -.2, 1.45], [0, -.25, 1.15], [0, .1, .95], [0, -.1, .95],
+    ])
+    return parents, points[None]
+
+
+def test_misplaced_trunk_landmark_does_not_judge_source_layout():
+    from omniretargeting.pose_relations import RelationEnvelope, comparable_trunk, heading_axes
+
+    parents, source = _trunk_figure(1.3)      # chest point near the shoulders
+    _, robot = _trunk_figure(1.04)            # robot origin at waist height
+    keep = comparable_trunk(parents, robot, source)
+    assert not keep[1] and keep[0]
+    axes = heading_axes(np.eye(3)[None])
+    envelope = RelationEnvelope(range(8), np.zeros((8, 3)), parents, robot, axes=axes,
+                                source_positions=source)
+    first, second = envelope.graph.pairs.T
+    involved = (first == 1) | (second == 1)
+    assert not envelope.source_layout_sign[:, involved].any()
+    assert envelope.source_layout_sign[:, ~involved].any()
+    # Hanging elbows: below the source chest, above the robot waist point.
+    assert not envelope.source_flips(_Positions(robot)).any()
+    _, matched = _trunk_figure(1.3)
+    assert comparable_trunk(parents, matched, source).all()
+
+
+def test_source_layout_flip_still_detects_an_arm_behind_the_body():
+    from omniretargeting.pose_relations import LAYOUT_FLIP_WINDOW_FRAMES, RelationEnvelope, heading_axes
+
+    frames = LAYOUT_FLIP_WINDOW_FRAMES + 3
+    parents, source = _trunk_figure(1.3)
+    source = np.repeat(source, frames, axis=0)
+    source[:, 3, 0] = .3                      # left elbow clearly in front
+    robot = source.copy()
+    axes = heading_axes(np.repeat(np.eye(3)[None], frames, axis=0))
+    envelope = RelationEnvelope(range(8), np.zeros((8, 3)), parents, robot, axes=axes,
+                                source_positions=source)
+    assert not envelope.source_flips(_Positions(robot)).any()
+    behind = robot.copy()
+    behind[:, 3, 0] = -.3
+    flagged = envelope.source_flips(_Positions(behind)) > envelope.SLACK
+    assert flagged[LAYOUT_FLIP_WINDOW_FRAMES - 1:].all()

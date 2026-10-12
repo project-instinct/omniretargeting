@@ -170,6 +170,9 @@ def _sustained(mask, window):
 LAYOUT_MARGIN = 2 * np.sin(0.1)
 LAYOUT_FLIP_MARGIN = LAYOUT_MARGIN
 LAYOUT_FLIP_WINDOW_FRAMES = 7
+# Largest normalized trunk-placement difference for a landmark to judge layout
+# against the source (see ``comparable_trunk``).
+TRUNK_PLACEMENT_TOLERANCE = 0.25
 # Unit of the soft posture regularizer: a whole-body relation change equal to
 # turning the reference by this angle (or by the robot's morphology angle to
 # the source, when larger) costs one. It weights posture against the other
@@ -219,9 +222,13 @@ class RelationEnvelope:
             components = np.zeros((len(reference_positions), len(self.graph.pairs), 3))
             components[:, mask] = source_relations[:, [i for i in selected if i is not None]]
             self.source_components = components
-            self.source_axes = heading_axes(_fit_rotations(
-                np.asarray(reference_positions)[:, :count], source_positions
-            ))
+            self._source_fit = _fit_rotations(np.asarray(reference_positions)[:, :count], source_positions)
+            # Solver hinges select pairs with these historical axes (bit-identical
+            # solves); they are not the source body frame used by source_flips.
+            self._hinge_source_axes = heading_axes(_hinge_rotations(
+                np.asarray(reference_positions)[:, :count], source_positions))
+            self._source_comparable = comparable_trunk(parents, np.asarray(reference_positions), source_positions)
+            self.source_axes = None
         scale = RANDOM_AXIS_FACTOR * np.linalg.norm(self.reference, axis=-1)
         self.whole_scale = scale.mean(-1)
         self.part_scale = scale @ self.graph.incidence.T
@@ -242,20 +249,26 @@ class RelationEnvelope:
             )
             self.layout_sign = reference_sign
             if self.source_components is not None:
-                source_components = np.einsum("fpk,fak->fpa", self.source_components, self.source_axes)
-                source_sign = np.where(
-                    (np.abs(source_components) >= LAYOUT_MARGIN) & across[None, :, None],
-                    np.sign(source_components), 0.0,
-                )
+                # The source's own body axes: the robot reference heading carried
+                # into the source by the per-frame best-fit rotation.
+                self.source_axes = heading_axes(
+                    np.swapaxes(self._source_fit, 1, 2) @ np.swapaxes(self.axes, 1, 2))
+                def signs(axes):
+                    values = np.einsum("fpk,fak->fpa", self.source_components, axes)
+                    return np.where((np.abs(values) >= LAYOUT_MARGIN) & across[None, :, None],
+                                    np.sign(values), 0.0)
                 # Effector tips have no mapped source landmark. Pairs without a
                 # source observation remain soft posture terms only.
                 source_count = self.source_landmark_count
                 observed = ((first < source_count) & (second < source_count))[None, :, None]
+                hinge_sign = signs(self._hinge_source_axes)
                 self.layout_sign = np.where(
-                    observed & (source_sign == reference_sign) & (source_sign != 0),
+                    observed & (hinge_sign == reference_sign) & (hinge_sign != 0),
                     reference_sign, 0.0,
                 )
-                self.source_layout_sign = np.where(observed & (source_sign != 0),
+                comparable = (self._source_comparable[first] & self._source_comparable[second])[None, :, None]
+                source_sign = signs(self.source_axes)
+                self.source_layout_sign = np.where(observed & comparable & (source_sign != 0),
                                                    source_sign, 0.0)
 
     def set_soft_angle(self, angle):
@@ -543,7 +556,23 @@ def heading_axes(rotations):
 
 
 def _fit_rotations(reference, source):
-    """Per-frame orthogonal best-fit rotations taking source to reference."""
+    """Per-frame proper rotations R minimizing |R source - reference| (Kabsch)."""
+    reference, source = np.asarray(reference, float), np.asarray(source, float)
+    centered_reference = reference - reference.mean(axis=1, keepdims=True)
+    centered_source = source - source.mean(axis=1, keepdims=True)
+    u, _, vt = np.linalg.svd(np.einsum("fki,fkj->fij", centered_source, centered_reference))
+    v = np.swapaxes(vt, 1, 2).copy()
+    d = np.sign(np.linalg.det(v @ np.swapaxes(u, 1, 2)))
+    v[:, :, -1] *= d[:, None]
+    return v @ np.swapaxes(u, 1, 2)
+
+
+def _hinge_rotations(reference, source):
+    """Historical per-frame fit used only to select solver hinge pairs.
+
+    It returns V^T U^T rather than the Kabsch V U^T; kept so that solves stay
+    bit-identical while layout judgement uses ``_fit_rotations``.
+    """
     reference, source = np.asarray(reference, float), np.asarray(source, float)
     centered_reference = reference - reference.mean(axis=1, keepdims=True)
     centered_source = source - source.mean(axis=1, keepdims=True)
@@ -553,6 +582,43 @@ def _fit_rotations(reference, source):
     right[reflect, :, -1] *= -1
     result[reflect] = np.einsum("fij,fkj->fik", right[reflect], left[reflect])
     return result
+
+
+def comparable_trunk(parents, reference, source, tolerance=TRUNK_PLACEMENT_TOLERANCE):
+    """Trunk landmarks whose placement along the trunk matches the source.
+
+    The trunk spans the two farthest-apart groups of limb roots (e.g. hips and
+    shoulders). Each trunk landmark is placed by its normalized position on
+    that span. When robot and source positions differ by more than
+    ``tolerance`` (e.g. a chest point mapped to a waist-level torso origin),
+    its relations do not describe the same geometry: a hanging elbow lies
+    below the source chest but above the robot point. Such landmarks cannot
+    judge layout against the source. Uses the tree only, no names.
+    """
+    parents = list(parents)
+    count = source.shape[1]
+    limb = limb_ids(parents[:count])
+    groups = {}
+    for child in range(count):
+        parent = parents[child]
+        if parent >= 0 and limb[child] >= 0 and limb[parent] < 0:
+            groups.setdefault(parent, []).append(child)
+    keep = np.ones(len(parents), bool)
+    if len(groups) < 2:
+        return keep
+    reference = np.asarray(reference)[:, :count]
+    centres = {k: reference[:, v].mean(axis=1) for k, v in groups.items()}
+    keys = list(groups)
+    lower, upper = max(((i, j) for i in keys for j in keys if i < j),
+                       key=lambda ij: np.median(np.linalg.norm(centres[ij[0]] - centres[ij[1]], axis=1)))
+    def placement(points, node):
+        start, stop = points[:, groups[lower]].mean(axis=1), points[:, groups[upper]].mean(axis=1)
+        axis = stop - start
+        return float(np.median(np.einsum("fk,fk->f", points[:, node] - start, axis)
+                               / np.maximum(np.einsum("fk,fk->f", axis, axis), 1e-12)))
+    for node in np.flatnonzero(limb < 0):
+        keep[node] = abs(placement(reference, node) - placement(source, node)) <= tolerance
+    return keep
 
 
 def source_relation_angles(envelope, kin, source_positions):

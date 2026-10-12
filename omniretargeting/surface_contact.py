@@ -464,6 +464,9 @@ def build_surface_contact_tasks(
         for k, v in source_contact_table.observation.items()
     }
     observation["active"] = source_contact_table.active.copy()
+    if "accepted_modes" in observation:
+        observation["modes"] = observation["accepted_modes"]
+        observation["confidence"] = observation["accepted_confidence"]
     report["source_contacts"] = source_contact_table.diagnostics
     contact_targets = None
     if support_evidence is not None:

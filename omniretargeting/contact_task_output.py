@@ -282,16 +282,16 @@ def build_contact_task_output(
                 # The representative itself must carry the exported role.
                 # Priority precedes confidence when explicit groups merge regions.
                 roles = [_role(str(regions[sample]), surface, frame,
-                               str(obs["modes"][frame, sample]), support_evidence,
+                               str(obs.get("accepted_modes", obs["modes"])[frame, sample]), support_evidence,
                                control_evidence, unresolved) for sample in active]
                 order = tuple(DEFAULT_IMPORTANCE)
                 selected = min(range(len(active)), key=lambda i: (
-                    order.index(roles[i]), -obs["confidence"][frame, active[i]], int(active[i])
+                    order.index(roles[i]), -obs.get("accepted_confidence", obs["confidence"])[frame, active[i]], int(active[i])
                 ))
                 sample, role = active[selected], roles[selected]
-                mode = str(obs["modes"][frame, sample])
+                mode = str(obs.get("accepted_modes", obs["modes"])[frame, sample])
                 _activate(arrays, frame, slot, obs["environment"][frame, sample],
-                          obs["normals"][frame, sample], obs["confidence"][frame, sample],
+                          obs["normals"][frame, sample], obs.get("accepted_confidence", obs["confidence"])[frame, sample],
                           mode, role, surface, sample)
         elif part in primary_tasks:
             task = primary_tasks[part]
