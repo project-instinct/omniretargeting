@@ -309,7 +309,7 @@ def create_nokov_data_source(
 
     return NokovDataSource(
         motion_file=motion_file,
-        start_frame=int(runtime_options.get("start_frame", 0)),
+        start_frame=int(runtime_options.get("start_frame", source_config.get("start_frame", 0))),
         metadata=runtime_options.get("metadata", {}),
     )
 

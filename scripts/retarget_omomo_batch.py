@@ -453,11 +453,11 @@ def _make_tasks(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch retarget OMOMO robot-object motions with OmniRetargeting.")
-    parser.add_argument("--input-dir", default="/home/duanxin/Datasets/OMOMO/omniretarget_robot_object/robot-object")
-    parser.add_argument("--output-dir", default="/home/duanxin/Datasets/OMOMO/retargeted_omniretarget_torso")
-    parser.add_argument("--log-dir", default="/home/duanxin/Datasets/OMOMO/retargeted_omniretarget_torso_logs")
-    parser.add_argument("--robot-config", default="robot_models/unitree_g1/unitree_g1.json")
-    parser.add_argument("--smplx-model-dir", default="/home/duanxin/Xyk/GMR/assets/body_models")
+    parser.add_argument("--input-dir", required=True, help="OMOMO robot-object motion directory")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--log-dir", default=None, help="default: <output-dir>_logs")
+    parser.add_argument("--robot-config", default="robot_models/unitree_g1/unitree_g1_mesh.json")
+    parser.add_argument("--smplx-model-dir", default="assets/body_models")
     parser.add_argument("--output-base-link", default="torso_link")
     parser.add_argument("--workers", type=int, default=6)
     parser.add_argument("--limit", type=int, default=None)
@@ -471,7 +471,7 @@ def main() -> None:
     tasks = _make_tasks(
         Path(args.input_dir),
         Path(args.output_dir),
-        Path(args.log_dir),
+        Path(args.log_dir or f"{args.output_dir.rstrip('/')}_logs"),
         overwrite=args.overwrite,
         limit=args.limit,
         smooth_window=args.smooth_window,

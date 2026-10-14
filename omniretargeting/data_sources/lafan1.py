@@ -369,7 +369,7 @@ def create_lafan1_data_source(
 
     return Lafan1DataSource(
         motion_file=motion_file,
-        start_frame=int(runtime_options.get("start_frame", 0)),
+        start_frame=int(runtime_options.get("start_frame", source_config.get("start_frame", 0))),
         metadata=runtime_options.get("metadata", {}),
     )
 

@@ -277,7 +277,7 @@ def create_bones_seed_data_source(
 
     return BonesSeedDataSource(
         motion_file=motion_file,
-        start_frame=int(runtime_options.get("start_frame", 0)),
+        start_frame=int(runtime_options.get("start_frame", source_config.get("start_frame", 0))),
         metadata=runtime_options.get("metadata", {}),
     )
 

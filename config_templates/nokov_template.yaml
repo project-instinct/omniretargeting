@@ -5,12 +5,13 @@
 # (Xposition Yposition Zposition + Zrotation Xrotation Yrotation) and
 # 3-channel child joints (Zrotation Xrotation Yrotation).
 #
-# Usage:
-#   python -m omniretargeting.main \
-#     --robot-config robot_models/unitree_h1/unitree_h1.json \
-#     --source-config config_templates/nokov_template.yaml \
-#     --output /tmp/retargeted.npz \
-#     --save-video /tmp/retargeted.mp4
+# Usage (solve + audit in one command):
+#   .venv/bin/python scripts/retarget_and_audit.py --source config_templates/nokov_template.yaml \
+#     --out /path/to/run_dir
+# Or solve only:
+#   .venv/bin/python -m omniretargeting.main \
+#     --source-config config_templates/nokov_template.yaml --output output.npz
+# The robot profile defaults to robot_models/unitree_g1/unitree_g1_mesh.json and the solver to fast.
 
 # Required: Data source type
 type: nokov
@@ -26,13 +27,11 @@ motion: /path/to/nokov_capture.bvh
 # If not specified, a flat ground plane will be used
 # terrain: /path/to/terrain.obj
 
-# Optional: Framerate override (default: auto-detected from BVH "Frame Time")
-# framerate: 120.0
 
 # Notes:
 # - BVH files from Nokov use Y-up coordinate system (converted to Z-up automatically)
 # - Bone names are extracted from the BVH hierarchy and used as target_names
-#   matching the "nokov" source entry in the robot config's target_mapping
+#   pass --mapping with a JSON that maps these bone names to robot links
 # - Human height is estimated from head and foot positions in the first frame
 # - Position units are automatically converted from cm to meters
 # - Root orientation is estimated from joint positions by the retargeting pipeline

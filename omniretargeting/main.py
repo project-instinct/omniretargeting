@@ -32,7 +32,9 @@ from omniretargeting.utils import (
     normalize_retargeted_output_path,
 )
 
-DEFAULT_ROBOT_CONFIG_PATH = "robot_models/unitree_g1/unitree_g1.json"
+DEFAULT_ROBOT_CONFIG_PATH = "robot_models/unitree_g1/unitree_g1_mesh.json"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SOLVER = "fast"
 
 
 
@@ -107,20 +109,23 @@ def main():
         help="Adapter for --source-motion when its format is ambiguous.",
     )
     parser.add_argument(
-        "--smplx_model_dir",
+        "--smplx-model-dir", "--smplx_model_dir",
+        dest="smplx_model_dir",
         default=None,
         help="Directory containing SMPLX model files",
     )
     parser.add_argument(
-        "--smplx_motion",
+        "--smplx-motion", "--smplx_motion",
+        dest="smplx_motion",
         default=None,
-        help="Legacy direct path to an SMPLX motion file (.npz)",
+        help="Legacy direct path to an SMPLX motion file (.npz); prefer --source-motion",
     )
     parser.add_argument("--source-denoise", choices=["off", "auto"], default="off",
                         help="Opt-in adaptive SMPL-X video-estimate denoising (default: off).")
     parser.add_argument("--output", required=True, help="Path to save output motion (.npz)")
     parser.add_argument("--solver", choices=["framewise", "sequence", "mink", "fast"], default=None,
-                        help="Retargeting solver; sequence jointly optimizes all input frames, "
+                        help="Retargeting solver (default: the profile's sequence_solver setting, "
+                            "otherwise fast, the production solver); sequence jointly optimizes all input frames, "
                             "mink solves the same objective as one small QP per frame (UMR-style), "
                             "fast solves the sequence objective by banded Gauss-Newton with exact "
                             "joint limits, root translation bound, sustained source layout and "
@@ -142,11 +147,6 @@ def main():
         default=None,
         help="Resample a generic source to this framerate before retargeting.",
     )
-    parser.add_argument(
-        "--scaled-objects",
-        default=None,
-        help=argparse.SUPPRESS,
-    )
     parser.add_argument("--output-base-link", default="torso_link",
                         help="Robot body link used for saved base_pos_w/base_quat_w.")
     parser.add_argument("--replace-cylinders-with-capsules", dest="replace_cylinders_with_capsules", action="store_true", default=False,
@@ -162,7 +162,7 @@ def main():
     if sum(value is not None for value in source_inputs) != 1:
         parser.error(
             "provide exactly one of --source-config, --source-motion, or "
-            "--smplx_motion"
+            "--smplx-motion"
         )
     if args.source_type is not None and args.source_motion is None:
         parser.error("--source-type is only valid with --source-motion")
@@ -173,6 +173,8 @@ def main():
         source_config = load_source_config(args.source_config)
     elif args.source_motion:
         source_config = direct_source_config(args.source_motion, args.source_type)
+        if args.smplx_model_dir is not None:
+            source_config["model_directory"] = args.smplx_model_dir
     else:
         source_config = None
 
@@ -187,6 +189,8 @@ def main():
     robot_config = {}
     if args.robot_config:
         robot_config_path = Path(args.robot_config)
+        if not robot_config_path.exists() and args.robot_config == DEFAULT_ROBOT_CONFIG_PATH:
+            robot_config_path = REPO_ROOT / DEFAULT_ROBOT_CONFIG_PATH
         if robot_config_path.exists():
             robot_config = load_robot_config(robot_config_path)
             profile_name = robot_config.get("name", robot_config_path.stem)
@@ -487,6 +491,10 @@ def main():
             retargeting=retargeting,
         )
         retargeter._production_started = production_started
+        if args.solver is None and "enabled" not in (
+            retargeting.get("sequence_solver") or {}
+        ):
+            args.solver = DEFAULT_SOLVER
         if args.solver is not None:
             sequence = retargeter.retargeting_config.setdefault("sequence_solver", {})
             sequence["enabled"] = args.solver in ("sequence", "mink", "fast")

@@ -13,6 +13,7 @@ import numpy as np
 
 from omniretargeting.robot_config import load_robot_config
 from omniretargeting.utils import load_robot_urdf_with_floating_base, resolve_robot_height
+from omniretargeting.data_sources.smplx_paths import smplx_model_search_paths
 
 
 SMPLX_JOINT_NAMES = [
@@ -129,11 +130,7 @@ def _build_default_smplx_pose(pelvis_position: np.ndarray, robot_height: float |
     return pelvis_position[None, :] + DEFAULT_SMPLX_OFFSETS * scale
 
 
-SMPLX_MODEL_SEARCH_PATHS = [
-    "/localhdd/Datasets/smplx",
-    "/localhdd/Datasets/",
-    "data/body_models/smplx",
-]
+SMPLX_MODEL_SEARCH_PATHS = smplx_model_search_paths()
 
 
 def _load_smplx_joints_from_betas(

@@ -1,5 +1,5 @@
 <mujoco model="g1_29dof_torsobase_original_mesh_collision_trial">
-  <compiler angle="radian" meshdir="/home/duanxin/Xyk/Project-Instinct/InstinctMJ/src/instinct_mj/assets/resources/unitree_g1/meshes" autolimits="true" discardvisual="false" />
+  <compiler angle="radian" meshdir="meshes" autolimits="true" discardvisual="false" />
   <default>
     <joint damping="0.5" armature="0.01" frictionloss="0.1" />
     <geom group="3" contype="1" conaffinity="1" />
@@ -25,7 +25,7 @@
     <mesh name="waist_roll_link" file="waist_roll_link_rev_1_0.STL" />
     <mesh name="torso_link" file="torso_link_rev_1_0.STL" />
     <mesh name="logo_link" file="logo_link.STL" />
-    <mesh name="head_link" file="head_link.STL" />
+    <mesh name="head_link" file="head_link_torsobase.STL" />
     <mesh name="left_shoulder_pitch_link" file="left_shoulder_pitch_link.STL" />
     <mesh name="left_shoulder_roll_link" file="left_shoulder_roll_link.STL" />
     <mesh name="left_shoulder_yaw_link" file="left_shoulder_yaw_link.STL" />

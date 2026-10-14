@@ -261,3 +261,14 @@ def test_start_frame_skip():
         assert md.positions.shape[0] == 2  # 3 total - 1 skipped = 2
     finally:
         os.unlink(path)
+
+
+def test_bvh_adapters_read_start_frame_from_source_config():
+    from pathlib import Path
+    from omniretargeting.data_sources.bones_seed import create_bones_seed_data_source
+    from omniretargeting.data_sources.lafan1 import create_lafan1_data_source
+    from omniretargeting.data_sources.nokov import create_nokov_data_source
+
+    for factory in (create_nokov_data_source, create_lafan1_data_source, create_bones_seed_data_source):
+        assert factory(Path("clip.bvh"), {"start_frame": 4}).start_frame == 4
+        assert factory(Path("clip.bvh"), {"start_frame": 4}, {"start_frame": 2}).start_frame == 2

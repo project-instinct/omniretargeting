@@ -2,11 +2,13 @@
 
 One command for any adapter config (SMPL-X/HER video, OMOMO, TRUMANS, ...):
 
-    .venv/bin/python scripts/retarget_and_audit.py --source source.json \
+    .venv/bin/python scripts/retarget_and_audit.py --source source.yaml \
         --out /path/on/data/disk/run --source-denoise auto --record
 
-``--source`` is the adapter config passed to ``omniretargeting.main
---source-config``. The run directory keeps every file the standard audits and
+``--source`` is either an adapter config (YAML/JSON, as for ``omniretargeting.main
+--source-config``) or a motion file whose adapter is inferred (.pkl=parc_ms,
+.npz=smplx; pass ``--source-type`` otherwise, and ``--smplx-model-dir`` for raw
+SMPL-X). The run directory keeps every file the standard audits and
 ``scripts/review_webviser.py`` read (prepared.npy, fixed_reference.npz,
 fast_report.json, timing.json, ...). Audits only read the saved motion; they are
 never used to re-solve. Write outputs to the data disk, not the system disk.
@@ -42,8 +44,26 @@ def child_env():
     return env
 
 
+CONFIG_SUFFIXES = {".yaml", ".yml", ".json"}
+
+
+def source_config(args):
+    """Adapter config for ``--source``: a YAML/JSON config or a motion file."""
+    from omniretargeting.source_config import direct_source_config, load_source_config
+
+    if args.source.suffix.casefold() in CONFIG_SUFFIXES:
+        if args.source_type is not None:
+            raise SystemExit("--source-type is only valid when --source is a motion file")
+        config = dict(load_source_config(args.source))
+    else:
+        config = direct_source_config(args.source, args.source_type)
+    if args.smplx_model_dir is not None:
+        config["model_directory"] = str(Path(args.smplx_model_dir).resolve())
+    return config
+
+
 def solve(args):
-    config = json.loads(Path(args.source).read_text())
+    config = source_config(args)
     capture_run(config, args.out, args.robot_config, source_root=ROOT, extra_argv=solver_argv(args))
 
 
@@ -58,7 +78,10 @@ def record(out, python, env):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--source", type=Path, required=True, help="adapter config JSON (--source-config)")
+    parser.add_argument("--source", type=Path, required=True,
+                        help="adapter config (YAML/JSON) or motion file (.pkl, .npz, ...)")
+    parser.add_argument("--source-type", default=None, help="adapter for a motion file whose format is ambiguous")
+    parser.add_argument("--smplx-model-dir", default=None, help="SMPL-X model directory for raw SMPL-X sources")
     parser.add_argument("--out", type=Path, required=True, help="new run directory (must not exist)")
     parser.add_argument("--robot-config", type=Path, default=DEFAULT_PROFILE)
     parser.add_argument("--source-denoise", choices=["off", "auto"], default=None,
@@ -81,6 +104,10 @@ def main(argv=None):
                  "--robot-config", str(Path(args.robot_config).resolve())]
     if args.source_denoise is not None:
         forwarded += ["--source-denoise", args.source_denoise]
+    if args.source_type is not None:
+        forwarded += ["--source-type", args.source_type]
+    if args.smplx_model_dir is not None:
+        forwarded += ["--smplx-model-dir", str(Path(args.smplx_model_dir).resolve())]
     args.out.parent.mkdir(parents=True, exist_ok=True)
     log = args.out.with_name(args.out.name + ".solve.log")
     with log.open("w") as handle:

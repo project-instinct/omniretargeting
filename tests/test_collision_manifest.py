@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import mujoco
+import pytest
 
 from omniretargeting.collision_manifest import (
     collision_manifest,
@@ -43,7 +44,7 @@ def test_collision_geometry_changes_change_hash():
 
 
 def test_structural_contact_excludes_change_hash_without_changing_geoms():
-    xml = MESH_MODEL.read_text()
+    xml = MESH_MODEL.read_text().replace('meshdir="meshes"', f'meshdir="{MESH_MODEL.parent / "meshes"}"')
     for first, second in [('torso_link', 'waist_yaw_link'),
                           ('left_knee_link', 'left_ankle_roll_link'),
                           ('right_knee_link', 'right_ankle_roll_link')]:
@@ -77,3 +78,21 @@ def test_popsicle_and_mesh_models_have_different_manifest_summaries():
         "mjGEOM_MESH": {"first": 35, "second": 0, "delta": -35},
         "mjGEOM_SPHERE": {"first": 0, "second": 1, "delta": 1},
     }
+
+
+def test_mesh_model_build_reproduces_the_committed_model(tmp_path):
+    import shutil
+    from scripts import build_g1_mesh_collision_model as build
+
+    try:
+        source = Path(load_robot_config(build.SOURCE_PROFILE)["urdf_path"])
+    except FileNotFoundError:
+        pytest.skip("InstinctMJ torso-base G1 model not available")
+    if not source.exists():
+        pytest.skip("InstinctMJ torso-base G1 model not available")
+    shutil.copytree(MESH_MODEL.parent / "meshes", tmp_path / "meshes")
+    for _ in range(2):  # a rebuild over its own output is a no-op
+        model = build.build(tmp_path)
+        assert model.read_text() == MESH_MODEL.read_text()
+    for mesh in (tmp_path / "meshes").iterdir():
+        assert mesh.read_bytes() == (MESH_MODEL.parent / "meshes" / mesh.name).read_bytes(), mesh.name

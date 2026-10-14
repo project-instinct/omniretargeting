@@ -300,8 +300,8 @@ class SmplxDataSource(DataSource):
             return None
 
         import os
-        search_paths = [self.model_directory] if self.model_directory else []
-        search_paths.extend(["/localhdd/Datasets/smplx", "/localhdd/Datasets/", "data/body_models/smplx"])
+        from .smplx_paths import smplx_model_search_paths
+        search_paths = smplx_model_search_paths(self.model_directory)
         model_path = next((p for p in search_paths if p and os.path.exists(p)), None)
         if model_path is None:
             return None

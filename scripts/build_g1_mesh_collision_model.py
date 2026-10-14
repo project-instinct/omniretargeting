@@ -22,6 +22,12 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE_PROFILE = ROOT / "robot_models/unitree_g1/unitree_g1_instinctmj.json"
 MODEL_NAME = "g1_29dof_torsobase_mesh.xml"
 PROFILE_NAME = "unitree_g1_mesh.json"
+# Hull pairs that overlap in the default pose and in every seeded joint-limit sample.
+STRUCTURAL_OVERLAP_NOTE = (" Default + 64 seed-0 joint-limit samples overlap 65/65:\n"
+                           "         minimum depths (mm): torso/waist_yaw 12.688, L/R knee/ankle_roll 17.026/17.033. ")
+STRUCTURAL_OVERLAP_EXCLUDES = (("torso_link", "waist_yaw_link"),
+                               ("left_knee_link", "left_ankle_roll_link"),
+                               ("right_knee_link", "right_ankle_roll_link"))
 
 
 def build(output_dir):
@@ -30,7 +36,8 @@ def build(output_dir):
     root = tree.getroot()
     root.set("model", "g1_29dof_torsobase_original_mesh_collision_trial")
     compiler = root.find("compiler")
-    compiler.set("meshdir", str((source.parent / compiler.get("meshdir", ".")).resolve()))
+    vendor_meshes(root, (source.parent / compiler.get("meshdir", ".")).resolve(), output_dir / "meshes")
+    compiler.set("meshdir", "meshes")
     option = root.find("option")
     if option is None:
         option = ET.SubElement(root, "option")
@@ -50,16 +57,38 @@ def build(output_dir):
                 collider.set("group", "3")
                 collider.set("density", "0")
                 body.append(collider)
+    contact = root.find("contact")
+    if contact is None:
+        contact = ET.SubElement(root, "contact")
+    contact.append(ET.Comment(STRUCTURAL_OVERLAP_NOTE))
+    for body1, body2 in STRUCTURAL_OVERLAP_EXCLUDES:
+        ET.SubElement(contact, "exclude", body1=body1, body2=body2)
     output_dir.mkdir(parents=True, exist_ok=True)
     model_path = output_dir / MODEL_NAME
     ET.indent(tree, space="  ")
-    tree.write(model_path, encoding="unicode")
+    model_path.write_text(ET.tostring(root, encoding="unicode") + "\n")
     profile = json.loads(SOURCE_PROFILE.read_text())
     profile["name"] = "unitree_g1_torso_base_original_mesh_collision_trial"
     profile["urdf_path"] = MODEL_NAME
     (output_dir / PROFILE_NAME).write_text(json.dumps(profile, indent=2) + "\n")
     check_kinematics(source, model_path)
     return model_path
+
+
+def vendor_meshes(root, source_dir, mesh_dir):
+    """Point every mesh at the repository copy; a differing source STL is vendored as ``*_torsobase``."""
+    mesh_dir.mkdir(parents=True, exist_ok=True)
+    for mesh in root.find("asset").iter("mesh"):
+        name = Path(mesh.get("file"))
+        data = (source_dir / name).read_bytes()
+        target = mesh_dir / name
+        if target.exists() and target.read_bytes() != data:
+            target = mesh_dir / f"{name.stem}_torsobase{name.suffix}"
+            if target.exists() and target.read_bytes() != data:
+                raise RuntimeError(f"{target} exists with different bytes than {source_dir / name}")
+        if not target.exists():
+            target.write_bytes(data)
+        mesh.set("file", target.name)
 
 
 def check_kinematics(source, model_path):

@@ -1,11 +1,12 @@
 # Bones-Seed (SOMA uniform) BVH Data Source Configuration Template
 #
-# Usage:
-#   python -m omniretargeting.main \
-#     --robot-config robot_models/unitree_g1/unitree_g1.json \
-#     --source-config config_templates/bones_seed_template.yaml \
-#     --output output.npz \
-#     --save-video output.mp4
+# Usage (solve + audit in one command):
+#   .venv/bin/python scripts/retarget_and_audit.py --source config_templates/bones_seed_template.yaml \
+#     --out /path/to/run_dir
+# Or solve only:
+#   .venv/bin/python -m omniretargeting.main \
+#     --source-config config_templates/bones_seed_template.yaml --output output.npz
+# The robot profile defaults to robot_models/unitree_g1/unitree_g1_mesh.json and the solver to fast.
 
 # Required: Data source type
 type: bones_seed
@@ -16,5 +17,3 @@ motion: /path/to/bones_seed/motion.bvh
 # Optional: Path to terrain mesh file
 # terrain: /path/to/terrain.obj
 
-# Optional: Framerate override (default: auto-detected from BVH, typically 120 fps)
-# framerate: 30.0

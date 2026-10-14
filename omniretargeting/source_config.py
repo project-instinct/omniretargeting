@@ -13,6 +13,25 @@ import yaml
 from scipy.spatial.transform import Rotation
 
 
+# Path-valued keys besides ``motion``; relative values are relative to the config file.
+PATH_KEYS = ("terrain", "model_directory", "data_root")
+
+
+def absolute_source_paths(config, base=None):
+    """Return ``config`` with relative input paths anchored at ``base`` (default: CWD).
+
+    Use before writing a generated config elsewhere: a saved config resolves
+    relative paths against its own directory.
+    """
+    base = Path.cwd() if base is None else Path(base)
+    resolved = dict(config)
+    for key in ("motion", *PATH_KEYS):
+        if resolved.get(key) and isinstance(resolved[key], (str, os.PathLike)):
+            value = Path(os.path.expandvars(os.path.expanduser(str(resolved[key]))))
+            resolved[key] = str(value if value.is_absolute() else (base / value).resolve())
+    return resolved
+
+
 def load_source_config(config_path):
     """Read a generic motion-source YAML/JSON config and resolve input paths."""
     path = Path(config_path)
@@ -35,8 +54,9 @@ def load_source_config(config_path):
 
     resolved = dict(config)
     resolved["motion"] = str(resolve_input(motion_path))
-    if config.get("terrain"):
-        resolved["terrain"] = str(resolve_input(config["terrain"]))
+    for key in PATH_KEYS:
+        if config.get(key):
+            resolved[key] = str(resolve_input(config[key]))
     return resolved
 
 

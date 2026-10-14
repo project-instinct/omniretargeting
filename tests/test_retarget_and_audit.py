@@ -54,3 +54,28 @@ def test_end_to_end_solve_keeps_audit_inputs(tmp_path):
     assert report["deadline"]["expired"] is False
     invocation = json.loads((out / "invocation.json").read_text())
     assert invocation["argv"][-2:] == ["--source-denoise", "auto"]
+
+
+def _source_args(source, **overrides):
+    return argparse.Namespace(**{"source": Path(source), "source_type": None, "smplx_model_dir": None,
+                                 **overrides})
+
+
+def test_source_accepts_yaml_config_with_relative_paths(tmp_path):
+    (tmp_path / "clip.bvh").write_text("")
+    config = tmp_path / "source.yaml"
+    config.write_text("type: nokov\nmotion: clip.bvh\nstart_frame: 3\n")
+    loaded = retarget_and_audit.source_config(_source_args(config))
+    assert loaded["type"] == "nokov" and loaded["start_frame"] == 3
+    assert Path(loaded["motion"]) == (tmp_path / "clip.bvh").resolve()
+    json.dumps(loaded)
+
+
+def test_source_accepts_motion_file_with_inferred_or_explicit_adapter(tmp_path):
+    motion = tmp_path / "clip.npz"
+    loaded = retarget_and_audit.source_config(_source_args(motion, smplx_model_dir=str(tmp_path)))
+    assert loaded == {"type": "smplx", "motion": str(motion.resolve()), "model_directory": str(tmp_path.resolve())}
+    bvh = retarget_and_audit.source_config(_source_args(tmp_path / "clip.bvh", source_type="lafan1"))
+    assert bvh["type"] == "lafan1"
+    with pytest.raises(SystemExit):
+        retarget_and_audit.source_config(_source_args(tmp_path / "source.json", source_type="smplx"))

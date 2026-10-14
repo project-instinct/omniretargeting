@@ -2,13 +2,13 @@
 Batch processing script for OmniRetargeting.
 
 Scans a folder of motion files, writes per-motion source configs,
-and executes main.py for each file with scaled terrain and video export.
+and executes main.py for each file with video export (scene scale stays 1.0).
 
 Usage:
     python -m omniretargeting.batch \
         --source-folder /path/to/motions \
         --source-type smplx \
-        --robot-config robot_models/unitree_g1/unitree_g1.json \
+        --robot-config robot_models/unitree_g1/unitree_g1_mesh.json \
         --output-dir /tmp/batch_output \
         --model-dir /path/to/smplx/models
 """
@@ -28,6 +28,7 @@ from pathlib import Path
 import yaml
 
 from omniretargeting.data_sources.registry import get_source_extensions
+from omniretargeting.source_config import absolute_source_paths
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -97,6 +98,7 @@ def write_source_config(
         config["terrain"] = terrain_path
     if extra_options:
         config.update(extra_options)
+    config = absolute_source_paths(config)
 
     configs_dir = output_dir / "configs" / (rel_subdir or "")
     configs_dir.mkdir(parents=True, exist_ok=True)
@@ -260,8 +262,6 @@ def _build_command(
         "--robot-config", robot_config_path,
         "--source-config", str(source_config_path),
         "--output", str(motion_dir / f"{motion_stem}_retargeted.npz"),
-        "--output-scaled-terrain", str(motion_dir / f"{motion_stem}_scaled_terrain.obj"),
-        "--scaled-objects", str(motion_dir / f"{motion_stem}_scaled_objects"),
     ]
     if save_video:
         cmd.extend(["--save-video", str(motion_dir / f"{motion_stem}_retargeted.mp4")])
@@ -600,8 +600,8 @@ def main() -> None:
                         help="Folder containing motion files to process")
     parser.add_argument("--source-type", required=True,
                         help="Type of motion data source (e.g. smplx, lafan1, nokov, omomo, bones_seed)")
-    parser.add_argument("--robot-config", required=True,
-                        help="Path to robot configuration JSON file")
+    parser.add_argument("--robot-config", default="robot_models/unitree_g1/unitree_g1_mesh.json",
+                        help="Path to robot configuration JSON file (default: G1 mesh-collision profile)")
     parser.add_argument("--output-dir", required=True,
                         help="Directory to save batch outputs")
     parser.add_argument("--model-dir", default=None,

@@ -84,18 +84,13 @@ class OmomoDataSource(DataSource):
         return str(value)
 
     def _resolve_model_directory(self) -> str:
-        search_paths = [
-            self.model_directory,
-            "/localhdd/Datasets/smplx",
-            "/localhdd/Datasets",
-            "data/body_models/smplx",
-        ]
-        for candidate in search_paths:
+        from .smplx_paths import smplx_model_search_paths
+        for candidate in smplx_model_search_paths(self.model_directory):
             if candidate and Path(candidate).exists():
                 return str(candidate)
         raise FileNotFoundError(
             "Could not locate SMPL-X model directory for OMOMO. "
-            "Provide model_directory or install the models under /localhdd/Datasets/smplx or /localhdd/Datasets."
+            "Provide model_directory, set OMNIRETARGETING_SMPLX_MODELS, or install the models under assets/body_models."
         )
 
     def _sample_object_points(self) -> np.ndarray:
@@ -256,7 +251,8 @@ def create_omomo_data_source(motion_file, source_config, runtime_options):
         return default
 
     sequence_index = int(option("sequence_index", default=0))
-    data_root = option("data_root", default="/localhdd/Datasets/OMOMO")
+    # OMOMO sequence files live in <data_root>/data/, next to captured_objects/.
+    data_root = option("data_root", default=str(Path(motion_file).resolve().parent.parent))
     n_object_samples = int(option("n_object_samples", default=100))
     target_names_override = option("target_names_override")
     model_directory = option("model_directory")

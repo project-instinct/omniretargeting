@@ -4,12 +4,13 @@
 # BVH files contain skeleton hierarchy, bone names, and per-frame
 # joint rotations/positions.
 #
-# Usage:
-#   python -m omniretargeting.main \
-#     --robot-config robot_models/unitree_g1/unitree_g1_lafan1.json \
-#     --source-config config_templates/lafan1_template.yaml \
-#     --output output.npz \
-#     --save-video output.mp4
+# Usage (solve + audit in one command):
+#   .venv/bin/python scripts/retarget_and_audit.py --source config_templates/lafan1_template.yaml \
+#     --robot-config robot_models/unitree_g1/unitree_g1_lafan1.json --out /path/to/run_dir
+# Or solve only:
+#   .venv/bin/python -m omniretargeting.main --source-config config_templates/lafan1_template.yaml \
+#     --robot-config robot_models/unitree_g1/unitree_g1_lafan1.json --output output.npz
+# LAFAN1 needs its own G1 profile (bone names and T-pose); the solver defaults to fast.
 
 # Required: Data source type
 type: lafan1
@@ -21,8 +22,6 @@ motion: /path/to/lafan1/motion.bvh
 # If not specified, a flat ground plane will be used
 # terrain: /path/to/terrain.obj
 
-# Optional: Framerate override (default: auto-detected from BVH "Frame Time")
-# framerate: 30.0
 
 # Notes:
 # - BVH files from LAFAN1 use Y-up coordinate system (converted to Z-up automatically)

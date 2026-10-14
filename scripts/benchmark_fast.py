@@ -3,6 +3,11 @@
 Use --prepare to freeze HEAD and create a manifest. --run-dir selects that run;
 --arm A uses the frozen baseline, other arms require an explicit source root.
 Normal timing and --trace are separate output trees. Audits never auto-resolve.
+
+Dataset locations (read by --prepare; relative paths are taken from the CWD):
+OMNIRETARGETING_TRUMANS_ROOT (TRUMANS Data_release), OMNIRETARGETING_OMOMO_ROOT
+(OMOMO root containing data/) and OMNIRETARGETING_SMPLX_MODELS (SMPL-X models,
+default assets/body_models).
 """
 from __future__ import annotations
 
@@ -54,13 +59,17 @@ def command_output(args):
 
 
 def source_config(clip):
+    """Benchmark clip config; dataset roots can be moved with environment variables."""
+    body_models = str(Path(os.environ.get("OMNIRETARGETING_SMPLX_MODELS", ROOT / "assets/body_models")).resolve())
     if clip in TRUMANS:
         segment, first, stop = TRUMANS[clip]
-        return dict(type="trumans", motion="/home/duanxin/Xyk/TRUMANS/Data_release", segment=segment,
-                    frame_start=first, frame_stop=stop, model_directory=str(ROOT / "assets/body_models"))
-    return dict(type="omomo", motion="/home/duanxin/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p",
-                sequence_index=int(clip.split("_")[1]), data_root="/home/duanxin/Datasets/OMOMO",
-                model_directory=str(ROOT / "assets/body_models"), framerate=30.0)
+        return dict(type="trumans", motion=os.environ.get("OMNIRETARGETING_TRUMANS_ROOT",
+                                                          "/home/duanxin/Xyk/TRUMANS/Data_release"),
+                    segment=segment, frame_start=first, frame_stop=stop, model_directory=body_models)
+    omomo = Path(os.environ.get("OMNIRETARGETING_OMOMO_ROOT", "/home/duanxin/Datasets/OMOMO"))
+    return dict(type="omomo", motion=str(omomo / "data/test_diffusion_manip_seq_joints24.p"),
+                sequence_index=int(clip.split("_")[1]), data_root=str(omomo),
+                model_directory=body_models, framerate=30.0)
 
 
 def prepare(args):
@@ -133,6 +142,8 @@ def capture_run(config, output, profile, *, source_root=ROOT, extra_argv=(), che
 
     out = Path(output).resolve()
     out.mkdir(parents=True, exist_ok=False)
+    from omniretargeting.source_config import absolute_source_paths
+    config = absolute_source_paths(config)
     save(out / "source.json", config)
     profile = Path(profile).resolve()
     model_path = load_robot_config(profile)["urdf_path"]

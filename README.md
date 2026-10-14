@@ -212,36 +212,36 @@ retargeter = OmniRetargeter(
 
 ### Robot Profile Config (Per-Humanoid)
 
-You can keep one JSON profile per humanoid robot (for example under `robot_models/<robot_name>/`) and feed it to the CLI:
+You can keep one JSON profile per humanoid robot (for example under `robot_models/<robot_name>/`) and feed it to the CLI.
+`--robot-config` defaults to `robot_models/unitree_g1/unitree_g1_mesh.json`, the
+collision-model contract shared by solving, audits and training, and `--solver`
+defaults to `fast` (the production solver). The robot model path is the profile's
+`urdf_path` (the CLI does not accept a separate URDF argument).
 
-```bash
-python -m omniretargeting.main \
-  --robot-config robot_models/unitree_g1/unitree_g1.json \
-  --smplx_model_dir /path/to/smplx/models \
-  --smplx_motion /path/to/motion.npz \
-  --terrain /path/to/terrain.obj \
-  --output /path/to/output.npz \
-  --output-scaled-terrain /path/to/scaled-terrain.obj
-```
-
-`--robot-config` defaults to `robot_models/unitree_g1/unitree_g1.json`. The robot URDF path must be set as `urdf_path` in that JSON profile (the CLI does not accept a separate URDF argument).
-
-Dataset clips can be passed directly; a separate source JSON is unnecessary
+Dataset clips can be passed directly; a separate source config is unnecessary
 for common unambiguous formats:
 
 ```bash
-python -m omniretargeting.main \
+.venv/bin/python -m omniretargeting.main \
   --source-motion /path/to/parc_ms_clip.pkl \
-  --robot-config robot_models/unitree_g1/unitree_g1_instinctmj.json \
   --output /path/to/retargeted.npz
 ```
 
-One command solves and audits a source (any adapter config), keeping every file
-the audits and the web viewer read; write the run directory to the data disk:
+Raw SMPL-X needs its model directory, and an optional scene mesh:
 
 ```bash
-.venv/bin/python scripts/retarget_and_audit.py --source source.json \
-    --out /home/duanxin/DataHHD/<project>/out/<run> --source-denoise auto --record
+.venv/bin/python -m omniretargeting.main \
+  --source-motion /path/to/motion.npz --smplx-model-dir /path/to/smplx/models \
+  --terrain /path/to/terrain.obj --output /path/to/output.npz
+```
+
+One command solves and audits a source, keeping every file the audits and the
+web viewer read. `--source` is a source config (YAML/JSON, see
+[config_templates](config_templates/README.md)) or a motion file:
+
+```bash
+.venv/bin/python scripts/retarget_and_audit.py --source source.yaml \
+    --out /path/to/run_dir --source-denoise auto --record
 ```
 
 `--source-denoise {off,auto}` defaults to `off`. For noisy video-estimated
@@ -257,8 +257,10 @@ unchanged. See [source denoising](docs/source_denoise.md) for thresholds and lim
 
 The CLI infers `.pkl` as `parc_ms` and `.npz` as `smplx`. For an ambiguous
 format such as BVH, add one adapter name, for example
-`--source-type lafan1`; source JSON remains available only for real per-source
-overrides.
+`--source-type lafan1`; a source config is only needed for real per-source
+facts (dataset index, scene, frame window). `--smplx-motion` is the legacy
+direct SMPL-X path; underscore spellings (`--smplx_motion`,
+`--smplx_model_dir`) remain accepted.
 
 ### Batch scheduling
 

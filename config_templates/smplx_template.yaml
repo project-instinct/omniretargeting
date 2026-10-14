@@ -4,12 +4,13 @@
 # Supports both raw SMPL-X parameters (.npz with betas, pose_body, etc.)
 # and processed joint positions (.npz with global_joint_positions).
 #
-# Usage:
-#   python -m omniretargeting.main \\
-#     --robot-config robot_models/unitree_g1/unitree_g1.json \\
-#     --source-config config_templates/smplx_template.yaml \\
-#     --output output.npz \\
-#     --save-video output.mp4
+# Usage (solve + audit in one command):
+#   .venv/bin/python scripts/retarget_and_audit.py --source config_templates/smplx_template.yaml \
+#     --out /path/to/run_dir
+# Or solve only:
+#   .venv/bin/python -m omniretargeting.main \
+#     --source-config config_templates/smplx_template.yaml --output output.npz
+# The robot profile defaults to robot_models/unitree_g1/unitree_g1_mesh.json and the solver to fast.
 
 # Required: Data source type
 type: smplx
@@ -19,17 +20,16 @@ type: smplx
 #   - .npz with raw SMPL-X parameters (betas, pose_body, root_orient, trans)
 #   - .npz with processed joint positions (global_joint_positions)
 #   - .npy with joint positions only (no orientations)
-motion: tests/resources/amass/wall_flip_smplx_amass.npz
+motion: ../tests/resources/amass/wall_flip_smplx_amass.npz
 
 # Required (for raw .npz): Path to SMPL-X model directory
 # Should contain SMPLX_{gender}.pkl files
-# Common locations: /localhdd/Datasets/smplx, /localhdd/Datasets/, data/body_models/smplx
-model_directory: /localhdd/Datasets/smplx
+model_directory: /path/to/smplx/models
 
 # Optional: Path to terrain mesh file
 # If not specified, a flat ground plane will be used
 # For wall_flip motion, use the corresponding scene mesh
-terrain: tests/resources/terrain/wall_flip_scene.obj
+terrain: ../tests/resources/terrain/wall_flip_scene.obj
 
 # Optional: Gender for SMPL-X model (default: "neutral")
 # Options: "neutral", "male", "female"
@@ -66,8 +66,6 @@ gender: neutral
 #   - L_Wrist
 #   - R_Wrist
 
-# Optional: Framerate override (default: auto-detected or 30.0)
-# framerate: 30.0
 
 # Notes:
 # - For raw .npz files, model_directory is required to run SMPL-X forward kinematics

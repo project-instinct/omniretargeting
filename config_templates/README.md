@@ -1,137 +1,73 @@
 # Source Configuration Templates
 
-This directory contains template YAML files for different motion data sources supported by OmniRetargeting.
+A source config is a small YAML/JSON file that names one motion and the dataset
+facts needed to load it. Solver policy is not configured here: it comes from the
+shared defaults (`omniretargeting/retargeting_defaults.py`) and the robot profile.
 
-## Overview
+## Quick start
 
-Instead of passing multiple command-line arguments, you create a YAML configuration file that specifies:
-- The data source type (OMOMO, SMPL-X, etc.)
-- Path to the motion file
-- All source-specific parameters
-
-## Available Templates
-
-### 1. OMOMO (Object Manipulation)
-**File:** `omomo_template.yaml`
-
-For OMOMO dataset sequences with object manipulation. Includes object mesh loading and 6D pose tracking.
-
-**Key parameters:**
-- `type: omomo`
-- `motion`: Path to .p sequence file
-- `sequence_index`: Which sequence to load
-- `data_root`: OMOMO dataset root directory
-- `n_object_samples`: Number of points to sample from object mesh
-
-**Example:**
-```yaml
-type: omomo
-motion: /localhdd/Datasets/OMOMO/data/test_diffusion_manip_seq_joints24.p
-sequence_index: 318
-data_root: /localhdd/Datasets/OMOMO
-n_object_samples: 100
-```
-
-### 2. SMPL-X (Parametric Body Model)
-**File:** `smplx_template.yaml`
-
-For SMPL-X motion data with 22 body joints. Supports both raw parameters and processed joint positions.
-
-**Key parameters:**
-- `type: smplx`
-- `motion`: Path to .npz or .npy file
-- `model_directory`: Path to SMPL-X model files
-- `gender`: "neutral", "male", or "female"
-- `betas`: Shape parameters (10 values)
-
-**Example:**
-```yaml
-type: smplx
-motion: /path/to/motion.npz
-model_directory: /localhdd/Datasets/smplx
-gender: neutral
-betas: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-```
-
-## Usage
-
-### Basic Usage
 ```bash
-python -m omniretargeting.main \
-  --robot-config robot_models/unitree_g1/unitree_g1.json \
-  --source-config config_templates/omomo_template.yaml \
-  --output output.npz
+# Solve with the production fast solver and run the standard audits once.
+.venv/bin/python scripts/retarget_and_audit.py \
+  --source config_templates/omomo_template.yaml --out /path/to/run_dir
+
+# Solve only.
+.venv/bin/python -m omniretargeting.main \
+  --source-config config_templates/omomo_template.yaml --output output.npz
 ```
 
-### With Video and Scaled Outputs
-```bash
-python -m omniretargeting.main \
-  --robot-config robot_models/unitree_g1/unitree_g1.json \
-  --source-config my_config.yaml \
-  --output output.npz \
-  --save-video output.mp4 \
-  --output-scaled-terrain scaled_terrain.obj \
-  --scaled-objects scaled_objects/
-```
+Both entry points default to `robot_models/unitree_g1/unitree_g1_mesh.json`
+(the collision-model contract) and the `fast` solver. Common motion files need
+no config at all: pass `--source-motion clip.pkl` (or `--source clip.npz` to the
+one-command entry); `.pkl` is read as `parc_ms` and `.npz` as `smplx`. Use
+`--source-type` for ambiguous formats such as BVH and `--smplx-model-dir` for
+raw SMPL-X.
 
-### Output Options
+## Keys
 
-- `--output`: Required. Path to save retargeted motion (.npz)
-- `--save-video`: Optional. Path to save visualization video (.mp4)
-- `--output-scaled-terrain`: Optional. Path to save scaled terrain mesh (.obj)
-- `--scaled-objects`: Optional. Directory to save scaled object meshes and pose trajectories
+| Key | Adapters | Meaning |
+| - | - | - |
+| `type` | all (required) | adapter name: `smplx`, `omomo`, `trumans`, `parc_ms`, `lafan1`, `nokov`, `bones_seed` |
+| `motion` | all (required) | motion file (TRUMANS: the `Data_release` directory) |
+| `terrain` | all | static scene mesh; flat ground when omitted |
+| `model_directory` | `smplx`, `omomo`, `trumans` | SMPL-X model files (`SMPLX_{gender}.pkl`) |
+| `gender`, `betas` | `smplx` | body model gender (default `neutral`) and shape (default: from the motion file) |
+| `target_names_override` | `smplx`, `omomo` | source joint names when the file uses a non-default skeleton |
+| `sequence_index`, `n_object_samples` | `omomo` | sequence in the `.p` file; object surface samples |
+| `framerate` | `omomo`, `trumans` | dataset frame rate (default 30); other adapters read it from the file |
+| `data_root` | `omomo`, `trumans` | dataset root (OMOMO default: two levels above `motion`) |
+| `segment`, `frame_start`, `frame_stop` | `trumans` | recording segment and frame window |
+| `start_frame` | `lafan1`, `nokov`, `bones_seed` | skip leading BVH frames |
+| `source_denoise` | `smplx`, `omomo`, `trumans` | `off` (default) or `auto`, same as `--source-denoise` |
+| `joint_mapping`, `base_orientation` | all | per-source override of the robot profile |
 
-When `--scaled-objects` is specified, the following files are created:
-- `{object_name}.obj`: Scaled object mesh
-- `{object_name}_poses.json`: Per-frame object poses (translation, rotation, scale)
+Relative paths (`motion`, `terrain`, `model_directory`, `data_root`) are
+resolved against the directory of the config file; `~` and `${VAR}` are
+expanded.
 
-## Creating Your Own Config
+## Templates
 
-1. Copy the appropriate template file
-2. Update the paths and parameters for your data
-3. Save with a descriptive name (e.g., `my_floorlamp_motion.yaml`)
-4. Use with `--source-config` flag
+| File | Source |
+| - | - |
+| `smplx_template.yaml` | SMPL-X / AMASS `.npz` (raw parameters or joint positions) |
+| `omomo_template.yaml`, `omomo_floorlamp_example.yaml` | OMOMO human-object sequences |
+| `lafan1_template.yaml` | LAFAN1 BVH (use `robot_models/unitree_g1/unitree_g1_lafan1.json`) |
+| `nokov_template.yaml` | Nokov BVH (pass `--mapping` for its bone names) |
+| `bones_seed_template.yaml` | Bones-Seed SOMA BVH |
 
-**Example workflow:**
-```bash
-# Copy template
-cp config_templates/omomo_template.yaml my_motion.yaml
+## Outputs
 
-# Edit with your paths
-vim my_motion.yaml
+- `--output`: retargeted motion (`*_retargeted.npz`, with contact tasks and
+  `collision_model_sha256`).
+- `--save-video`: optional offscreen render (`MUJOCO_GL=egl` when headless).
+- The one-command entry also writes the audit inputs and reports into `--out`.
 
-# Run retargeting
-python -m omniretargeting.main \
-  --robot-config robot_models/unitree_g1/unitree_g1.json \
-  --source-config my_motion.yaml \
-  --output results/output.npz \
-  --save-video results/output.mp4 \
-  --scaled-objects results/objects/
-```
+Scenes and objects keep `scale=1.0`. `--output-scaled-terrain` enables terrain
+scaling and is only for explicit experiments.
 
-## Common Parameters
+## Adding a data source
 
-All source configs support these optional parameters:
-
-- `framerate`: Override motion framerate (default: auto-detected or 30.0)
-
-## Adding New Data Sources
-
-To add support for a new data source:
-
-1. Create a new adapter in `omniretargeting/data_sources/`
-2. Register it with `register_data_source()`
-3. Create a template YAML in this directory
-4. Document the parameters in the template file
-
-See `omniretargeting/data_sources/omomo.py` for a reference implementation.
-
-## Notes
-
-- YAML files use standard YAML syntax
-- Paths can be absolute or relative to the current working directory
-- Comments start with `#`
-- Lists use YAML array syntax: `[item1, item2]` or multi-line format
-- All templates include detailed inline documentation
-- `--source-config` is the recommended interface for new workflows
-- Legacy flags such as `--motion`, `--model-dir`, and `--source-options` still work, but they are deprecated
+1. Add an adapter in `omniretargeting/data_sources/` and register it with
+   `register_data_source()`.
+2. Read its keys from the source config (see `create_omomo_data_source`).
+3. Add a template here and a row to the table above.

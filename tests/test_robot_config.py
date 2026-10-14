@@ -10,6 +10,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ROBOT_PROFILE_CASES = (
     pytest.param(REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1.json", id="g1"),
     pytest.param(REPO_ROOT / "robot_models" / "unitree_h1" / "unitree_h1.json", id="h1"),
+    pytest.param(REPO_ROOT / "robot_models" / "unitree_g1" / "unitree_g1_mesh.json", id="g1_mesh"),
+    pytest.param(REPO_ROOT / "robot_models" / "booster_k1" / "booster_k1.json", id="booster_k1"),
+    pytest.param(REPO_ROOT / "robot_models" / "hightorque_mini_pi_plus" / "hightorque_mini_pi_plus.json",
+                 id="hightorque_mini_pi_plus"),
 )
 
 
