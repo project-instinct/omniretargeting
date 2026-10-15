@@ -20,9 +20,11 @@ Example
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import matplotlib
@@ -326,6 +328,26 @@ def _ask_open_motion() -> str | None:
     if not os.path.isdir(initial_dir):
         initial_dir = os.path.expanduser("~")
 
+    if sys.platform == "darwin":
+        osascript = shutil.which("osascript")
+        if osascript is None:
+            return None
+        script = (
+            "const app = Application.currentApplication();\n"
+            "app.includeStandardAdditions = true;\n"
+            "const selectedFile = app.chooseFile({\n"
+            '  withPrompt: "Select SMPL-X motion file",\n'
+            f"  defaultLocation: Path({json.dumps(initial_dir)}),\n"
+            "});\n"
+            "selectedFile.toString();"
+        )
+        result = subprocess.run(
+            [osascript, "-l", "JavaScript", "-e", script],
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() or None
+
     if shutil.which("zenity"):
         result = subprocess.run(
             [
@@ -356,7 +378,7 @@ def _ask_open_motion() -> str | None:
         )
         return result.stdout.strip() or None
 
-    # Fallback for systems without Zenity/KDialog (e.g. Windows/macOS).
+    # Fallback for systems without Zenity/KDialog (e.g. Windows).
     import tkinter as tk
     from tkinter import filedialog
 
@@ -618,9 +640,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Animation FPS (default: motion framerate, else 30).")
     parser.add_argument("--gender", default=None,
                         help="SMPL-X gender (default: read from the motion file, else neutral).")
-    parser.add_argument("--coords", choices=("zup", "smplx"), default="zup",
-                        help="SMPL-X mesh coordinate frame: 'zup' converts to +Z-up "
-                             "world frame to match terrain (default), 'smplx' keeps native Y-up.")
+    parser.add_argument("--coords", choices=("zup", "smplx"), default="smplx",
+                        help="SMPL-X mesh coordinate frame: 'smplx' keeps native Y-up "
+                             "(default), 'zup' converts to the +Z-up terrain world frame.")
     parser.add_argument("--scale", type=float, default=1.0,
                         help="Uniform scale applied to the SMPL-X mesh (default: 1.0).")
     parser.add_argument("--z-offset", type=float, default=0.0,
